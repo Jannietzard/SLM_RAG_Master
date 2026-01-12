@@ -1,0 +1,144 @@
+# ============================================================================
+# DECENTRALIZED AI ARCHITECTURE - EDGE RAG CONFIGURATION
+# ============================================================================
+# Masterthesis: "Enhancing Reasoning Fidelity in Quantized SLMs on Edge"
+
+project:
+  name: "Graph-Augmented Edge-RAG"
+  version: "0.1.0"
+  author: "Jan Nietzard"
+  institution: "RWTH Aachen"
+
+# ============================================================================
+# LANGUAGE MODEL CONFIGURATION
+# ============================================================================
+llm:
+  # Ollama-basiertes Modell für lokale Inferenz (quantisiert)
+  provider: "ollama"
+  model_name: "phi3"  # Quantisiertes SLM für Edge: ~2-4GB RAM
+  base_url: "http://localhost:11434"
+  temperature: 0.3
+  top_p: 0.9
+  top_k: 40
+  max_tokens: 256
+  # Wichtig für Edge: Reduzierte Token-Länge für geringe Latenz
+
+# ============================================================================
+# EMBEDDING MODEL (für Vektordatenbank)
+# ============================================================================
+embeddings:
+  provider: "ollama"
+  model_name: "nomic-embed-text"  # Lightweight, quantisiert
+  base_url: "http://localhost:11434"
+  embedding_dim: 768  # nomic-embed-text output dimension
+
+# ============================================================================
+# DOCUMENT INGESTION & CHUNKING STRATEGY
+# ============================================================================
+chunking:
+  # Recursive Character Chunking mit Overlap
+  # Begründung: Reduziert Kontextverlust bei SLMs (vgl. RAG-Papiere, Lemur et al.)
+  strategy: "recursive_character"
+  chunk_size: 512  # Tokens, optimiert für Phi-3 context window
+  chunk_overlap: 128  # 25% overlap für semantische Kontinuität
+  separators:
+    - "\n\n"
+    - "\n"
+    - " "
+    - ""
+  
+  # Semantic Chunking (optional, für zukünftige Erweiterung)
+  semantic_chunking_enabled: false
+  semantic_threshold: 0.5
+
+# ============================================================================
+# VECTOR STORE (LanceDB) - Embedded, Edge-optimiert
+# ============================================================================
+vector_store:
+  provider: "lancedb"
+  db_path: "./data/vector_db"
+  index_type: "ivfflat"  # Für schnelle Suche auf Edge-Devices
+  metric: "cosine"
+  
+  # Hybrid retrieval settings
+  top_k_vectors: 5  # K für Vektorsuche
+  similarity_threshold: 0.5
+
+# ============================================================================
+# KNOWLEDGE GRAPH (NetworkX) - Lokale Struktur
+# ============================================================================
+graph:
+  # Begründung: Graphen ermöglichen multi-hop reasoning, reduzieren 
+  # Information Bottleneck in SLMs (vgl. Graph-RAG Konzepte)
+  enabled: true
+  provider: "networkx"
+  graph_path: "./data/knowledge_graph"
+  
+  # Entity extraction settings
+  entity_extraction_enabled: true
+  relation_types:
+    - "mentions"
+    - "references"
+    - "defines"
+    - "extends"
+  
+  # Graph retrieval
+  max_hops: 2  # Maximale Distanz im Graph
+  top_k_entities: 3
+
+# ============================================================================
+# RETRIEVAL AUGMENTED GENERATION (RAG) PIPELINE
+# ============================================================================
+rag:
+  # Hybrid Retrieval: Vektor + Graph
+  retrieval_mode: "hybrid"  # ["vector", "graph", "hybrid"]
+  
+  # Vector retrieval
+  vector_weight: 0.6
+  graph_weight: 0.4
+  
+  # Reranking (optional)
+  reranking_enabled: false
+  reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+# ============================================================================
+# QUANTIZATION SETTINGS (für SLM-Optimierung)
+# ============================================================================
+quantization:
+  # Edge-optimiert: 4-bit oder 8-bit quantization
+  enabled: true
+  bits: 4  # 4-bit für minimalen RAM-Footprint
+  group_size: 128
+
+# ============================================================================
+# DATA PATHS
+# ============================================================================
+paths:
+  root: "./"
+  data: "./data"
+  documents: "./data/documents"
+  vector_db: "./data/vector_db"
+  graph_db: "./data/knowledge_graph"
+  logs: "./logs"
+  cache: "./cache"
+
+# ============================================================================
+# LOGGING & MONITORING
+# ============================================================================
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "./logs/edge_rag.log"
+
+# ============================================================================
+# PERFORMANCE TUNING
+# ============================================================================
+performance:
+  # Edge Device Constraints
+  batch_size: 4
+  num_workers: 2
+  device: "cpu"  # "cpu" oder "cuda" wenn verfügbar
+  
+  # Memory management
+  cache_embeddings: true
+  max_cache_size_mb: 512
