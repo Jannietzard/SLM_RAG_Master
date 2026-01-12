@@ -443,6 +443,9 @@ class SemanticChunker:
             separators=["\n\n", "\n", ". ", " ", ""],
         )
     
+   # FIX für semantic_chunking.py (Zeile ~450-490)
+# Ersetze die chunk_document() Methode in SemanticChunker
+
     def chunk_document(self, document: Document) -> List[Document]:
         """
         Chunke Dokument vollautomatisch.
@@ -480,7 +483,7 @@ class SemanticChunker:
             if not keep:
                 filter_stats['filtered'] += 1
                 filter_stats['reasons'][reason] = filter_stats['reasons'].get(reason, 0) + 1
-                logger.debug(f"Filtered chunk {i}: {reason}")
+                logger.debug(f"Filtered chunk {i}: {reason}")  # DEBUG statt INFO
                 continue
             
             filter_stats['kept'] += 1
@@ -500,8 +503,8 @@ class SemanticChunker:
                 'heading_level': metadata.heading_level,
                 'is_header': metadata.is_header,
                 'chunking_method': 'semantic_automatic',
-                'importance_score': round(importance_score, 4),  # TF-IDF based!
-                'lexical_diversity': round(lexical_diversity, 4),  # Statistical!
+                'importance_score': round(importance_score, 4),
+                'lexical_diversity': round(lexical_diversity, 4),
             })
             
             chunk_doc = Document(
@@ -511,14 +514,24 @@ class SemanticChunker:
             
             processed_chunks.append(chunk_doc)
         
-        # Log statistics
-        logger.info(
-            f"Automatic semantic chunking: {len(chunks)} raw → {filter_stats['kept']} kept "
-            f"(filtered {filter_stats['filtered']}: {filter_stats['reasons']})"
-        )
+        # CONDITIONAL LOGGING: Only log if significant filtering or large batch
+        if filter_stats['filtered'] > 5 or len(chunks) > 50:
+            logger.info(
+                f"Semantic chunking: {len(chunks)} raw → {filter_stats['kept']} kept "
+                f"(filtered {filter_stats['filtered']}: {filter_stats['reasons']})"
+            )
+        else:
+            # For small batches, use DEBUG level
+            logger.debug(
+                f"Semantic chunking: {len(chunks)} raw → {filter_stats['kept']} kept "
+                f"(filtered {filter_stats['filtered']}: {filter_stats['reasons']})"
+            )
         
         return processed_chunks
-    
+
+
+    # WICHTIG: Diese Änderung in src/semantic_chunking.py einfügen!
+# Ersetze die gesamte chunk_document() Methode (ca. Zeile 450-490)
     def _semantic_chunk(self, text: str) -> List[str]:
         """
         Chunke Text basierend auf semantischen Grenzen.

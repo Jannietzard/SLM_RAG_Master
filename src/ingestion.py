@@ -6,10 +6,10 @@ Neu:
 - Header-based Metadata Extraction
 - Context-Aware Quality Filtering
 """
-
+from typing import List, Dict, Any, Optional
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+
 from dataclasses import dataclass
 import yaml
 
@@ -170,12 +170,15 @@ class DocumentIngestionPipeline:
             Liste semantisch gechunkter Dokumente
         """
         all_chunks = []
+        total_filtered = 0
+        total_kept = 0
         
         for doc in documents:
             try:
                 # Semantic chunking per page
                 page_chunks = self.semantic_chunker.chunk_document(doc)
                 all_chunks.extend(page_chunks)
+                total_kept += len(page_chunks)
                 
             except Exception as e:
                 self.logger.warning(
@@ -194,13 +197,14 @@ class DocumentIngestionPipeline:
                 
                 all_chunks.extend(fallback_chunks)
         
+        # AGGREGATE LOGGING: One summary instead of per-page
         self.logger.info(
-            f"Semantic chunking complete: {len(documents)} docs → {len(all_chunks)} chunks"
+            f"✓ Semantic chunking complete: {len(documents)} pages → {len(all_chunks)} chunks"
         )
         
         return all_chunks
     
-    def _chunk_documents_standard(self, documents: List[Document]) -> List[Document]:
+    def chunk_documents_standard(self, documents: List[Document]) -> List[Document]:
         """
         Standard Recursive Character Chunking (Original-Methode).
         

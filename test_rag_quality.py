@@ -60,7 +60,7 @@ def load_and_verify_config(config_path: Path = Path("./config/settings.yaml")):
 def test_vector_search_raw(
     hybrid_store: HybridStore,
     embeddings: BatchedOllamaEmbeddings,
-    query: str = "Was ist Wissensmanagement?"
+    query: str = "Summarize how Big Data impacts our world."
 ):
     """Test raw vector search without threshold filtering."""
     print("\n" + "="*70)
@@ -129,7 +129,7 @@ def test_vector_search_raw(
 def test_different_thresholds(
     hybrid_store: HybridStore,
     embeddings: BatchedOllamaEmbeddings,
-    query: str = "Was ist Wissensmanagement?"
+    query: str = "Summarize how Big Data impacts our world."
 ):
     """Test retrieval with different threshold values."""
     print("\n" + "="*70)
@@ -170,11 +170,7 @@ def test_german_queries(
     
     if queries is None:
         queries = [
-            "Was ist Wissensmanagement?",
-            "Welche Methoden werden diskutiert?",
-            "Community of Practice Konzept",
-            "Wie wird Wissen zwischen Generationen geteilt?",
-            "Welche Forschungsfragen werden behandelt?",
+            "Summarize how Big Data impacts our world."
         ]
     
     print(f"\nTesting {len(queries)} German queries...\n")
@@ -366,15 +362,7 @@ def main():
     test_german_queries(retriever)
     
     # 4. Calculate metrics
-    test_queries = [
-        "Was ist Wissensmanagement?",
-        "Welche Methoden werden diskutiert?",
-        "Community of Practice",
-        "Wie wird Wissen zwischen Generationen geteilt?",
-        "Welche Forschungsfragen werden behandelt?",
-        "Andragogik Definition",
-        "Qualitative Forschungsmethoden",
-    ]
+    test_queries = ["Summarize how Big Data impacts our world."]
     
     metrics = calculate_rag_quality_metrics(retriever, test_queries)
     

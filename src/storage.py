@@ -149,11 +149,19 @@ class VectorStoreAdapter:
             # Konvertiere Distance → Similarity und filtere
             filtered = []
             for i, result in enumerate(raw_results):
-                # LanceDB Column: _distance (Cosine Distance in [0, 2])
+                # LanceDB gibt Cosine Distance zurück (Range: 0.0 = identical, 2.0 = opposite)
+                # WICHTIG: Bei normalized vectors ist Cosine Distance in [0, 2]
                 distance = result.get("_distance", 1.0)
                 
-                # Conversion: Cosine Distance → Similarity [0, 1]
-                similarity = max(0.0, 1.0 - (distance / 2.0))
+                # KORREKTE Conversion: Cosine Similarity = 1 - Cosine Distance
+                # Bei normalized vectors (was Embeddings sind):
+                # Distance 0.0 → Similarity 1.0 (perfekt)
+                # Distance 1.0 → Similarity 0.0 (orthogonal)
+                # Distance 2.0 → Similarity -1.0 (opposite)
+                similarity = 1.0 - distance
+                
+                # Clamp zu [0, 1] für negative Similarities
+                similarity = max(0.0, min(1.0, similarity))
                 
                 # Debug für erste 3 Results
                 if i < 3:
