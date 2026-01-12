@@ -1,16 +1,11 @@
 """
 Ablation Study: Vergleiche Hybrid vs Vector vs Graph Retrieval.
 
+FIXED: Korrekte Imports + Ingestion Pipeline Initialization
+
 Scientific Purpose:
 Diese Skript ermöglicht systematische Evaluierung der
 verschiedenen Retrieval-Modi für die Masterthesis.
-Mess-Metriken:
-- Retrieval Latency (ms)
-- Relevance Score Distribution
-- Coverage (wie viele Queries liefern Results)
-
-Usage:
-    python examples/ablation_study.py
 """
 
 import logging
@@ -19,8 +14,8 @@ from pathlib import Path
 from typing import List, Dict, Any
 
 import yaml
-from langchain_community.embeddings import OllamaEmbeddings
 
+from src.embeddings import BatchedOllamaEmbeddings  # ✓ FIXED
 from src.ingestion import DocumentIngestionPipeline, load_ingestion_config
 from src.storage import HybridStore, StorageConfig
 from src.retrieval import HybridRetriever, RetrievalConfig, RetrievalMode
@@ -33,23 +28,16 @@ class AblationStudy:
     """
     Durchführe Ablation Study für Retrieval-Modi.
     
-    Experimentales Design:
-    - Fixed: Dokumente, Embeddings, Modelle
-    - Variable: Retrieval Mode (vector, graph, hybrid)
-    - Messung: Latenz, Score Distribution, Coverage
+    FIXED: Initialisiert Ingestion Pipeline korrekt
     """
 
     def __init__(self, config_path: Path = Path("./config/settings.yaml")):
-        """
-        Initialisiere Ablation Study.
-
-        Args:
-            config_path: Pfad zur Config
-        """
+        """Initialisiere Ablation Study."""
         self.config_path = config_path
         self.config = self._load_config()
         self.embeddings = None
         self.hybrid_store = None
+        self.ingestion_pipeline = None  # ✓ FIXED: Hinzugefügt
         self.results = {}
 
     def _load_config(self) -> dict:
@@ -71,18 +59,25 @@ class AblationStudy:
             device=perf_config.get("device", "cpu"),
         )
 
+        # ✓ FIXED: Initialisiere Ingestion Pipeline
+        chunking_config = load_ingestion_config(self.config_path)
+        document_path = Path(self.config.get("paths", {}).get("documents", "./data/documents"))
+        
+        self.ingestion_pipeline = DocumentIngestionPipeline(
+            chunking_config=chunking_config,
+            document_path=document_path,
+            logger_instance=logger,
+        )
+
         # Hybrid Store
         storage_config = StorageConfig(
             vector_db_path=Path(self.config.get("paths", {}).get("vector_db", "./data/vector_db")),
             graph_db_path=Path(self.config.get("paths", {}).get("graph_db", "./data/knowledge_graph")),
-            embedding_dim=embedding_config.get("embedding_dim", 384),
+            embedding_dim=embedding_config.get("embedding_dim", 768),
         )
 
         self.hybrid_store = HybridStore(config=storage_config, embeddings=self.embeddings)
         
-        # Lade gespeicherte Stores
-        self.hybrid_store.load()
-
         print("✓ Pipeline initialisiert")
 
     def run_retrieval_experiment(
@@ -92,13 +87,6 @@ class AblationStudy:
     ) -> Dict[str, Any]:
         """
         Führe Retrieval-Experiment für einen Modus durch.
-
-        Args:
-            mode: RetrievalMode (VECTOR, GRAPH, HYBRID)
-            queries: Liste von Test-Queries
-
-        Returns:
-            Experimentalresultate mit Metrics
         """
         # Konfiguriere Retriever für diesen Modus
         rag_config = self.config.get("rag", {})
@@ -176,26 +164,11 @@ class AblationStudy:
                 f"{metrics['avg_relevance_score']:<12.4f}"
             )
 
-        # Ablation Insights
-        print(f"\n{'='*60}")
-        print("ABLATION INSIGHTS")
-        print(f"{'='*60}")
-
-        if "hybrid" in self.results and "vector" in self.results:
-            hybrid_latency = self.results["hybrid"]["avg_latency_ms"]
-            vector_latency = self.results["vector"]["avg_latency_ms"]
-            latency_overhead = (hybrid_latency - vector_latency) / vector_latency * 100
-
-            print(f"\nHybrid vs Vector:")
-            print(f"  Latency Overhead: {latency_overhead:+.1f}%")
-            print(f"  Coverage Delta: {self.results['hybrid']['coverage'] - self.results['vector']['coverage']:+.1%}")
-
     def run_full_study(self, queries: List[str]) -> None:
         """
         Führe vollständige Ablation Study durch.
-
-        Args:
-            queries: Liste von Test-Queries
+        
+        ✓ FIXED: Korrekte Ingestion vor jedem Experiment
         """
         print("EDGE-RAG ABLATION STUDY")
         print(f"Queries: {len(queries)}")
@@ -207,32 +180,32 @@ class AblationStudy:
         # Experiment für jeden Modus
         for mode in [RetrievalMode.VECTOR, RetrievalMode.GRAPH, RetrievalMode.HYBRID]:
             try:
-                # WICHTIG: Reset Vector Store vor jedem Experiment
-                # (Graph bleibt gleich, da strukturelle Relationen unverändert)
                 print(f"\n{'='*60}")
-                print(f"Resetting Vector Store für sauberes Experiment: {mode.value}")
+                print(f"Resetting Vector Store für: {mode.value}")
                 print(f"{'='*60}")
                 
+                # Reset für saubere Baseline
                 self.hybrid_store.reset_vector_store()
                 
-                # Re-populate Store für diesen Durchlauf
+                # Re-ingest Dokumente
+                print("Re-ingesting Dokumente...")
                 documents = self.ingestion_pipeline.process_documents()
                 self.hybrid_store.add_documents(documents)
-                # (In Production: Würde aus Cache stammen via Embedding Cache)
                 
+                # Run Experiment
                 metrics = self.run_retrieval_experiment(mode, queries)
                 self.results[mode.value] = metrics
                 
             except Exception as e:
                 print(f"✗ Fehler bei {mode.value}: {str(e)}")
+                import traceback
+                traceback.print_exc()
 
         # Summary
         self.print_summary()
-
-        # Speichere Results
         self._save_results()
         
-        # Print Embedding Cache Stats
+        # Embedding Stats
         print(f"\n{'='*60}")
         print("EMBEDDING CACHE STATISTICS")
         print(f"{'='*60}")
@@ -251,7 +224,13 @@ class AblationStudy:
 
 def main():
     """Main Entry Point für Ablation Study."""
-    # Test Queries (für Thesis: erweitere mit Domain-spezifischen Queries)
+    # Setup Logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    
+    # Test Queries
     test_queries = [
         "What is the main concept of the paper?",
         "How does quantization affect performance?",

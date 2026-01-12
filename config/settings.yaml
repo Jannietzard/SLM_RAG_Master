@@ -135,7 +135,7 @@ logging:
 # ============================================================================
 performance:
   # Edge Device Constraints
-  batch_size: 4
+  batch_size: 32
   num_workers: 2
   device: "cpu"  # "cpu" oder "cuda" wenn verfügbar
   

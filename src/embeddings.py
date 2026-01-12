@@ -17,13 +17,14 @@ Batching reduziert Overhead von HTTP-Requests und nutzt
 GPU-Parallelisierung effizienter (vgl. Ollama Performance Tuning).
 Caching für identical texts ist Standard in Production RAG.
 """
-
+from typing import List, Optional, Dict, Any
 import logging
 import hashlib
 import sqlite3
 import json
+from tqdm import tqdm
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+
 import time
 from dataclasses import dataclass
 
@@ -322,87 +323,90 @@ class BatchedOllamaEmbeddings(Embeddings):
             raise
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-    """
-    Embedde Liste von Dokumenten mit Batching + Caching.
+        """
+        Embedde Liste von Dokumenten mit Batching + Caching.
 
-    FIXED: Korrekte Metrics Counting
+        FIXED: Korrekte Metrics Counting
 
-    Args:
+        Args:
         texts: Liste von Dokumenten/Chunks
 
-    Returns:
+        Returns:
         Liste von Embedding Vectors (same order)
-    """
-    start_time = time.time()
-    embeddings = []
-    texts_to_embed = []
-    text_indices = []
+         """
+        start_time = time.time()
+        embeddings = []
+        texts_to_embed = []
+        text_indices = []
 
-    # Phase 1: Cache Lookup
-    cache_hits_this_run = 0
-    cache_misses_this_run = 0
-    
-    for i, text in enumerate(texts):
-        cached = self.cache.get(text, self.model_name)
+        # Phase 1: Cache Lookup
+        cache_hits_this_run = 0
+        cache_misses_this_run = 0
+        
+        for i, text in enumerate(texts):
+            cached = self.cache.get(text, self.model_name)
 
-        if cached:
-            embeddings.append((i, cached))
-            cache_hits_this_run += 1
-        else:
-            texts_to_embed.append(text)
-            text_indices.append(i)
-            cache_misses_this_run += 1
+            if cached:
+                embeddings.append((i, cached))
+                cache_hits_this_run += 1
+            else:
+                texts_to_embed.append(text)
+                text_indices.append(i)
+                cache_misses_this_run += 1
 
-    # Update Metrics (für diesen Run)
-    self.metrics.cache_hits += cache_hits_this_run
-    self.metrics.cache_misses += cache_misses_this_run
-    self.metrics.total_texts += len(texts)
+        # Update Metrics (für diesen Run)
+        self.metrics.cache_hits += cache_hits_this_run
+        self.metrics.cache_misses += cache_misses_this_run
+        self.metrics.total_texts += len(texts)
 
-    # Phase 2: Batch Processing (nur Cache Misses)
-    batches_this_run = 0
-    
-    if texts_to_embed:
-        num_batches = (len(texts_to_embed) + self.batch_size - 1) // self.batch_size
+        # Phase 2: Batch Processing (nur Cache Misses)
+        batches_this_run = 0
+        
+        if texts_to_embed:
+            num_batches = (len(texts_to_embed) + self.batch_size - 1) // self.batch_size
+            
+            # Hier fügen wir tqdm hinzu:
+            print(f"\nGeneriere Embeddings für {len(texts_to_embed)} neue Chunks...")
+            
+            for batch_idx in tqdm(range(num_batches), desc="Ollama Batch Embedding", unit="batch"):
+                start_idx = batch_idx * self.batch_size
+                end_idx = min(start_idx + self.batch_size, len(texts_to_embed))
+                batch_texts = texts_to_embed[start_idx:end_idx]
 
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * self.batch_size
-            end_idx = min(start_idx + self.batch_size, len(texts_to_embed))
-            batch_texts = texts_to_embed[start_idx:end_idx]
+                # API Call für Batch
+                batch_embeddings = self._embed_batch(batch_texts)
 
-            # API Call für Batch
-            batch_embeddings = self._embed_batch(batch_texts)
+                # Cache + collect results
+                for j, (text, embedding) in enumerate(zip(batch_texts, batch_embeddings)):
+                    self.cache.put(text, embedding, self.model_name)
+                    # Original Index für Sortierung
+                    original_idx = text_indices[start_idx + j]
+                    embeddings.append((original_idx, embedding))
 
-            # Cache + collect results
-            for j, (text, embedding) in enumerate(zip(batch_texts, batch_embeddings)):
-                self.cache.put(text, embedding, self.model_name)
-                # Original Index für Sortierung
-                original_idx = text_indices[start_idx + j]
-                embeddings.append((original_idx, embedding))
+                batches_this_run += 1
 
-            batches_this_run += 1
+            self.metrics.batch_count += batches_this_run
 
-        self.metrics.batch_count += batches_this_run
+        # Phase 3: Sort zurück zu Original-Order
+        embeddings.sort(key=lambda x: x[0])
+        result = [e[1] for e in embeddings]
 
-    # Phase 3: Sort zurück zu Original-Order
-    embeddings.sort(key=lambda x: x[0])
-    result = [e[1] for e in embeddings]
+        # Update Time Metrics
+        elapsed_ms = (time.time() - start_time) * 1000
+        self.metrics.total_time_ms += elapsed_ms
 
-    # Update Time Metrics
-    elapsed_ms = (time.time() - start_time) * 1000
-    self.metrics.total_time_ms += elapsed_ms
+        # Log Performance (für diesen Run, nicht kumulativ!)
+        cache_hit_rate = (cache_hits_this_run / len(texts) * 100) if texts else 0
+        
+        self.logger.info(
+            f"Embedded {len(texts)} docs: "
+            f"{cache_hit_rate:.1f}% cache hit | "
+            f"{batches_this_run} batches | "
+            f"{elapsed_ms:.1f}ms total | "
+            f"{elapsed_ms/len(texts):.2f}ms/doc"
+        )
 
-    # Log Performance (für diesen Run, nicht kumulativ!)
-    cache_hit_rate = (cache_hits_this_run / len(texts) * 100) if texts else 0
-    
-    self.logger.info(
-        f"Embedded {len(texts)} docs: "
-        f"{cache_hit_rate:.1f}% cache hit | "
-        f"{batches_this_run} batches | "
-        f"{elapsed_ms:.1f}ms total | "
-        f"{elapsed_ms/len(texts):.2f}ms/doc"
-    )
-
-    return result
+        return result
 
     def embed_query(self, text: str) -> List[float]:
         """
