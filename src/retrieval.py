@@ -175,10 +175,27 @@ class GraphRetriever:
         Returns:
             Liste potentieller Entity-Strings
         """
-        # Einfache Heuristik: Capitalized Words
-        words = query.split()
-        entities = [w.strip('.,!?') for w in words if w and w[0].isupper()]
-        return entities if entities else ["query"]
+        """
+        Improved entity extraction with keyword focus.
+        """
+        # Remove question words
+        stopwords = {"what", "how", "why", "when", "where", "who", 
+                    "is", "are", "the", "a", "an"}
+        
+        # Extract meaningful words
+        words = query.lower().split()
+        entities = []
+        
+        for word in words:
+            cleaned = word.strip('.,!?')
+            if cleaned and cleaned not in stopwords and len(cleaned) > 3:
+                entities.append(cleaned)
+        
+        # Fallback: use full query as entity
+        if not entities:
+            entities = [query.lower()]
+        
+        return entities
 
     def retrieve(self, query: str) -> List[RetrievalResult]:
         """

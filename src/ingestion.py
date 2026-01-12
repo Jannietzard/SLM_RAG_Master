@@ -1,12 +1,10 @@
 """
-Document Ingestion Pipeline for Graph-Augmented Edge-RAG.
+Document Ingestion Pipeline mit Semantic Chunking (UPDATED).
 
-Scientific Foundation:
-- Recursive Character Chunking reduziert Context Fragmentation und
-  maximiert Information Coherence für SLMs (vgl. Gao et al., RAG Survey 2023)
-- Chunk Overlap (25%) preserviert semantische Kontinuität über Grenzen hinweg,
-  kritisch für Modelle mit reduziertem Context Windows (<4K tokens)
-- PDF extraction nutzt PyPDF2 für Konsistenz und Reproduzierbarkeit
+Neu:
+- Semantic Chunking statt fester Zeichen-Splits
+- Header-based Metadata Extraction
+- Context-Aware Quality Filtering
 """
 
 import logging
@@ -19,6 +17,9 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.schema import Document
 
+# Import semantic chunking
+from src.semantic_chunking import SemanticChunker, create_semantic_chunker
+
 
 logger = logging.getLogger(__name__)
 
@@ -26,28 +27,28 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ChunkingConfig:
     """
-    Konfiguration für Recursive Character Chunking.
+    Konfiguration für Chunking.
     
-    Wissenschaftliche Begründung:
-    Recursive splitting mit hierarchischen Separatoren maximiert
-    die semantische Kohärenz von Chunks für Small Language Models.
+    Unterstützt beide Modi:
+    - standard: Recursive Character Chunking
+    - semantic: Intelligent Semantic Chunking
     """
-    chunk_size: int
-    chunk_overlap: int
-    separators: List[str]
+    mode: str = "semantic"  # "standard" or "semantic"
+    chunk_size: int = 1024
+    chunk_overlap: int = 128
+    min_chunk_size: int = 200
+    separators: List[str] = None
 
 
 class DocumentIngestionPipeline:
     """
-    Robuste Pipeline für PDF-Ingestion und intelligentes Chunking.
+    Robuste Pipeline mit Semantic Chunking Support.
     
-    Design Pattern: Strategy Pattern (austauschbare Chunking-Strategien)
-    Dependency Injection: ChunkingConfig wird injiziert, nicht hardcoded.
-    
-    Scientific Rationale:
-    Recursive Character Chunking mit Overlap ist state-of-the-art für RAG,
-    da es sowohl semantische Grenzen (Absätze) als auch Token-Grenzen
-    berücksichtigt (vgl. LangChain RAG Best Practices).
+    Neu in dieser Version:
+    - Semantic Chunking als Default
+    - Header Metadata Extraction
+    - Context-Aware Filtering
+    - Fallback auf Standard Chunking bei Fehlern
     """
 
     def __init__(
@@ -57,12 +58,12 @@ class DocumentIngestionPipeline:
         logger_instance: logging.Logger = logger,
     ):
         """
-        Initialisiere die Ingestion Pipeline mit Dependency Injection.
+        Initialisiere Pipeline.
 
         Args:
             chunking_config: ChunkingConfig mit Chunk-Parametern
             document_path: Pfad zum Dokumentenverzeichnis
-            logger_instance: Logger-Instanz für Debugging
+            logger_instance: Logger-Instanz
         """
         self.chunking_config = chunking_config
         self.document_path = Path(document_path)
@@ -72,17 +73,32 @@ class DocumentIngestionPipeline:
         if not self.document_path.exists():
             raise FileNotFoundError(f"Dokumentenverzeichnis nicht gefunden: {document_path}")
 
-        # Initialisiere Text Splitter
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunking_config.chunk_size,
-            chunk_overlap=chunking_config.chunk_overlap,
-            separators=chunking_config.separators,
-            length_function=len,
-            is_separator_regex=False,
-        )
+        # Initialize appropriate chunker
+        if chunking_config.mode == "semantic":
+            self.logger.info("Using SEMANTIC chunking mode")
+            self.semantic_chunker = create_semantic_chunker(
+                chunk_size=chunking_config.chunk_size,
+                chunk_overlap=chunking_config.chunk_overlap,
+                min_chunk_size=chunking_config.min_chunk_size,
+            )
+            self.text_splitter = None  # Not used in semantic mode
+            
+        else:  # standard mode
+            self.logger.info("Using STANDARD chunking mode")
+            self.semantic_chunker = None
+            
+            separators = chunking_config.separators or ["\n\n", "\n", ". ", " ", ""]
+            self.text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=chunking_config.chunk_size,
+                chunk_overlap=chunking_config.chunk_overlap,
+                separators=separators,
+                length_function=len,
+                is_separator_regex=False,
+            )
         
         self.logger.info(
             f"DocumentIngestionPipeline initialisiert: "
+            f"mode={chunking_config.mode}, "
             f"chunk_size={chunking_config.chunk_size}, "
             f"overlap={chunking_config.chunk_overlap}"
         )
@@ -130,18 +146,69 @@ class DocumentIngestionPipeline:
 
     def chunk_documents(self, documents: List[Document]) -> List[Document]:
         """
-        Teile Dokumente in semantische Chunks mit Overlap.
-
-        Scientific Foundation:
-        Recursive Character Chunking mit 25% Overlap preserviert
-        Context Boundaries und reduziert "Lost-in-the-Middle" Problem
-        für SLMs (vgl. Liu et al., Position Bias in LLMs, 2023).
+        Teile Dokumente in Chunks (semantic oder standard).
 
         Args:
             documents: Liste ungechunkter Dokumente
 
         Returns:
-            Liste gechunkter Dokumente mit Chunk-Metadaten
+            Liste gechunkter Dokumente mit enriched Metadaten
+        """
+        if self.chunking_config.mode == "semantic":
+            return self._chunk_documents_semantic(documents)
+        else:
+            return self._chunk_documents_standard(documents)
+    
+    def _chunk_documents_semantic(self, documents: List[Document]) -> List[Document]:
+        """
+        Semantic Chunking mit Header Extraction und Quality Filtering.
+        
+        Args:
+            documents: Liste von Dokumenten (pages)
+            
+        Returns:
+            Liste semantisch gechunkter Dokumente
+        """
+        all_chunks = []
+        
+        for doc in documents:
+            try:
+                # Semantic chunking per page
+                page_chunks = self.semantic_chunker.chunk_document(doc)
+                all_chunks.extend(page_chunks)
+                
+            except Exception as e:
+                self.logger.warning(
+                    f"Semantic chunking failed for page, using fallback: {e}"
+                )
+                # Fallback to standard chunking for this page
+                if self.text_splitter is None:
+                    # Create temporary standard splitter
+                    fallback_splitter = RecursiveCharacterTextSplitter(
+                        chunk_size=self.chunking_config.chunk_size,
+                        chunk_overlap=self.chunking_config.chunk_overlap,
+                    )
+                    fallback_chunks = fallback_splitter.split_documents([doc])
+                else:
+                    fallback_chunks = self.text_splitter.split_documents([doc])
+                
+                all_chunks.extend(fallback_chunks)
+        
+        self.logger.info(
+            f"Semantic chunking complete: {len(documents)} docs → {len(all_chunks)} chunks"
+        )
+        
+        return all_chunks
+    
+    def _chunk_documents_standard(self, documents: List[Document]) -> List[Document]:
+        """
+        Standard Recursive Character Chunking (Original-Methode).
+        
+        Args:
+            documents: Liste von Dokumenten
+            
+        Returns:
+            Liste gechunkter Dokumente
         """
         chunked_docs = self.text_splitter.split_documents(documents)
         
@@ -149,9 +216,10 @@ class DocumentIngestionPipeline:
         for i, chunk in enumerate(chunked_docs):
             chunk.metadata["chunk_id"] = i
             chunk.metadata["chunk_size"] = len(chunk.page_content)
+            chunk.metadata["chunking_method"] = "standard"
         
         self.logger.info(
-            f"Dokumenten geckt: {len(documents)} Docs → {len(chunked_docs)} Chunks "
+            f"Standard chunking: {len(documents)} docs → {len(chunked_docs)} chunks "
             f"(avg chunk size: {sum(len(d.page_content) for d in chunked_docs) // len(chunked_docs)} chars)"
         )
         
@@ -192,7 +260,9 @@ def load_ingestion_config(config_path: Path) -> ChunkingConfig:
     chunking_cfg = config.get("chunking", {})
     
     return ChunkingConfig(
-        chunk_size=chunking_cfg.get("chunk_size", 512),
+        mode=chunking_cfg.get("mode", "semantic"),  # Default: semantic
+        chunk_size=chunking_cfg.get("chunk_size", 1024),
         chunk_overlap=chunking_cfg.get("chunk_overlap", 128),
-        separators=chunking_cfg.get("separators", ["\n\n", "\n", " ", ""]),
+        min_chunk_size=chunking_cfg.get("min_chunk_size", 200),
+        separators=chunking_cfg.get("separators", ["\n\n", "\n", ". ", " ", ""]),
     )

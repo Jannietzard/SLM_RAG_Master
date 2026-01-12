@@ -409,7 +409,7 @@ def main() -> None:
             pipeline.run_storage_pipeline(documents)
 
             # Beispiel-Retrieval
-            query = "What is the main concept discussed?"
+            query = "Summarize how Big Data impacts our world."
             results = pipeline.retrieve(query)
 
             logger.info("\n" + "=" * 70)
