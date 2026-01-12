@@ -279,12 +279,12 @@ class EdgeRAGPipeline:
             self.logger.error(f"Fehler beim Initialisieren des Retrievers: {str(e)}")
             raise
 
-    def run_ingestion_pipeline(self) -> int:
+    def run_ingestion_pipeline(self) -> List[Document]:
         """
         Führe Document Ingestion aus.
 
         Returns:
-            Anzahl gechunkter Dokumente
+            Gechunkte Dokumente (nicht nur Count!)
 
         Raises:
             Exception: Bei Ingestion-Fehler
@@ -293,8 +293,8 @@ class EdgeRAGPipeline:
             self.logger.info("Starte Document Ingestion...")
             documents = self.ingestion_pipeline.process_documents()
             
-            self.logger.info(f"[OK] {len(documents)} Dokumente gechunked")
-            return len(documents)
+            self.logger.info(f"✓ {len(documents)} Dokumente gechunked")
+            return documents  # ← RETURN DOCUMENTS, nicht Count!
 
         except Exception as e:
             self.logger.error(f"Ingestion Pipeline fehlgeschlagen: {str(e)}")
@@ -389,12 +389,11 @@ def main() -> None:
         pipeline = EdgeRAGPipeline(config, logger)
         pipeline.setup()
 
-        # Führe Ingestion aus (falls Dokumente vorhanden)
-        doc_count = pipeline.run_ingestion_pipeline()
+        # Führe Ingestion aus (einmal, gibt Dokumente zurück!)
+        documents = pipeline.run_ingestion_pipeline()
 
-        if doc_count > 0:
-            # Speichere in Storage
-            documents = pipeline.ingestion_pipeline.process_documents()
+        if len(documents) > 0:
+            # Speichere in Storage (nutze schon geladene Dokumente!)
             pipeline.run_storage_pipeline(documents)
 
             # Beispiel-Retrieval
@@ -405,11 +404,14 @@ def main() -> None:
             logger.info("RETRIEVAL RESULTS")
             logger.info("=" * 70)
 
-            for i, result in enumerate(results[:3], 1):
-                logger.info(f"\nResult {i}:")
-                logger.info(f"  Score: {result.relevance_score:.4f}")
-                logger.info(f"  Method: {result.retrieval_method}")
-                logger.info(f"  Text: {result.text[:200]}...")
+            if results:
+                for i, result in enumerate(results[:3], 1):
+                    logger.info(f"\nResult {i}:")
+                    logger.info(f"  Score: {result.relevance_score:.4f}")
+                    logger.info(f"  Method: {result.retrieval_method}")
+                    logger.info(f"  Text: {result.text[:200]}...")
+            else:
+                logger.warning("Keine Retrieval Results! Prüfe Vector Store.")
             
             # Print Embedding Metrics
             pipeline.embeddings.print_metrics()
@@ -417,7 +419,7 @@ def main() -> None:
         else:
             logger.warning(
                 "Keine Dokumente gefunden. "
-                "Bitte Platziere PDFs in: ./data/documents"
+                "Bitte platziere PDFs in: ./data/documents"
             )
 
     except Exception as e:

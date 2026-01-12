@@ -216,6 +216,8 @@ class AblationStudy:
                 self.hybrid_store.reset_vector_store()
                 
                 # Re-populate Store für diesen Durchlauf
+                documents = self.ingestion_pipeline.process_documents()
+                self.hybrid_store.add_documents(documents)
                 # (In Production: Würde aus Cache stammen via Embedding Cache)
                 
                 metrics = self.run_retrieval_experiment(mode, queries)
