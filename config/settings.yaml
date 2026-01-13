@@ -3,17 +3,20 @@
 # ============================================================================
 # Masterthesis: "Enhancing Reasoning Fidelity in Quantized SLMs on Edge"
 # 
-# VERSION 0.3.0 - Mit Semantic Chunking
+# VERSION 2.1.0 - CORRECTED METRIC CONFIGURATION
 # 
-# WICHTIGE ÄNDERUNGEN:
-# - Embedding Dimension: 768 (nicht 384 - deine spezielle nomic-embed-text Version!)
-# - Similarity Threshold: 0.25 (optimiert für dein Setup)
-# - Chunk Size: 1024 (verdoppelt von 512 für besseren Kontext)
-# - Semantic Chunking: Aktiviert (intelligentes, kontextbewusstes Chunking)
+# CRITICAL CHANGES (v2.1.0):
+# - Added distance_metric: "cosine" to vector_store section
+# - This fixes the similarity score computation bug
+# - Previous versions defaulted to L2 distance, causing incorrect scores
+#
+# Expected Impact:
+# - Similarity scores should increase from 0.17-0.25 to 0.70-0.90
+# - Retrieval coverage should improve from 0% to 80%+
 
 project:
   name: "Graph-Augmented Edge-RAG"
-  version: "0.3.0"
+  version: "2.1.0"
   author: "Jan Nietzard"
   institution: "RWTH Aachen"
 
@@ -21,231 +24,110 @@ project:
 # LANGUAGE MODEL CONFIGURATION
 # ============================================================================
 llm:
-  # Ollama-basiertes Modell für lokale Inferenz (quantisiert)
   provider: "ollama"
-  model_name: "phi3"  # Quantisiertes SLM für Edge: ~2-4GB RAM
+  model_name: "phi3"
   base_url: "http://localhost:11434"
   temperature: 0.3
   top_p: 0.9
   top_k: 40
   max_tokens: 256
-  # Wichtig für Edge: Reduzierte Token-Länge für geringe Latenz
-  
-  # QUANTISIERUNG ERKLÄRT:
-  # Phi-3 ist standardmäßig 4-bit quantisiert (von 16-bit FP)
-  # Das bedeutet:
-  # - Modellgröße: 2.3 GB (statt ~7 GB FP16)
-  # - RAM-Bedarf: 2-4 GB (statt 8-10 GB)
-  # - Geschwindigkeit: 2-3x schneller auf CPU
-  # - Qualitätsverlust: ~2-3% vs FP16 (minimal!)
-  # 
-  # Quantisierung komprimiert Gewichte von 16-bit → 4-bit:
-  # 16-bit: -32768 bis +32767 (65536 Werte)
-  # 4-bit:  -8 bis +7 (16 Werte)
-  # → 4x weniger Speicher, gleiche Architektur
-  #
-  # Für deine Thesis: Vergleiche 4-bit (Standard) vs 8-bit Performance!
 
 # ============================================================================
-# EMBEDDING MODEL (für Vektordatenbank)
+# EMBEDDING MODEL
 # ============================================================================
 embeddings:
   provider: "ollama"
-  model_name: "nomic-embed-text"  # Lightweight, quantisiert
-  base_url: "http://localhost:11434"
-  embedding_dim: 768  # WICHTIG: Deine Version ist 768-dim, NICHT Standard 384!
-  
-  # WARUM 768 statt 384?
-  # Standard nomic-embed-text: 384 Dimensionen
-  # Deine Version (vermutlich v1.5 oder Ollama-spezifisch): 768 Dimensionen
-  # Bedeutung:
-  # - 2x mehr Dimensionen = 2x mehr Speicher (~150MB statt ~75MB für 526 chunks)
-  # - Potenziell bessere Trennbarkeit im Vektorraum
-  # - MUSS mit embedding_dim in Code übereinstimmen!
-  #
-  # Für Thesis: Dokumentiere welche Version du nutzt!
-  # Check mit: ollama show nomic-embed-text
-
-# ============================================================================
-# DOCUMENT INGESTION & CHUNKING STRATEGY
-# ============================================================================
-chunking:
-  mode: "standard"  # oder "semantic"
-  chunk_size: 512
-  chunk_overlap: 128
-  enable_pdf_cleaning: true  # ← NEU! Aktiviert PDF Cleaning
-
-# In embeddings Sektion:
-embeddings:
   model_name: "nomic-embed-text"
   base_url: "http://localhost:11434"
-  embedding_dim: 768  # ← OPTIONAL! Wird jetzt auto-detected!
-
-# In storage/vector_store Sektion:
-vector_store:
-  normalize_embeddings: true  # ← NEU! Aktiviert L2-Normalisierung
-
-  min_chunk_size: 200  # NEU: Minimum für semantic chunking
-  
-  separators:  # Hierarchische Trennung für bessere semantische Grenzen
-    - "\n\n"   # Absätze (höchste Priorität)
-    - "\n"     # Zeilenumbrüche
-    - ". "     # NEU: Sätze (wichtig für deutsche Texte!)
-    - " "      # Wörter
-    - ""       # Zeichen (letzter Ausweg)
-  
-  # Semantic Chunking (NEU!)
-  semantic:
-    # Header Detection - Erkennt Dokumentstruktur
-    enable_header_extraction: true
-    header_patterns:
-      - chapter       # "1. Einleitung"
-      - section       # "1.1 Problemstellung"
-      - subsection    # "1.1.1 Forschungsfragen"
-    
-    # Quality Filtering - Filtert Noise aus
-    enable_quality_filter: true
-    min_words: 15              # Minimum Wortanzahl pro Chunk
-    min_keyword_ratio: 0.05    # Minimum 5% Fachbegriffe
-    
-    # Smalltalk/Transcript Filtering
-    filter_transcripts: true   # Filtert "I: ... B4: ..." Interviewtranskripte
-    filter_smalltalk: true     # Filtert Umgangssprache ("ja, also", "irgendwie")
-    
-    # Domain Keywords für Fachbegriff-Erkennung
-    # Passe diese an deine Thesis an!
-    domain_keywords:
-    
-  
-  # Semantic Chunking (optional, für zukünftige Erweiterung - DEPRECATED)
-  # → Jetzt durch semantic.enable_header_extraction ersetzt
-  semantic_chunking_enabled: false
-  semantic_threshold: 0.5
+  embedding_dim: 768  # Auto-detected, but can be specified for validation
 
 # ============================================================================
-# VECTOR STORE (LanceDB) - Embedded, Edge-optimiert
+# DOCUMENT INGESTION & CHUNKING
+# ============================================================================
+chunking:
+  mode: "standard"
+  chunk_size: 512
+  chunk_overlap: 128
+  min_chunk_size: 200
+  enable_pdf_cleaning: true
+  
+  separators:
+    - "\n\n"
+    - "\n"
+    - ". "
+    - " "
+    - ""
+
+# ============================================================================
+# VECTOR STORE (LanceDB)
 # ============================================================================
 vector_store:
   provider: "lancedb"
   db_path: "./data/vector_db"
-  index_type: "ivfflat"  # IVF-FLAT: Inverted File Index für schnelle Suche auf Edge
-  metric: "cosine"       # Cosine Similarity (Standard für Text Embeddings)
+  index_type: "ivfflat"
   
-  # Hybrid retrieval settings
-  top_k_vectors: 10  # ERHÖHT von 5 - K für Vektorsuche (mehr Kandidaten = bessere Recall)
-  similarity_threshold: 0.25  # GESENKT von 0.5 - Optimiert für deine 768-dim Embeddings!
-  
-  # WARUM threshold 0.25?
-  # Bei 0.50: 0 Results (zu strikt)
-  # Bei 0.25: 15 Results mit Scores 0.45-0.46 (optimal!)
-  # Bei 0.20: Noch mehr Results, aber mehr False Positives
+  # =========================================================================
+  # CRITICAL: Distance metric specification
+  # =========================================================================
+  # LanceDB supports: "cosine", "l2" (euclidean), "dot"
+  # For text embeddings, "cosine" is the standard choice.
   #
-  # Threshold-Kalibrierung ist KRITISCH für jedes neue Embedding-Modell!
-  # Für Thesis: Dokumentiere Threshold-Optimization mit Ablation Study
+  # WARNING: If you change this after indexing, you must re-index all documents!
+  # =========================================================================
+  distance_metric: "cosine"
+  
+  # L2 normalization for embeddings
+  # When true, vectors are normalized to unit length before storage.
+  # This makes cosine similarity equivalent to dot product (faster computation).
+  normalize_embeddings: true
+  
+  # Retrieval parameters
+  top_k_vectors: 10
+  similarity_threshold: 0.3  # Minimum similarity score [0.0, 1.0]
 
 # ============================================================================
-# KNOWLEDGE GRAPH (NetworkX) - Lokale Struktur
+# KNOWLEDGE GRAPH (NetworkX)
 # ============================================================================
 graph:
-  # Begründung: Graphen ermöglichen multi-hop reasoning, reduzieren 
-  # Information Bottleneck in SLMs (vgl. Graph-RAG Konzepte)
   enabled: true
-  provider: "networkx"  # Lokale Python Graph-Library
+  provider: "networkx"
   graph_path: "./data/knowledge_graph"
-  
-  # Entity extraction settings
   entity_extraction_enabled: true
-  entity_extraction_method: "keyword"  # "keyword" oder "ner" (Named Entity Recognition mit spaCy)
+  entity_extraction_method: "keyword"
   
   relation_types:
-    - "mentions"    # Text erwähnt Entity
-    - "references"  # Text referenziert andere Entity
-    - "defines"     # Text definiert Entity
-    - "extends"     # Konzept erweitert anderes Konzept
-    - "part_of"     # NEU: Chunk ist Teil von Kapitel (Hierarchie)
-    - "follows"     # NEU: Abschnitt folgt auf anderen (Sequenz)
+    - "mentions"
+    - "references"
+    - "defines"
+    - "extends"
+    - "part_of"
+    - "follows"
   
-  # Graph retrieval
-  max_hops: 2  # Maximale Distanz im Graph (Multi-Hop Reasoning)
-  # 1 hop: Direkte Nachbarn
-  # 2 hops: Nachbarn von Nachbarn (typisch für "2nd degree connections")
-  # >2: Meist zu viel Noise, "Small World" Problem
-  
-  top_k_entities: 5  # ERHÖHT von 3 - Anzahl Entity-Candidates aus Graph
+  max_hops: 2
+  top_k_entities: 5
 
 # ============================================================================
-# RETRIEVAL AUGMENTED GENERATION (RAG) PIPELINE
+# RETRIEVAL AUGMENTED GENERATION (RAG)
 # ============================================================================
 rag:
-  # Hybrid Retrieval: Vektor + Graph
-  retrieval_mode: "hybrid"  # ["vector", "graph", "hybrid"]
+  retrieval_mode: "hybrid"
   
-  # Wichtig für Ablation Studies in Thesis:
-  # - "vector": Nur semantische Ähnlichkeit (Baseline)
-  # - "graph": Nur strukturelle Relationen (Vergleich)
-  # - "hybrid": Gewichtete Kombination (deine Lösung)
+  # Current evaluation: Vector-only (graph_weight=0)
+  # This isolates vector retrieval performance for initial testing.
+  # Adjust weights for hybrid evaluation after vector baseline is established.
+  vector_weight: 1.0
+  graph_weight: 0.0
   
-  # Vector retrieval
-  vector_weight: 1  # 60% Gewicht auf Vektor-Scores
-  graph_weight: 0   # 40% Gewicht auf Graph-Scores
-  
-  # Begründung für 60/40 Split:
-  # Vector dominiert (bessere Semantik), Graph ergänzt (Struktur)
-  # Für Thesis: Teste verschiedene Ratios (50/50, 70/30, 80/20)
-  
-  # Reranking (optional, aktuell disabled für Edge-Performance)
   reranking_enabled: false
-  reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
-  # Reranking würde Latenz erhöhen (100ms → 500ms), aber Precision verbessern
-  # Für Production: Aktivieren und Performance messen!
-  
-  # Query expansion (optional, noch nicht implementiert)
   query_expansion_enabled: false
-  expansion_strategies:
-    - "synonyms"      # "Wissensmanagement" → "Knowledge Management"
-    - "translations"  # Deutsch ↔ English
 
 # ============================================================================
-# QUANTIZATION SETTINGS (für SLM-Optimierung)
+# QUANTIZATION SETTINGS
 # ============================================================================
 quantization:
-  # Edge-optimiert: 4-bit oder 8-bit quantization
   enabled: true
-  bits: 4  # 4-bit für minimalen RAM-Footprint
-  group_size: 128  # Quantisierungs-Granularität
-  
-  # QUANTISIERUNG DETAILS:
-  # 
-  # Phi-3 Standard (ohne Quantisierung):
-  # - FP16 (16-bit floating point)
-  # - Modellgröße: ~7 GB
-  # - RAM-Bedarf: 8-10 GB
-  # - Präzision: Volle Genauigkeit
-  #
-  # Phi-3 4-bit Quantisiert (Ollama Standard):
-  # - INT4 (4-bit integer)
-  # - Modellgröße: ~2.3 GB (70% Reduktion!)
-  # - RAM-Bedarf: 2-4 GB
-  # - Präzision: 97-98% von FP16 (minimal loss!)
-  # - Geschwindigkeit: 2-3x schneller auf CPU
-  #
-  # Wie funktioniert 4-bit Quantisierung?
-  # 1. Gewichte werden von FP16 [-65536, +65536] auf INT4 [-8, +7] abgebildet
-  # 2. Pro "group_size" (128) Gewichte wird ein Skalierungs-Faktor gespeichert
-  # 3. Zur Inferenz: INT4 × Skalierung ≈ Original FP16
-  # 4. Genauigkeitsverlust: ~2-3% (meist nicht wahrnehmbar!)
-  #
-  # Für Thesis - Vergleich:
-  # - FP16 Baseline (Vollgenauigkeit)
-  # - 8-bit Quantisiert (mittlerer Kompromiss)
-  # - 4-bit Quantisiert (Edge-Optimum)
-  # - 2-bit Quantisiert (extreme Kompression, aber >10% Quality Loss)
-  #
-  # Metriken zu messen:
-  # - Modellgröße (GB)
-  # - RAM-Verbrauch (GB)
-  # - Inferenz-Latenz (ms/token)
-  # - Generierungsqualität (BLEU, ROUGE, Human Eval)
+  bits: 4
+  group_size: 128
 
 # ============================================================================
 # DATA PATHS
@@ -253,57 +135,26 @@ quantization:
 paths:
   root: "./"
   data: "./data"
-  documents: "./data/documents"  # Hier PDFs reinlegen!
+  documents: "./data/documents"
   vector_db: "./data/vector_db"
   graph_db: "./data/knowledge_graph"
   logs: "./logs"
-  cache: "./cache"  # Embedding Cache (SQLite) für 100x Speedup
+  cache: "./cache"
 
 # ============================================================================
-# LOGGING & MONITORING
+# LOGGING
 # ============================================================================
 logging:
-  level: "INFO"  # DEBUG für detaillierte Semantic Chunking Logs
+  level: "INFO"
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
   file: "./logs/edge_rag.log"
-  
-  # Log Levels:
-  # - DEBUG: Sehr detailliert (jeder Chunk, jede Entscheidung)
-  # - INFO: Normal (Pipeline-Fortschritt, wichtige Metriken)
-  # - WARNING: Nur Warnungen (Fallbacks, Fehler)
-  # - ERROR: Nur Fehler
 
 # ============================================================================
 # PERFORMANCE TUNING
 # ============================================================================
 performance:
-  # Edge Device Constraints
-  batch_size: 32  # Optimal für nomic-embed-text auf CPU
-  # Kleinere Batches (16): Weniger RAM, aber langsamer
-  # Größere Batches (64): Mehr RAM, potenziell schneller
-  
-  num_workers: 2  # Parallel Processing (nicht für alle Operationen)
-  device: "cpu"   # "cpu" oder "cuda" wenn GPU verfügbar
-  # Auf Edge: meist CPU-only
-  # Mit GPU: 5-10x schneller, aber höherer Stromverbrauch
-  
-  # Memory management
-  cache_embeddings: true  # KRITISCH: Ohne Cache = 100x langsamer!
-  max_cache_size_mb: 512  # Disk-Limit für Embedding Cache
-  # 512 MB ≈ ~17000 gecachte Embeddings (768-dim)
-  
-  # PERFORMANCE ERWARTUNGEN (deine Hardware):
-  # Ingestion (526 chunks):
-  # - First Run (cold cache): ~6 Minuten
-  # - Second Run (warm cache): ~10 Sekunden (95% hit rate!)
-  # 
-  # Retrieval (per query):
-  # - Vector Search: ~50ms
-  # - Graph Traversal: ~10ms
-  # - Ensemble Ranking: ~5ms
-  # - Total: ~65ms ✓ (unter 100ms Ziel!)
-  #
-  # Für Thesis: Miss Latency mit verschiedenen:
-  # - Query-Typen (kurz/lang, generisch/spezifisch)
-  # - Cache-Zuständen (cold/warm)
-  # - Retrieval-Modi (vector/graph/hybrid)
+  batch_size: 32
+  num_workers: 2
+  device: "cpu"
+  cache_embeddings: true
+  max_cache_size_mb: 512

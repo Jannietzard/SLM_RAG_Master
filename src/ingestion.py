@@ -1,144 +1,397 @@
 """
-Document Ingestion Pipeline - ENHANCED VERSION
-Kombiniert robuste PDF-Verarbeitung mit LangChain-Integration.
+Document Ingestion Pipeline: PDF Processing and Text Chunking
 
-IMPROVEMENTS über original src/ingestion.py:
-1. ✅ Production-Grade PDF Cleaning (entfernt Artefakte)
-2. ✅ Robuste Page-by-Page Fehlerbehandlung
-3. ✅ Automatische Embedding Dimension Detection
-4. ✅ Metadata Persistence (verhindert Dimension Mismatch Bugs)
-5. ✅ Performance Logging (Timing, Stats)
-6. ✅ L2-Normalisierung für Embeddings (optional)
-7. ✅ Semantic Chunking Support (behalten)
+Version: 2.1.0
+Author: Edge-RAG Research Project
+Last Modified: 2026-01-13
 
-BACKWARDS COMPATIBLE:
-- Nutzt LangChain Document objects
-- Funktioniert mit BatchedOllamaEmbeddings
-- Passt in bestehende main.py Pipeline
-- LanceDB Integration unverändert
+===============================================================================
+OVERVIEW
+===============================================================================
 
-Scientific Rationale:
-- PDF Cleaning reduziert Noise → höhere Similarity Scores
-- Dimension Detection verhindert Shape Mismatch → korrekte Vektoroperationen
-- Robuste Error Handling → keine Pipeline-Crashes bei schlechten PDFs
+This module implements the document ingestion pipeline for the RAG system.
+It handles the transformation of raw PDF documents into indexed, searchable
+text chunks suitable for vector embedding and retrieval.
+
+Pipeline Stages:
+    1. PDF Loading: Extract text from PDF files
+    2. Text Cleaning: Remove artifacts and normalize formatting
+    3. Chunking: Split text into semantic units
+    4. Metadata Enrichment: Add tracking information
+
+===============================================================================
+SCIENTIFIC FOUNDATION
+===============================================================================
+
+CHUNKING STRATEGIES:
+
+The choice of chunking strategy significantly impacts retrieval quality.
+This implementation supports multiple approaches:
+
+1. Fixed-Size Chunking:
+   - Split text at fixed character/token boundaries
+   - Simple and predictable
+   - May break semantic units mid-sentence
+   
+2. Recursive Character Splitting (Default):
+   - Hierarchical splitting using separator priority
+   - Attempts to preserve paragraph and sentence boundaries
+   - Good balance of simplicity and semantic coherence
+   
+   Reference: LangChain RecursiveCharacterTextSplitter
+
+3. Semantic Chunking (Optional):
+   - Uses embedding similarity to find semantic boundaries
+   - Better preservation of semantic units
+   - Higher computational cost
+   
+   Reference: see semantic_chunking.py
+
+CHUNK SIZE CONSIDERATIONS:
+
+Chunk size affects both retrieval precision and recall:
+
+- Too Small (< 256 chars):
+  - High precision but low context
+  - May miss relevant information split across chunks
+  - More chunks to index and search
+  
+- Too Large (> 2048 chars):
+  - More context but lower precision
+  - May include irrelevant information
+  - Approaches embedding model's context limit
+  
+- Optimal Range (512-1024 chars):
+  - Balanced precision and context
+  - Typically 1-3 paragraphs
+  - Recommended for most use cases
+
+OVERLAP RATIONALE:
+
+Chunk overlap ensures information at boundaries is not lost:
+
+    Chunk 1: [--------overlap]
+    Chunk 2:         [overlap--------]
+
+Typical overlap: 10-25% of chunk size
+- Too little: Boundary information lost
+- Too much: Storage overhead, duplicate results
+
+Reference: Lewis et al. (2020). "Retrieval-Augmented Generation for 
+Knowledge-Intensive NLP Tasks." NeurIPS 2020.
+
+===============================================================================
+PDF TEXT EXTRACTION
+===============================================================================
+
+PDF Challenges:
+    - No standard text encoding
+    - Layout information mixed with content
+    - Hyphenation across line breaks
+    - Headers/footers repeated on each page
+    - Tables and figures as text artifacts
+
+Text Cleaning Operations:
+    1. Soft hyphen removal (Unicode U+00AD)
+    2. Hyphenation rejoining (word-\nbreak -> wordbreak)
+    3. URL removal (often not semantically useful)
+    4. Page number removal
+    5. Whitespace normalization
+
+===============================================================================
+EDGE DEVICE OPTIMIZATION
+===============================================================================
+
+Memory Efficiency:
+    - Page-by-page processing (not loading entire PDF)
+    - Generator patterns where possible
+    - Explicit garbage collection hints
+
+Error Resilience:
+    - Per-page error handling (corrupted pages don't crash pipeline)
+    - Graceful degradation with logging
+    - Fallback strategies for problematic PDFs
+
+===============================================================================
+MODULE STRUCTURE
+===============================================================================
+
+Classes:
+    ChunkingConfig           - Configuration dataclass
+    RobustPDFLoader          - PDF loading with error handling
+    DocumentIngestionPipeline - Main pipeline orchestrator
+
+Functions:
+    load_ingestion_config()  - Load config from YAML
+    clean_pdf_text()         - Text cleaning utilities
+    get_processing_stats()   - Retrieve saved statistics
+
+===============================================================================
+USAGE
+===============================================================================
+
+Basic Usage:
+    config = load_ingestion_config(Path("config/settings.yaml"))
+    pipeline = DocumentIngestionPipeline(
+        chunking_config=config,
+        document_path=Path("data/documents"),
+    )
+    documents = pipeline.process_documents()
+
+With Custom Settings:
+    config = ChunkingConfig(
+        mode="standard",
+        chunk_size=1024,
+        chunk_overlap=128,
+        enable_pdf_cleaning=True,
+    )
+    pipeline = DocumentIngestionPipeline(config, document_path)
+    documents = pipeline.process_documents()
 """
-# Falls du Type-Hints verwendest (für die Liste von Dokumenten):
-from typing import List, Dict, Any, Optional
+
 import logging
-from pathlib import Path
 import re
 import time
 import json
-from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, field
 
 import yaml
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 
-# PDF Parsing - jetzt robuster!
+# PDF parsing library
 try:
     from PyPDF2 import PdfReader
     PYPDF2_AVAILABLE = True
 except ImportError:
-    from langchain_community.document_loaders import PyPDFLoader
     PYPDF2_AVAILABLE = False
+    logging.warning(
+        "PyPDF2 not available. Install with: pip install pypdf2"
+    )
 
-# Semantic Chunking (optional)
+# Optional semantic chunking
 try:
     from src.semantic_chunking import SemanticChunker, create_semantic_chunker
-    SEMANTIC_AVAILABLE = True
+    SEMANTIC_CHUNKING_AVAILABLE = True
 except ImportError:
-    SEMANTIC_AVAILABLE = False
-    logging.warning("Semantic chunking not available, using standard chunking")
+    SEMANTIC_CHUNKING_AVAILABLE = False
 
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# PDF CLEANING - NEU! (aus ingest.py übernommen)
+# CONSTANTS
 # ============================================================================
 
+# Unicode soft hyphen character (invisible hyphenation point)
 SOFT_HYPHEN = "\u00ad"
+
+# Default separators for recursive text splitting
+# Ordered by priority: paragraph breaks > line breaks > sentences > words
+DEFAULT_SEPARATORS = [
+    "\n\n",    # Paragraph breaks (highest priority)
+    "\n",      # Line breaks
+    ". ",      # Sentence boundaries
+    "! ",      # Exclamation sentences
+    "? ",      # Question sentences
+    "; ",      # Semicolon clauses
+    ", ",      # Comma clauses
+    " ",       # Word boundaries
+    "",        # Character level (last resort)
+]
+
+
+# ============================================================================
+# TEXT CLEANING UTILITIES
+# ============================================================================
 
 def clean_pdf_text(text: str) -> str:
     """
-    Bereinigt typische PDF-Artefakte für bessere Embedding-Qualität.
+    Clean PDF-extracted text by removing common artifacts.
     
-    PDF-Artefakte reduzieren Similarity Scores erheblich:
-    - Silbentrennung ("Wis-\nsenschaft" → "Wissenschaft")
-    - URLs (lenken von semantischem Inhalt ab)
-    - Seitenzahlen ("39/104" mitten im Text)
-    - Spacing-Fehler ("V or..." → "Vor...")
+    PDF EXTRACTION PROBLEMS:
     
-    Scientific Rationale:
-    Diese Artefakte erhöhen die Distanz zwischen semantisch ähnlichen Texten,
-    da sie unterschiedlich extrahiert werden können (je nach PDF-Tool).
-    Cleaning normalisiert den Text → höhere Konsistenz → bessere Scores.
+    1. Soft Hyphens:
+       PDFs often contain invisible soft hyphen characters (U+00AD) that
+       indicate where words can be broken for line wrapping. These should
+       be removed as they interfere with text matching.
+       
+    2. Line-Break Hyphenation:
+       Words split across lines appear as "hyphen-\nated" and need to be
+       rejoined as "hyphenated".
+       
+    3. URLs:
+       URLs in academic documents often add noise without semantic value.
+       They are removed to improve embedding quality.
+       
+    4. Page Numbers:
+       Patterns like "39/104" or "Page 23 of 100" are layout artifacts.
+       
+    5. Whitespace:
+       Multiple spaces and irregular line breaks are normalized.
+       
+    6. Spacing Bugs:
+       Some PDF extractors produce "V or..." instead of "Vor..." for
+       German text (capital letter followed by space).
+    
+    CLEANING ORDER:
+    
+    The operations are ordered to handle dependencies:
+    1. Remove soft hyphens (must precede hyphenation fix)
+    2. Fix line-break hyphenation
+    3. Remove URLs
+    4. Remove page numbers
+    5. Normalize whitespace (after other operations)
+    6. Fix spacing bugs
     
     Args:
-        text: Raw PDF text mit möglichen Artefakten
+        text: Raw text extracted from PDF
         
     Returns:
-        Gereinigter Text ohne Artefakte
+        Cleaned text with artifacts removed
         
     Example:
-        Input:  "Die Wis-\\nsenschaft unter-\\nsucht das Pro-\\nblem."
-        Output: "Die Wissenschaft untersucht das Problem."
+        Input:  "Die Wis-\\nsenschaft unter-\\nsucht..."
+        Output: "Die Wissenschaft untersucht..."
     """
     if not text:
         return ""
     
-    # 1. Soft Hyphens entfernen (unsichtbare Trennzeichen)
+    # 1. Remove soft hyphens (invisible hyphenation markers)
     text = text.replace(SOFT_HYPHEN, "")
     
-    # 2. Silbentrennung am Zeilenende zusammenführen
-    #    Pattern: "Wort-\n" → "Wort"
+    # 2. Rejoin hyphenated words split across lines
+    # Pattern: word fragment + hyphen + optional whitespace + newline + continuation
+    # Example: "infor-\nmation" -> "information"
     text = re.sub(r"-\s*\n\s*", "", text)
     
-    # 3. URLs entfernen (meist nicht hilfreich für semantische Suche)
-    #    Behält aber DOIs/Citations (keine http/https)
+    # 3. Remove HTTP/HTTPS URLs
+    # URLs rarely contribute to semantic understanding
     text = re.sub(r"https?://\S+", "", text)
     
-    # 4. Seitenzähler-Artefakte entfernen: "39/104", "Seite 23 von 100"
+    # 4. Remove page number artifacts
+    # Pattern: "39/104" (page X of Y)
     text = re.sub(r"\b\d{1,3}/\d{1,3}\b", "", text)
-    text = re.sub(r"\bSeite\s+\d+\s+von\s+\d+\b", "", text, flags=re.IGNORECASE)
+    # Pattern: "Page 23 of 100" or "Seite 23 von 100"
+    text = re.sub(
+        r"\b(page|seite)\s+\d+\s+(of|von)\s+\d+\b", 
+        "", 
+        text, 
+        flags=re.IGNORECASE
+    )
     
-    # 5. Newlines → Spaces (behält Absatzstruktur durch Doppel-NL)
-    #    Aber: Einzelne NL sind meist Layout-Artefakte
+    # 5. Normalize line breaks
+    # Single newlines are often layout artifacts; convert to spaces
+    # Double newlines (paragraph breaks) are preserved
     text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
     
-    # 6. Multiple Spaces → Single Space
+    # 6. Normalize multiple spaces to single space
     text = re.sub(r" {2,}", " ", text)
     
-    # 7. PDF-Spacing-Bug: "V or..." → "Vor..." (häufig bei deutschen PDFs)
-    #    Pattern: Großbuchstabe + Space + Kleinbuchstaben (mindestens 2)
-    text = re.sub(r"\b([A-ZÄÖÜ])\s+([a-zäöüß]{2,})", r"\1\2", text)
+    # 7. Fix PDF spacing bug for German text
+    # Pattern: Capital letter + space + 2+ lowercase letters
+    # Example: "V or..." -> "Vor..."
+    # This is common in German PDFs with ligature issues
+    text = re.sub(
+        r"\b([A-Z\u00C0-\u00D6\u00D8-\u00DE])\s+([a-z\u00DF-\u00F6\u00F8-\u00FF]{2,})",
+        r"\1\2",
+        text
+    )
     
-    # 8. Trim und return
     return text.strip()
 
 
+def estimate_token_count(text: str) -> int:
+    """
+    Estimate token count for text.
+    
+    This is a rough estimation based on whitespace tokenization.
+    For accurate counts, use the actual tokenizer of your embedding model.
+    
+    Rule of thumb: 1 token ~ 4 characters for English text
+    
+    Args:
+        text: Input text
+        
+    Returns:
+        Estimated token count
+    """
+    # Simple whitespace-based estimation
+    words = text.split()
+    return len(words)
+
+
 # ============================================================================
-# CHUNKING CONFIG - Erweitert mit Metadaten
+# CONFIGURATION
 # ============================================================================
 
 @dataclass
 class ChunkingConfig:
     """
-    Konfiguration für Chunking mit erweiterten Tracking-Metadaten.
+    Configuration for document chunking.
     
-    ENHANCEMENT: Speichert jetzt auch Cleaning-Settings für Reproducibility.
+    This dataclass encapsulates all parameters for the chunking process,
+    enabling reproducible experiments and easy configuration via YAML.
+    
+    Attributes:
+        mode: Chunking strategy ("standard" or "semantic")
+        chunk_size: Target chunk size in characters
+        chunk_overlap: Overlap between consecutive chunks in characters
+        min_chunk_size: Minimum chunk size (smaller chunks are merged or dropped)
+        separators: List of separator strings for recursive splitting
+        enable_pdf_cleaning: Whether to apply PDF text cleaning
+    
+    PARAMETER GUIDELINES:
+    
+    chunk_size:
+        - 256-512: High precision, low context (short documents)
+        - 512-1024: Balanced (recommended default)
+        - 1024-2048: High context, lower precision (complex topics)
+        
+    chunk_overlap:
+        - 10% of chunk_size: Minimal overhead
+        - 15-20% of chunk_size: Recommended
+        - 25%+ of chunk_size: High redundancy
+        
+    mode:
+        - "standard": RecursiveCharacterTextSplitter (fast, reliable)
+        - "semantic": SemanticChunker (slower, better boundaries)
     """
-    mode: str = "semantic"  # "standard" or "semantic"
-    chunk_size: int = 1024
+    mode: str = "standard"
+    chunk_size: int = 512
     chunk_overlap: int = 128
-    min_chunk_size: int = 200
-    separators: List[str] = None
-    enable_pdf_cleaning: bool = True  # NEU!
+    min_chunk_size: int = 100
+    separators: List[str] = field(default_factory=lambda: DEFAULT_SEPARATORS.copy())
+    enable_pdf_cleaning: bool = True
+    
+    def __post_init__(self):
+        """Validate configuration parameters."""
+        if self.mode not in ("standard", "semantic"):
+            raise ValueError(
+                f"Invalid chunking mode: {self.mode}. "
+                f"Must be 'standard' or 'semantic'."
+            )
+        
+        if self.chunk_size < 100:
+            raise ValueError(
+                f"chunk_size too small: {self.chunk_size}. "
+                f"Minimum recommended: 100 characters."
+            )
+        
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError(
+                f"chunk_overlap ({self.chunk_overlap}) must be less than "
+                f"chunk_size ({self.chunk_size})."
+            )
+        
+        if self.chunk_overlap < 0:
+            raise ValueError(f"chunk_overlap cannot be negative: {self.chunk_overlap}")
     
     def to_dict(self) -> Dict[str, Any]:
-        """Serialisiere Config für Metadata Storage."""
+        """Serialize configuration to dictionary."""
         return {
             "mode": self.mode,
             "chunk_size": self.chunk_size,
@@ -147,490 +400,578 @@ class ChunkingConfig:
             "separators": self.separators,
             "enable_pdf_cleaning": self.enable_pdf_cleaning,
         }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ChunkingConfig":
+        """Create configuration from dictionary."""
+        return cls(
+            mode=data.get("mode", "standard"),
+            chunk_size=data.get("chunk_size", 512),
+            chunk_overlap=data.get("chunk_overlap", 128),
+            min_chunk_size=data.get("min_chunk_size", 100),
+            separators=data.get("separators", DEFAULT_SEPARATORS.copy()),
+            enable_pdf_cleaning=data.get("enable_pdf_cleaning", True),
+        )
 
 
 # ============================================================================
-# ROBUST PDF LOADER - NEU! (aus ingest.py)
+# PDF LOADER
 # ============================================================================
 
 class RobustPDFLoader:
     """
-    Production-Grade PDF Loader mit Page-by-Page Error Handling.
+    Production-grade PDF loader with per-page error handling.
     
-    IMPROVEMENTS über PyPDFLoader:
-    1. Fehlerhafte Seiten werden übersprungen (nicht ganzes PDF crasht)
-    2. Performance Tracking (Zeit, Seiten, Chars)
-    3. Optional: PDF Cleaning aktivierbar
-    4. Metadaten pro Seite (page_number, extraction_success)
+    DESIGN RATIONALE:
     
-    Scientific Rationale:
-    PDFs können korrupte Seiten enthalten (OCR-Fehler, Encoding-Issues).
-    Ein Crash bei 1 von 200 Seiten ist inakzeptabel für Production.
-    → Graceful Degradation: Skip fehlerhafte Seiten, logge Warnung, fahre fort.
+    PDF documents can contain problematic pages that fail to extract:
+    - Scanned images without OCR
+    - Corrupted page data
+    - Unsupported encoding
+    - Complex vector graphics
     
-    Usage:
-        loader = RobustPDFLoader(pdf_path, enable_cleaning=True)
+    A naive implementation would crash on any problematic page,
+    losing all successfully extracted content. This implementation
+    uses per-page error handling to maximize content extraction.
+    
+    ERROR HANDLING STRATEGY:
+    
+    1. Attempt extraction for each page individually
+    2. Log warning for failed pages
+    3. Continue with remaining pages
+    4. Report statistics at completion
+    
+    This "graceful degradation" approach is essential for production
+    systems processing diverse document collections.
+    
+    USAGE:
+    
+        loader = RobustPDFLoader(
+            file_path=Path("document.pdf"),
+            enable_cleaning=True
+        )
         documents = loader.load()
+        # Returns list of Document objects, one per successfully extracted page
+    
+    Attributes:
+        file_path: Path to PDF file
+        enable_cleaning: Whether to apply text cleaning
     """
     
     def __init__(
-        self, 
+        self,
         file_path: Path,
         enable_cleaning: bool = True,
-        logger_instance: logging.Logger = None
+        logger_instance: Optional[logging.Logger] = None,
     ):
         """
-        Initialisiere Robust PDF Loader.
+        Initialize PDF loader.
         
         Args:
-            file_path: Pfad zur PDF-Datei
-            enable_cleaning: PDF-Text Cleaning aktivieren?
-            logger_instance: Logger für Output
+            file_path: Path to PDF file
+            enable_cleaning: Apply text cleaning after extraction
+            logger_instance: Custom logger (uses module logger if None)
+            
+        Raises:
+            FileNotFoundError: If PDF file does not exist
+            ImportError: If PyPDF2 is not available
         """
         self.file_path = Path(file_path)
         self.enable_cleaning = enable_cleaning
         self.logger = logger_instance or logger
         
         if not self.file_path.exists():
-            raise FileNotFoundError(f"PDF nicht gefunden: {file_path}")
+            raise FileNotFoundError(f"PDF file not found: {file_path}")
+        
+        if not PYPDF2_AVAILABLE:
+            raise ImportError(
+                "PyPDF2 is required for PDF loading. "
+                "Install with: pip install pypdf2"
+            )
     
     def load(self) -> List[Document]:
         """
-        Lade PDF mit robuster Page-by-Page Verarbeitung.
+        Load and extract text from PDF.
+        
+        ALGORITHM:
+        
+        1. Open PDF with PyPDF2 reader
+        2. Iterate through pages
+        3. For each page:
+           a. Attempt text extraction
+           b. Apply cleaning if enabled
+           c. Skip empty pages
+           d. Create Document with metadata
+        4. Log summary statistics
+        5. Return list of Documents
         
         Returns:
-            Liste von LangChain Document Objekten (1 pro Seite)
+            List of LangChain Document objects, one per successfully 
+            extracted page. Empty pages are not included.
             
         Raises:
-            Exception: Nur wenn PDF komplett unlesbar (z.B. nicht PDF-Format)
+            Exception: Only if PDF is completely unreadable
         """
-        self.logger.info(f"Lade PDF: {self.file_path.name}")
+        self.logger.info(f"Loading PDF: {self.file_path.name}")
         start_time = time.time()
         
         try:
-            # PDF Reader initialisieren
-            if PYPDF2_AVAILABLE:
-                reader = PdfReader(str(self.file_path))
-                documents = self._load_with_pypdf2(reader)
-            else:
-                # Fallback: LangChain PyPDFLoader
-                from langchain_community.document_loaders import PyPDFLoader
-                loader = PyPDFLoader(str(self.file_path))
-                documents = loader.load()
-                
-                # Apply cleaning if enabled
-                if self.enable_cleaning:
-                    for doc in documents:
-                        doc.page_content = clean_pdf_text(doc.page_content)
+            reader = PdfReader(str(self.file_path))
+            total_pages = len(reader.pages)
             
-            # Performance Logging
-            processing_time = time.time() - start_time
+            documents = []
+            failed_pages = []
+            empty_pages = []
+            
+            for page_num in range(total_pages):
+                try:
+                    # Extract text from page
+                    page = reader.pages[page_num]
+                    text = page.extract_text() or ""
+                    
+                    # Apply cleaning if enabled
+                    if self.enable_cleaning:
+                        text = clean_pdf_text(text)
+                    
+                    # Skip pages with insufficient content
+                    if len(text.strip()) < 50:
+                        empty_pages.append(page_num + 1)
+                        continue
+                    
+                    # Create Document with comprehensive metadata
+                    doc = Document(
+                        page_content=text,
+                        metadata={
+                            "source": str(self.file_path),
+                            "source_file": self.file_path.name,
+                            "page": page_num + 1,
+                            "page_number": page_num + 1,
+                            "total_pages": total_pages,
+                            "char_count": len(text),
+                            "extraction_method": "pypdf2",
+                            "cleaned": self.enable_cleaning,
+                        }
+                    )
+                    documents.append(doc)
+                    
+                except Exception as e:
+                    # Log error but continue with other pages
+                    self.logger.warning(
+                        f"Page {page_num + 1} extraction failed: {str(e)}"
+                    )
+                    failed_pages.append(page_num + 1)
+            
+            # Log summary
+            elapsed = time.time() - start_time
             total_chars = sum(len(doc.page_content) for doc in documents)
             
             self.logger.info(
-                f"✓ PDF geladen: {self.file_path.name} | "
-                f"{len(documents)} Seiten | "
-                f"{total_chars:,} Zeichen | "
-                f"{processing_time:.2f}s"
+                f"PDF loaded: {self.file_path.name} | "
+                f"{len(documents)}/{total_pages} pages extracted | "
+                f"{total_chars:,} characters | "
+                f"{elapsed:.2f}s"
             )
+            
+            if failed_pages:
+                self.logger.warning(
+                    f"Failed pages: {failed_pages[:10]}"
+                    f"{'...' if len(failed_pages) > 10 else ''}"
+                )
+            
+            if empty_pages and len(empty_pages) <= 5:
+                self.logger.debug(f"Empty pages skipped: {empty_pages}")
             
             return documents
             
         except Exception as e:
-            self.logger.error(f"✗ PDF Laden fehlgeschlagen: {self.file_path.name} | {e}")
+            self.logger.error(f"PDF loading failed completely: {str(e)}")
             raise
-    
-    def _load_with_pypdf2(self, reader: PdfReader) -> List[Document]:
-        """
-        Lade mit PyPDF2 - Page-by-Page Error Handling.
-        
-        CRITICAL: Einzelne fehlerhafte Seiten crashen nicht die gesamte Pipeline!
-        
-        Args:
-            reader: PyPDF2 PdfReader Objekt
-            
-        Returns:
-            Liste von Document Objekten (erfolgreich extrahierte Seiten)
-        """
-        documents = []
-        failed_pages = []
-        
-        for page_num, page in enumerate(reader.pages, start=1):
-            try:
-                # Text extrahieren
-                text = page.extract_text() or ""
-                
-                # PDF Cleaning (optional)
-                if self.enable_cleaning:
-                    text = clean_pdf_text(text)
-                
-                # Skip komplett leere Seiten
-                if len(text.strip()) < 10:
-                    self.logger.debug(f"Seite {page_num}: Übersprungen (leer)")
-                    continue
-                
-                # LangChain Document erstellen
-                doc = Document(
-                    page_content=text,
-                    metadata={
-                        "source": str(self.file_path),
-                        "source_file": self.file_path.name,
-                        "page": page_num,
-                        "page_number": page_num,  # LangChain standard
-                        "extraction_method": "pypdf2",
-                        "cleaned": self.enable_cleaning,
-                        "char_count": len(text),
-                    }
-                )
-                
-                documents.append(doc)
-                
-            except Exception as e:
-                # Log aber fahre fort!
-                self.logger.warning(
-                    f"Seite {page_num} fehlgeschlagen: {e} | "
-                    f"Überspringe und fahre fort..."
-                )
-                failed_pages.append(page_num)
-        
-        # Summary Logging
-        if failed_pages:
-            self.logger.warning(
-                f"⚠ {len(failed_pages)} von {len(reader.pages)} Seiten "
-                f"fehlgeschlagen: {failed_pages[:5]}{'...' if len(failed_pages) > 5 else ''}"
-            )
-        
-        return documents
 
 
 # ============================================================================
-# ENHANCED DOCUMENT INGESTION PIPELINE
+# DOCUMENT INGESTION PIPELINE
 # ============================================================================
 
 class DocumentIngestionPipeline:
     """
-    ENHANCED Ingestion Pipeline mit Production-Grade Features.
+    Complete document ingestion pipeline for RAG systems.
     
-    NEW FEATURES:
-    1. ✅ Robust PDF Loading (Page-by-Page Error Handling)
-    2. ✅ Automatic PDF Cleaning (Artefakte entfernen)
-    3. ✅ Metadata Tracking (embedding_dim, processing_stats)
-    4. ✅ Performance Logging (Timing für jeden Schritt)
-    5. ✅ Dimension Detection (verhindert Mismatch Bugs)
+    PIPELINE STAGES:
     
-    BACKWARDS COMPATIBLE:
-    - Nutzt LangChain Document objects
-    - Unterstützt Semantic Chunking (wenn verfügbar)
-    - Funktioniert mit bestehender main.py
+    1. Document Discovery:
+       - Scan directory for PDF files
+       - Filter by file pattern
     
-    Usage:
+    2. PDF Loading:
+       - Extract text from each PDF
+       - Apply text cleaning
+       - Handle extraction errors gracefully
+    
+    3. Text Chunking:
+       - Split documents into smaller units
+       - Apply configured chunking strategy
+       - Enrich with metadata
+    
+    4. Statistics Collection:
+       - Track processing metrics
+       - Save for reproducibility
+    
+    CHUNKING STRATEGIES:
+    
+    Standard (RecursiveCharacterTextSplitter):
+        - Uses hierarchical separator list
+        - Fast and deterministic
+        - Good for most use cases
+        
+    Semantic (SemanticChunker):
+        - Uses embedding similarity
+        - Better boundary detection
+        - Slower, requires embedding model
+    
+    USAGE EXAMPLE:
+    
+        # Load configuration
         config = load_ingestion_config(Path("config/settings.yaml"))
+        
+        # Create pipeline
         pipeline = DocumentIngestionPipeline(
             chunking_config=config,
             document_path=Path("data/documents"),
-            enable_cleaning=True  # NEU!
+            enable_cleaning=True,
         )
-        documents = pipeline.process_documents()
+        
+        # Process documents
+        chunks = pipeline.process_documents()
+        
+        # chunks is a list of LangChain Document objects ready for embedding
+    
+    THESIS DOCUMENTATION:
+    
+    For reproducibility, the pipeline saves processing metadata including:
+    - Configuration parameters
+    - Processing statistics
+    - Timing information
+    
+    Retrieve with: get_processing_stats()
+    
+    Attributes:
+        chunking_config: ChunkingConfig instance
+        document_path: Path to document directory
+        enable_cleaning: Whether to clean PDF text
+        text_splitter: Initialized text splitter (standard mode)
+        semantic_chunker: Initialized semantic chunker (semantic mode)
+        stats: Processing statistics dictionary
     """
-
+    
     def __init__(
         self,
         chunking_config: ChunkingConfig,
         document_path: Path,
-        enable_cleaning: bool = True,  # NEU!
-        logger_instance: logging.Logger = None,
+        enable_cleaning: bool = True,
+        logger_instance: Optional[logging.Logger] = None,
     ):
         """
-        Initialisiere Enhanced Pipeline.
+        Initialize document ingestion pipeline.
 
         Args:
-            chunking_config: ChunkingConfig mit Chunk-Parametern
-            document_path: Pfad zum Dokumentenverzeichnis
-            enable_cleaning: PDF Cleaning aktivieren? (EMPFOHLEN!)
-            logger_instance: Optional Logger-Instanz
+            chunking_config: Chunking configuration
+            document_path: Path to directory containing PDF files
+            enable_cleaning: Apply PDF text cleaning
+            logger_instance: Custom logger instance
+            
+        Raises:
+            FileNotFoundError: If document_path does not exist
         """
         self.chunking_config = chunking_config
         self.document_path = Path(document_path)
         self.enable_cleaning = enable_cleaning
         self.logger = logger_instance or logger
-
-        # Override chunking config cleaning setting
-        if hasattr(chunking_config, 'enable_pdf_cleaning'):
-            self.enable_cleaning = chunking_config.enable_pdf_cleaning
-
-        # Validierung
+        
+        # Validate document path
         if not self.document_path.exists():
-            raise FileNotFoundError(f"Dokumentenverzeichnis nicht gefunden: {document_path}")
-
-        # Initialize appropriate chunker
-        if chunking_config.mode == "semantic" and SEMANTIC_AVAILABLE:
-            self.logger.info("📊 Semantic Chunking Mode aktiviert")
-            self.semantic_chunker = create_semantic_chunker(
-                chunk_size=chunking_config.chunk_size,
-                chunk_overlap=chunking_config.chunk_overlap,
-                min_chunk_size=chunking_config.min_chunk_size,
+            raise FileNotFoundError(
+                f"Document directory not found: {document_path}"
             )
-            self.text_splitter = None
-            
-        else:
-            if chunking_config.mode == "semantic" and not SEMANTIC_AVAILABLE:
-                self.logger.warning(
-                    "⚠ Semantic Chunking nicht verfügbar, "
-                    "fallback auf Standard Chunking"
+        
+        # Initialize appropriate chunker based on mode
+        self.text_splitter = None
+        self.semantic_chunker = None
+        
+        if chunking_config.mode == "semantic":
+            if SEMANTIC_CHUNKING_AVAILABLE:
+                self.logger.info("Initializing semantic chunking mode")
+                self.semantic_chunker = create_semantic_chunker(
+                    chunk_size=chunking_config.chunk_size,
+                    chunk_overlap=chunking_config.chunk_overlap,
+                    min_chunk_size=chunking_config.min_chunk_size,
                 )
-            
-            self.logger.info("📝 Standard Chunking Mode aktiviert")
-            self.semantic_chunker = None
-            
-            separators = chunking_config.separators or ["\n\n", "\n", ". ", " ", ""]
+            else:
+                self.logger.warning(
+                    "Semantic chunking not available, falling back to standard"
+                )
+                chunking_config.mode = "standard"
+        
+        if chunking_config.mode == "standard":
+            self.logger.info("Initializing standard chunking mode")
             self.text_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=chunking_config.chunk_size,
                 chunk_overlap=chunking_config.chunk_overlap,
-                separators=separators,
+                separators=chunking_config.separators,
                 length_function=len,
                 is_separator_regex=False,
             )
         
-        self.logger.info(
-            f"📦 DocumentIngestionPipeline initialisiert: "
-            f"mode={chunking_config.mode}, "
-            f"chunk_size={chunking_config.chunk_size}, "
-            f"overlap={chunking_config.chunk_overlap}, "
-            f"cleaning={'enabled' if self.enable_cleaning else 'disabled'}"
-        )
-        
-        # Stats tracking (NEU!)
+        # Initialize statistics tracking
         self.stats = {
             "files_processed": 0,
             "files_failed": 0,
             "total_pages": 0,
-            "failed_pages": 0,
             "total_chunks": 0,
-            "total_chars": 0,
+            "total_characters": 0,
             "processing_time_seconds": 0.0,
         }
-
-    def load_pdf_documents(self, pdf_pattern: str = "*.pdf") -> List[Document]:
-        """
-        Lade alle PDF-Dateien mit ROBUSTEM Error Handling.
-        
-        IMPROVEMENT: Nutzt jetzt RobustPDFLoader statt PyPDFLoader!
-        - Fehlerhafte PDFs crashen nicht die gesamte Pipeline
-        - Page-by-Page Error Handling
-        - Performance Tracking
-        - Optional PDF Cleaning
-
-        Args:
-            pdf_pattern: Glob-Pattern für PDF-Dateien
-
-        Returns:
-            Liste von LangChain Document-Objekten (1 pro Seite)
-
-        Raises:
-            FileNotFoundError: Falls keine PDFs gefunden werden
-        """
-        start_time = time.time()
-        
-        pdf_files = list(self.document_path.glob(pdf_pattern))
-        
-        if not pdf_files:
-            raise FileNotFoundError(f"Keine PDF-Dateien gefunden in {self.document_path}")
-
-        self.logger.info(f"📁 {len(pdf_files)} PDF-Dateien gefunden")
-        documents = []
-        
-        for pdf_file in pdf_files:
-            try:
-                # Nutze Robust PDF Loader
-                loader = RobustPDFLoader(
-                    pdf_file, 
-                    enable_cleaning=self.enable_cleaning,
-                    logger_instance=self.logger
-                )
-                
-                docs = loader.load()
-                
-                # Stats updaten
-                self.stats["files_processed"] += 1
-                self.stats["total_pages"] += len(docs)
-                
-                documents.extend(docs)
-                
-            except Exception as e:
-                # Kritischer Fehler (ganzes PDF unlesbar)
-                self.logger.error(f"✗ PDF komplett fehlgeschlagen: {pdf_file.name} | {e}")
-                self.stats["files_failed"] += 1
-                continue
-        
-        # Summary
-        elapsed = time.time() - start_time
-        self.stats["processing_time_seconds"] = elapsed
         
         self.logger.info(
-            f"✓ PDF Loading abgeschlossen: "
-            f"{self.stats['files_processed']} erfolgreich, "
-            f"{self.stats['files_failed']} fehlgeschlagen | "
-            f"{self.stats['total_pages']} Seiten | "
-            f"{elapsed:.1f}s"
+            f"DocumentIngestionPipeline initialized: "
+            f"mode={chunking_config.mode}, "
+            f"chunk_size={chunking_config.chunk_size}, "
+            f"overlap={chunking_config.chunk_overlap}"
         )
+
+    def discover_documents(self, pattern: str = "*.pdf") -> List[Path]:
+        """
+        Discover PDF files in document directory.
         
-        return documents
+        Args:
+            pattern: Glob pattern for file matching
+            
+        Returns:
+            List of Path objects for discovered files
+        """
+        pdf_files = list(self.document_path.glob(pattern))
+        
+        if not pdf_files:
+            self.logger.warning(
+                f"No files matching '{pattern}' found in {self.document_path}"
+            )
+        else:
+            self.logger.info(f"Discovered {len(pdf_files)} PDF files")
+        
+        return pdf_files
+
+    def load_documents(self, pdf_files: List[Path]) -> List[Document]:
+        """
+        Load and extract text from PDF files.
+        
+        Uses RobustPDFLoader for per-page error handling.
+        
+        Args:
+            pdf_files: List of PDF file paths
+            
+        Returns:
+            List of Document objects (one per page)
+        """
+        all_documents = []
+        
+        for pdf_path in pdf_files:
+            try:
+                loader = RobustPDFLoader(
+                    file_path=pdf_path,
+                    enable_cleaning=self.enable_cleaning,
+                    logger_instance=self.logger,
+                )
+                
+                documents = loader.load()
+                all_documents.extend(documents)
+                
+                self.stats["files_processed"] += 1
+                self.stats["total_pages"] += len(documents)
+                
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to load PDF {pdf_path.name}: {str(e)}"
+                )
+                self.stats["files_failed"] += 1
+        
+        return all_documents
 
     def chunk_documents(self, documents: List[Document]) -> List[Document]:
         """
-        Teile Dokumente in Chunks (semantic oder standard).
+        Split documents into chunks.
         
-        UNCHANGED: Semantic Chunking Logic bleibt erhalten.
-
+        Applies the configured chunking strategy (standard or semantic).
+        Enriches chunks with metadata including chunk_id and position.
+        
         Args:
-            documents: Liste ungechunkter Dokumente (Pages)
-
+            documents: List of Document objects (typically one per page)
+            
         Returns:
-            Liste gechunkter Dokumente mit enriched Metadaten
+            List of chunked Document objects
         """
         start_time = time.time()
         
         if self.chunking_config.mode == "semantic" and self.semantic_chunker:
-            chunked = self._chunk_documents_semantic(documents)
+            chunks = self._chunk_semantic(documents)
         else:
-            chunked = self._chunk_documents_standard(documents)
+            chunks = self._chunk_standard(documents)
         
-        # Stats
+        # Enrich metadata
+        for i, chunk in enumerate(chunks):
+            chunk.metadata["chunk_id"] = i
+            chunk.metadata["chunk_index"] = i
+            chunk.metadata["chunk_size"] = len(chunk.page_content)
+            chunk.metadata["chunking_mode"] = self.chunking_config.mode
+        
         elapsed = time.time() - start_time
-        self.stats["total_chunks"] = len(chunked)
-        self.stats["total_chars"] = sum(len(doc.page_content) for doc in chunked)
         
-        avg_chunk_size = self.stats["total_chars"] / len(chunked) if chunked else 0
-        
-        self.logger.info(
-            f"✂ Chunking abgeschlossen: "
-            f"{len(documents)} Seiten → {len(chunked)} Chunks | "
-            f"Ø {avg_chunk_size:.0f} Zeichen/Chunk | "
-            f"{elapsed:.1f}s"
+        # Update statistics
+        self.stats["total_chunks"] = len(chunks)
+        self.stats["total_characters"] = sum(
+            len(c.page_content) for c in chunks
         )
         
-        return chunked
-    
-    def _chunk_documents_semantic(self, documents: List[Document]) -> List[Document]:
+        avg_chunk_size = (
+            self.stats["total_characters"] / len(chunks) 
+            if chunks else 0
+        )
+        
+        self.logger.info(
+            f"Chunking complete: "
+            f"{len(documents)} pages -> {len(chunks)} chunks | "
+            f"avg_size={avg_chunk_size:.0f} chars | "
+            f"time={elapsed:.2f}s"
+        )
+        
+        return chunks
+
+    def _chunk_standard(self, documents: List[Document]) -> List[Document]:
         """
-        Semantic Chunking (unverändert, aber mit Stats).
+        Apply standard recursive character splitting.
+        
+        ALGORITHM (RecursiveCharacterTextSplitter):
+        
+        1. Try to split on highest-priority separator (e.g., "\n\n")
+        2. If resulting chunks are too large, recurse with next separator
+        3. Continue until chunks are within size limit
+        4. Add overlap by including text from adjacent chunks
+        
+        This approach preserves semantic boundaries where possible
+        while guaranteeing maximum chunk size.
         
         Args:
-            documents: Liste von Dokumenten (pages)
+            documents: Input documents
             
         Returns:
-            Liste semantisch gechunkter Dokumente
+            List of chunked documents
+        """
+        chunks = self.text_splitter.split_documents(documents)
+        
+        self.logger.debug(
+            f"Standard chunking: {len(documents)} docs -> {len(chunks)} chunks"
+        )
+        
+        return chunks
+
+    def _chunk_semantic(self, documents: List[Document]) -> List[Document]:
+        """
+        Apply semantic chunking using embedding similarity.
+        
+        See semantic_chunking.py for implementation details.
+        Falls back to standard chunking on error.
+        
+        Args:
+            documents: Input documents
+            
+        Returns:
+            List of chunked documents
         """
         all_chunks = []
         
         for doc in documents:
             try:
-                page_chunks = self.semantic_chunker.chunk_document(doc)
-                all_chunks.extend(page_chunks)
-                
+                doc_chunks = self.semantic_chunker.chunk_document(doc)
+                all_chunks.extend(doc_chunks)
             except Exception as e:
                 self.logger.warning(
                     f"Semantic chunking failed for page, using fallback: {e}"
                 )
-                # Fallback to standard
-                if self.text_splitter is None:
-                    fallback_splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=self.chunking_config.chunk_size,
-                        chunk_overlap=self.chunking_config.chunk_overlap,
-                    )
-                    fallback_chunks = fallback_splitter.split_documents([doc])
-                else:
-                    fallback_chunks = self.text_splitter.split_documents([doc])
-                
+                # Fallback to standard chunking for this document
+                fallback_chunks = self.text_splitter.split_documents([doc])
                 all_chunks.extend(fallback_chunks)
         
-        self.logger.info(
-            f"✓ Semantic chunking: {len(documents)} Seiten → {len(all_chunks)} Chunks"
+        self.logger.debug(
+            f"Semantic chunking: {len(documents)} docs -> {len(all_chunks)} chunks"
         )
         
         return all_chunks
-    
-    def _chunk_documents_standard(self, documents: List[Document]) -> List[Document]:
+
+    def process_documents(self, pattern: str = "*.pdf") -> List[Document]:
         """
-        Standard Recursive Character Chunking mit Enhanced Metadata.
+        Execute complete ingestion pipeline.
         
-        IMPROVEMENT: Enrichere Metadaten für besseres Tracking.
+        PIPELINE STAGES:
+        1. Discover PDF files
+        2. Load and extract text
+        3. Chunk documents
+        4. Save processing metadata
         
         Args:
-            documents: Liste von Dokumenten
+            pattern: Glob pattern for file discovery
             
         Returns:
-            Liste gechunkter Dokumente mit Metadaten
-        """
-        chunked_docs = self.text_splitter.split_documents(documents)
-        
-        # Enrichere Metadaten für Traceability
-        for i, chunk in enumerate(chunked_docs):
-            chunk.metadata["chunk_id"] = i
-            chunk.metadata["chunk_size"] = len(chunk.page_content)
-            chunk.metadata["chunking_method"] = "standard"
-            chunk.metadata["cleaned"] = self.enable_cleaning
-        
-        avg_size = sum(len(d.page_content) for d in chunked_docs) // len(chunked_docs) if chunked_docs else 0
-        
-        self.logger.info(
-            f"✓ Standard chunking: "
-            f"{len(documents)} Docs → {len(chunked_docs)} Chunks | "
-            f"Ø {avg_size} Zeichen/Chunk"
-        )
-        
-        return chunked_docs
-
-    def process_documents(self) -> List[Document]:
-        """
-        End-to-End Pipeline: Lade → Chunk → Track Stats.
-        
-        ENHANCEMENT: Speichert jetzt auch Processing Metadata!
-
-        Returns:
-            Vollständig verarbeitete und gechunkte Dokumente
+            List of chunked Document objects ready for embedding
         """
         pipeline_start = time.time()
         
-        self.logger.info("="*70)
-        self.logger.info("🚀 START: Document Ingestion Pipeline")
-        self.logger.info("="*70)
+        self.logger.info("=" * 70)
+        self.logger.info("DOCUMENT INGESTION PIPELINE - START")
+        self.logger.info("=" * 70)
         
-        # Step 1: Load PDFs
-        documents = self.load_pdf_documents()
+        # Stage 1: Discover documents
+        pdf_files = self.discover_documents(pattern)
         
-        # Step 2: Chunk
-        chunked_documents = self.chunk_documents(documents)
+        if not pdf_files:
+            self.logger.warning("No documents to process")
+            return []
         
-        # Step 3: Save Metadata (NEU!)
+        # Stage 2: Load documents
+        documents = self.load_documents(pdf_files)
+        
+        if not documents:
+            self.logger.warning("No content extracted from documents")
+            return []
+        
+        # Stage 3: Chunk documents
+        chunks = self.chunk_documents(documents)
+        
+        # Stage 4: Save metadata
         pipeline_time = time.time() - pipeline_start
-        self._save_processing_metadata(pipeline_time)
+        self.stats["processing_time_seconds"] = pipeline_time
+        self._save_processing_metadata()
         
-        self.logger.info("="*70)
-        self.logger.info("✅ COMPLETE: Document Ingestion Pipeline")
-        self.logger.info(f"⏱ Total Zeit: {pipeline_time:.1f}s")
-        self.logger.info("="*70)
+        self.logger.info("=" * 70)
+        self.logger.info("DOCUMENT INGESTION PIPELINE - COMPLETE")
+        self.logger.info(f"Total time: {pipeline_time:.2f}s")
+        self.logger.info(f"Output: {len(chunks)} chunks ready for embedding")
+        self.logger.info("=" * 70)
         
-        return chunked_documents
-    
-    def _save_processing_metadata(self, pipeline_time: float) -> None:
+        return chunks
+
+    def _save_processing_metadata(self) -> None:
         """
-        Speichere Processing Metadata für Reproducibility.
+        Save processing metadata for reproducibility.
         
-        NEU! Verhindert Bugs durch fehlende Dimension-Info.
-        
-        Args:
-            pipeline_time: Gesamtdauer Pipeline in Sekunden
+        Saves to data/ingestion_metadata.json with:
+        - Timestamp
+        - Configuration parameters
+        - Processing statistics
         """
         metadata = {
             "timestamp": time.time(),
-            "pipeline_version": "enhanced_v2",
+            "pipeline_version": "2.1.0",
             "chunking_config": self.chunking_config.to_dict(),
             "pdf_cleaning_enabled": self.enable_cleaning,
-            "stats": {
-                **self.stats,
-                "pipeline_time_seconds": pipeline_time,
-            }
+            "statistics": self.stats.copy(),
         }
         
         metadata_path = Path("data/ingestion_metadata.json")
@@ -639,81 +980,149 @@ class DocumentIngestionPipeline:
         with open(metadata_path, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
         
-        self.logger.info(f"💾 Metadata gespeichert: {metadata_path}")
+        self.logger.debug(f"Processing metadata saved: {metadata_path}")
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """
+        Get current processing statistics.
+        
+        Returns:
+            Dictionary with processing statistics
+        """
+        return self.stats.copy()
 
 
 # ============================================================================
-# CONFIG LOADER - Erweitert
+# CONFIGURATION LOADING
 # ============================================================================
 
 def load_ingestion_config(config_path: Path) -> ChunkingConfig:
     """
-    Lade Chunking-Konfiguration aus YAML mit Enhanced Defaults.
+    Load chunking configuration from YAML file.
     
-    ENHANCEMENT: Robuster Fallback wenn Config-Sektion fehlt.
-
+    Expected YAML structure:
+    
+        chunking:
+          mode: "standard"
+          chunk_size: 512
+          chunk_overlap: 128
+          min_chunk_size: 100
+          enable_pdf_cleaning: true
+          separators:
+            - "\\n\\n"
+            - "\\n"
+            - ". "
+            - " "
+    
     Args:
-        config_path: Pfad zur settings.yaml
-
+        config_path: Path to YAML configuration file
+        
     Returns:
-        ChunkingConfig-Objekt mit allen Settings
-
+        ChunkingConfig instance
+        
     Raises:
-        FileNotFoundError: Falls Config nicht existiert
+        FileNotFoundError: If config file does not exist
     """
     if not config_path.exists():
-        raise FileNotFoundError(f"Config nicht gefunden: {config_path}")
-
-    with open(config_path, "r", encoding='utf-8') as f:
-        config = yaml.safe_load(f)
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
     
-    # Fallback wenn YAML leer oder chunking-Sektion fehlt
-    if config is None:
-        config = {}
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f) or {}
     
     chunking_cfg = config.get("chunking", {})
     
-    # Wenn chunking Sektion komplett fehlt, gebe Warnung
     if not chunking_cfg:
-        logger.warning("⚠ 'chunking' Sektion fehlt in Config, nutze Defaults")
+        logger.warning(
+            "No 'chunking' section in config, using defaults"
+        )
     
     return ChunkingConfig(
-        mode=chunking_cfg.get("mode", "standard"),  # Default: standard
-        chunk_size=chunking_cfg.get("chunk_size", 512),  # Default: 512
+        mode=chunking_cfg.get("mode", "standard"),
+        chunk_size=chunking_cfg.get("chunk_size", 512),
         chunk_overlap=chunking_cfg.get("chunk_overlap", 128),
-        min_chunk_size=chunking_cfg.get("min_chunk_size", 200),
-        separators=chunking_cfg.get("separators", ["\n\n", "\n", ". ", " ", ""]),
+        min_chunk_size=chunking_cfg.get("min_chunk_size", 100),
+        separators=chunking_cfg.get("separators", DEFAULT_SEPARATORS.copy()),
         enable_pdf_cleaning=chunking_cfg.get("enable_pdf_cleaning", True),
     )
 
 
-# ============================================================================
-# UTILITY: GET PROCESSING STATS
-# ============================================================================
-
-def get_processing_stats(metadata_path: Path = Path("data/ingestion_metadata.json")) -> Optional[Dict]:
+def get_processing_stats(
+    metadata_path: Path = Path("data/ingestion_metadata.json")
+) -> Optional[Dict[str, Any]]:
     """
-    Lade Processing Stats aus gespeicherter Metadata.
+    Load processing statistics from saved metadata.
     
-    NEU! Utility für Debugging und Thesis-Dokumentation.
+    Useful for:
+    - Thesis documentation
+    - Debugging processing issues
+    - Verifying reproducibility
     
     Args:
-        metadata_path: Pfad zur Metadata JSON
+        metadata_path: Path to metadata JSON file
         
     Returns:
-        Dict mit Stats oder None falls nicht vorhanden
-        
-    Usage:
-        stats = get_processing_stats()
-        print(f"Processed {stats['stats']['total_chunks']} chunks")
+        Dictionary with processing metadata, or None if not found
     """
     if not metadata_path.exists():
-        logger.warning(f"Metadata nicht gefunden: {metadata_path}")
+        logger.warning(f"Processing metadata not found: {metadata_path}")
         return None
     
     try:
         with open(metadata_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     except Exception as e:
-        logger.error(f"Fehler beim Laden von Metadata: {e}")
+        logger.error(f"Failed to load processing metadata: {e}")
         return None
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def validate_chunks(chunks: List[Document]) -> Dict[str, Any]:
+    """
+    Validate chunked documents and compute statistics.
+    
+    Useful for quality assurance and thesis documentation.
+    
+    Args:
+        chunks: List of chunked documents
+        
+    Returns:
+        Dictionary containing validation results and statistics
+    """
+    if not chunks:
+        return {
+            "valid": False,
+            "error": "No chunks provided",
+            "count": 0,
+        }
+    
+    sizes = [len(c.page_content) for c in chunks]
+    
+    # Check for empty chunks
+    empty_chunks = [i for i, s in enumerate(sizes) if s == 0]
+    
+    # Check for very small chunks
+    small_threshold = 50
+    small_chunks = [i for i, s in enumerate(sizes) if 0 < s < small_threshold]
+    
+    # Compute statistics
+    import statistics
+    
+    result = {
+        "valid": len(empty_chunks) == 0,
+        "count": len(chunks),
+        "size_min": min(sizes),
+        "size_max": max(sizes),
+        "size_mean": statistics.mean(sizes),
+        "size_median": statistics.median(sizes),
+        "size_stdev": statistics.stdev(sizes) if len(sizes) > 1 else 0,
+        "empty_chunks": empty_chunks,
+        "small_chunks": small_chunks,
+    }
+    
+    if empty_chunks:
+        result["error"] = f"Found {len(empty_chunks)} empty chunks"
+    
+    return result

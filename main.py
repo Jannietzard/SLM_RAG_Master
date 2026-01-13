@@ -1,17 +1,25 @@
 """
 Main Entry-Point: Graph-Augmented Edge-RAG Pipeline Orchestration.
 
+Version: 2.1.0
+Last Modified: 2026-01-13
+
 Pipeline:
 1. Load Config (settings.yaml)
-2. Initiate Document Ingestion (PDF → Chunks)
+2. Initiate Document Ingestion (PDF -> Chunks)
 3. Initialize Embeddings (Ollama nomic-embed-text)
 4. Store: Vectors (LanceDB) + Graph (NetworkX)
 5. Retrieval: Hybrid (Vector + Graph Ensemble)
 
 Scientific Foundation:
-Decentralized AI Architecture für Edge Devices mit quantisierten SLMs.
-Full Stack: Ingestion → Embedding → Storage → Retrieval → Generation
+Decentralized AI Architecture for Edge Devices with quantized SLMs.
+Full Stack: Ingestion -> Embedding -> Storage -> Retrieval -> Generation
 All on-device, zero cloud dependencies.
+
+CHANGES IN v2.1.0:
+- Added distance_metric parameter to StorageConfig
+- Explicit cosine metric for correct similarity computation
+- Improved logging without UTF-8 special characters
 """
 import logging
 import sys
@@ -26,17 +34,6 @@ from src.ingestion import DocumentIngestionPipeline, load_ingestion_config
 from src.storage import HybridStore, StorageConfig
 from src.retrieval import HybridRetriever, RetrievalConfig, RetrievalMode
 from src.embeddings import BatchedOllamaEmbeddings
-import logging
-import sys
-from pathlib import Path
-
-import yaml
-
-# Local imports
-from src.ingestion import DocumentIngestionPipeline, load_ingestion_config
-from src.storage import HybridStore, StorageConfig
-from src.retrieval import HybridRetriever, RetrievalConfig, RetrievalMode
-from src.embeddings import BatchedOllamaEmbeddings
 
 
 # ============================================================================
@@ -45,15 +42,15 @@ from src.embeddings import BatchedOllamaEmbeddings
 
 def setup_logging(log_file: Path = Path("./logs/edge_rag.log")) -> logging.Logger:
     """
-    Windows-kompatibles Logging Setup mit UTF-8 support.
+    Windows-compatible logging setup with UTF-8 support.
     
-    Fixt das Windows cp1252 Encoding Problem mit Unicode-Chars (✓, →, etc).
+    Fixes Windows cp1252 encoding issues with Unicode characters.
 
     Args:
-        log_file: Pfad zur Log-Datei
+        log_file: Path to log file
 
     Returns:
-        Logger Instance
+        Logger instance
     """
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -61,16 +58,16 @@ def setup_logging(log_file: Path = Path("./logs/edge_rag.log")) -> logging.Logge
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
-    # Console Handler mit UTF-8 (for Windows CP1252 fix)
+    # Console Handler with UTF-8 (for Windows CP1252 fix)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
     
-    # Windows UTF-8 Fix: Force UTF-8 encoding für Console Output
+    # Windows UTF-8 Fix: Force UTF-8 encoding for console output
     if hasattr(console_handler.stream, 'reconfigure'):
         console_handler.stream.reconfigure(encoding='utf-8')
 
-    # File Handler mit UTF-8 (wichtig für Windows)
+    # File Handler with UTF-8
     file_handler = logging.FileHandler(log_file, encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
@@ -90,25 +87,25 @@ def setup_logging(log_file: Path = Path("./logs/edge_rag.log")) -> logging.Logge
 
 def load_configuration(config_path: Path) -> dict:
     """
-    Lade zentrale Konfiguration aus YAML.
+    Load central configuration from YAML.
 
     Args:
-        config_path: Pfad zur settings.yaml
+        config_path: Path to settings.yaml
 
     Returns:
-        Config Dictionary
+        Config dictionary
 
     Raises:
-        FileNotFoundError: Falls Config nicht existiert
+        FileNotFoundError: If config does not exist
     """
     if not config_path.exists():
-        raise FileNotFoundError(f"Config nicht gefunden: {config_path}")
+        raise FileNotFoundError(f"Config not found: {config_path}")
 
-    with open(config_path, "r", encoding="utf-8") as f:  # ← ADD encoding="utf-8"
+    with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     logger = logging.getLogger(__name__)
-    logger.info(f"Konfiguration geladen: {config_path}")
+    logger.info(f"Configuration loaded: {config_path}")
 
     return config
 
@@ -119,51 +116,51 @@ def load_configuration(config_path: Path) -> dict:
 
 class EdgeRAGPipeline:
     """
-    Orchestriert die gesamte Edge-RAG Pipeline.
+    Orchestrates the complete Edge-RAG Pipeline.
     
     Design Pattern: Pipeline/Orchestrator Pattern
-    Verantwortlichkeiten:
+    Responsibilities:
     - Config Management
     - Component Initialization
     - Data Flow Orchestration
-    - Error Handling & Logging
+    - Error Handling and Logging
     """
 
     def __init__(self, config: dict, logger_instance: logging.Logger):
         """
-        Initialisiere Pipeline mit Config.
+        Initialize pipeline with configuration.
 
         Args:
-            config: Konfigurationsdict
-            logger_instance: Logger Instance
+            config: Configuration dictionary
+            logger_instance: Logger instance
         """
         self.config = config
         self.logger = logger_instance
 
-        # Pfade aus Config
+        # Paths from config
         self.data_path = Path(config.get("paths", {}).get("documents", "./data/documents"))
         self.vector_db_path = Path(config.get("paths", {}).get("vector_db", "./data/vector_db"))
         self.graph_db_path = Path(config.get("paths", {}).get("graph_db", "./data/knowledge_graph"))
 
-        # Komponenten (werden lazy initialisiert)
+        # Components (lazy initialized)
         self.embeddings = None
         self.ingestion_pipeline = None
         self.hybrid_store = None
         self.retriever = None
 
-        self.logger.info("EdgeRAGPipeline initialisiert")
+        self.logger.info("EdgeRAGPipeline initialized")
 
     def initialize_embeddings(self) -> BatchedOllamaEmbeddings:
         """
-        Initialisiere Embedding-Modell (Ollama nomic-embed-text).
+        Initialize embedding model (Ollama nomic-embed-text).
         
-        Mit Batching + Caching für 10-100x Speedup!
+        With batching + caching for 10-100x speedup.
 
         Returns:
-            BatchedOllamaEmbeddings Instance
+            BatchedOllamaEmbeddings instance
 
         Raises:
-            Exception: Falls Ollama nicht erreichbar
+            Exception: If Ollama is not reachable
         """
         try:
             embedding_config = self.config.get("embeddings", {})
@@ -177,12 +174,12 @@ class EdgeRAGPipeline:
                 device=perf_config.get("device", "cpu"),
             )
 
-            # Test: Embedde einen Beispieltext
+            # Test: Embed a sample text
             test_embedding = embeddings.embed_query("test")
             embedding_dim = len(test_embedding)
 
             self.logger.info(
-                f"[OK] Embeddings initialisiert: {embedding_config.get('model_name')} "
+                f"[OK] Embeddings initialized: {embedding_config.get('model_name')} "
                 f"(dim={embedding_dim}, batch_size={perf_config.get('batch_size', 32)}, "
                 f"cached={embeddings.cache.get_stats()['total_entries']} entries)"
             )
@@ -191,26 +188,26 @@ class EdgeRAGPipeline:
 
         except Exception as e:
             self.logger.error(
-                f"Fehler beim Initialisieren der Embeddings: {str(e)}. "
-                f"Stelle sicher, dass Ollama läuft: ollama serve"
+                f"Error initializing embeddings: {str(e)}. "
+                f"Make sure Ollama is running: ollama serve"
             )
             raise
 
     def initialize_ingestion(self) -> DocumentIngestionPipeline:
         """
-        Initialisiere Document Ingestion Pipeline.
+        Initialize Document Ingestion Pipeline.
 
         Returns:
-            DocumentIngestionPipeline Instance
+            DocumentIngestionPipeline instance
 
         Raises:
-            FileNotFoundError: Falls Document Path nicht existiert
+            FileNotFoundError: If document path does not exist
         """
         try:
-            # Lade Chunking Config
+            # Load chunking config
             chunking_config = load_ingestion_config(Path("./config/settings.yaml"))
 
-            # Erstelle Dokumentverzeichnis falls nicht existiert
+            # Create document directory if not exists
             self.data_path.mkdir(parents=True, exist_ok=True)
 
             ingestion = DocumentIngestionPipeline(
@@ -219,29 +216,43 @@ class EdgeRAGPipeline:
                 logger_instance=self.logger,
             )
 
-            self.logger.info("Ingestion Pipeline initialisiert")
+            self.logger.info("Ingestion Pipeline initialized")
             return ingestion
 
         except Exception as e:
-            self.logger.error(f"Fehler beim Initialisieren der Ingestion: {str(e)}")
+            self.logger.error(f"Error initializing ingestion: {str(e)}")
             raise
 
     def initialize_storage(self) -> HybridStore:
         """
-        Initialisiere Hybrid Storage (Vectors + Graph).
+        Initialize Hybrid Storage (Vectors + Graph).
+        
+        CRITICAL UPDATE v2.1.0:
+        - Added distance_metric="cosine" to ensure correct similarity computation
+        - Added normalize_embeddings=True for consistent vector processing
 
         Returns:
-            HybridStore Instance
+            HybridStore instance
         """
         try:
             embedding_config = self.config.get("embeddings", {})
+            vector_store_config = self.config.get("vector_store", {})
             
+            # ================================================================
+            # CRITICAL: Include distance_metric parameter
+            # ================================================================
             storage_config = StorageConfig(
                 vector_db_path=self.vector_db_path,
                 graph_db_path=self.graph_db_path,
                 embedding_dim=embedding_config.get("embedding_dim", 768),
-                similarity_threshold=self.config.get("vector_store", {}).get(
-                    "similarity_threshold", 0.5
+                similarity_threshold=vector_store_config.get(
+                    "similarity_threshold", 0.3
+                ),
+                normalize_embeddings=vector_store_config.get(
+                    "normalize_embeddings", True
+                ),
+                distance_metric=vector_store_config.get(
+                    "distance_metric", "cosine"  # EXPLICIT COSINE METRIC
                 ),
             )
 
@@ -250,31 +261,40 @@ class EdgeRAGPipeline:
                 embeddings=self.embeddings,
             )
 
-            self.logger.info("Hybrid Store initialisiert")
+            self.logger.info(
+                f"Hybrid Store initialized: "
+                f"metric={storage_config.distance_metric}, "
+                f"normalize={storage_config.normalize_embeddings}"
+            )
             return store
 
         except Exception as e:
-            self.logger.error(f"Fehler beim Initialisieren des Stores: {str(e)}")
+            self.logger.error(f"Error initializing store: {str(e)}")
             raise
 
     def initialize_retriever(self) -> HybridRetriever:
         """
-        Initialisiere Hybrid Retriever (Vector + Graph Ensemble).
+        Initialize Hybrid Retriever (Vector + Graph Ensemble).
+        
+        Note:
+            Currently configured with graph_weight=0 for vector-only evaluation.
+            This allows isolated testing of vector retrieval performance.
 
         Returns:
-            HybridRetriever Instance
+            HybridRetriever instance
         """
         try:
             rag_config = self.config.get("rag", {})
+            vector_store_config = self.config.get("vector_store", {})
             
             retrieval_config = RetrievalConfig(
                 mode=RetrievalMode(rag_config.get("retrieval_mode", "hybrid")),
-                top_k_vector=rag_config.get("top_k_vectors", 5),
-                top_k_graph=rag_config.get("top_k_entities", 3),
-                vector_weight=rag_config.get("vector_weight", 0.6),
-                graph_weight=rag_config.get("graph_weight", 0.4),
-                similarity_threshold=self.config.get("vector_store", {}).get(
-                    "similarity_threshold", 0.5
+                top_k_vector=vector_store_config.get("top_k_vectors", 10),
+                top_k_graph=rag_config.get("top_k_entities", 5),
+                vector_weight=rag_config.get("vector_weight", 1.0),  # Vector-only for now
+                graph_weight=rag_config.get("graph_weight", 0.0),   # Graph disabled
+                similarity_threshold=vector_store_config.get(
+                    "similarity_threshold", 0.3
                 ),
             )
 
@@ -284,79 +304,84 @@ class EdgeRAGPipeline:
                 embeddings=self.embeddings,
             )
 
-            self.logger.info(f"Hybrid Retriever initialisiert: mode={retrieval_config.mode}")
+            self.logger.info(
+                f"Hybrid Retriever initialized: "
+                f"mode={retrieval_config.mode}, "
+                f"vector_weight={retrieval_config.vector_weight}, "
+                f"graph_weight={retrieval_config.graph_weight}"
+            )
             return retriever
 
         except Exception as e:
-            self.logger.error(f"Fehler beim Initialisieren des Retrievers: {str(e)}")
+            self.logger.error(f"Error initializing retriever: {str(e)}")
             raise
 
     def run_ingestion_pipeline(self) -> List[Document]:
         """
-        Führe Document Ingestion aus.
+        Execute Document Ingestion.
 
         Returns:
-            Gechunkte Dokumente (nicht nur Count!)
+            Chunked documents (not just count)
 
         Raises:
-            Exception: Bei Ingestion-Fehler
+            Exception: On ingestion error
         """
         try:
-            self.logger.info("Starte Document Ingestion...")
+            self.logger.info("Starting Document Ingestion...")
             documents = self.ingestion_pipeline.process_documents()
             
-            self.logger.info(f"✓ {len(documents)} Dokumente gechunked")
-            return documents  # ← RETURN DOCUMENTS, nicht Count!
+            self.logger.info(f"[OK] {len(documents)} documents chunked")
+            return documents
 
         except Exception as e:
-            self.logger.error(f"Ingestion Pipeline fehlgeschlagen: {str(e)}")
+            self.logger.error(f"Ingestion Pipeline failed: {str(e)}")
             raise
 
     def run_storage_pipeline(self, documents: list) -> None:
         """
-        Füge Dokumente zu Storage hinzu.
+        Add documents to storage.
 
         Args:
-            documents: Gechunkte Dokumente
+            documents: Chunked documents
         """
         try:
-            self.logger.info("Füge Dokumente zu Hybrid Store hinzu...")
+            self.logger.info("Adding documents to Hybrid Store...")
             self.hybrid_store.add_documents(documents)
             self.hybrid_store.save()
             
-            self.logger.info("[OK] Dokumente in Storage gespeichert")
+            self.logger.info("[OK] Documents saved to storage")
 
         except Exception as e:
-            self.logger.error(f"Storage Pipeline fehlgeschlagen: {str(e)}")
+            self.logger.error(f"Storage Pipeline failed: {str(e)}")
             raise
 
     def retrieve(self, query: str) -> list:
         """
-        Führe Hybrid Retrieval durch.
+        Perform Hybrid Retrieval.
 
         Args:
-            query: Nutzer-Anfrage
+            query: User query
 
         Returns:
-            Liste von RetrievalResult-Objekten
+            List of RetrievalResult objects
         """
         try:
-            self.logger.info(f"Retrieval für Query: '{query}'")
+            self.logger.info(f"Retrieval for query: '{query}'")
             results = self.retriever.retrieve(query)
             
-            self.logger.info(f"[OK] {len(results)} Results zurückgegeben")
+            self.logger.info(f"[OK] {len(results)} results returned")
             return results
 
         except Exception as e:
-            self.logger.error(f"Retrieval fehlgeschlagen: {str(e)}")
+            self.logger.error(f"Retrieval failed: {str(e)}")
             raise
 
     def setup(self) -> None:
         """
-        Führe vollständiges Setup aus: Init all components in dependency order.
+        Execute complete setup: Initialize all components in dependency order.
         """
         self.logger.info("=" * 70)
-        self.logger.info("STARTE EDGE-RAG PIPELINE SETUP")
+        self.logger.info("STARTING EDGE-RAG PIPELINE SETUP")
         self.logger.info("=" * 70)
 
         try:
@@ -373,11 +398,11 @@ class EdgeRAGPipeline:
             self.retriever = self.initialize_retriever()
 
             self.logger.info("=" * 70)
-            self.logger.info("[OK] PIPELINE SETUP ERFOLGREICH")
+            self.logger.info("[OK] PIPELINE SETUP SUCCESSFUL")
             self.logger.info("=" * 70)
 
         except Exception as e:
-            self.logger.error(f"Setup fehlgeschlagen: {str(e)}")
+            self.logger.error(f"Setup failed: {str(e)}")
             raise
 
 
@@ -387,29 +412,29 @@ class EdgeRAGPipeline:
 
 def main() -> None:
     """
-    Main Entry Point für Edge-RAG Pipeline.
+    Main Entry Point for Edge-RAG Pipeline.
     """
     # Setup Logging
     logger = setup_logging()
     logger.info("Edge-RAG Pipeline Start")
 
     try:
-        # Lade Config
+        # Load Config
         config = load_configuration(Path("./config/settings.yaml"))
 
-        # Initialisiere Pipeline
+        # Initialize Pipeline
         pipeline = EdgeRAGPipeline(config, logger)
         pipeline.setup()
 
-        # Führe Ingestion aus (einmal, gibt Dokumente zurück!)
+        # Execute Ingestion (once, returns documents)
         documents = pipeline.run_ingestion_pipeline()
 
         if len(documents) > 0:
-            # Speichere in Storage (nutze schon geladene Dokumente!)
+            # Save to Storage (use already loaded documents)
             pipeline.run_storage_pipeline(documents)
 
-            # Beispiel-Retrieval
-            query = "Summarize how Big Data impacts our world."
+            # Example Retrieval
+            query = "What is the model structure of MTMEC"
             results = pipeline.retrieve(query)
 
             logger.info("\n" + "=" * 70)
@@ -417,29 +442,29 @@ def main() -> None:
             logger.info("=" * 70)
 
             if results:
-                for i, result in enumerate(results[:3], 1):
+                for i, result in enumerate(results[:5], 1):
                     logger.info(f"\nResult {i}:")
                     logger.info(f"  Score: {result.relevance_score:.4f}")
                     logger.info(f"  Method: {result.retrieval_method}")
                     logger.info(f"  Text: {result.text[:200]}...")
             else:
-                logger.warning("Keine Retrieval Results! Prüfe Vector Store.")
+                logger.warning("No retrieval results. Check vector store configuration.")
             
             # Print Embedding Metrics
             pipeline.embeddings.print_metrics()
 
         else:
             logger.warning(
-                "Keine Dokumente gefunden. "
-                "Bitte platziere PDFs in: ./data/documents"
+                "No documents found. "
+                "Please place PDFs in: ./data/documents"
             )
 
     except Exception as e:
-        logger.critical(f"Pipeline Fehler: {str(e)}", exc_info=True)
+        logger.critical(f"Pipeline Error: {str(e)}", exc_info=True)
         sys.exit(1)
 
     logger.info("=" * 70)
-    logger.info("Edge-RAG Pipeline beendet")
+    logger.info("Edge-RAG Pipeline completed")
     logger.info("=" * 70)
 
 

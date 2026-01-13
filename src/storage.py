@@ -1,37 +1,71 @@
 """
-Hybrid Storage: Vector Store (LanceDB) + Knowledge Graph (NetworkX) - ENHANCED.
+Hybrid Storage Module: Vector Store (LanceDB) + Knowledge Graph (NetworkX)
 
-IMPROVEMENTS über original storage.py:
-1. ✅ Automatische Embedding Dimension Detection (verhindert Mismatch Bug!)
-2. ✅ Optional L2-Normalisierung für Embeddings
-3. ✅ Verbesserte Distance→Similarity Conversion
-4. ✅ Metadata Persistence (embedding_dim wird gespeichert)
-5. ✅ Validation Layer (prüft Dimensionen vor jedem Add)
-6. ✅ Enhanced Logging (zeigt Dimension Info)
+Version: 2.1.0 - CORRECTED
+Author: Edge-RAG Research Project
+Last Modified: 2026-01-13
 
-BUG FIXES:
-- ✅ Embedding Dimension Mismatch (dein 0.16 Score Bug!)
-- ✅ Cosine Distance Conversion (korrigiert für LanceDB)
-- ✅ Shape Validation vor Vector Store Add
+CRITICAL BUG FIX (v2.1.0):
+    The previous implementation did NOT specify the distance metric for LanceDB.
+    LanceDB defaults to L2 (Euclidean) distance, but the code assumed Cosine distance.
+    
+    Mathematical Impact:
+    - L2 Distance range: [0, +infinity)  
+    - Cosine Distance range: [0, 2]
+    - The formula "similarity = 1 - distance" is ONLY valid for Cosine Distance
+    
+    Observed Symptoms:
+    - Maximum similarity scores around 0.25 instead of expected 0.7-0.9
+    - All results filtered out at threshold >= 0.25
+    - Poor retrieval coverage (0%)
+    
+    Solution:
+    - Explicitly set .metric("cosine") in LanceDB search operations
+    - Apply mathematically correct distance-to-similarity conversion
 
-Scientific Foundation:
-- Vector Store: Dense embeddings für semantic similarity
-- Knowledge Graph: Strukturelle Relationen für multi-hop reasoning
-- Hybrid: Kombiniert Vorteile beider Ansätze (vgl. Graph-RAG)
-- L2-Normalisierung: Macht Cosine Similarity äquivalent zu Dot Product (schneller!)
+SCIENTIFIC FOUNDATION:
 
-BACKWARDS COMPATIBLE:
-- Gleiche API wie original storage.py
-- Funktioniert mit main.py ohne Änderungen
-- LanceDB Integration unverändert
+    Vector Similarity Search:
+        Given query vector q and document vector d, both in R^n:
+        
+        Cosine Similarity:
+            sim(q, d) = (q . d) / (||q|| * ||d||)
+            Range: [-1, 1] for general vectors, [0, 1] for positive embeddings
+            
+        For L2-normalized vectors (||v|| = 1):
+            sim(q, d) = q . d  (dot product equals cosine similarity)
+            
+        LanceDB Cosine Distance:
+            dist(q, d) = 1 - sim(q, d)
+            Range: [0, 2] where 0 = identical, 1 = orthogonal, 2 = opposite
+            
+    Conversion Formula:
+        similarity = 1.0 - cosine_distance
+        
+    References:
+        - Manning, C.D., Raghavan, P., Schuetze, H. (2008). 
+          "Introduction to Information Retrieval", Chapter 6.
+        - LanceDB Documentation: https://lancedb.github.io/lancedb/
+
+EDGE DEVICE OPTIMIZATION:
+    - LanceDB: Embedded database, no server process required
+    - Memory-mapped file access for large vector collections
+    - IVF-FLAT indexing for sub-linear search complexity
+    - L2 normalization enables dot-product search (faster than cosine)
+
+ARCHITECTURE:
+    StorageConfig        - Configuration dataclass with validation
+    VectorStoreAdapter   - LanceDB wrapper with correct metric handling
+    KnowledgeGraphStore  - NetworkX-based graph for structural relations
+    HybridStore          - Facade combining both storage backends
 """
 
 import logging
 import json
 import shutil
 from pathlib import Path
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass, field
 import time
 
 import lancedb
@@ -45,208 +79,346 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# STORAGE CONFIG - Enhanced mit Validation
+# CONFIGURATION
 # ============================================================================
 
 @dataclass
 class StorageConfig:
     """
-    Konfiguration für Hybrid Storage mit Auto-Detection.
+    Configuration for Hybrid Storage System.
     
-    ENHANCEMENT: embedding_dim kann jetzt None sein → Auto-Detection!
+    Attributes:
+        vector_db_path: Directory path for LanceDB vector database
+        graph_db_path: File path for NetworkX graph (GraphML format)
+        embedding_dim: Dimensionality of embedding vectors (None = auto-detect)
+        similarity_threshold: Minimum similarity score for retrieval [0.0, 1.0]
+        normalize_embeddings: Whether to L2-normalize vectors before storage
+        distance_metric: Distance metric for vector search ("cosine" or "l2")
+    
+    Validation:
+        - embedding_dim must be positive if specified
+        - similarity_threshold must be in [0.0, 1.0]
+        - distance_metric must be "cosine" or "l2"
     """
     vector_db_path: Path
     graph_db_path: Path
-    embedding_dim: Optional[int] = None  # NEU: Auto-detect wenn None!
-    similarity_threshold: float = 0.5
-    normalize_embeddings: bool = True  # NEU: L2-Normalisierung aktivieren?
+    embedding_dim: Optional[int] = None
+    similarity_threshold: float = 0.3
+    normalize_embeddings: bool = True
+    distance_metric: str = "cosine"  # CRITICAL: Must be explicit
     
     def __post_init__(self):
-        """Validiere Config nach Initialisierung."""
+        """Validate configuration parameters after initialization."""
         if self.embedding_dim is not None and self.embedding_dim <= 0:
-            raise ValueError(f"embedding_dim muss positiv sein, ist: {self.embedding_dim}")
+            raise ValueError(
+                f"embedding_dim must be positive, got: {self.embedding_dim}"
+            )
         
         if not (0.0 <= self.similarity_threshold <= 1.0):
             raise ValueError(
-                f"similarity_threshold muss in [0, 1] sein, ist: {self.similarity_threshold}"
+                f"similarity_threshold must be in [0.0, 1.0], got: {self.similarity_threshold}"
+            )
+        
+        if self.distance_metric not in ("cosine", "l2"):
+            raise ValueError(
+                f"distance_metric must be 'cosine' or 'l2', got: {self.distance_metric}"
             )
 
 
 # ============================================================================
-# VECTOR STORE ADAPTER (LanceDB) - ENHANCED
+# VECTOR STORE ADAPTER (LanceDB)
 # ============================================================================
 
 class VectorStoreAdapter:
     """
-    LanceDB Vector Store Adapter mit Auto-Dimension-Detection.
+    LanceDB Vector Store Adapter with correct distance metric handling.
     
-    CRITICAL BUG FIX:
-    Original hatte hardcoded embedding_dim in Config → Mismatch wenn Model anders!
-    → Lösung: Auto-detect aus erstem Embedding, speichere in Metadata
+    This class wraps LanceDB operations and ensures mathematically correct
+    similarity score computation for retrieval tasks.
     
-    NEW FEATURES:
-    1. ✅ Automatische Dimension Detection
-    2. ✅ Optional L2-Normalisierung
-    3. ✅ Shape Validation vor jedem Add
-    4. ✅ Metadata Persistence
-    5. ✅ Verbesserte Error Messages
+    CRITICAL IMPLEMENTATION NOTES:
     
-    Scientific Rationale:
-    - L2-Normalisierung macht Cosine Similarity = Dot Product
-    - Dot Product ist schneller als Cosine (keine Division)
-    - Normalisierte Vektoren haben Magnitude 1 → numerisch stabiler
+    1. Distance Metric Selection:
+       LanceDB supports multiple distance metrics. The default is L2 (Euclidean),
+       but for text embeddings, Cosine distance is typically more appropriate.
+       
+       This implementation EXPLICITLY sets the metric to avoid ambiguity.
+    
+    2. Distance to Similarity Conversion:
+       For Cosine distance in LanceDB:
+           cosine_distance = 1 - cosine_similarity
+           
+       Therefore:
+           cosine_similarity = 1 - cosine_distance
+           
+       For L2 distance, conversion is more complex:
+           similarity = 1 / (1 + l2_distance)
+           
+       This ensures similarity scores are always in [0, 1].
+    
+    3. Vector Normalization:
+       L2-normalized vectors (unit length) have beneficial properties:
+       - Cosine similarity equals dot product (faster computation)
+       - Numerical stability improved
+       - Score interpretation simplified
+    
+    Attributes:
+        db: LanceDB connection object
+        embedding_dim: Vector dimensionality
+        normalize_embeddings: Whether to normalize vectors
+        distance_metric: Distance metric ("cosine" or "l2")
+        table: LanceDB table object (lazy initialized)
     """
 
+    # LanceDB table schema for documents
+    SCHEMA_VERSION = "2.1.0"
+    TABLE_NAME = "documents"
+    
     def __init__(
         self, 
         db_path: Path, 
         embedding_dim: Optional[int] = None,
-        normalize_embeddings: bool = True
+        normalize_embeddings: bool = True,
+        distance_metric: str = "cosine"
     ):
         """
-        Initialisiere LanceDB Connection mit Auto-Detection Support.
+        Initialize LanceDB connection with explicit configuration.
 
         Args:
-            db_path: Pfad zur LanceDB Datenbasis
-            embedding_dim: Dimensionalität (None = auto-detect)
-            normalize_embeddings: L2-Normalisierung aktivieren?
+            db_path: Path to LanceDB database directory
+            embedding_dim: Expected embedding dimensionality (None = auto-detect)
+            normalize_embeddings: Whether to L2-normalize vectors
+            distance_metric: Distance metric for search ("cosine" or "l2")
+        
+        Raises:
+            ValueError: If distance_metric is not supported
         """
+        if distance_metric not in ("cosine", "l2"):
+            raise ValueError(f"Unsupported distance metric: {distance_metric}")
+        
+        db_path = Path(db_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
+        
         self.db = lancedb.connect(str(db_path))
-        self.embedding_dim = embedding_dim  # Kann None sein!
+        self.db_path = db_path
+        self.embedding_dim = embedding_dim
         self.normalize_embeddings = normalize_embeddings
+        self.distance_metric = distance_metric
         self.table = None
         self.logger = logging.getLogger(__name__)
         
         self.logger.info(
-            f"LanceDB initialisiert: {db_path} | "
-            f"dim={'auto-detect' if embedding_dim is None else embedding_dim} | "
+            f"VectorStoreAdapter initialized: "
+            f"path={db_path}, "
+            f"dim={'auto' if embedding_dim is None else embedding_dim}, "
+            f"metric={distance_metric}, "
             f"normalize={normalize_embeddings}"
         )
         
-        # Try to load existing metadata
+        # Load existing metadata if available
         self._load_metadata()
 
+    def _get_metadata_path(self) -> Path:
+        """Return path to metadata JSON file."""
+        return self.db_path.parent / "vector_store_metadata.json"
+    
     def _load_metadata(self) -> None:
         """
-        Lade Metadata aus vorheriger Ingestion (falls vorhanden).
+        Load metadata from previous ingestion session.
         
-        NEU! Verhindert Dimension Mismatch nach Neustart.
+        This ensures consistency across restarts and prevents
+        dimension mismatch errors when loading existing data.
         """
-        metadata_path = Path("data/vector_store_metadata.json")
+        metadata_path = self._get_metadata_path()
         
-        if metadata_path.exists():
-            try:
-                with open(metadata_path, 'r') as f:
-                    metadata = json.load(f)
+        if not metadata_path.exists():
+            return
+            
+        try:
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+            
+            stored_dim = metadata.get("embedding_dim")
+            stored_metric = metadata.get("distance_metric", "cosine")
+            
+            if stored_dim and self.embedding_dim is None:
+                self.embedding_dim = stored_dim
+                self.logger.info(
+                    f"Loaded embedding dimension from metadata: {stored_dim}"
+                )
+            elif stored_dim and self.embedding_dim != stored_dim:
+                self.logger.warning(
+                    f"Dimension mismatch: config={self.embedding_dim}, "
+                    f"stored={stored_dim}. Using config value."
+                )
+            
+            if stored_metric != self.distance_metric:
+                self.logger.warning(
+                    f"Metric mismatch: config={self.distance_metric}, "
+                    f"stored={stored_metric}. Data may need re-indexing."
+                )
                 
-                stored_dim = metadata.get("embedding_dim")
-                
-                if stored_dim and self.embedding_dim is None:
-                    self.embedding_dim = stored_dim
-                    self.logger.info(f"✓ Embedding Dimension aus Metadata geladen: {stored_dim}")
-                elif stored_dim and self.embedding_dim != stored_dim:
-                    self.logger.warning(
-                        f"⚠ Dimension Mismatch! "
-                        f"Config: {self.embedding_dim}, Metadata: {stored_dim} | "
-                        f"Verwende Config-Wert"
-                    )
-            except Exception as e:
-                self.logger.debug(f"Metadata Laden fehlgeschlagen: {e}")
+        except Exception as e:
+            self.logger.debug(f"Could not load metadata: {e}")
     
     def _save_metadata(self) -> None:
         """
-        Speichere Vector Store Metadata.
+        Persist metadata for reproducibility and consistency checking.
         
-        NEU! Für Reproducibility und Dimension Tracking.
+        Stored information:
+        - embedding_dim: Vector dimensionality
+        - distance_metric: Search metric used
+        - normalize_embeddings: Normalization setting
+        - num_documents: Document count
+        - schema_version: For migration support
+        - timestamp: Last modification time
         """
         if self.embedding_dim is None:
-            return  # Noch keine Dimension bekannt
+            return
         
         metadata = {
+            "schema_version": self.SCHEMA_VERSION,
             "embedding_dim": self.embedding_dim,
+            "distance_metric": self.distance_metric,
             "normalize_embeddings": self.normalize_embeddings,
-            "timestamp": time.time(),
             "num_documents": len(self.table) if self.table else 0,
+            "timestamp": time.time(),
         }
         
-        metadata_path = Path("data/vector_store_metadata.json")
+        metadata_path = self._get_metadata_path()
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         
-        with open(metadata_path, 'w') as f:
+        with open(metadata_path, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, indent=2)
         
-        self.logger.debug(f"Vector Store Metadata gespeichert: {metadata_path}")
+        self.logger.debug(f"Metadata saved: {metadata_path}")
 
     def _normalize_vectors(self, vectors: np.ndarray) -> np.ndarray:
         """
-        L2-Normalisierung von Embedding-Vektoren.
+        Apply L2 normalization to embedding vectors.
         
-        Scientific Rationale:
-        Normalized vectors haben Magnitude 1.0:
-        - Cosine Similarity wird zu Dot Product
-        - Dot Product ist schneller (keine Division)
-        - Numerisch stabiler (kein Division by Zero)
+        Mathematical Definition:
+            v_normalized = v / ||v||_2
+            
+        where ||v||_2 = sqrt(sum(v_i^2)) is the L2 norm.
         
-        Formula: v_norm = v / ||v||_2
+        Properties of L2-normalized vectors:
+        1. ||v_normalized||_2 = 1 (unit length)
+        2. cosine_similarity(u, v) = dot_product(u, v) for normalized vectors
+        3. Numerical stability improved (avoids very large/small values)
         
         Args:
-            vectors: Numpy array shape (N, D)
+            vectors: Input vectors, shape (N, D)
             
         Returns:
-            Normalized vectors shape (N, D)
+            Normalized vectors, shape (N, D), each with L2 norm = 1
+            
+        Note:
+            Zero vectors are left unchanged to avoid division by zero.
         """
         if not self.normalize_embeddings:
             return vectors
         
-        # L2 Norm berechnen (per row)
+        # Compute L2 norms for each row
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         
-        # Avoid division by zero
-        norms = np.where(norms == 0, 1, norms)
+        # Avoid division by zero for zero vectors
+        norms = np.where(norms == 0, 1.0, norms)
         
-        # Normalize
-        normalized = vectors / norms
-        
-        return normalized
+        return vectors / norms
 
     def _validate_embedding_dimension(self, embeddings: List[List[float]]) -> None:
         """
-        Validiere Embedding Dimensionen gegen erwartete Dimension.
+        Validate embedding dimensions against expected configuration.
         
-        CRITICAL: Verhindert den 0.16 Score Bug!
+        This validation is critical for catching configuration errors early.
+        Dimension mismatches between stored vectors and query vectors will
+        result in meaningless similarity scores.
         
         Args:
-            embeddings: Liste von Embedding Vektoren
+            embeddings: List of embedding vectors
             
         Raises:
-            ValueError: Wenn Dimensionen nicht matchen
+            ValueError: If dimensions do not match expected value
         """
         if not embeddings:
             return
         
         actual_dim = len(embeddings[0])
         
-        # Auto-detect dimension beim ersten Add
+        # Auto-detect on first use
         if self.embedding_dim is None:
             self.embedding_dim = actual_dim
-            self.logger.info(f"✓ Auto-detected Embedding Dimension: {actual_dim}")
+            self.logger.info(f"Auto-detected embedding dimension: {actual_dim}")
             self._save_metadata()
             return
         
-        # Validate gegen bekannte Dimension
+        # Validate against known dimension
         if actual_dim != self.embedding_dim:
             raise ValueError(
-                f"🚨 EMBEDDING DIMENSION MISMATCH! 🚨\n"
+                f"EMBEDDING DIMENSION MISMATCH\n"
                 f"Expected: {self.embedding_dim} dimensions\n"
-                f"Got: {actual_dim} dimensions\n"
+                f"Received: {actual_dim} dimensions\n"
                 f"\n"
-                f"Dies ist wahrscheinlich die Ursache für niedrige Scores!\n"
-                f"Lösung:\n"
-                f"1. Prüfe config/settings.yaml: embedding_dim = {actual_dim}\n"
-                f"2. Lösche Vector Store: rm -rf data/vector_db/\n"
-                f"3. Neu ingestieren: python main.py\n"
+                f"This mismatch will cause incorrect similarity scores.\n"
+                f"Resolution steps:\n"
+                f"1. Verify embedding model configuration\n"
+                f"2. Delete existing vector store: rm -rf {self.db_path}\n"
+                f"3. Re-run ingestion pipeline"
             )
+
+    def _distance_to_similarity(self, distance: float) -> float:
+        """
+        Convert distance metric to similarity score in [0, 1].
+        
+        MATHEMATICAL FOUNDATION:
+        
+        For Cosine Distance (LanceDB definition):
+            cosine_distance = 1 - cosine_similarity
+            
+            Therefore:
+            cosine_similarity = 1 - cosine_distance
+            
+            Range: cosine_distance in [0, 2]
+                   - 0 = identical vectors
+                   - 1 = orthogonal vectors  
+                   - 2 = opposite vectors
+                   
+            Resulting similarity in [-1, 1], clamped to [0, 1]
+        
+        For L2 (Euclidean) Distance:
+            l2_distance = ||q - d||_2 = sqrt(sum((q_i - d_i)^2))
+            
+            Range: [0, +infinity)
+            
+            Conversion using inverse relationship:
+            similarity = 1 / (1 + l2_distance)
+            
+            This maps:
+            - distance=0 -> similarity=1 (identical)
+            - distance=1 -> similarity=0.5
+            - distance->inf -> similarity->0
+        
+        Args:
+            distance: Raw distance value from LanceDB
+            
+        Returns:
+            Similarity score in [0.0, 1.0]
+        """
+        if self.distance_metric == "cosine":
+            # Cosine: similarity = 1 - distance
+            # Clamp to [0, 1] to handle numerical edge cases
+            similarity = 1.0 - distance
+            return max(0.0, min(1.0, similarity))
+        
+        elif self.distance_metric == "l2":
+            # L2: inverse relationship
+            # This formula ensures similarity in (0, 1]
+            return 1.0 / (1.0 + distance)
+        
+        else:
+            # Should never reach here due to validation
+            raise ValueError(f"Unknown distance metric: {self.distance_metric}")
 
     def add_documents_with_embeddings(
         self,
@@ -254,53 +426,52 @@ class VectorStoreAdapter:
         embeddings: Embeddings,
     ) -> None:
         """
-        Füge Dokumente mit Embeddings zu Vector Store hinzu.
+        Add documents with their embeddings to the vector store.
         
-        ENHANCEMENTS:
-        1. Auto-detect Embedding Dimension
-        2. Validate Dimensions
-        3. Optional Normalisierung
-        4. Better Error Messages
-
+        Processing Pipeline:
+        1. Extract text content from documents
+        2. Generate embeddings via embedding model
+        3. Validate embedding dimensions
+        4. Apply L2 normalization (if enabled)
+        5. Store in LanceDB with metadata
+        
         Args:
-            documents: Liste der Dokumente
-            embeddings: Embedding-Modell (LangChain Embeddings Interface)
-
+            documents: List of LangChain Document objects
+            embeddings: Embedding model implementing embed_documents()
+            
         Raises:
-            ValueError: Falls Embedding-Dimension nicht matched
+            ValueError: If embedding dimensions are inconsistent
         """
         if not documents:
-            self.logger.warning("Keine Dokumente zum Hinzufügen")
+            self.logger.warning("No documents provided for indexing")
             return
 
-        # Generiere Embeddings
         texts = [doc.page_content for doc in documents]
-        self.logger.info(f"Generiere Embeddings für {len(texts)} Dokumente...")
+        self.logger.info(f"Generating embeddings for {len(texts)} documents...")
         
         start_time = time.time()
         embeddings_list = embeddings.embed_documents(texts)
         embed_time = time.time() - start_time
         
         self.logger.info(
-            f"✓ Embeddings generiert: {len(embeddings_list)} vectors | "
-            f"{embed_time:.1f}s ({embed_time/len(texts)*1000:.1f}ms/doc)"
+            f"Embeddings generated: {len(embeddings_list)} vectors, "
+            f"{embed_time:.2f}s total, "
+            f"{(embed_time/len(texts)*1000):.1f}ms per document"
         )
 
-        # CRITICAL: Validate Dimensions
+        # Validate dimensions before processing
         self._validate_embedding_dimension(embeddings_list)
 
-        # Convert to numpy for normalization
+        # Convert to numpy and normalize
         embeddings_array = np.array(embeddings_list, dtype=np.float32)
         
-        # Optional: L2 Normalisierung
         if self.normalize_embeddings:
             embeddings_array = self._normalize_vectors(embeddings_array)
-            self.logger.debug(f"✓ Embeddings L2-normalisiert")
+            self.logger.debug("Embeddings L2-normalized")
         
-        # Convert back to list for LanceDB
         embeddings_list = embeddings_array.tolist()
 
-        # Vorbereite Daten für LanceDB
+        # Prepare data records for LanceDB
         data = []
         for doc, emb in zip(documents, embeddings_list):
             data.append({
@@ -311,178 +482,219 @@ class VectorStoreAdapter:
                 "source_file": doc.metadata.get("source_file", "unknown"),
             })
 
-        # Speichere in LanceDB
+        # Insert into LanceDB
         try:
             if self.table is None:
-                self.table = self.db.create_table("documents", data=data, mode="overwrite")
-                self.logger.info(f"✓ Neue Tabelle erstellt mit {len(data)} Dokumenten")
+                self.table = self.db.create_table(
+                    self.TABLE_NAME, 
+                    data=data, 
+                    mode="overwrite"
+                )
+                self.logger.info(f"Created new table with {len(data)} documents")
             else:
                 self.table.add(data)
-                self.logger.info(f"✓ {len(data)} Dokumente hinzugefügt")
+                self.logger.info(f"Added {len(data)} documents to existing table")
             
-            # Save metadata
             self._save_metadata()
             
         except Exception as e:
-            self.logger.error(f"Fehler beim Einfügen in Vector Store: {str(e)}")
+            self.logger.error(f"Failed to insert documents: {e}")
             raise
 
     def vector_search(
         self,
         query_embedding: List[float],
         top_k: int = 5,
-        threshold: float = 0.5,
+        threshold: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """
-        Vector-basierte Similarity Search mit korrigierter Distance Conversion.
+        Perform vector similarity search with explicit metric specification.
         
-        FIXED: Korrekte Conversion von LanceDB Cosine Distance → Similarity
+        CRITICAL IMPLEMENTATION:
+        This method explicitly sets the distance metric in the LanceDB query
+        to ensure correct similarity score computation.
         
-        LanceDB mit metric="cosine" gibt zurück:
-        - Cosine Distance ∈ [0, 2] where:
-          * 0 = identical vectors
-          * 1 = orthogonal (90°)
-          * 2 = opposite (180°)
+        Algorithm:
+        1. Validate query embedding dimension
+        2. Normalize query embedding (if enabled)
+        3. Execute LanceDB search with EXPLICIT metric
+        4. Convert distances to similarities
+        5. Filter by threshold
+        6. Sort and return top-k results
         
-        Conversion zu Similarity ∈ [0, 1]:
-        - Wenn Embeddings normalized: similarity = 1 - distance
-        - Wenn Embeddings nicht normalized: similarity = 1 - (distance / 2)
-        
-        Scientific Rationale:
-        Für normalized vectors (magnitude=1):
-        - Cosine Distance = 2 * (1 - cosine_similarity)
-        - → cosine_similarity = 1 - (distance / 2)
-        
-        Aber da wir normalisieren, gilt:
-        - distance = 1 - similarity (direkt)
-
         Args:
-            query_embedding: Query Vector
-            top_k: Anzahl Top Results
-            threshold: Similarity Threshold (0.0-1.0)
-
+            query_embedding: Query vector (must match stored dimensionality)
+            top_k: Maximum number of results to return
+            threshold: Minimum similarity score [0.0, 1.0]
+            
         Returns:
-            Liste von Results mit Text, Score, Metadaten
+            List of dictionaries containing:
+            - text: Document content
+            - similarity: Similarity score in [0, 1]
+            - document_id: Unique identifier
+            - metadata: Document metadata dict
+            
+        Note:
+            Returns empty list if table is not initialized or no results
+            meet the threshold criteria.
         """
         if self.table is None:
-            self.logger.warning("Vector Store ist leer - keine Dokumente")
+            self.logger.warning("Vector store is empty - no documents indexed")
             return []
 
         try:
             # Validate query dimension
             if self.embedding_dim and len(query_embedding) != self.embedding_dim:
                 raise ValueError(
-                    f"Query Embedding Dimension Mismatch! "
-                    f"Expected {self.embedding_dim}, got {len(query_embedding)}"
+                    f"Query dimension mismatch: "
+                    f"expected {self.embedding_dim}, got {len(query_embedding)}"
                 )
             
-            # Normalize query embedding
+            # Normalize query embedding to match stored vectors
             if self.normalize_embeddings:
                 query_array = np.array([query_embedding], dtype=np.float32)
                 query_array = self._normalize_vectors(query_array)
                 query_embedding = query_array[0].tolist()
             
-            # LanceDB Search
-            raw_results = self.table.search(query_embedding).limit(top_k * 3).to_list()
+            # ================================================================
+            # CRITICAL FIX: Explicitly specify distance metric
+            # ================================================================
+            # LanceDB defaults to L2 distance if not specified.
+            # We MUST set .metric() to ensure correct similarity computation.
+            # ================================================================
+            
+            raw_results = (
+                self.table
+                .search(query_embedding)
+                .metric(self.distance_metric)  # EXPLICIT METRIC SPECIFICATION
+                .limit(top_k * 3)  # Over-fetch for threshold filtering
+                .to_list()
+            )
             
             if not raw_results:
-                self.logger.debug("Vector Search: Keine Results von LanceDB")
+                self.logger.debug("No results returned from LanceDB")
                 return []
 
-            # Convert Distance → Similarity
-            filtered = []
+            # Convert distances to similarities and filter
+            filtered_results = []
             
-            for i, result in enumerate(raw_results):
-                # LanceDB gibt Cosine Distance zurück
-                distance = result.get("_distance", 1.0)
+            for idx, result in enumerate(raw_results):
+                distance = result.get("_distance", 0.0)
+                similarity = self._distance_to_similarity(distance)
                 
-                # KORREKTE Conversion für normalized embeddings:
-                # Cosine Similarity = 1 - Cosine Distance
-                similarity = 1.0 - distance
-                
-                # Clamp zu [0, 1] (safety)
-                similarity = max(0.0, min(1.0, similarity))
-                
-                # Debug für erste 3 Results
-                if i < 3:
+                # Debug logging for first few results
+                if idx < 3:
                     self.logger.debug(
-                        f"  Result {i}: distance={distance:.4f} → similarity={similarity:.4f}"
+                        f"Result {idx}: distance={distance:.4f} -> "
+                        f"similarity={similarity:.4f} (metric={self.distance_metric})"
                     )
                 
-                # Threshold Check
+                # Apply threshold filter
                 if similarity >= threshold:
-                    # Parse Metadata
                     try:
                         metadata = json.loads(result.get("metadata", "{}"))
-                    except:
+                    except (json.JSONDecodeError, TypeError):
                         metadata = {}
                     
-                    filtered.append({
+                    filtered_results.append({
                         "text": result.get("text", ""),
                         "similarity": similarity,
                         "document_id": result.get("document_id", "unknown"),
                         "metadata": metadata,
                     })
 
-            # Sortiere nach Similarity (höchste zuerst)
-            filtered.sort(key=lambda x: x["similarity"], reverse=True)
+            # Sort by similarity (descending) and limit to top_k
+            filtered_results.sort(key=lambda x: x["similarity"], reverse=True)
+            final_results = filtered_results[:top_k]
             
-            # Return nur top_k beste
-            final_results = filtered[:top_k]
-            
+            # Log search statistics
             self.logger.info(
-                f"Vector Search: {len(raw_results)} raw → {len(filtered)} filtered "
-                f"→ {len(final_results)} returned (threshold={threshold:.2f})"
+                f"Vector search: {len(raw_results)} candidates -> "
+                f"{len(filtered_results)} above threshold -> "
+                f"{len(final_results)} returned (threshold={threshold:.2f})"
             )
             
-            # Log score distribution
             if final_results:
-                scores = [r['similarity'] for r in final_results]
+                scores = [r["similarity"] for r in final_results]
                 self.logger.info(
-                    f"Score Range: [{min(scores):.4f}, {max(scores):.4f}] "
-                    f"Avg: {sum(scores)/len(scores):.4f}"
+                    f"Score range: [{min(scores):.4f}, {max(scores):.4f}], "
+                    f"mean={sum(scores)/len(scores):.4f}"
                 )
             
             return final_results
 
         except Exception as e:
-            self.logger.error(f"Fehler bei Vector Search: {str(e)}", exc_info=True)
+            self.logger.error(f"Vector search failed: {e}", exc_info=True)
             return []
 
 
 # ============================================================================
-# KNOWLEDGE GRAPH STORE (NetworkX) - UNVERÄNDERT
+# KNOWLEDGE GRAPH STORE (NetworkX)
 # ============================================================================
 
 class KnowledgeGraphStore:
     """
-    NetworkX-basierter Knowledge Graph für strukturelle Relationen.
+    NetworkX-based Knowledge Graph for structural document relations.
     
-    UNCHANGED: Funktioniert wie bisher.
+    This component provides graph-based retrieval capabilities that complement
+    vector similarity search. While vector search captures semantic similarity,
+    graph traversal can capture structural relationships such as:
+    
+    - Document hierarchy (sections, chapters)
+    - Citation networks
+    - Entity co-occurrence
+    - Temporal sequences
+    
+    The graph is stored as GraphML for portability and human readability.
+    
+    Note:
+        Currently configured with graph_weight=0 for vector-only evaluation.
+        Graph retrieval can be enabled by adjusting weights in RetrievalConfig.
+    
+    Attributes:
+        graph_path: Path to GraphML file
+        graph: NetworkX DiGraph instance
     """
 
     def __init__(self, graph_path: Path):
-        """Initialisiere Knowledge Graph."""
-        self.graph_path = graph_path
+        """
+        Initialize Knowledge Graph store.
+        
+        Args:
+            graph_path: Path for GraphML file storage
+        """
+        self.graph_path = Path(graph_path)
         self.graph = nx.DiGraph()
         self.logger = logging.getLogger(__name__)
 
-        # Lade existierenden Graph falls vorhanden
+        # Load existing graph if available
         if self.graph_path.exists():
             try:
                 self.graph = nx.read_graphml(str(self.graph_path))
                 self.logger.info(
-                    f"Graph geladen: {self.graph.number_of_nodes()} Knoten, "
-                    f"{self.graph.number_of_edges()} Kanten"
+                    f"Loaded graph: {self.graph.number_of_nodes()} nodes, "
+                    f"{self.graph.number_of_edges()} edges"
                 )
             except Exception as e:
-                self.logger.error(f"Fehler beim Laden des Graphs: {str(e)}")
+                self.logger.error(f"Failed to load graph: {e}")
                 self.graph = nx.DiGraph()
         else:
-            self.logger.info("Neuer Graph initialisiert")
+            self.logger.info("Initialized empty knowledge graph")
 
-    def add_entity(self, entity_id: str, entity_type: str, metadata: Dict[str, Any]) -> None:
-        """Füge Entity zum Graph hinzu."""
+    def add_entity(
+        self, 
+        entity_id: str, 
+        entity_type: str, 
+        metadata: Dict[str, Any]
+    ) -> None:
+        """
+        Add an entity node to the graph.
+        
+        Args:
+            entity_id: Unique identifier for the entity
+            entity_type: Category of entity (e.g., "document_chunk", "concept")
+            metadata: Additional attributes to store with the node
+        """
         self.graph.add_node(entity_id, entity_type=entity_type, **metadata)
 
     def add_relation(
@@ -492,7 +704,15 @@ class KnowledgeGraphStore:
         relation_type: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Füge Relation zwischen Entities hinzu."""
+        """
+        Add a directed relation (edge) between entities.
+        
+        Args:
+            source_id: Source entity identifier
+            target_id: Target entity identifier
+            relation_type: Type of relation (e.g., "from_source", "references")
+            metadata: Additional edge attributes
+        """
         edge_data = {"relation_type": relation_type}
         if metadata:
             edge_data.update(metadata)
@@ -504,7 +724,20 @@ class KnowledgeGraphStore:
         relation_types: Optional[List[str]] = None,
         max_hops: int = 2,
     ) -> Dict[str, int]:
-        """BFS-basierte Graph-Traversal."""
+        """
+        Perform BFS traversal from a starting entity.
+        
+        This method finds all entities reachable within max_hops from
+        the starting entity, optionally filtering by relation type.
+        
+        Args:
+            start_entity: Starting node identifier
+            relation_types: If specified, only follow edges of these types
+            max_hops: Maximum traversal depth
+            
+        Returns:
+            Dictionary mapping entity_id to hop distance from start
+        """
         if start_entity not in self.graph:
             return {}
 
@@ -529,59 +762,69 @@ class KnowledgeGraphStore:
         return visited
 
     def save(self) -> None:
-        """Speichere Graph als GraphML."""
+        """Persist graph to GraphML file."""
         try:
             self.graph_path.parent.mkdir(parents=True, exist_ok=True)
             nx.write_graphml(self.graph, str(self.graph_path))
-            self.logger.info(f"✓ Graph gespeichert: {self.graph_path}")
+            self.logger.info(f"Graph saved: {self.graph_path}")
         except Exception as e:
-            self.logger.error(f"Fehler beim Speichern des Graphs: {str(e)}")
+            self.logger.error(f"Failed to save graph: {e}")
 
 
 # ============================================================================
-# HYBRID STORE (Facade Pattern) - ENHANCED
+# HYBRID STORE (Facade Pattern)
 # ============================================================================
 
 class HybridStore:
     """
-    Unified Interface für Vector Store + Knowledge Graph mit Auto-Detection.
+    Unified interface for Vector Store and Knowledge Graph.
     
-    ENHANCEMENTS:
-    1. ✅ Auto-detect Embedding Dimension
-    2. ✅ Validate Dimensions vor jedem Add
-    3. ✅ Enhanced Logging mit Dimension Info
-    4. ✅ Metadata Persistence
+    This class implements the Facade pattern, providing a simple interface
+    to the underlying storage components. It handles:
     
-    BACKWARDS COMPATIBLE:
-    - Gleiche API wie original HybridStore
-    - Funktioniert mit main.py ohne Änderungen
+    - Automatic embedding dimension detection
+    - Coordinated document indexing (vector + graph)
+    - Metadata persistence
+    - Reset operations for ablation studies
+    
+    Current Configuration:
+        For initial evaluation, graph_weight is set to 0 in the retrieval
+        configuration. This allows isolated evaluation of vector retrieval
+        performance before introducing graph-based augmentation.
+    
+    Attributes:
+        config: StorageConfig instance
+        embeddings: Embedding model
+        vector_store: VectorStoreAdapter instance
+        graph_store: KnowledgeGraphStore instance
     """
 
     def __init__(self, config: StorageConfig, embeddings: Embeddings):
         """
-        Initialisiere Hybrid Store mit Auto-Detection.
-
+        Initialize Hybrid Store with automatic dimension detection.
+        
         Args:
-            config: StorageConfig (embedding_dim kann None sein!)
-            embeddings: Embedding-Modell
+            config: Storage configuration (embedding_dim can be None)
+            embeddings: Embedding model for dimension detection and encoding
         """
         self.config = config
         self.embeddings = embeddings
         self.logger = logging.getLogger(__name__)
 
-        # Auto-detect dimension falls nicht gesetzt
+        # Auto-detect embedding dimension if not specified
         if config.embedding_dim is None:
-            self.logger.info("🔍 Auto-detecting Embedding Dimension...")
-            test_embedding = embeddings.embed_query("test")
+            self.logger.info("Auto-detecting embedding dimension...")
+            test_embedding = embeddings.embed_query("dimension detection test")
             detected_dim = len(test_embedding)
             config.embedding_dim = detected_dim
-            self.logger.info(f"✓ Detected Dimension: {detected_dim}")
+            self.logger.info(f"Detected embedding dimension: {detected_dim}")
 
-        # Initialize Sub-Stores
+        # Initialize sub-stores
         self.vector_store = VectorStoreAdapter(
             db_path=config.vector_db_path,
             embedding_dim=config.embedding_dim,
             normalize_embeddings=config.normalize_embeddings,
+            distance_metric=config.distance_metric,
         )
 
         self.graph_store = KnowledgeGraphStore(
@@ -589,93 +832,108 @@ class HybridStore:
         )
 
         self.logger.info(
-            f"HybridStore initialisiert: "
+            f"HybridStore initialized: "
             f"dim={config.embedding_dim}, "
+            f"metric={config.distance_metric}, "
             f"normalize={config.normalize_embeddings}"
         )
 
     def add_documents(self, documents: List[Document]) -> None:
         """
-        Füge Dokumente zu beiden Stores hinzu mit Validation.
-
+        Add documents to both vector and graph stores.
+        
+        Processing:
+        1. Index documents in vector store with embeddings
+        2. Create entity nodes for each document chunk
+        3. Create relation edges to source documents
+        
         Args:
-            documents: Liste von Dokumenten
+            documents: List of LangChain Document objects
         """
         if not documents:
-            self.logger.warning("Keine Dokumente zum Hinzufügen")
+            self.logger.warning("No documents to add")
             return
 
         try:
-            # 1. Add to Vector Store (mit Auto-Dimension-Detection)
-            self.logger.info(f"Füge {len(documents)} Dokumente zu Vector Store hinzu...")
-            self.vector_store.add_documents_with_embeddings(documents, self.embeddings)
+            # Add to vector store
+            self.logger.info(f"Adding {len(documents)} documents to vector store...")
+            self.vector_store.add_documents_with_embeddings(
+                documents, 
+                self.embeddings
+            )
 
-            # 2. Extract Entities und füge zu Graph hinzu
-            self.logger.info("Extrahiere Entities für Knowledge Graph...")
+            # Add to knowledge graph
+            self.logger.info("Creating knowledge graph entities...")
             for doc in documents:
                 doc_id = str(doc.metadata.get("chunk_id", "unknown"))
                 source_file = doc.metadata.get("source_file", "unknown")
 
-                # Add Document als Entity
+                # Add document chunk as entity
                 self.graph_store.add_entity(
                     entity_id=doc_id,
                     entity_type="document_chunk",
                     metadata={"source_file": source_file},
                 )
 
-                # Add Source File als Entity
+                # Add source document as entity and create relation
                 if source_file != "unknown":
                     self.graph_store.add_entity(
                         entity_id=source_file,
                         entity_type="source_document",
                         metadata={},
                     )
-
-                    # Relation: Document → Source File
                     self.graph_store.add_relation(
                         source_id=doc_id,
                         target_id=source_file,
                         relation_type="from_source",
                     )
 
-            self.logger.info("✓ Dokumente erfolgreich zu Hybrid Store hinzugefügt")
+            self.logger.info("Documents successfully added to hybrid store")
 
         except Exception as e:
-            self.logger.error(f"Fehler beim Hinzufügen zu Hybrid Store: {str(e)}")
+            self.logger.error(f"Failed to add documents: {e}")
             raise
 
     def save(self) -> None:
-        """Speichere beide Stores persistent."""
+        """Persist both stores to disk."""
         try:
-            # Vector Store speichert automatisch
-            # Nur Graph muss explizit gespeichert werden
+            # Vector store persists automatically
+            # Graph store requires explicit save
             self.graph_store.save()
-            self.logger.info("✓ Hybrid Store gespeichert")
+            self.logger.info("Hybrid store saved")
         except Exception as e:
-            self.logger.error(f"Fehler beim Speichern: {str(e)}")
+            self.logger.error(f"Failed to save hybrid store: {e}")
 
     def load(self) -> None:
-        """Lade beide Stores (falls persistent)."""
+        """Load stores from disk (primarily for graph)."""
         try:
-            # Vector Store lädt automatisch beim Initialisieren
-            # Graph wird im Constructor geladen
-            self.logger.info("✓ Hybrid Store geladen")
+            self.logger.info("Hybrid store loaded")
         except Exception as e:
-            self.logger.error(f"Fehler beim Laden: {str(e)}")
+            self.logger.error(f"Failed to load hybrid store: {e}")
 
     # ========================================================================
-    # RESET METHODS (für Ablation Studies) - UNVERÄNDERT
+    # RESET METHODS (for Ablation Studies)
     # ========================================================================
 
     def reset_vector_store(self) -> None:
-        """Setze Vector Store zurück (für Ablation Studies)."""
+        """
+        Reset vector store for clean ablation study runs.
+        
+        This method:
+        1. Deletes the vector database directory
+        2. Removes associated metadata
+        3. Reinitializes an empty vector store
+        
+        Warning:
+            This is a destructive operation. All indexed vectors will be lost.
+        """
         try:
             if self.config.vector_db_path.exists():
                 shutil.rmtree(self.config.vector_db_path)
-                self.logger.info("✓ Vector Store Verzeichnis gelöscht")
+                self.logger.info("Vector store directory deleted")
             
             # Delete metadata
-            metadata_path = Path("data/vector_store_metadata.json")
+            metadata_path = self.config.vector_db_path.parent / "vector_store_metadata.json"
             if metadata_path.exists():
                 metadata_path.unlink()
             
@@ -684,28 +942,101 @@ class HybridStore:
                 self.config.vector_db_path,
                 self.config.embedding_dim,
                 self.config.normalize_embeddings,
+                self.config.distance_metric,
             )
-            self.logger.info("✓ Vector Store zurückgesetzt")
+            self.logger.info("Vector store reset complete")
+            
         except Exception as e:
-            self.logger.error(f"Fehler beim Reset von Vector Store: {str(e)}")
+            self.logger.error(f"Failed to reset vector store: {e}")
             raise
 
     def reset_graph_store(self) -> None:
-        """Setze Graph Store zurück (für Ablation Studies)."""
+        """
+        Reset graph store for clean ablation study runs.
+        
+        Warning:
+            This is a destructive operation. All graph data will be lost.
+        """
         try:
             if self.config.graph_db_path.exists():
                 self.config.graph_db_path.unlink()
-                self.logger.info("✓ Graph Datei gelöscht")
+                self.logger.info("Graph file deleted")
             
-            # Reinitialize
             self.graph_store = KnowledgeGraphStore(self.config.graph_db_path)
-            self.logger.info("✓ Graph Store zurückgesetzt")
+            self.logger.info("Graph store reset complete")
+            
         except Exception as e:
-            self.logger.error(f"Fehler beim Reset von Graph Store: {str(e)}")
+            self.logger.error(f"Failed to reset graph store: {e}")
             raise
 
     def reset_all(self) -> None:
-        """Setze beide Stores komplett zurück."""
+        """Reset both stores completely."""
         self.reset_vector_store()
         self.reset_graph_store()
-        self.logger.warning("✗ HYBRID STORE KOMPLETT ZURÜCKGESETZT")
+        self.logger.warning("HYBRID STORE COMPLETELY RESET")
+
+
+# ============================================================================
+# MODULE DIAGNOSTICS
+# ============================================================================
+
+def run_diagnostics(config: StorageConfig, embeddings: Embeddings) -> Dict[str, Any]:
+    """
+    Run diagnostic checks on storage configuration.
+    
+    This function validates the storage setup and reports potential issues.
+    Useful for debugging retrieval quality problems.
+    
+    Args:
+        config: Storage configuration to test
+        embeddings: Embedding model to test
+        
+    Returns:
+        Dictionary containing diagnostic results
+    """
+    results = {
+        "embedding_dim": None,
+        "embedding_normalized": False,
+        "distance_metric": config.distance_metric,
+        "test_similarity": None,
+        "issues": [],
+    }
+    
+    # Test embedding generation
+    try:
+        test_emb = embeddings.embed_query("diagnostic test query")
+        results["embedding_dim"] = len(test_emb)
+        
+        # Check normalization
+        norm = np.linalg.norm(test_emb)
+        results["embedding_normalized"] = abs(norm - 1.0) < 0.01
+        
+        if not results["embedding_normalized"] and config.normalize_embeddings:
+            results["issues"].append(
+                f"Embedding not normalized (norm={norm:.4f}), "
+                "but normalize_embeddings=True in config"
+            )
+    except Exception as e:
+        results["issues"].append(f"Embedding generation failed: {e}")
+    
+    # Test similarity computation
+    try:
+        emb1 = embeddings.embed_query("financial analysis")
+        emb2 = embeddings.embed_query("financial sentiment analysis")
+        
+        # Normalize for comparison
+        emb1 = np.array(emb1) / np.linalg.norm(emb1)
+        emb2 = np.array(emb2) / np.linalg.norm(emb2)
+        
+        cosine_sim = np.dot(emb1, emb2)
+        results["test_similarity"] = float(cosine_sim)
+        
+        if cosine_sim < 0.5:
+            results["issues"].append(
+                f"Low similarity ({cosine_sim:.4f}) for related terms. "
+                "Check embedding model quality."
+            )
+    except Exception as e:
+        results["issues"].append(f"Similarity test failed: {e}")
+    
+    return results
