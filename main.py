@@ -104,7 +104,7 @@ def load_configuration(config_path: Path) -> dict:
     if not config_path.exists():
         raise FileNotFoundError(f"Config nicht gefunden: {config_path}")
 
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding="utf-8") as f:  # ← ADD encoding="utf-8"
         config = yaml.safe_load(f)
 
     logger = logging.getLogger(__name__)
@@ -239,7 +239,7 @@ class EdgeRAGPipeline:
             storage_config = StorageConfig(
                 vector_db_path=self.vector_db_path,
                 graph_db_path=self.graph_db_path,
-                embedding_dim=embedding_config.get("embedding_dim", 384),
+                embedding_dim=embedding_config.get("embedding_dim", 768),
                 similarity_threshold=self.config.get("vector_store", {}).get(
                     "similarity_threshold", 0.5
                 ),

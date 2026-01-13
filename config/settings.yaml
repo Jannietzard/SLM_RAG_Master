@@ -70,16 +70,21 @@ embeddings:
 # DOCUMENT INGESTION & CHUNKING STRATEGY
 # ============================================================================
 chunking:
-  # Chunking Mode: "semantic" (intelligent) oder "standard" (fixed size)
-  mode: "semantic"  # NEU: Intelligentes Chunking aktiviert!
-  
-  # Recursive Character Chunking mit Overlap
-  # Begründung: Reduziert Kontextverlust bei SLMs (vgl. RAG-Papiere, Lemur et al.)
-  strategy: "recursive_character"
-  chunk_size: 1024  # ERHÖHT von 512 - Tokens, optimiert für Phi-3 context window
-  chunk_overlap: 128  # 12.5% overlap (war 25% bei 512 chunk_size)
-  # Overlap bewahrt semantische Kontinuität über Chunk-Grenzen
-  
+  mode: "standard"  # oder "semantic"
+  chunk_size: 512
+  chunk_overlap: 128
+  enable_pdf_cleaning: true  # ← NEU! Aktiviert PDF Cleaning
+
+# In embeddings Sektion:
+embeddings:
+  model_name: "nomic-embed-text"
+  base_url: "http://localhost:11434"
+  embedding_dim: 768  # ← OPTIONAL! Wird jetzt auto-detected!
+
+# In storage/vector_store Sektion:
+vector_store:
+  normalize_embeddings: true  # ← NEU! Aktiviert L2-Normalisierung
+
   min_chunk_size: 200  # NEU: Minimum für semantic chunking
   
   separators:  # Hierarchische Trennung für bessere semantische Grenzen
@@ -181,8 +186,8 @@ rag:
   # - "hybrid": Gewichtete Kombination (deine Lösung)
   
   # Vector retrieval
-  vector_weight: 0.6  # 60% Gewicht auf Vektor-Scores
-  graph_weight: 0.4   # 40% Gewicht auf Graph-Scores
+  vector_weight: 1  # 60% Gewicht auf Vektor-Scores
+  graph_weight: 0   # 40% Gewicht auf Graph-Scores
   
   # Begründung für 60/40 Split:
   # Vector dominiert (bessere Semantik), Graph ergänzt (Struktur)
