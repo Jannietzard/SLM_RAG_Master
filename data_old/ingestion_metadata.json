@@ -1,0 +1,27 @@
+{
+  "timestamp": 1768348014.0976603,
+  "pipeline_version": "2.1.0",
+  "chunking_config": {
+    "mode": "standard",
+    "chunk_size": 512,
+    "chunk_overlap": 128,
+    "min_chunk_size": 200,
+    "separators": [
+      "\n\n",
+      "\n",
+      ". ",
+      " ",
+      ""
+    ],
+    "enable_pdf_cleaning": true
+  },
+  "pdf_cleaning_enabled": true,
+  "statistics": {
+    "files_processed": 1,
+    "files_failed": 0,
+    "total_pages": 386,
+    "total_chunks": 2457,
+    "total_characters": 996949,
+    "processing_time_seconds": 9.492068529129028
+  }
+}

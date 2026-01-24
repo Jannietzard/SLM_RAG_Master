@@ -29,8 +29,8 @@ except ImportError:
     logging.warning("LangGraph nicht installiert: pip install langgraph")
 
 # Lokale Imports
-from planner import Planner, create_planner
-from verifier import Verifier, create_verifier, VerificationResult
+from src.logic_layer.planner import Planner, create_planner
+from src.logic_layer.verifier import Verifier, create_verifier, VerificationResult
 
 logger = logging.getLogger(__name__)
 

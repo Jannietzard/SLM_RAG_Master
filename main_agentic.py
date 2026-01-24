@@ -178,7 +178,7 @@ def import_data_layer():
     modules = {}
     
     try:
-        from src.storage import HybridStore, StorageConfig
+        from src.data_layer.storage import HybridStore, StorageConfig
         modules['HybridStore'] = HybridStore
         modules['StorageConfig'] = StorageConfig
     except ImportError as e:
@@ -193,7 +193,7 @@ def import_data_layer():
         return modules, False
     
     try:
-        from src.ingestion import DocumentIngestionPipeline, load_ingestion_config
+        from src.data_layer.ingestion import DocumentIngestionPipeline, load_ingestion_config
         modules['DocumentIngestionPipeline'] = DocumentIngestionPipeline
         modules['load_ingestion_config'] = load_ingestion_config
     except ImportError as e:
@@ -201,7 +201,7 @@ def import_data_layer():
         return modules, False
     
     try:
-        from src.retrieval import HybridRetriever, RetrievalConfig, RetrievalMode
+        from src.data_layer.retrieval import HybridRetriever, RetrievalConfig, RetrievalMode
         modules['HybridRetriever'] = HybridRetriever
         modules['RetrievalConfig'] = RetrievalConfig
         modules['RetrievalMode'] = RetrievalMode

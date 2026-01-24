@@ -97,7 +97,7 @@ from enum import Enum
 
 from langchain.embeddings.base import Embeddings
 
-from src.storage import HybridStore
+from src.data_layer.storage import HybridStore
 
 
 logger = logging.getLogger(__name__)

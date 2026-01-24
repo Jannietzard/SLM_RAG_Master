@@ -1,28 +1,21 @@
 """
-Graph-Augmented Edge-RAG Library.
+Data Layer Package for Edge-RAG System.
 
-Submodules:
-- ingestion: PDF Ingestion & Chunking
-- storage: Hybrid Storage (Vector DB + Graph)
-- retrieval: Hybrid Retrieval (Vector + Graph Ensemble)
+Modules:
+- ingestion: PDF processing and chunking
+- embeddings: Batched embeddings with caching
+- storage: Vector store + Knowledge graph
+- retrieval: Hybrid retrieval engine
+- preprocessing: Content filtering
 
-Usage:
-    from src.ingestion import DocumentIngestionPipeline
-    from src.storage import HybridStore
-    from src.retrieval import HybridRetriever
+Import directly from modules:
+    from src.data_layer.embeddings import BatchedOllamaEmbeddings
+    from src.data_layer.storage import HybridStore, StorageConfig
+    from src.data_layer.retrieval import HybridRetriever, RetrievalConfig
 """
 
-__version__ = "0.1.0"
-__author__ = "Your Name"
-__institution__ = "RWTH Aachen"
+__version__ = "2.1.0"
+__author__ = "Edge-RAG Research Project"
 
-# Optional: Expose häufig genutzte Klassen
-from src.ingestion import DocumentIngestionPipeline
-from src.storage import HybridStore
-from src.retrieval import HybridRetriever
-
-__all__ = [
-    "DocumentIngestionPipeline",
-    "HybridStore",
-    "HybridRetriever",
-]
+# Don't auto-import to avoid circular import issues
+# Users should import directly from submodules
