@@ -15,7 +15,7 @@ from typing import List, Dict, Any
 
 import yaml
 
-from src.embeddings import BatchedOllamaEmbeddings  # ✓ FIXED
+from src.data_layer.embeddings import BatchedOllamaEmbeddings  # ✓ FIXED
 from src.ingestion import DocumentIngestionPipeline, load_ingestion_config
 from src.storage import HybridStore, StorageConfig
 from src.retrieval import HybridRetriever, RetrievalConfig, RetrievalMode

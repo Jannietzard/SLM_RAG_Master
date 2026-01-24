@@ -18,7 +18,7 @@ import sys
 # Add project to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.embeddings import BatchedOllamaEmbeddings
+from src.data_layer.embeddings import BatchedOllamaEmbeddings
 from src.storage import HybridStore, StorageConfig
 from src.retrieval import HybridRetriever, RetrievalConfig, RetrievalMode
 

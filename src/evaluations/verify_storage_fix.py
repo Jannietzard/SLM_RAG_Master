@@ -151,7 +151,7 @@ def verify_embedding_model():
     print("=" * 70)
     
     try:
-        from src.embeddings import BatchedOllamaEmbeddings
+        from src.data_layer.embeddings import BatchedOllamaEmbeddings
         
         config_path = Path("./config/settings.yaml")
         with open(config_path, "r", encoding="utf-8") as f:
@@ -227,7 +227,7 @@ def verify_vector_search():
     print("=" * 70)
     
     try:
-        from src.embeddings import BatchedOllamaEmbeddings
+        from src.data_layer.embeddings import BatchedOllamaEmbeddings
         from src.storage import HybridStore, StorageConfig
         
         config_path = Path("./config/settings.yaml")
