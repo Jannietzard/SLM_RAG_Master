@@ -1,492 +1,24 @@
 """
-Main Entry-Point: Graph-Augmented Edge-RAG Pipeline Orchestration.
-
-Version: 2.1.0
-Last Modified: 2026-01-13
-
-Pipeline:
-1. Load Config (settings.yaml)
-2. Initiate Document Ingestion (PDF -> Chunks)
-3. Initialize Embeddings (Ollama nomic-embed-text)
-4. Store: Vectors (LanceDB) + Graph (NetworkX)
-5. Retrieval: Hybrid (Vector + Graph Ensemble)
-
-Scientific Foundation:
-Decentralized AI Architecture for Edge Devices with quantized SLMs.
-Full Stack: Ingestion -> Embedding -> Storage -> Retrieval -> Generation
-All on-device, zero cloud dependencies.
-
-CHANGES IN v2.1.0:
-- Added distance_metric parameter to StorageConfig
-- Explicit cosine metric for correct similarity computation
-- Improved logging without UTF-8 special characters
-"""
-import logging
-import sys
-from pathlib import Path
-from typing import List
-
-import yaml
-from langchain.schema import Document
-
-# Local imports
-from src/data_layer.ingestion import DocumentIngestionPipeline, load_ingestion_config
-from src/data_layer.storage import HybridStore, StorageConfig
-from src.retrieval import HybridRetriever, RetrievalConfig, RetrievalMode
-from src.data_layer.embeddings import BatchedOllamaEmbeddings
-
-
-# ============================================================================
-# LOGGING SETUP
-# ============================================================================
-
-def setup_logging(log_file: Path = Path("./logs/edge_rag.log")) -> logging.Logger:
-    """
-    Windows-compatible logging setup with UTF-8 support.
-    
-    Fixes Windows cp1252 encoding issues with Unicode characters.
-
-    Args:
-        log_file: Path to log file
-
-    Returns:
-        Logger instance
-    """
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-
-    # Console Handler with UTF-8 (for Windows CP1252 fix)
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    
-    # Windows UTF-8 Fix: Force UTF-8 encoding for console output
-    if hasattr(console_handler.stream, 'reconfigure'):
-        console_handler.stream.reconfigure(encoding='utf-8')
-
-    # File Handler with UTF-8
-    file_handler = logging.FileHandler(log_file, encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-
-    # Root Logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
-    root_logger.addHandler(console_handler)
-    root_logger.addHandler(file_handler)
-
-    return root_logger
-
-
-# ============================================================================
-# CONFIGURATION LOADER
-# ============================================================================
-
-def load_configuration(config_path: Path) -> dict:
-    """
-    Load central configuration from YAML.
-
-    Args:
-        config_path: Path to settings.yaml
-
-    Returns:
-        Config dictionary
-
-    Raises:
-        FileNotFoundError: If config does not exist
-    """
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config not found: {config_path}")
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    logger = logging.getLogger(__name__)
-    logger.info(f"Configuration loaded: {config_path}")
-
-    return config
-
-
-# ============================================================================
-# PIPELINE ORCHESTRATION
-# ============================================================================
-
-class EdgeRAGPipeline:
-    """
-    Orchestrates the complete Edge-RAG Pipeline.
-    
-    Design Pattern: Pipeline/Orchestrator Pattern
-    Responsibilities:
-    - Config Management
-    - Component Initialization
-    - Data Flow Orchestration
-    - Error Handling and Logging
-    """
-
-    def __init__(self, config: dict, logger_instance: logging.Logger):
-        """
-        Initialize pipeline with configuration.
-
-        Args:
-            config: Configuration dictionary
-            logger_instance: Logger instance
-        """
-        self.config = config
-        self.logger = logger_instance
-
-        # Paths from config
-        self.data_path = Path(config.get("paths", {}).get("documents", "./data/documents"))
-        self.vector_db_path = Path(config.get("paths", {}).get("vector_db", "./data/vector_db"))
-        self.graph_db_path = Path(config.get("paths", {}).get("graph_db", "./data/knowledge_graph"))
-
-        # Components (lazy initialized)
-        self.embeddings = None
-        self.ingestion_pipeline = None
-        self.hybrid_store = None
-        self.retriever = None
-
-        self.logger.info("EdgeRAGPipeline initialized")
-
-    def initialize_embeddings(self) -> BatchedOllamaEmbeddings:
-        """
-        Initialize embedding model (Ollama nomic-embed-text).
-        
-        With batching + caching for 10-100x speedup.
-
-        Returns:
-            BatchedOllamaEmbeddings instance
-
-        Raises:
-            Exception: If Ollama is not reachable
-        """
-        try:
-            embedding_config = self.config.get("embeddings", {})
-            perf_config = self.config.get("performance", {})
-            
-            embeddings = BatchedOllamaEmbeddings(
-                model_name=embedding_config.get("model_name", "nomic-embed-text"),
-                base_url=embedding_config.get("base_url", "http://localhost:11434"),
-                batch_size=perf_config.get("batch_size", 32),
-                cache_path=Path(self.config.get("paths", {}).get("cache", "./cache")) / "embeddings.db",
-                device=perf_config.get("device", "cpu"),
-            )
-
-            # Test: Embed a sample text
-            test_embedding = embeddings.embed_query("test")
-            embedding_dim = len(test_embedding)
-
-            self.logger.info(
-                f"[OK] Embeddings initialized: {embedding_config.get('model_name')} "
-                f"(dim={embedding_dim}, batch_size={perf_config.get('batch_size', 32)}, "
-                f"cached={embeddings.cache.get_stats()['total_entries']} entries)"
-            )
-
-            return embeddings
-
-        except Exception as e:
-            self.logger.error(
-                f"Error initializing embeddings: {str(e)}. "
-                f"Make sure Ollama is running: ollama serve"
-            )
-            raise
-
-    def initialize_ingestion(self) -> DocumentIngestionPipeline:
-        """
-        Initialize Document Ingestion Pipeline.
-
-        Returns:
-            DocumentIngestionPipeline instance
-
-        Raises:
-            FileNotFoundError: If document path does not exist
-        """
-        try:
-            # Load chunking config
-            chunking_config = load_ingestion_config(Path("./config/settings.yaml"))
-
-            # Create document directory if not exists
-            self.data_path.mkdir(parents=True, exist_ok=True)
-
-            ingestion = DocumentIngestionPipeline(
-                chunking_config=chunking_config,
-                document_path=self.data_path,
-                logger_instance=self.logger,
-            )
-
-            self.logger.info("Ingestion Pipeline initialized")
-            return ingestion
-
-        except Exception as e:
-            self.logger.error(f"Error initializing ingestion: {str(e)}")
-            raise
-
-    def initialize_storage(self) -> HybridStore:
-        """
-        Initialize Hybrid Storage (Vectors + Graph).
-        
-        CRITICAL UPDATE v2.1.0:
-        - Added distance_metric="cosine" to ensure correct similarity computation
-        - Added normalize_embeddings=True for consistent vector processing
-
-        Returns:
-            HybridStore instance
-        """
-        try:
-            embedding_config = self.config.get("embeddings", {})
-            vector_store_config = self.config.get("vector_store", {})
-            
-            # ================================================================
-            # CRITICAL: Include distance_metric parameter
-            # ================================================================
-            storage_config = StorageConfig(
-                vector_db_path=self.vector_db_path,
-                graph_db_path=self.graph_db_path,
-                embedding_dim=embedding_config.get("embedding_dim", 768),
-                similarity_threshold=vector_store_config.get(
-                    "similarity_threshold", 0.3
-                ),
-                normalize_embeddings=vector_store_config.get(
-                    "normalize_embeddings", True
-                ),
-                distance_metric=vector_store_config.get(
-                    "distance_metric", "cosine"  # EXPLICIT COSINE METRIC
-                ),
-            )
-
-            store = HybridStore(
-                config=storage_config,
-                embeddings=self.embeddings,
-            )
-
-            self.logger.info(
-                f"Hybrid Store initialized: "
-                f"metric={storage_config.distance_metric}, "
-                f"normalize={storage_config.normalize_embeddings}"
-            )
-            return store
-
-        except Exception as e:
-            self.logger.error(f"Error initializing store: {str(e)}")
-            raise
-
-    def initialize_retriever(self) -> HybridRetriever:
-        """
-        Initialize Hybrid Retriever (Vector + Graph Ensemble).
-        
-        Note:
-            Currently configured with graph_weight=0 for vector-only evaluation.
-            This allows isolated testing of vector retrieval performance.
-
-        Returns:
-            HybridRetriever instance
-        """
-        try:
-            rag_config = self.config.get("rag", {})
-            vector_store_config = self.config.get("vector_store", {})
-            
-            retrieval_config = RetrievalConfig(
-                mode=RetrievalMode(rag_config.get("retrieval_mode", "hybrid")),
-                top_k_vector=vector_store_config.get("top_k_vectors", 10),
-                top_k_graph=rag_config.get("top_k_entities", 5),
-                vector_weight=rag_config.get("vector_weight", 1.0),  # Vector-only for now
-                graph_weight=rag_config.get("graph_weight", 0.0),   # Graph disabled
-                similarity_threshold=vector_store_config.get(
-                    "similarity_threshold", 0.3
-                ),
-            )
-
-            retriever = HybridRetriever(
-                config=retrieval_config,
-                hybrid_store=self.hybrid_store,
-                embeddings=self.embeddings,
-            )
-
-            self.logger.info(
-                f"Hybrid Retriever initialized: "
-                f"mode={retrieval_config.mode}, "
-                f"vector_weight={retrieval_config.vector_weight}, "
-                f"graph_weight={retrieval_config.graph_weight}"
-            )
-            return retriever
-
-        except Exception as e:
-            self.logger.error(f"Error initializing retriever: {str(e)}")
-            raise
-
-    def run_ingestion_pipeline(self) -> List[Document]:
-        """
-        Execute Document Ingestion.
-
-        Returns:
-            Chunked documents (not just count)
-
-        Raises:
-            Exception: On ingestion error
-        """
-        try:
-            self.logger.info("Starting Document Ingestion...")
-            documents = self.ingestion_pipeline.process_documents()
-            
-            self.logger.info(f"[OK] {len(documents)} documents chunked")
-            return documents
-
-        except Exception as e:
-            self.logger.error(f"Ingestion Pipeline failed: {str(e)}")
-            raise
-
-    def run_storage_pipeline(self, documents: list) -> None:
-        """
-        Add documents to storage.
-
-        Args:
-            documents: Chunked documents
-        """
-        try:
-            self.logger.info("Adding documents to Hybrid Store...")
-            self.hybrid_store.add_documents(documents)
-            self.hybrid_store.save()
-            
-            self.logger.info("[OK] Documents saved to storage")
-
-        except Exception as e:
-            self.logger.error(f"Storage Pipeline failed: {str(e)}")
-            raise
-
-    def retrieve(self, query: str) -> list:
-        """
-        Perform Hybrid Retrieval.
-
-        Args:
-            query: User query
-
-        Returns:
-            List of RetrievalResult objects
-        """
-        try:
-            self.logger.info(f"Retrieval for query: '{query}'")
-            results = self.retriever.retrieve(query)
-            
-            self.logger.info(f"[OK] {len(results)} results returned")
-            return results
-
-        except Exception as e:
-            self.logger.error(f"Retrieval failed: {str(e)}")
-            raise
-
-    def setup(self) -> None:
-        """
-        Execute complete setup: Initialize all components in dependency order.
-        """
-        self.logger.info("=" * 70)
-        self.logger.info("STARTING EDGE-RAG PIPELINE SETUP")
-        self.logger.info("=" * 70)
-
-        try:
-            # 1. Embeddings
-            self.embeddings = self.initialize_embeddings()
-
-            # 2. Ingestion
-            self.ingestion_pipeline = self.initialize_ingestion()
-
-            # 3. Storage
-            self.hybrid_store = self.initialize_storage()
-
-            # 4. Retriever
-            self.retriever = self.initialize_retriever()
-
-            self.logger.info("=" * 70)
-            self.logger.info("[OK] PIPELINE SETUP SUCCESSFUL")
-            self.logger.info("=" * 70)
-
-        except Exception as e:
-            self.logger.error(f"Setup failed: {str(e)}")
-            raise
-
-
-# ============================================================================
-# MAIN ENTRY POINT
-# ============================================================================
-
-def main() -> None:
-    """
-    Main Entry Point for Edge-RAG Pipeline.
-    """
-    # Setup Logging
-    logger = setup_logging()
-    logger.info("Edge-RAG Pipeline Start")
-
-    try:
-        # Load Config
-        config = load_configuration(Path("./config/settings.yaml"))
-
-        # Initialize Pipeline
-        pipeline = EdgeRAGPipeline(config, logger)
-        pipeline.setup()
-
-        # Execute Ingestion (once, returns documents)
-        documents = pipeline.run_ingestion_pipeline()
-
-        if len(documents) > 0:
-            # Save to Storage (use already loaded documents)
-            pipeline.run_storage_pipeline(documents)
-
-            # Example Retrieval
-            query = "What is the model structure of MTMEC"
-            results = pipeline.retrieve(query)
-
-            logger.info("\n" + "=" * 70)
-            logger.info("RETRIEVAL RESULTS")
-            logger.info("=" * 70)
-
-            if results:
-                for i, result in enumerate(results[:5], 1):
-                    logger.info(f"\nResult {i}:")
-                    logger.info(f"  Score: {result.relevance_score:.4f}")
-                    logger.info(f"  Method: {result.retrieval_method}")
-                    logger.info(f"  Text: {result.text[:200]}...")
-            else:
-                logger.warning("No retrieval results. Check vector store configuration.")
-            
-            # Print Embedding Metrics
-            pipeline.embeddings.print_metrics()
-
-        else:
-            logger.warning(
-                "No documents found. "
-                "Please place PDFs in: ./data/documents"
-            )
-
-    except Exception as e:
-        logger.critical(f"Pipeline Error: {str(e)}", exc_info=True)
-        sys.exit(1)
-
-    logger.info("=" * 70)
-    logger.info("Edge-RAG Pipeline completed")
-    logger.info("=" * 70)
-
-"""
-Main Application - End-to-End Hybrid RAG System.
+main_retrieval.py - Artifact A Testing: Hybrid Retrieval Pipeline
 
 Masterthesis: "Enhancing Reasoning Fidelity in Quantized SLMs on Edge"
 
-Integriert deine bestehenden Module mit dem neuen Agentic Controller:
-- storage.py → HybridStore, KnowledgeGraphStore
-- embeddings.py → BatchedOllamaEmbeddings  
-- ingestion.py → DocumentIngestionPipeline
-- retrieval.py → HybridRetriever
+Purpose:
+    Test and evaluate the Data Layer components (Artifact A):
+    - ingestion.py → DocumentIngestionPipeline
+    - embeddings.py → BatchedOllamaEmbeddings
+    - storage.py → HybridStore (Vector + Graph)
+    - retrieval.py → HybridRetriever
 
-Neue Module (Artifact B):
-- planner.py → Query Decomposition
-- verifier.py → Answer Generation + Verification
-- agent.py → Agentic Controller
+This script tests retrieval ONLY without LLM generation.
+Use main_agentic.py for the full Agentic RAG pipeline (Artifact B).
 
 Usage:
-    python main.py ingest --documents ./data/documents
-    python main.py query "What is knowledge management?"
-    python main.py interactive
+    python main_retrieval.py                    # Run full pipeline
+    python main_retrieval.py --ingest-only      # Only ingest documents
+    python main_retrieval.py --query "..."      # Single query
+    python main_retrieval.py --interactive      # Interactive mode
+    python main_retrieval.py --benchmark        # Run benchmark queries
 """
 
 import logging
@@ -494,341 +26,743 @@ import sys
 import argparse
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
 
 import yaml
 
 # ============================================================================
-# IMPORTS - Deine bestehenden Module
+# LOGGING SETUP
 # ============================================================================
 
-try:
-    from storage import HybridStore, StorageConfig
-    from embeddings import BatchedOllamaEmbeddings
-    from ingestion import DocumentIngestionPipeline, load_ingestion_config
-    from retrieval import HybridRetriever, RetrievalConfig, RetrievalMode
-    CORE_AVAILABLE = True
-except ImportError as e:
-    CORE_AVAILABLE = False
-    print(f"⚠ Core modules nicht gefunden: {e}")
-
-# Neue Module (Artifact B)
-try:
-    from planner import create_planner
-    from verifier import create_verifier
-    from agent import AgenticController, create_controller
-    AGENT_AVAILABLE = True
-except ImportError as e:
-    AGENT_AVAILABLE = False
-    print(f"⚠ Agent modules nicht gefunden: {e}")
-
-
-def setup_logging(level: str = "INFO", log_file: Optional[Path] = None):
-    """Konfiguriere Logging."""
-    handlers = [logging.StreamHandler(sys.stdout)]
+def setup_logging(
+    level: str = "INFO",
+    log_file: Optional[Path] = None
+) -> logging.Logger:
+    """
+    Configure logging with UTF-8 support (Windows compatible).
+    
+    Args:
+        level: Logging level
+        log_file: Optional path for file logging
+        
+    Returns:
+        Configured logger instance
+    """
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    
+    handlers = []
+    
+    # Console handler with UTF-8
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(getattr(logging, level.upper(), logging.INFO))
+    console_handler.setFormatter(formatter)
+    
+    # Windows UTF-8 fix
+    if hasattr(console_handler.stream, 'reconfigure'):
+        console_handler.stream.reconfigure(encoding='utf-8')
+    
+    handlers.append(console_handler)
+    
+    # File handler
     if log_file:
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding='utf-8'))
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
+        handlers.append(file_handler)
     
+    # Configure root logger
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=handlers,
+        force=True,
     )
+    
+    # Suppress noisy loggers
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    
+    return logging.getLogger(__name__)
 
 
-def load_config(config_path: Path = Path("settings.yaml")) -> Dict[str, Any]:
-    """Lade Konfiguration aus settings.yaml."""
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+def load_config(config_path: Path = Path("./config/settings.yaml")) -> Dict[str, Any]:
+    """
+    Load configuration from YAML file.
+    
+    Args:
+        config_path: Path to settings.yaml
+        
+    Returns:
+        Configuration dictionary
+    """
     if not config_path.exists():
-        logging.warning(f"Config nicht gefunden: {config_path}")
+        logging.warning(f"Config not found: {config_path}, using defaults")
         return get_default_config()
     
     with open(config_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f) or get_default_config()
+        config = yaml.safe_load(f) or {}
+    
+    # Merge with defaults
+    default = get_default_config()
+    for key, value in default.items():
+        if key not in config:
+            config[key] = value
+        elif isinstance(value, dict):
+            for subkey, subvalue in value.items():
+                if subkey not in config[key]:
+                    config[key][subkey] = subvalue
+    
+    return config
 
 
 def get_default_config() -> Dict[str, Any]:
-    """Default Konfiguration."""
+    """Return default configuration."""
     return {
-        "llm": {"model_name": "phi3", "base_url": "http://localhost:11434", "temperature": 0.1},
-        "embeddings": {"model_name": "nomic-embed-text", "base_url": "http://localhost:11434"},
-        "chunking": {"mode": "standard", "chunk_size": 512, "chunk_overlap": 128},
-        "vector_store": {"db_path": "./data/vector_db", "similarity_threshold": 0.25},
-        "graph": {"graph_path": "./data/knowledge_graph.graphml", "max_hops": 2},
-        "rag": {"retrieval_mode": "hybrid", "top_k_vector": 10, "top_k_graph": 5,
-                "vector_weight": 0.6, "graph_weight": 0.4},
-        "paths": {"documents": "./data/documents"},
+        "embeddings": {
+            "model_name": "nomic-embed-text",
+            "base_url": "http://localhost:11434",
+            "embedding_dim": 768,
+        },
+        "chunking": {
+            "mode": "standard",
+            "chunk_size": 512,
+            "chunk_overlap": 128,
+        },
+        "vector_store": {
+            "db_path": "./data/vector_db",
+            "similarity_threshold": 0.3,
+            "distance_metric": "cosine",
+            "normalize_embeddings": True,
+            "top_k_vectors": 10,
+        },
+        "graph": {
+            "graph_path": "./data/knowledge_graph",
+            "max_hops": 2,
+            "top_k_entities": 5,
+        },
+        "rag": {
+            "retrieval_mode": "hybrid",
+            "vector_weight": 0.7,
+            "graph_weight": 0.3,
+        },
+        "paths": {
+            "documents": "./data/documents",
+            "vector_db": "./data/vector_db",
+            "graph_db": "./data/knowledge_graph",
+            "cache": "./cache",
+            "logs": "./logs",
+        },
+        "performance": {
+            "batch_size": 32,
+            "device": "cpu",
+            "cache_embeddings": True,
+        },
     }
 
 
-class HybridRAGSystem:
+# ============================================================================
+# IMPORTS - DATA LAYER MODULES (ARTIFACT A)
+# ============================================================================
+
+def import_modules():
     """
-    Hauptklasse für das Hybrid RAG System.
+    Import Data Layer modules with error handling.
     
-    Verbindet deine bestehenden Module mit dem neuen Agentic Controller.
+    Returns:
+        Tuple of (modules_dict, success_bool)
+    """
+    modules = {}
+    
+    try:
+        from src.data_layer.storage import HybridStore, StorageConfig
+        modules['HybridStore'] = HybridStore
+        modules['StorageConfig'] = StorageConfig
+    except ImportError as e:
+        print(f"[ERROR] Cannot import storage: {e}")
+        return modules, False
+    
+    try:
+        from src.data_layer.embeddings import BatchedOllamaEmbeddings
+        modules['BatchedOllamaEmbeddings'] = BatchedOllamaEmbeddings
+    except ImportError as e:
+        print(f"[ERROR] Cannot import embeddings: {e}")
+        return modules, False
+    
+    try:
+        from src.data_layer.ingestion import DocumentIngestionPipeline, load_ingestion_config
+        modules['DocumentIngestionPipeline'] = DocumentIngestionPipeline
+        modules['load_ingestion_config'] = load_ingestion_config
+    except ImportError as e:
+        print(f"[ERROR] Cannot import ingestion: {e}")
+        return modules, False
+    
+    try:
+        from src.data_layer.retrieval import HybridRetriever, RetrievalConfig, RetrievalMode
+        modules['HybridRetriever'] = HybridRetriever
+        modules['RetrievalConfig'] = RetrievalConfig
+        modules['RetrievalMode'] = RetrievalMode
+    except ImportError as e:
+        print(f"[ERROR] Cannot import retrieval: {e}")
+        return modules, False
+    
+    return modules, True
+
+
+# ============================================================================
+# RETRIEVAL PIPELINE (ARTIFACT A)
+# ============================================================================
+
+@dataclass
+class RetrievalMetrics:
+    """Metrics for retrieval evaluation."""
+    query: str
+    num_results: int
+    avg_score: float
+    max_score: float
+    min_score: float
+    retrieval_time_ms: float
+    retrieval_mode: str
+
+
+class RetrievalPipeline:
+    """
+    Artifact A: Hybrid Retrieval Pipeline.
+    
+    Components:
+    - Embeddings (BatchedOllamaEmbeddings)
+    - Ingestion (DocumentIngestionPipeline)
+    - Storage (HybridStore: Vector + Graph)
+    - Retrieval (HybridRetriever)
+    
+    NO LLM generation - retrieval only.
     """
     
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], logger: logging.Logger):
         self.config = config
-        self.logger = logging.getLogger(__name__)
+        self.logger = logger
         
+        # Components
         self.embeddings = None
         self.hybrid_store = None
         self.retriever = None
-        self.controller = None
-        self.documents = {}
+        self.ingestion_pipeline = None
+        
+        # Import modules
+        self.modules, success = import_modules()
+        if not success:
+            raise ImportError("Failed to import required modules")
+        
+        self.logger.info("RetrievalPipeline initialized")
     
-    def initialize_data_layer(self) -> None:
-        """Initialisiere Data Layer (deine Module)."""
-        self.logger.info("Initialisiere Data Layer...")
+    def setup(self) -> None:
+        """Initialize all components."""
+        self.logger.info("=" * 70)
+        self.logger.info("ARTIFACT A: RETRIEVAL PIPELINE SETUP")
+        self.logger.info("=" * 70)
         
-        if not CORE_AVAILABLE:
-            raise ImportError("Core modules nicht verfügbar")
+        self._init_embeddings()
+        self._init_storage()
+        self._init_retriever()
         
-        # Embeddings (dein embeddings.py)
+        self.logger.info("=" * 70)
+        self.logger.info("[OK] RETRIEVAL PIPELINE READY")
+        self.logger.info("=" * 70)
+    
+    def _init_embeddings(self) -> None:
+        """Initialize embedding model."""
+        self.logger.info("Initializing Embeddings...")
+        
+        embedding_config = self.config.get("embeddings", {})
+        perf_config = self.config.get("performance", {})
+        cache_path = Path(self.config["paths"].get("cache", "./cache")) / "embeddings.db"
+        
+        BatchedOllamaEmbeddings = self.modules['BatchedOllamaEmbeddings']
+        
         self.embeddings = BatchedOllamaEmbeddings(
-            model_name=self.config["embeddings"]["model_name"],
-            base_url=self.config["embeddings"]["base_url"],
-            cache_path=Path("./cache/embeddings.db"),
+            model_name=embedding_config.get("model_name", "nomic-embed-text"),
+            base_url=embedding_config.get("base_url", "http://localhost:11434"),
+            batch_size=perf_config.get("batch_size", 32),
+            cache_path=cache_path,
+            device=perf_config.get("device", "cpu"),
         )
         
-        # Storage Config
-        storage_config = StorageConfig(
-            vector_db_path=Path(self.config["vector_store"]["db_path"]),
-            graph_db_path=Path(self.config["graph"]["graph_path"]),
-            similarity_threshold=self.config["vector_store"]["similarity_threshold"],
-        )
-        
-        # Hybrid Store (dein storage.py)
-        self.hybrid_store = HybridStore(storage_config, self.embeddings)
-        self.logger.info("✓ Data Layer initialisiert")
+        self.logger.info(f"  Model: {embedding_config.get('model_name')}")
+        self.logger.info(f"  Cache: {cache_path}")
+        self.logger.info("[OK] Embeddings initialized")
     
-    def initialize_logic_layer(self) -> None:
-        """Initialisiere Logic Layer (neue Module)."""
-        self.logger.info("Initialisiere Logic Layer...")
+    def _init_storage(self) -> None:
+        """Initialize hybrid storage (Vector + Graph)."""
+        self.logger.info("Initializing Hybrid Storage...")
         
-        if not AGENT_AVAILABLE:
-            raise ImportError("Agent modules nicht verfügbar")
-        if not CORE_AVAILABLE:
-            raise ImportError("Core modules nicht verfügbar")
+        embedding_config = self.config.get("embeddings", {})
+        vector_config = self.config.get("vector_store", {})
         
-        # Retrieval Config (für deinen HybridRetriever)
-        retrieval_config = RetrievalConfig(
-            mode=RetrievalMode(self.config["rag"]["retrieval_mode"]),
-            top_k_vector=self.config["rag"]["top_k_vector"],
-            top_k_graph=self.config["rag"]["top_k_graph"],
-            vector_weight=self.config["rag"]["vector_weight"],
-            graph_weight=self.config["rag"]["graph_weight"],
-            similarity_threshold=self.config["vector_store"]["similarity_threshold"],
+        StorageConfig = self.modules['StorageConfig']
+        HybridStore = self.modules['HybridStore']
+        
+        storage_config = StorageConfig(
+            vector_db_path=Path(self.config["paths"].get("vector_db", "./data/vector_db")),
+            graph_db_path=Path(self.config["paths"].get("graph_db", "./data/knowledge_graph")),
+            embedding_dim=embedding_config.get("embedding_dim", 768),
+            similarity_threshold=vector_config.get("similarity_threshold", 0.3),
+            normalize_embeddings=vector_config.get("normalize_embeddings", True),
+            distance_metric=vector_config.get("distance_metric", "cosine"),
         )
         
-        # Dein HybridRetriever (retrieval.py)
+        self.hybrid_store = HybridStore(config=storage_config, embeddings=self.embeddings)
+        
+        # Try to load existing data
+        self._try_load_existing_store()
+        
+        self.logger.info(f"  Vector DB: {storage_config.vector_db_path}")
+        self.logger.info(f"  Graph DB: {storage_config.graph_db_path}")
+        self.logger.info(f"  Distance Metric: {storage_config.distance_metric}")
+        self.logger.info("[OK] Hybrid Storage initialized")
+    
+    def _try_load_existing_store(self) -> None:
+        """Try to load existing vector store."""
+        try:
+            vector_path = Path(self.config["paths"].get("vector_db", "./data/vector_db"))
+            table_path = vector_path / "documents.lance"
+            
+            if table_path.exists():
+                if hasattr(self.hybrid_store.vector_store, 'db'):
+                    self.hybrid_store.vector_store.table = \
+                        self.hybrid_store.vector_store.db.open_table("documents")
+                    doc_count = len(self.hybrid_store.vector_store.table)
+                    self.logger.info(f"  Loaded existing store: {doc_count} documents")
+        except Exception as e:
+            self.logger.debug(f"No existing store to load: {e}")
+    
+    def _init_retriever(self) -> None:
+        """Initialize hybrid retriever."""
+        self.logger.info("Initializing Retriever...")
+        
+        rag_config = self.config.get("rag", {})
+        vector_config = self.config.get("vector_store", {})
+        graph_config = self.config.get("graph", {})
+        
+        RetrievalConfig = self.modules['RetrievalConfig']
+        RetrievalMode = self.modules['RetrievalMode']
+        HybridRetriever = self.modules['HybridRetriever']
+        
+        retrieval_config = RetrievalConfig(
+            mode=RetrievalMode(rag_config.get("retrieval_mode", "hybrid")),
+            top_k_vector=vector_config.get("top_k_vectors", 10),
+            top_k_graph=graph_config.get("top_k_entities", 5),
+            vector_weight=rag_config.get("vector_weight", 0.7),
+            graph_weight=rag_config.get("graph_weight", 0.3),
+            similarity_threshold=vector_config.get("similarity_threshold", 0.3),
+        )
+        
         self.retriever = HybridRetriever(
             config=retrieval_config,
             hybrid_store=self.hybrid_store,
             embeddings=self.embeddings,
         )
         
-        # Neuer Agentic Controller (agent.py)
-        self.controller = create_controller(
-            model_name=self.config["llm"]["model_name"],
-            base_url=self.config["llm"]["base_url"],
-        )
-        
-        # Verbinde Controller mit deinen Modulen
-        self.controller.set_retriever(self.retriever, self.documents)
-        self.controller.set_graph_store(self.hybrid_store.graph_store)
-        
-        self.logger.info("✓ Logic Layer initialisiert")
+        self.logger.info(f"  Mode: {rag_config.get('retrieval_mode', 'hybrid')}")
+        self.logger.info(f"  Vector Weight: {rag_config.get('vector_weight', 0.7)}")
+        self.logger.info(f"  Graph Weight: {rag_config.get('graph_weight', 0.3)}")
+        self.logger.info("[OK] Retriever initialized")
     
-    def ingest_documents(self, documents_path: Path) -> int:
-        """Ingestion Pipeline (dein ingestion.py)."""
-        self.logger.info(f"Starte Ingestion: {documents_path}")
+    def ingest_documents(self, documents_path: Optional[Path] = None) -> int:
+        """
+        Run document ingestion pipeline.
         
-        chunking_config = load_ingestion_config(Path("settings.yaml"))
+        Args:
+            documents_path: Path to documents folder
+            
+        Returns:
+            Number of chunks processed
+        """
+        self.logger.info("=" * 70)
+        self.logger.info("DOCUMENT INGESTION")
+        self.logger.info("=" * 70)
         
-        pipeline = DocumentIngestionPipeline(
+        if documents_path is None:
+            documents_path = Path(self.config["paths"].get("documents", "./data/documents"))
+        
+        if not documents_path.exists():
+            self.logger.error(f"Documents path not found: {documents_path}")
+            return 0
+        
+        # Load ingestion config
+        load_ingestion_config = self.modules['load_ingestion_config']
+        DocumentIngestionPipeline = self.modules['DocumentIngestionPipeline']
+        
+        chunking_config = load_ingestion_config(Path("./config/settings.yaml"))
+        
+        # Create ingestion pipeline
+        self.ingestion_pipeline = DocumentIngestionPipeline(
             documents_path=documents_path,
             chunking_config=chunking_config,
         )
         
-        chunked_docs = pipeline.process_documents()
+        # Process documents
+        start_time = time.time()
+        chunked_docs = self.ingestion_pipeline.process_documents()
+        
+        if not chunked_docs:
+            self.logger.warning("No documents found to ingest")
+            return 0
+        
+        # Add to storage
         self.hybrid_store.add_documents(chunked_docs)
         self.hybrid_store.save()
         
-        # Cache für Navigator
-        for doc in chunked_docs:
-            doc_id = str(doc.metadata.get("chunk_id", len(self.documents)))
-            self.documents[doc_id] = doc.page_content
+        elapsed = time.time() - start_time
         
-        self.logger.info(f"✓ {len(chunked_docs)} Chunks indexiert")
+        self.logger.info(f"[OK] Ingested {len(chunked_docs)} chunks in {elapsed:.2f}s")
+        
         return len(chunked_docs)
     
-    def query(self, question: str) -> Dict[str, Any]:
-        """Führe Query durch Agentic Pipeline."""
-        if self.controller is None:
-            raise RuntimeError("Logic Layer nicht initialisiert")
-        return self.controller.run(question)
-    
-    def interactive_mode(self) -> None:
-        """Interaktiver Chat-Modus."""
-        print("\n" + "="*70)
-        print("HYBRID RAG SYSTEM - Interactive Mode")
-        print("="*70)
-        print("Stelle Fragen oder 'quit' zum Beenden.\n")
+    def retrieve(
+        self,
+        query: str,
+        top_k: Optional[int] = None
+    ) -> List[Any]:
+        """
+        Perform hybrid retrieval.
         
-        while True:
-            try:
-                question = input("📝 Frage: ").strip()
-                
-                if question.lower() in ['quit', 'exit', 'q']:
-                    print("Auf Wiedersehen!")
-                    break
-                
-                if not question:
-                    continue
-                
-                print("\n🔄 Verarbeite...")
-                result = self.query(question)
-                
-                print(f"\n📌 Antwort: {result['answer']}")
-                print(f"⏱ {result['total_time_ms']:.0f}ms | "
-                      f"📄 {len(result.get('context', []))} Docs | "
-                      f"🔄 {result.get('iterations', 1)} Iter.\n")
-                
-            except KeyboardInterrupt:
-                print("\nAbgebrochen.")
+        Args:
+            query: Search query
+            top_k: Number of results (optional)
+            
+        Returns:
+            List of RetrievalResult objects
+        """
+        if self.retriever is None:
+            raise RuntimeError("Retriever not initialized. Call setup() first.")
+        
+        start_time = time.time()
+        results = self.retriever.retrieve(query)
+        elapsed_ms = (time.time() - start_time) * 1000
+        
+        if top_k:
+            results = results[:top_k]
+        
+        self.logger.debug(f"Retrieved {len(results)} results in {elapsed_ms:.1f}ms")
+        
+        return results
+    
+    def retrieve_with_metrics(self, query: str) -> tuple:
+        """
+        Retrieve with detailed metrics.
+        
+        Args:
+            query: Search query
+            
+        Returns:
+            Tuple of (results, metrics)
+        """
+        start_time = time.time()
+        results = self.retrieve(query)
+        elapsed_ms = (time.time() - start_time) * 1000
+        
+        if results:
+            scores = [r.relevance_score for r in results]
+            metrics = RetrievalMetrics(
+                query=query,
+                num_results=len(results),
+                avg_score=sum(scores) / len(scores),
+                max_score=max(scores),
+                min_score=min(scores),
+                retrieval_time_ms=elapsed_ms,
+                retrieval_mode=self.config.get("rag", {}).get("retrieval_mode", "hybrid"),
+            )
+        else:
+            metrics = RetrievalMetrics(
+                query=query,
+                num_results=0,
+                avg_score=0.0,
+                max_score=0.0,
+                min_score=0.0,
+                retrieval_time_ms=elapsed_ms,
+                retrieval_mode=self.config.get("rag", {}).get("retrieval_mode", "hybrid"),
+            )
+        
+        return results, metrics
+    
+    def print_results(self, results: List[Any], max_display: int = 5) -> None:
+        """Pretty print retrieval results."""
+        if not results:
+            print("\n[!] No results found.\n")
+            return
+        
+        print("\n" + "=" * 70)
+        print(f"RETRIEVAL RESULTS ({len(results)} total)")
+        print("=" * 70)
+        
+        for i, result in enumerate(results[:max_display], 1):
+            print(f"\n--- Result {i} ---")
+            print(f"Score: {result.relevance_score:.4f}")
+            print(f"Method: {result.retrieval_method}")
+            
+            # Truncate text
+            text = result.text[:300] + "..." if len(result.text) > 300 else result.text
+            print(f"Text: {text}")
+        
+        if len(results) > max_display:
+            print(f"\n... and {len(results) - max_display} more results")
+        
+        print("=" * 70 + "\n")
+    
+    def print_embedding_metrics(self) -> None:
+        """Print embedding performance metrics."""
+        if self.embeddings and hasattr(self.embeddings, 'print_metrics'):
+            self.embeddings.print_metrics()
+
+
+# ============================================================================
+# INTERACTIVE MODE
+# ============================================================================
+
+def run_interactive(pipeline: RetrievalPipeline) -> None:
+    """Run interactive query mode."""
+    print("\n" + "=" * 70)
+    print("ARTIFACT A: INTERACTIVE RETRIEVAL MODE")
+    print("=" * 70)
+    print("Commands:")
+    print("  [query]     - Search for documents")
+    print("  :metrics    - Show last query metrics")
+    print("  :stats      - Show embedding stats")
+    print("  :quit       - Exit")
+    print("=" * 70 + "\n")
+    
+    last_metrics = None
+    
+    while True:
+        try:
+            query = input("Query> ").strip()
+            
+            if not query:
+                continue
+            
+            if query.lower() in [':quit', ':exit', ':q']:
+                print("Exiting...")
                 break
-            except Exception as e:
-                print(f"❌ Fehler: {e}\n")
+            
+            if query == ':metrics' and last_metrics:
+                print(f"\nLast Query Metrics:")
+                print(f"  Results: {last_metrics.num_results}")
+                print(f"  Avg Score: {last_metrics.avg_score:.4f}")
+                print(f"  Max Score: {last_metrics.max_score:.4f}")
+                print(f"  Time: {last_metrics.retrieval_time_ms:.1f}ms")
+                continue
+            
+            if query == ':stats':
+                pipeline.print_embedding_metrics()
+                continue
+            
+            # Perform retrieval
+            results, last_metrics = pipeline.retrieve_with_metrics(query)
+            pipeline.print_results(results)
+            
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+            break
+        except Exception as e:
+            print(f"[ERROR] {e}")
 
 
 # ============================================================================
-# CLI COMMANDS
+# BENCHMARK MODE
 # ============================================================================
 
-def cmd_ingest(args, config):
-    """Ingestion Command."""
-    system = HybridRAGSystem(config)
-    system.initialize_data_layer()
+BENCHMARK_QUERIES = [
+    "What is financial sentiment analysis?",
+    "How does knowledge management work?",
+    "What is the model structure of MTMEC?",
+    "Explain neural network architectures",
+    "What are embedding models?",
+    "How does retrieval augmented generation work?",
+    "What is hybrid search?",
+    "Explain vector databases",
+]
+
+
+def run_benchmark(pipeline: RetrievalPipeline) -> None:
+    """Run benchmark queries."""
+    print("\n" + "=" * 70)
+    print("ARTIFACT A: RETRIEVAL BENCHMARK")
+    print("=" * 70 + "\n")
     
-    documents_path = Path(args.documents or config["paths"]["documents"])
-    if not documents_path.exists():
-        print(f"❌ Nicht gefunden: {documents_path}")
+    all_metrics = []
+    
+    for query in BENCHMARK_QUERIES:
+        results, metrics = pipeline.retrieve_with_metrics(query)
+        all_metrics.append(metrics)
+        
+        print(f"Query: {query[:50]}...")
+        print(f"  Results: {metrics.num_results} | "
+              f"Avg: {metrics.avg_score:.3f} | "
+              f"Max: {metrics.max_score:.3f} | "
+              f"Time: {metrics.retrieval_time_ms:.1f}ms")
+    
+    # Summary
+    print("\n" + "-" * 70)
+    print("BENCHMARK SUMMARY")
+    print("-" * 70)
+    
+    total_results = sum(m.num_results for m in all_metrics)
+    queries_with_results = sum(1 for m in all_metrics if m.num_results > 0)
+    avg_time = sum(m.retrieval_time_ms for m in all_metrics) / len(all_metrics)
+    
+    print(f"  Queries: {len(BENCHMARK_QUERIES)}")
+    print(f"  Queries with results: {queries_with_results}/{len(BENCHMARK_QUERIES)}")
+    print(f"  Total results: {total_results}")
+    print(f"  Avg retrieval time: {avg_time:.1f}ms")
+    
+    if queries_with_results > 0:
+        avg_scores = [m.avg_score for m in all_metrics if m.num_results > 0]
+        print(f"  Avg relevance score: {sum(avg_scores) / len(avg_scores):.4f}")
+    
+    print("=" * 70 + "\n")
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Artifact A: Hybrid Retrieval Pipeline Testing"
+    )
+    
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("./config/settings.yaml"),
+        help="Path to configuration file"
+    )
+    
+    parser.add_argument(
+        "--ingest-only",
+        action="store_true",
+        help="Only run document ingestion"
+    )
+    
+    parser.add_argument(
+        "--query",
+        type=str,
+        help="Single query to execute"
+    )
+    
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Run in interactive mode"
+    )
+    
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run benchmark queries"
+    )
+    
+    parser.add_argument(
+        "--documents",
+        type=Path,
+        help="Path to documents folder for ingestion"
+    )
+    
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Logging level"
+    )
+    
+    return parser.parse_args()
+
+
+def main() -> int:
+    """Main entry point."""
+    args = parse_args()
+    
+    # Setup logging
+    log_file = Path("./logs/retrieval_pipeline.log")
+    logger = setup_logging(level=args.log_level, log_file=log_file)
+    
+    logger.info("=" * 70)
+    logger.info("ARTIFACT A: HYBRID RETRIEVAL PIPELINE")
+    logger.info("=" * 70)
+    
+    try:
+        # Load configuration
+        config = load_config(args.config)
+        
+        # Initialize pipeline
+        pipeline = RetrievalPipeline(config, logger)
+        pipeline.setup()
+        
+        # Ingest documents if needed or requested
+        if args.ingest_only:
+            doc_path = args.documents or Path(config["paths"].get("documents"))
+            num_chunks = pipeline.ingest_documents(doc_path)
+            logger.info(f"Ingestion complete: {num_chunks} chunks")
+            return 0
+        
+        # Check if we have documents
+        try:
+            vector_path = Path(config["paths"].get("vector_db", "./data/vector_db"))
+            table_path = vector_path / "documents.lance"
+            
+            if not table_path.exists():
+                logger.warning("No documents indexed. Running ingestion...")
+                doc_path = args.documents or Path(config["paths"].get("documents"))
+                pipeline.ingest_documents(doc_path)
+        except Exception as e:
+            logger.debug(f"Could not check vector store: {e}")
+        
+        # Execute based on mode
+        if args.query:
+            # Single query mode
+            results, metrics = pipeline.retrieve_with_metrics(args.query)
+            pipeline.print_results(results)
+            logger.info(f"Query completed: {metrics.num_results} results in {metrics.retrieval_time_ms:.1f}ms")
+        
+        elif args.interactive:
+            # Interactive mode
+            run_interactive(pipeline)
+        
+        elif args.benchmark:
+            # Benchmark mode
+            run_benchmark(pipeline)
+        
+        else:
+            # Default: run example query
+            example_query = "What is knowledge management?"
+            logger.info(f"Running example query: {example_query}")
+            
+            results, metrics = pipeline.retrieve_with_metrics(example_query)
+            pipeline.print_results(results)
+            
+            # Print embedding metrics
+            pipeline.print_embedding_metrics()
+        
+        logger.info("=" * 70)
+        logger.info("ARTIFACT A: PIPELINE COMPLETED")
+        logger.info("=" * 70)
+        
+        return 0
+        
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        return 130
+    except Exception as e:
+        logger.critical(f"Pipeline failed: {e}", exc_info=True)
         return 1
-    
-    num_chunks = system.ingest_documents(documents_path)
-    print(f"\n✅ {num_chunks} Chunks indexiert")
-    return 0
-
-
-def cmd_query(args, config):
-    """Query Command."""
-    system = HybridRAGSystem(config)
-    system.initialize_data_layer()
-    system.initialize_logic_layer()
-    
-    result = system.query(args.question)
-    
-    print("\n" + "="*70)
-    print(f"Answer: {result['answer']}")
-    print("-"*70)
-    print(f"Sub-Queries: {result.get('sub_queries', [])}")
-    print(f"Time: {result.get('total_time_ms', 0):.0f}ms")
-    return 0
-
-
-def cmd_interactive(args, config):
-    """Interactive Mode."""
-    system = HybridRAGSystem(config)
-    system.initialize_data_layer()
-    system.initialize_logic_layer()
-    system.interactive_mode()
-    return 0
-
-
-def cmd_demo(args, config):
-    """Demo mit Sample Data (ohne Ingestion)."""
-    print("\n" + "="*70)
-    print("DEMO MODE")
-    print("="*70)
-    
-    if not AGENT_AVAILABLE:
-        print("❌ Agent modules nicht verfügbar")
-        return 1
-    
-    controller = create_controller()
-    
-    # Mock Context
-    sample_context = [
-        "Microsoft was founded by Bill Gates and Paul Allen in 1975.",
-        "Bill Gates attended Harvard University but dropped out in 1975.",
-        "The Eiffel Tower is located in Paris, France.",
-        "Paris is the capital of France.",
-    ]
-    
-    # Mock Navigator
-    controller.retriever = type('MockRetriever', (), {
-        'retrieve': lambda self, q: [
-            type('Result', (), {'text': ctx})() for ctx in sample_context
-        ]
-    })()
-    
-    queries = [
-        "What university did the founder of Microsoft attend?",
-        "What is the capital of the country where the Eiffel Tower is located?",
-    ]
-    
-    for query in queries:
-        print(f"\n📝 Query: {query}")
-        result = controller.run(query)
-        print(f"📌 Answer: {result['answer']}")
-        print(f"⏱ {result['total_time_ms']:.0f}ms")
-    
-    return 0
-
-
-def main():
-    """Main Entry Point."""
-    parser = argparse.ArgumentParser(description="Hybrid RAG System")
-    parser.add_argument("--config", "-c", type=Path, default=Path("settings.yaml"))
-    parser.add_argument("--log-level", "-l", default="INFO")
-    
-    subparsers = parser.add_subparsers(dest="command")
-    
-    # Ingest
-    p = subparsers.add_parser("ingest", help="Dokumente indexieren")
-    p.add_argument("--documents", "-d", type=Path)
-    
-    # Query
-    p = subparsers.add_parser("query", help="Einzelne Frage")
-    p.add_argument("question")
-    
-    # Interactive
-    subparsers.add_parser("interactive", help="Chat-Modus")
-    
-    # Demo
-    subparsers.add_parser("demo", help="Demo ohne Daten")
-    
-    args = parser.parse_args()
-    setup_logging(args.log_level)
-    config = load_config(args.config)
-    
-    commands = {
-        "ingest": cmd_ingest,
-        "query": cmd_query,
-        "interactive": cmd_interactive,
-        "demo": cmd_demo,
-    }
-    
-    if args.command in commands:
-        return commands[args.command](args, config)
-    
-    parser.print_help()
-    return 0
-
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
