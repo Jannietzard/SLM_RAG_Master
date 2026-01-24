@@ -30,8 +30,8 @@ import yaml
 from langchain.schema import Document
 
 # Local imports
-from src.ingestion import DocumentIngestionPipeline, load_ingestion_config
-from src.storage import HybridStore, StorageConfig
+from src/data_layer.ingestion import DocumentIngestionPipeline, load_ingestion_config
+from src/data_layer.storage import HybridStore, StorageConfig
 from src.retrieval import HybridRetriever, RetrievalConfig, RetrievalMode
 from src.data_layer.embeddings import BatchedOllamaEmbeddings
 
