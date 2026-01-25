@@ -254,7 +254,12 @@ class HotpotQALoader(DatasetLoader):
 
 
 class WikiMultiHopLoader(DatasetLoader):
-    """2WikiMultiHopQA: Requires 2 Wikipedia articles."""
+    """
+    2WikiMultiHopQA: Requires 2 Wikipedia articles.
+    
+    FIX: framolfese/2WikiMultihopQA hat die GLEICHE Struktur wie HotpotQA:
+         context = {'title': [...], 'sentences': [[...], ...]}
+    """
     
     @property
     def name(self) -> str:
@@ -266,14 +271,11 @@ class WikiMultiHopLoader(DatasetLoader):
         logger.info("Loading 2WikiMultiHopQA from HuggingFace...")
         
         try:
-            ds = load_dataset("xanhho/2WikiMultihopQA", split="validation")
-        except Exception:
-            try:
-                ds = load_dataset("knowrohit07/2wikimultihop", split="validation")
-            except Exception as e:
-                logger.error(f"2WikiMultiHopQA not available: {e}")
-                logger.info("  Try: pip install datasets --upgrade")
-                return [], []
+            ds = load_dataset("framolfese/2WikiMultihopQA", split="validation")
+        except Exception as e:
+            logger.error(f"2WikiMultiHopQA not available: {e}")
+            logger.info("  Try: pip install datasets --upgrade")
+            return [], []
         
         if n_samples:
             ds = ds.select(range(min(n_samples, len(ds))))
@@ -287,47 +289,84 @@ class WikiMultiHopLoader(DatasetLoader):
             
             # Question
             q = TestQuestion(
-                id=item.get("_id", f"2wiki_{idx}"),
+                id=item.get("id", f"2wiki_{idx}"),
                 question=item["question"],
                 answer=item["answer"],
                 dataset="2wikimultihop",
                 question_type=item.get("type", "unknown"),
+                supporting_facts=list(zip(
+                    item.get("supporting_facts", {}).get("title", []),
+                    item.get("supporting_facts", {}).get("sent_id", [])
+                )) if item.get("supporting_facts") else [],
             )
             questions.append(q)
             
-            # Articles from context
-            context = item.get("context", [])
-            for ctx in context:
-                try:
-                    if isinstance(ctx, (list, tuple)) and len(ctx) >= 2:
-                        title = str(ctx[0])
-                        sentences = ctx[1] if isinstance(ctx[1], list) else [str(ctx[1])]
-                    elif isinstance(ctx, dict):
-                        title = ctx.get("title", f"doc_{len(articles_dict)}")
-                        content = ctx.get("sentences", ctx.get("text", ""))
-                        sentences = content if isinstance(content, list) else [content]
-                    else:
-                        continue
-                    
+            # ═══════════════════════════════════════════════════════════════
+            # FIX: Context ist ein DICT mit 'title' und 'sentences' Listen
+            # (Gleiche Struktur wie HotpotQA!)
+            # ═══════════════════════════════════════════════════════════════
+            context = item.get("context", {})
+            
+            # Prüfe ob context ein Dict ist (framolfese Format)
+            if isinstance(context, dict):
+                titles = context.get("title", [])
+                sentences_list = context.get("sentences", [])
+                
+                for title, sentences in zip(titles, sentences_list):
                     if title and title not in articles_dict:
+                        # sentences ist eine Liste von Strings
+                        if isinstance(sentences, list):
+                            text = " ".join(str(s) for s in sentences)
+                            sent_list = [str(s) for s in sentences]
+                        else:
+                            text = str(sentences)
+                            sent_list = [text]
+                        
                         articles_dict[title] = Article(
                             id=f"2wiki_{len(articles_dict)}",
                             title=title,
-                            text=" ".join(str(s) for s in sentences),
-                            sentences=[str(s) for s in sentences],
+                            text=text,
+                            sentences=sent_list,
                             dataset="2wikimultihop",
                         )
-                except Exception:
-                    continue
+            
+            # Fallback: Falls context eine Liste ist (altes Format)
+            elif isinstance(context, list):
+                for ctx in context:
+                    try:
+                        if isinstance(ctx, (list, tuple)) and len(ctx) >= 2:
+                            title = str(ctx[0])
+                            sentences = ctx[1] if isinstance(ctx[1], list) else [str(ctx[1])]
+                        else:
+                            continue
+                        
+                        if title and title not in articles_dict:
+                            articles_dict[title] = Article(
+                                id=f"2wiki_{len(articles_dict)}",
+                                title=title,
+                                text=" ".join(str(s) for s in sentences),
+                                sentences=[str(s) for s in sentences],
+                                dataset="2wikimultihop",
+                            )
+                    except Exception:
+                        continue
         
         articles = list(articles_dict.values())
         logger.info(f"  2WikiMultiHop: {len(articles)} articles, {len(questions)} questions")
         
         return articles, questions
 
-
 class StrategyQALoader(DatasetLoader):
-    """StrategyQA: Yes/No questions with implicit reasoning."""
+    """
+    StrategyQA: Yes/No questions with implicit reasoning.
+    
+    FIX: Verschiedene HuggingFace Versionen haben unterschiedliche Felder.
+         - wics/strategy-qa: Nur question + answer (keine facts)
+         - ChilleD/StrategyQA: Hat facts
+         - voidful/StrategyQA: Hat evidence paragraphs (aber broken)
+    
+    Lösung: Nutze ChilleD/StrategyQA für facts, oder generiere Dummy-Facts.
+    """
     
     @property
     def name(self) -> str:
@@ -338,11 +377,33 @@ class StrategyQALoader(DatasetLoader):
         
         logger.info("Loading StrategyQA from HuggingFace...")
         
+        # Versuche verschiedene Quellen
+        ds = None
+        source = None
+        
+        # Option 1: ChilleD hat facts
         try:
-            ds = load_dataset("wics/strategy-qa", split="test")
+            ds = load_dataset("ChilleD/StrategyQA", split="train")
+            source = "ChilleD/StrategyQA"
+            logger.info(f"  Loaded from {source}")
         except Exception:
+            pass
+        
+        # Option 2: wics (kein facts, aber stabil)
+        if ds is None:
             try:
-                ds = load_dataset("ChilleD/StrategyQA", split="train")
+                ds = load_dataset("wics/strategy-qa", "strategyQA", split="test")
+                source = "wics/strategy-qa"
+                logger.info(f"  Loaded from {source}")
+            except Exception:
+                pass
+        
+        # Option 3: metaeval
+        if ds is None:
+            try:
+                ds = load_dataset("metaeval/strategy-qa", split="test")
+                source = "metaeval/strategy-qa"
+                logger.info(f"  Loaded from {source}")
             except Exception as e:
                 logger.error(f"StrategyQA not available: {e}")
                 return [], []
@@ -353,15 +414,26 @@ class StrategyQALoader(DatasetLoader):
         articles = []
         questions = []
         
+        # Debug: Zeige verfügbare Felder
+        if len(ds) > 0:
+            sample = ds[0]
+            logger.info(f"  Available fields: {list(sample.keys())}")
+        
         for idx, item in enumerate(ds):
-            # Answer: boolean -> yes/no
+            # ═══════════════════════════════════════════════════════════════
+            # Answer: boolean/int -> yes/no
+            # ═══════════════════════════════════════════════════════════════
             raw_answer = item.get("answer", item.get("label", False))
             if isinstance(raw_answer, bool):
                 answer = "yes" if raw_answer else "no"
             elif isinstance(raw_answer, int):
                 answer = "yes" if raw_answer == 1 else "no"
+            elif isinstance(raw_answer, str):
+                answer = raw_answer.lower().strip()
+                if answer not in ["yes", "no"]:
+                    answer = "yes" if answer in ["true", "1"] else "no"
             else:
-                answer = str(raw_answer).lower()
+                answer = "yes" if raw_answer else "no"
             
             q = TestQuestion(
                 id=f"strategyqa_{idx}",
@@ -372,20 +444,58 @@ class StrategyQALoader(DatasetLoader):
             )
             questions.append(q)
             
-            # Facts as articles (if available)
-            facts = item.get("facts", item.get("evidence", []))
-            if isinstance(facts, list):
-                for i, fact in enumerate(facts):
-                    if isinstance(fact, str) and len(fact.strip()) > 20:
-                        articles.append(Article(
-                            id=f"strategyqa_fact_{idx}_{i}",
-                            title=f"Fact_{idx}_{i}",
-                            text=fact.strip(),
-                            sentences=[fact.strip()],
-                            dataset="strategyqa",
-                        ))
+            # ═══════════════════════════════════════════════════════════════
+            # Facts/Evidence extrahieren (verschiedene Feldnamen möglich)
+            # ═══════════════════════════════════════════════════════════════
+            facts = None
+            
+            # Versuche verschiedene Feldnamen
+            for field_name in ["facts", "evidence", "paragraphs", "decomposition"]:
+                if field_name in item and item[field_name]:
+                    facts = item[field_name]
+                    break
+            
+            if facts:
+                # Facts können verschiedene Formate haben
+                if isinstance(facts, list):
+                    for i, fact in enumerate(facts):
+                        fact_text = None
+                        
+                        if isinstance(fact, str) and len(fact.strip()) > 10:
+                            fact_text = fact.strip()
+                        elif isinstance(fact, dict):
+                            # Manche Datasets haben {'content': '...'} Format
+                            fact_text = fact.get("content", fact.get("text", ""))
+                        elif isinstance(fact, list) and len(fact) > 0:
+                            # Nested list
+                            fact_text = " ".join(str(f) for f in fact)
+                        
+                        if fact_text and len(fact_text) > 10:
+                            articles.append(Article(
+                                id=f"strategyqa_fact_{idx}_{i}",
+                                title=f"Fact_{idx}_{i}",
+                                text=fact_text,
+                                sentences=[fact_text],
+                                dataset="strategyqa",
+                            ))
+                
+                elif isinstance(facts, str) and len(facts) > 20:
+                    # Einzelner String (z.B. decomposition)
+                    articles.append(Article(
+                        id=f"strategyqa_fact_{idx}_0",
+                        title=f"Reasoning_{idx}",
+                        text=facts,
+                        sentences=[facts],
+                        dataset="strategyqa",
+                    ))
         
         logger.info(f"  StrategyQA: {len(articles)} facts, {len(questions)} questions")
+        
+        # Warnung wenn keine Facts gefunden
+        if len(articles) == 0 and len(questions) > 0:
+            logger.warning("  ⚠ No facts/evidence found in this StrategyQA version!")
+            logger.warning("  ⚠ StrategyQA requires external knowledge or web search.")
+            logger.warning("  ⚠ Consider using a different evaluation approach for this dataset.")
         
         return articles, questions
 
@@ -904,30 +1014,40 @@ def cmd_evaluate(args, config: Dict, store_manager: StoreManager):
         vector_weight=args.vector_weight,
         graph_weight=args.graph_weight,
     )
-    
+    try:
     # Run evaluation
-    config_name = f"v{args.vector_weight}_g{args.graph_weight}"
-    result = evaluate_dataset(
-        dataset, questions, pipeline,
-        config_name, args.vector_weight, args.graph_weight,
-    )
+        config_name = f"v{args.vector_weight}_g{args.graph_weight}"
+        result = evaluate_dataset(
+            dataset, questions, pipeline,
+            config_name, args.vector_weight, args.graph_weight,
+        )
+        
+        # Print results
+        logger.info(f"\n{'─'*70}")
+        logger.info("RESULTS")
+        logger.info(f"{'─'*70}")
+        logger.info(f"  Exact Match:  {result.exact_match:.2%}")
+        logger.info(f"  F1 Score:     {result.f1_score:.3f}")
+        logger.info(f"  Coverage:     {result.coverage:.2%}")
+        logger.info(f"  Avg Time:     {result.avg_time_ms:.0f}ms")
     
-    # Print results
-    logger.info(f"\n{'─'*70}")
-    logger.info("RESULTS")
-    logger.info(f"{'─'*70}")
-    logger.info(f"  Exact Match:  {result.exact_match:.2%}")
-    logger.info(f"  F1 Score:     {result.f1_score:.3f}")
-    logger.info(f"  Coverage:     {result.coverage:.2%}")
-    logger.info(f"  Avg Time:     {result.avg_time_ms:.0f}ms")
-    
-    if result.by_type:
-        logger.info(f"\n  By Question Type:")
-        for qtype, stats in result.by_type.items():
-            logger.info(f"    {qtype}: EM={stats['exact_match']:.2%}, F1={stats['f1']:.3f}")
-    
-    logger.info("="*70)
-
+        if result.by_type:
+            logger.info(f"\n  By Question Type:")
+            for qtype, stats in result.by_type.items():
+                logger.info(f"    {qtype}: EM={stats['exact_match']:.2%}, F1={stats['f1']:.3f}")
+        
+        logger.info("="*70)
+    finally:
+        # Cleanup
+        if hasattr(pipeline, 'hybrid_store') and pipeline.hybrid_store is not None:
+            if hasattr(pipeline.hybrid_store, 'graph_db') and pipeline.hybrid_store.graph_db is not None:
+                try:
+                    pipeline.hybrid_store.graph_db.close()
+                except:
+                    pass
+        del pipeline
+        import gc
+        gc.collect()
 
 def cmd_ablation(args, config: Dict, store_manager: StoreManager):
     """
@@ -978,29 +1098,52 @@ def cmd_ablation(args, config: Dict, store_manager: StoreManager):
         
         dataset_results = []
         
-        for config_name, v_weight, g_weight in ABLATION_CONFIGS:
-            logger.info(f"\n  ─── Config: {config_name} (v={v_weight}, g={g_weight}) ───")
+    for config_name, v_weight, g_weight in ABLATION_CONFIGS:
+        logger.info(f"\n  ─── Config: {config_name} (v={v_weight}, g={g_weight}) ───")
+        
+        pipeline = None  # Initialize
+        try:
+            # Create pipeline with THIS dataset's store
+            pipeline = create_pipeline(
+                dataset, config, store_manager,
+                vector_weight=v_weight,
+                graph_weight=g_weight,
+            )
+
+            # Evaluate
+            result = evaluate_dataset(
+                dataset, questions, pipeline,
+                config_name, v_weight, g_weight,
+            )
+
+            if result:
+                dataset_results.append(result)
+                logger.info(f"    → EM={result.exact_match:.2%}, F1={result.f1_score:.3f}")
+
+        except Exception as e:
+            logger.error(f"    Failed: {e}")
+        
+        finally:
+            # CRITICAL: Cleanup pipeline and close database connections
+            if pipeline is not None:
+                # Close hybrid store if it exists
+                if hasattr(pipeline, 'hybrid_store') and pipeline.hybrid_store is not None:
+                    if hasattr(pipeline.hybrid_store, 'graph_db') and pipeline.hybrid_store.graph_db is not None:
+                        try:
+                            pipeline.hybrid_store.graph_db.close()
+                        except:
+                            pass
+                
+                # Delete pipeline object
+                del pipeline
             
-            try:
-                # Create pipeline with THIS dataset's store
-                pipeline = create_pipeline(
-                    dataset, config, store_manager,
-                    vector_weight=v_weight,
-                    graph_weight=g_weight,
-                )
-                
-                # Evaluate
-                result = evaluate_dataset(
-                    dataset, questions, pipeline,
-                    config_name, v_weight, g_weight,
-                )
-                
-                if result:
-                    dataset_results.append(result)
-                    logger.info(f"    → EM={result.exact_match:.2%}, F1={result.f1_score:.3f}")
-                    
-            except Exception as e:
-                logger.error(f"    Failed: {e}")
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            # Give OS time to release file locks (important on Windows!)
+            import time
+            time.sleep(0.5)
         
         all_results[dataset] = dataset_results
     
@@ -1285,6 +1428,7 @@ Examples:
         cmd_ablation(args, config, store_manager)
     elif args.command == "status":
         cmd_status(args, config, store_manager)
+
 
 
 if __name__ == "__main__":

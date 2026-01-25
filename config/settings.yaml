@@ -1,62 +1,57 @@
 # ============================================================================
-# DECENTRALIZED AI ARCHITECTURE - EDGE RAG CONFIGURATION
+# EDGE-RAG UNIFIED CONFIGURATION
 # ============================================================================
-# Masterthesis: "Enhancing Reasoning Fidelity in Quantized SLMs on Edge"
-# 
-# VERSION 2.1.0 - CORRECTED METRIC CONFIGURATION
-# 
-# CRITICAL CHANGES (v2.1.0):
-# - Added distance_metric: "cosine" to vector_store section
-# - This fixes the similarity score computation bug
-# - Previous versions defaulted to L2 distance, causing incorrect scores
 #
-# Expected Impact:
-# - Similarity scores should increase from 0.17-0.25 to 0.70-0.90
-# - Retrieval coverage should improve from 0% to 80%+
-
-project:
-  name: "Graph-Augmented Edge-RAG"
-  version: "2.1.0"
-  author: "Jan Nietzard"
-  institution: "RWTH Aachen"
-
+# Version: 3.1.0 - UNIFIED
+# Author: Edge-RAG Research Project
+# Last Modified: 2026-01-25
+#
+# CONSOLIDATION: settings.yaml + settings_kuzu.yaml → UNIFIED settings.yaml
+#
+# This configuration supports both KuzuDB and NetworkX graph backends.
+# Select your preferred backend in the 'graph' section below.
+#
 # ============================================================================
-# LANGUAGE MODEL CONFIGURATION
-# ============================================================================
-llm:
-  provider: "ollama"
-  model_name: "phi3"
-  base_url: "http://localhost:11434"
-  temperature: 0.3
-  top_p: 0.9
-  top_k: 40
-  max_tokens: 256
 
 # ============================================================================
 # EMBEDDING MODEL
 # ============================================================================
 embeddings:
-  provider: "ollama"
+  # Model name (must match Ollama installed model)
   model_name: "nomic-embed-text"
+  
+  # Ollama API endpoint
   base_url: "http://localhost:11434"
-  embedding_dim: 768  # Auto-detected, but can be specified for validation
+  
+  # Embedding dimensionality
+  # nomic-embed-text: 768
+  # all-MiniLM-L6-v2: 384
+  # bge-base-en: 768
+  embedding_dim: 768
 
 # ============================================================================
-# DOCUMENT INGESTION & CHUNKING
+# DOCUMENT CHUNKING
 # ============================================================================
 chunking:
+  # Mode: "standard" (fixed size) or "semantic" (structure-aware)
   mode: "standard"
-  chunk_size: 512
-  chunk_overlap: 128
-  min_chunk_size: 200
-  enable_pdf_cleaning: true
   
-  separators:
-    - "\n\n"
-    - "\n"
-    - ". "
-    - " "
-    - ""
+  # Standard chunking parameters
+  chunk_size: 512         # Characters per chunk
+  chunk_overlap: 128      # Overlap between chunks
+  
+  # Semantic chunking parameters (if mode="semantic")
+  semantic:
+    min_chunk_size: 200
+    max_chunk_size: 1000
+    detect_structure: true
+    quality_filter: true
+  
+  # Content to filter out
+  filter_patterns:
+    - "^\\s*$"            # Empty lines
+    - "^Page \\d+$"       # Page numbers
+    - "^\\d+$"            # Standalone numbers
 
 # ============================================================================
 # VECTOR STORE (LanceDB)
@@ -64,70 +59,132 @@ chunking:
 vector_store:
   provider: "lancedb"
   db_path: "./data/vector_db"
+  
+  # Index type: "flat" (exact) or "ivfflat" (approximate, faster)
   index_type: "ivfflat"
   
   # =========================================================================
-  # CRITICAL: Distance metric specification
+  # DISTANCE METRIC - CRITICAL SETTING
   # =========================================================================
-  # LanceDB supports: "cosine", "l2" (euclidean), "dot"
-  # For text embeddings, "cosine" is the standard choice.
-  #
-  # WARNING: If you change this after indexing, you must re-index all documents!
-  # =========================================================================
+  # Must be "cosine" for text embeddings.
+  # LanceDB defaults to L2 which gives incorrect similarity scores!
   distance_metric: "cosine"
   
-  # L2 normalization for embeddings
-  # When true, vectors are normalized to unit length before storage.
-  # This makes cosine similarity equivalent to dot product (faster computation).
+  # L2 normalization for numerical stability
   normalize_embeddings: true
   
   # Retrieval parameters
   top_k_vectors: 10
-  similarity_threshold: 0.3  # Minimum similarity score [0.0, 1.0]
+  similarity_threshold: 0.3    # Minimum similarity [0.0, 1.0]
 
 # ============================================================================
-# KNOWLEDGE GRAPH (NetworkX)
+# KNOWLEDGE GRAPH
 # ============================================================================
 graph:
   enabled: true
-  provider: "networkx"
+  
+  # =========================================================================
+  # BACKEND SELECTION
+  # =========================================================================
+  # Options:
+  #   "kuzu"     - KuzuDB (recommended): Native Cypher, 10-100x faster
+  #   "networkx" - NetworkX (fallback): Pure Python, GraphML persistence
+  #
+  # KuzuDB requires: pip install kuzu
+  # NetworkX requires: pip install networkx
+  #
+  # If selected backend is unavailable, system will auto-fallback to other.
+  # =========================================================================
+  backend: "kuzu"
+  
+  # Database path
+  # KuzuDB: Directory (e.g., "./data/knowledge_graph")
+  # NetworkX: File (e.g., "./data/knowledge_graph/graph.graphml")
   graph_path: "./data/knowledge_graph"
-  entity_extraction_enabled: true
+  
+  # Graph traversal settings
+  max_hops: 2                    # Maximum path length for traversal
+  top_k_entities: 5              # Number of graph results
+  expand_context: true           # Include surrounding chunks (KuzuDB only)
+  
+  # Entity extraction method
+  # "keyword" - Simple keyword-based (fast, basic)
+  # "spacy"   - spaCy NER (requires: pip install spacy)
+  # "gliner"  - GLiNER zero-shot NER (requires: pip install gliner)
   entity_extraction_method: "keyword"
   
+  # Relationship types stored in graph
   relation_types:
-    - "mentions"
-    - "references"
-    - "defines"
-    - "extends"
-    - "part_of"
-    - "follows"
-  
-  max_hops: 2
-  top_k_entities: 5
+    - "from_source"     # Chunk -> Document
+    - "next_chunk"      # Chunk -> Chunk (sequential)
+    - "mentions"        # Chunk -> Entity
+    - "related_to"      # Entity -> Entity
 
 # ============================================================================
 # RETRIEVAL AUGMENTED GENERATION (RAG)
 # ============================================================================
 rag:
+  # =========================================================================
+  # RETRIEVAL MODE
+  # =========================================================================
+  # Options:
+  #   "vector" - Vector similarity only (baseline)
+  #   "graph"  - Graph traversal only (structural)
+  #   "hybrid" - Weighted combination (recommended)
+  # =========================================================================
   retrieval_mode: "hybrid"
   
-  # Current evaluation: Vector-only (graph_weight=0)
-  # This isolates vector retrieval performance for initial testing.
-  # Adjust weights for hybrid evaluation after vector baseline is established.
-  vector_weight: 1.0
-  graph_weight: 0.0
+  # =========================================================================
+  # HYBRID WEIGHTS - Ablation Study Configuration
+  # =========================================================================
+  # Experiment 1: Vector-only  → vector_weight=1.0, graph_weight=0.0
+  # Experiment 2: Graph-only   → vector_weight=0.0, graph_weight=1.0
+  # Experiment 3: Hybrid 70/30 → vector_weight=0.7, graph_weight=0.3
+  # Experiment 4: Hybrid 50/50 → vector_weight=0.5, graph_weight=0.5
+  # Experiment 5: Graph-heavy  → vector_weight=0.3, graph_weight=0.7
+  # =========================================================================
+  vector_weight: 0.7
+  graph_weight: 0.3
   
+  # Future work options
   reranking_enabled: false
   query_expansion_enabled: false
+
+# ============================================================================
+# LLM CONFIGURATION (for Artifact B - Logic Layer)
+# ============================================================================
+llm:
+  # Model name (Ollama)
+  model_name: "phi3"
+  
+  # Alternative models (ordered by speed):
+  # - "phi3:mini"      # Fastest, ~3.8B params
+  # - "phi3"           # Standard, ~3.8B params
+  # - "qwen2:1.5b"     # Very fast, good quality
+  # - "llama3.1:8b"    # Larger, better quality
+  # - "mistral"        # 7B, good balance
+  
+  base_url: "http://localhost:11434"
+  temperature: 0.1    # Low for factual responses
+  max_tokens: 300     # Response length limit
+
+# ============================================================================
+# AGENTIC CONTROLLER (Artifact B)
+# ============================================================================
+agent:
+  # Maximum verification iterations in self-correction loop
+  max_verification_iterations: 3
+  
+  # Enable/disable verification stage
+  enable_verification: true
 
 # ============================================================================
 # QUANTIZATION SETTINGS
 # ============================================================================
 quantization:
   enabled: true
-  bits: 4
-  group_size: 128
+  bits: 4           # 4-bit quantization (llama.cpp default)
+  group_size: 128   # Group size for quantization
 
 # ============================================================================
 # DATA PATHS
@@ -145,7 +202,7 @@ paths:
 # LOGGING
 # ============================================================================
 logging:
-  level: "INFO"
+  level: "INFO"      # DEBUG, INFO, WARNING, ERROR
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
   file: "./logs/edge_rag.log"
 
@@ -153,8 +210,45 @@ logging:
 # PERFORMANCE TUNING
 # ============================================================================
 performance:
-  batch_size: 32
+  # Embedding batch size (higher = faster ingestion, more memory)
+  batch_size: 64
+  
+  # Number of worker threads for parallel processing
   num_workers: 2
+  
+  # Compute device: "cpu" or "cuda" (if available)
   device: "cpu"
+  
+  # Enable embedding cache (SQLite-based)
   cache_embeddings: true
+  
+  # Maximum cache size in MB
   max_cache_size_mb: 512
+
+# ============================================================================
+# BENCHMARK CONFIGURATION (for Thesis Evaluation)
+# ============================================================================
+benchmark:
+  # Available datasets for evaluation
+  datasets:
+    - "hotpotqa"
+    - "2wikimultihop"
+    - "strategyqa"
+  
+  # Default number of samples per dataset
+  default_samples: 500
+  
+  # Ablation study configurations
+  ablation_configs:
+    - name: "vector_only"
+      vector_weight: 1.0
+      graph_weight: 0.0
+    - name: "graph_only"
+      vector_weight: 0.0
+      graph_weight: 1.0
+    - name: "hybrid_70_30"
+      vector_weight: 0.7
+      graph_weight: 0.3
+    - name: "hybrid_50_50"
+      vector_weight: 0.5
+      graph_weight: 0.5

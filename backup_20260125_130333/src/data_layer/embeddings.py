@@ -1032,4 +1032,3 @@ class BatchedOllamaEmbeddings(Embeddings):
         """Cleanup: close cache database connection."""
         if hasattr(self, 'cache') and self.cache is not None:
             self.cache.close()
-

@@ -166,7 +166,7 @@ from dataclasses import dataclass, field
 
 import requests
 from tqdm import tqdm
-from langchain_core.embeddings import Embeddings
+from langchain.embeddings.base import Embeddings
 
 
 logger = logging.getLogger(__name__)
@@ -1032,4 +1032,3 @@ class BatchedOllamaEmbeddings(Embeddings):
         """Cleanup: close cache database connection."""
         if hasattr(self, 'cache') and self.cache is not None:
             self.cache.close()
-

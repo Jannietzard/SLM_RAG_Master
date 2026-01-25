@@ -1260,4 +1260,3 @@ def run_diagnostics(config: StorageConfig, embeddings: Embeddings) -> Dict[str, 
         results["issues"].append("KuzuDB requested but not installed")
     
     return results
-

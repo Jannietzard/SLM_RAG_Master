@@ -197,8 +197,10 @@ def import_data_layer():
         modules['DocumentIngestionPipeline'] = DocumentIngestionPipeline
         modules['load_ingestion_config'] = load_ingestion_config
     except ImportError as e:
-        print(f"[ERROR] Cannot import ingestion: {e}")
-        return modules, False
+        print(f"[WARNING] Ingestion module not available: {e}")
+        # Ingestion ist optional für --interactive Mode
+        modules['DocumentIngestionPipeline'] = None
+        modules['load_ingestion_config'] = None
     
     try:
         from src.data_layer.retrieval import HybridRetriever, RetrievalConfig, RetrievalMode

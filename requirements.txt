@@ -1,16 +1,174 @@
-langchain==0.1.20
-langchain-community==0.0.38
-lancedb>=0.6,<0.7
-networkx==3.2.1
-pydantic==2.5.0
-pyyaml==6.0.1
-python-dotenv==1.0.0
-llama-cpp-python==0.2.61
-pdf2image==1.16.3
-pypdf==4.0.0
-python-docx==0.8.11
-typing-extensions==4.9.0
-numpy==1.24.3
-scipy==1.11.4
-scikit-learn==1.3.2
-requests==2.31.0
+# ============================================================================
+# EDGE-RAG UNIFIED REQUIREMENTS - FIXED VERSION
+# ============================================================================
+#
+# Version: 3.2.1 - KORRIGIERTE VERSIONEN
+# Author: Edge-RAG Research Project
+# Last Modified: 2026-01-25
+#
+# WICHTIG: Diese Version behebt die Dependency-Konflikte korrekt!
+#
+# Das Problem in v3.2.0 war:
+# - langchain 0.3.x benötigt langchain-core 0.3.x (NICHT 1.2.x!)
+# - Diese Version hat die korrekten Constraints
+#
+# Installation:
+#   pip install -r requirements_fixed.txt
+#
+# ============================================================================
+
+# ============================================================================
+# CORE DEPENDENCIES - KORRIGIERTE VERSIONEN
+# ============================================================================
+
+# LangChain Framework - MIT KORREKTEN VERSIONEN
+langchain>=0.3.0,<0.4.0
+langchain-core>=0.3.0,<0.4.0
+langchain-community>=0.3.0,<0.4.0
+langchain-text-splitters>=0.3.0,<0.4.0
+
+# LangSmith (benötigt von LangChain 0.3.x)
+langsmith>=0.2.0,<1.0.0
+
+# LangGraph - FÜR AGENTIC CONTROLLER
+langgraph>=1.0.0,<2.0.0
+langgraph-checkpoint>=2.1.0,<5.0.0
+
+# Data Processing
+pydantic>=2.5.0,<3.0.0
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+
+# Numerical Computing
+numpy>=1.24.0,<2.0.0
+scipy>=1.11.0
+scikit-learn>=1.3.0
+
+# Networking
+requests>=2.31.0
+httpx>=0.25.0
+
+# Progress Bars
+tqdm>=4.65.0
+
+# Typing Extensions
+typing-extensions>=4.9.0
+
+# ============================================================================
+# VECTOR STORE (LanceDB - Embedded)
+# ============================================================================
+lancedb>=0.6.0,<0.8.0
+pyarrow>=12.0.0
+
+# ============================================================================
+# GRAPH DATABASE OPTIONS
+# ============================================================================
+
+# KuzuDB (Recommended - Native Cypher, 10-100x faster)
+kuzu>=0.3.0
+
+# NetworkX (Fallback - Pure Python)
+networkx>=3.2.0
+
+# ============================================================================
+# PDF PROCESSING
+# ============================================================================
+pypdf>=4.0.0
+pdf2image>=1.16.0
+python-docx>=1.1.0
+
+============================================================================
+# BENCHMARK DEPENDENCIES - NEU!
+# ============================================================================
+
+# HuggingFace Datasets - für HotpotQA, 2WikiMultihop, StrategyQA
+datasets>=2.14.0
+
+# Unified Planning - für Agentic Controller Planner Stage
+unified-planning>=1.0.0
+unified-planning[pyperplan]>=1.0.0
+
+# 
+# ============================================================================
+# OPTIONAL: Enhanced Entity Extraction (NER)
+# ============================================================================
+
+# spaCy - Traditional NER (recommended for Edge)
+# Installation: pip install spacy && python -m spacy download en_core_web_sm
+# spacy>=3.5.0
+
+# GLiNER - Zero-Shot NER (larger, more flexible)
+# gliner>=0.2.0
+
+# ============================================================================
+# OPTIONAL: Thesis Evaluation & Visualization
+# ============================================================================
+
+# Data Analysis
+# pandas>=2.0.0
+
+# Visualization
+# matplotlib>=3.7.0
+# seaborn>=0.12.0
+
+# HuggingFace Datasets (for benchmarks like HotpotQA)
+# datasets>=2.14.0
+
+# ============================================================================
+# VERSION COMPATIBILITY NOTES - KORRIGIERT
+# ============================================================================
+#
+# KORREKTUR von v3.2.0 → v3.2.1:
+#
+# FEHLER in v3.2.0:
+# - langchain-core: 1.2.x (FALSCH!)
+#   → langchain 0.3.x benötigt core 0.3.x, nicht 1.2.x!
+#
+# KORREKTUR in v3.2.1:
+# - langchain: 0.3.x
+# - langchain-core: 0.3.x (KORREKT!)
+# - langchain-community: 0.3.x
+# - langchain-text-splitters: 0.3.x
+# - langgraph: 1.0.x (funktioniert mit core 0.3.x!)
+#
+# WARUM FUNKTIONIERT DAS JETZT?
+# - langgraph 1.0.x akzeptiert langchain-core>=0.3.0
+# - langchain 0.3.x benötigt langchain-core 0.3.x
+# - Beide sind kompatibel!
+#
+# ============================================================================
+
+# ============================================================================
+# QUICK INSTALL COMMANDS
+# ============================================================================
+#
+# Schnelle Installation:
+#   pip install -r requirements_fixed.txt
+#
+# Mit KuzuDB:
+#   pip install kuzu
+#
+# Mit spaCy NER:
+#   pip install spacy
+#   python -m spacy download en_core_web_sm
+#
+# Full Installation:
+#   pip install -r requirements_fixed.txt spacy pandas matplotlib
+#   python -m spacy download en_core_web_sm
+#
+# ============================================================================
+
+# ============================================================================
+# TESTS NACH INSTALLATION
+# ============================================================================
+#
+# Teste ob LangGraph funktioniert:
+#   python -c "from langgraph.graph import StateGraph; print('LangGraph OK!')"
+#
+# Teste ob LangChain funktioniert:
+#   python -c "from langchain_core.embeddings import Embeddings; print('LangChain OK!')"
+#
+# Teste vollständige Kompatibilität:
+#   python -c "import langchain; import langgraph; print(f'langchain {langchain.__version__}'); print(f'langgraph {langgraph.__version__}')"
+#
+# ============================================================================
