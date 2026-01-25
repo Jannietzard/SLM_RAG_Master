@@ -394,20 +394,26 @@ class KuzuGraphStore:
         Initialize KuzuDB graph store.
         
         Args:
-            db_path: Directory path for KuzuDB database
+            db_path: DIRECTORY path for KuzuDB database
+        
+        CRITICAL FIX for KuzuDB 0.11.3+:
+            KuzuDB wants the PARENT directory to exist, but will create
+            the database directory itself. DO NOT create db_path!
         """
         self.db_path = Path(db_path)
         self.logger = logging.getLogger(__name__)
         
         if not KUZU_AVAILABLE:
-            raise ImportError(
-                "KuzuDB not installed. Install with: pip install kuzu"
-            )
+            raise ImportError("KuzuDB not installed. Install with: pip install kuzu")
         
-        # Create database directory
-        self.db_path.mkdir(parents=True, exist_ok=True)
+        # ===================================================================
+        # CRITICAL FIX: Create PARENT directory only, let KuzuDB create db_path
+        # ===================================================================
+        # KuzuDB 0.11.3+ will create the db_path directory itself
+        # We just need to ensure the parent exists
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Initialize KuzuDB
+        # Initialize KuzuDB - it will create db_path directory
         self.db = kuzu.Database(str(self.db_path))
         self.conn = kuzu.Connection(self.db)
         
@@ -415,7 +421,7 @@ class KuzuGraphStore:
         self._init_schema()
         
         self.logger.info(f"KuzuGraphStore initialized: {self.db_path}")
-    
+        
     def _init_schema(self) -> None:
         """
         Initialize graph schema (creates tables if not exist).
@@ -650,20 +656,6 @@ class KuzuGraphStore:
         """
         Perform multi-hop graph traversal using Cypher.
         
-        This is the KEY PERFORMANCE IMPROVEMENT over NetworkX!
-        
-        Instead of Python BFS:
-            visited = {}
-            queue = [start]
-            while queue:
-                current = queue.pop(0)
-                for neighbor in graph.neighbors(current):
-                    ...
-        
-        We use native Cypher path query:
-            MATCH (start)-[*1..max_hops]-(connected)
-            RETURN connected, length(path)
-        
         Args:
             start_entity: Starting node ID (chunk_id or entity_id)
             relation_types: Filter by relation types (None = all)
@@ -675,17 +667,13 @@ class KuzuGraphStore:
         visited = {start_entity: 0}
         
         try:
-            # Try as DocumentChunk first
+            # Try as DocumentChunk first - FIXED: Use undirected pattern
             result = self.conn.execute(
                 f"""
                 MATCH (start:DocumentChunk {{chunk_id: $start_id}})
-                MATCH path = (start)-[*1..{max_hops}]-(connected)
+                MATCH path = (start)-[*1..{max_hops}]-(connected:DocumentChunk)
                 RETURN DISTINCT 
-                    CASE 
-                        WHEN connected:DocumentChunk THEN connected.chunk_id
-                        WHEN connected:SourceDocument THEN connected.doc_id
-                        WHEN connected:Entity THEN connected.entity_id
-                    END AS node_id,
+                    connected.chunk_id AS node_id,
                     length(path) AS hops
                 """,
                 {"start_id": start_entity}
