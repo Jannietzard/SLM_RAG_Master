@@ -59,7 +59,17 @@ from datetime import datetime
 from abc import ABC, abstractmethod
 
 import yaml
-
+try:
+    from src.data_layer.ingestion import (
+        DocumentIngestionPipeline, 
+        IngestionConfig,
+        load_ingestion_config,
+        create_pipeline,
+    )
+    INGESTION_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARNING] Ingestion module not available: {e}")
+    INGESTION_AVAILABLE = False
 
 # ============================================================================
 # LOGGING
@@ -611,9 +621,49 @@ class StoreManager:
 # ============================================================================
 # DOCUMENT CREATION & INGESTION
 # ============================================================================
+def create_langchain_documents(
+    articles: List[Article], 
+    chunk_sentences: int = 3,
+    chunking_strategy: str = "sentence",
+    config: IngestionConfig = None,
+) -> List:
+    '''
+    Convert articles to LangChain Document objects with configurable chunking.
+    
+    Args:
+        articles: List of Article objects
+        chunk_sentences: Sentences per chunk (for sentence strategy)
+        chunking_strategy: "sentence", "semantic", "fixed", "recursive"
+        config: Optional IngestionConfig for full control
+        
+    Returns:
+        List of LangChain Document objects
+    '''
+    if not INGESTION_AVAILABLE:
+        # Fallback to old implementation
+        return _create_langchain_documents_legacy(articles, chunk_sentences)
+    
+    # Use new ingestion pipeline
+    if config is None:
+        config = IngestionConfig(
+            chunking_strategy=chunking_strategy,
+            sentences_per_chunk=chunk_sentences,
+            min_chunk_size=50,
+            extract_entities=True,
+        )
+    
+    pipeline = DocumentIngestionPipeline(config)
+    documents, _ = pipeline.process_articles(articles)
+    
+    logger.info(
+        f"Created {len(documents)} chunks using '{chunking_strategy}' strategy"
+    )
+    
+    return documents
 
-def create_langchain_documents(articles: List[Article], chunk_sentences: int = 3) -> List:
-    """Convert articles to LangChain Document objects with chunking."""
+
+def _create_langchain_documents_legacy(articles: List[Article], chunk_sentences: int = 3) -> List:
+    '''Legacy fallback wenn ingestion.py nicht verfügbar.'''
     from langchain.schema import Document
     
     documents = []
@@ -622,12 +672,10 @@ def create_langchain_documents(articles: List[Article], chunk_sentences: int = 3
     for article in articles:
         sentences = article.sentences
         
-        # Chunk by sentences
         for i in range(0, len(sentences), chunk_sentences):
             chunk_sents = sentences[i:i + chunk_sentences]
             chunk_text = " ".join(chunk_sents)
             
-            # Skip very short chunks
             if len(chunk_text.strip()) < 50:
                 continue
             
@@ -649,7 +697,10 @@ def create_langchain_documents(articles: List[Article], chunk_sentences: int = 3
 
 
 def run_ingestion(
-    documents: List,
+    documents = create_langchain_documents(
+    articles,
+    chunk_sentences=args.chunk_sentences,
+    chunking_strategy=args.chunking_strategy,
     vector_path: Path,
     graph_path: Path,
     config: Dict,
@@ -1413,6 +1464,30 @@ Examples:
         parser.print_help()
         return
     
+    # In der argparse-Sektion, füge hinzu:
+
+    parser.add_argument(
+        "--chunking-strategy",
+        type=str,
+        choices=["sentence", "semantic", "fixed", "recursive"],
+        default="sentence",
+        help="Chunking strategy to use (default: sentence)"
+    )
+
+    parser.add_argument(
+        "--chunk-sentences",
+        type=int,
+        default=3,
+        help="Sentences per chunk for sentence strategy (default: 3)"
+    )
+
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=1024,
+        help="Max chunk size in characters for other strategies (default: 1024)"
+)
+
     # Load config
     config = load_config_file()
     

@@ -6,7 +6,7 @@ Logic Layer - Agentic RAG Components
 - Agent: Agentic Controller (DAG Orchestration)
 """
 
-from src.logic_layer.planner import Planner, create_planner
+from src.logic_layer.planner import Planner, create_planner, PlannerConfig
 from src.logic_layer.verifier import Verifier, create_verifier
 from src.logic_layer.Agent import AgenticController, create_controller
 

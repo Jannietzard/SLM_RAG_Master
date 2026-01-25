@@ -135,7 +135,14 @@ class QueryPlan:
     parallel_groups: List[List[int]]  # Steps that can run in parallel
     estimated_cost: float       # Estimated execution time
 
-
+@dataclass
+class PlannerConfig:
+    """Konfiguration für Planner Stage."""
+    model_name: str = "phi3"
+    base_url: str = "http://localhost:11434"
+    solver: str = "pyperplan"
+    timeout: float = 5.0
+    
 # =============================================================================
 # PDDL DOMAIN DEFINITION
 # =============================================================================
@@ -191,7 +198,7 @@ class MultiHopQADomain:
         e = self.retrieve_action.parameter("e")
         # Precondition: query mentions entity and entity not yet known
         self.retrieve_action.add_precondition(self.mentions(q, e))
-        self.retrieve_action.add_precondition(Not(self.known(e)))
+        # self.retrieve_action.add_precondition(Not(self.known(e)))
         # Effect: entity becomes known
         self.retrieve_action.add_effect(self.known(e), True)
         
