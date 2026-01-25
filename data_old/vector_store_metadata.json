@@ -1,8 +1,0 @@
-{
-  "schema_version": "2.1.0",
-  "embedding_dim": 768,
-  "distance_metric": "cosine",
-  "normalize_embeddings": true,
-  "num_documents": 2457,
-  "timestamp": 1768348864.5931637
-}

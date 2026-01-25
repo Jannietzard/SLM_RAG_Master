@@ -94,6 +94,7 @@ wheels/
 .DS_Store
 
 # Data & Logs
+data_old/
 data/
 logs/
 cache/
