@@ -59,3 +59,103 @@ checkpoints/
 tmp/
 temp/
 *.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Data & Logs
+data/
+logs/
+cache/
+*.db
+*.sqlite
+*.lancedb
+
+# ⚠️ NEUE EINTRÄGE - SEHR WICHTIG! ⚠️
+
+# Embedding Cache (kann SEHR groß werden!)
+cache/embeddings.db
+cache/embeddings.db-shm
+cache/embeddings.db-wal
+
+# LanceDB Vector Store (oft mehrere GB!)
+data/vector_db/
+*.lance
+
+# KuzuDB Graph Database
+data/knowledge_graph_kuzu/
+
+# Evaluation Results (JSON files können groß werden)
+evaluation_results/
+ablation_results.json
+
+# HotpotQA Dataset Files
+data/hotpotqa_*.json
+
+# Benchmark Datasets (falls du welche lokal hast)
+Benchmark_datasets/
+
+# Log Files (können schnell wachsen)
+logs/*.log
+*.log
+
+# Temporary Test Files
+tmp/
+temp/
+*.tmp
+test_*.db
+
+# Jupyter Notebooks Checkpoints
+.ipynb_checkpoints/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Model Artifacts
+models/
+checkpoints/
+*.bin
+*.safetensors
+
+# Zusatz Ordner (sieht nach Test-Scripts aus)
+Zusatz/
+
+# Beispiel-Outputs
+examples/output/
