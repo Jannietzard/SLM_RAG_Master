@@ -1,0 +1,16 @@
+dataset,config,question_id,exact_match,f1_score,time_ms,iterations,verified,retrieval_count
+hotpotqa,vector_only,5a8c7595554299585d9e36b6,0,0.000,41044,1,1,5
+hotpotqa,vector_only,5a8b57f25542995d1e6f1371,0,0.000,20145,1,1,5
+hotpotqa,vector_only,5a8e3ea95542995a26add48d,0,0.185,55072,1,1,5
+hotpotqa,vector_only,5a8db19d5542994ba4e3dd00,0,0.000,42868,1,1,5
+hotpotqa,vector_only,5a85b2d95542997b5ce40028,0,0.051,49612,1,1,5
+2wikimultihop,vector_only,61a46987092f11ebbdaeac1f6bf848b6,0,0.000,15935,1,1,6
+2wikimultihop,vector_only,8813f87c0bdd11eba7f7acde48001122,0,0.000,28124,1,1,5
+2wikimultihop,vector_only,f9dcb4a60bda11eba7f7acde48001122,0,0.000,23055,1,1,5
+2wikimultihop,vector_only,2ec440560bb011ebab90acde48001122,0,0.000,24511,1,1,5
+2wikimultihop,vector_only,019bed300bde11eba7f7acde48001122,0,0.000,36906,1,1,5
+strategyqa,vector_only,strategyqa_1,0,0.000,47017,1,1,5
+strategyqa,vector_only,strategyqa_0,0,0.024,46136,1,1,5
+strategyqa,vector_only,strategyqa_4,0,0.000,41318,1,1,5
+strategyqa,vector_only,strategyqa_9,0,0.049,51065,1,1,5
+strategyqa,vector_only,strategyqa_6,0,0.000,69328,1,1,5

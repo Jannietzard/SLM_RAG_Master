@@ -71,6 +71,18 @@ except ImportError as e:
     print(f"[WARNING] Ingestion module not available: {e}")
     INGESTION_AVAILABLE = False
 
+# Nach den anderen Imports:
+try:
+    from ablation_study import AblationStudy, AblationConfig
+    ABLATION_MODULE_AVAILABLE = True
+except ImportError:
+    try:
+        from src.evaluations.ablation_study import AblationStudy, AblationConfig
+        ABLATION_MODULE_AVAILABLE = True
+    except ImportError:
+        ABLATION_MODULE_AVAILABLE = False
+        print("[WARNING] Ablation module not found. Using legacy ablation.")
+
 # ============================================================================
 # LOGGING
 # ============================================================================
@@ -625,7 +637,7 @@ def create_langchain_documents(
     articles: List[Article], 
     chunk_sentences: int = 3,
     chunking_strategy: str = "sentence",
-    config: IngestionConfig = None,
+    config: Optional[Any]= None,
 ) -> List:
     '''
     Convert articles to LangChain Document objects with configurable chunking.
@@ -696,11 +708,9 @@ def _create_langchain_documents_legacy(articles: List[Article], chunk_sentences:
     return documents
 
 
+
 def run_ingestion(
-    documents = create_langchain_documents(
-    articles,
-    chunk_sentences=args.chunk_sentences,
-    chunking_strategy=args.chunking_strategy,
+    documents,
     vector_path: Path,
     graph_path: Path,
     config: Dict,
@@ -759,6 +769,7 @@ def run_ingestion(
     
     elapsed = time.time() - start_time
     logger.info(f"  Ingestion complete: {elapsed:.1f}s")
+    
 
 
 # ============================================================================
@@ -1100,117 +1111,148 @@ def cmd_evaluate(args, config: Dict, store_manager: StoreManager):
         import gc
         gc.collect()
 
-def cmd_ablation(args, config: Dict, store_manager: StoreManager):
+def cmd_ablation(args, config: Dict, store_manager) -> None:
     """
-    Ablation study - test all configurations on all datasets.
+    Führe wissenschaftliche Ablationsstudie durch.
     
-    WICHTIG: Jedes Dataset wird mit seinem EIGENEN Store evaluiert!
+    Nutzt das neue AblationStudy-Modul für:
+    - Klare Fortschrittsanzeige
+    - Detaillierte Metriken
+    - Wissenschaftliche Outputs (JSON, CSV, Markdown, LaTeX)
     """
     
-    # Determine datasets
-    if args.dataset == "all":
-        datasets = AVAILABLE_DATASETS
-    else:
-        datasets = [d.strip() for d in args.dataset.split(",")]
+    # Suppress noisy outputs
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning)
     
-    # Filter to existing datasets
-    datasets = [ds for ds in datasets if store_manager.dataset_exists(ds)]
+    try:
+        import unified_planning as up
+        up.shortcuts.get_environment().credits_stream = None
+    except:
+        pass
     
-    if not datasets:
-        logger.error("No ingested datasets found!")
-        logger.error("Run: python benchmark_datasets.py ingest --dataset all")
-        return
+    # Check if new module available
+    if not ABLATION_MODULE_AVAILABLE:
+        logger.warning("Using legacy ablation (new module not found)")
+        return cmd_ablation_legacy(args, config, store_manager)
     
-    logger.info("\n" + "="*70)
-    logger.info("ABLATION STUDY")
-    logger.info("="*70)
-    logger.info(f"Datasets: {datasets}")
-    logger.info(f"Samples per dataset: {args.samples}")
-    logger.info(f"Configurations: {len(ABLATION_CONFIGS)}")
-    logger.info("="*70)
+    # Parse arguments
+    datasets_to_run = args.datasets if hasattr(args, 'datasets') and args.datasets else AVAILABLE_DATASETS
+    samples = args.samples if hasattr(args, 'samples') else 10
     
-    # Store all results
-    all_results: Dict[str, List[ConfigResult]] = {}
+    logger.info("=" * 70)
+    logger.info("ABLATION STUDY (Scientific Mode)")
+    logger.info("=" * 70)
     
-    for dataset in datasets:
-        logger.info(f"\n{'═'*70}")
-        logger.info(f"DATASET: {dataset.upper()}")
-        logger.info(f"{'═'*70}")
-        
-        # Load questions for this dataset
-        questions = store_manager.load_questions(dataset)
-        if not questions:
-            continue
-        
-        if args.samples:
-            questions = questions[:args.samples]
-        
-        logger.info(f"Questions: {len(questions)}")
-        
-        dataset_results = []
-        
-    for config_name, v_weight, g_weight in ABLATION_CONFIGS:
-        logger.info(f"\n  ─── Config: {config_name} (v={v_weight}, g={g_weight}) ───")
-        
-        pipeline = None  # Initialize
-        try:
-            # Create pipeline with THIS dataset's store
-            pipeline = create_pipeline(
-                dataset, config, store_manager,
-                vector_weight=v_weight,
-                graph_weight=g_weight,
-            )
-
-            # Evaluate
-            result = evaluate_dataset(
-                dataset, questions, pipeline,
-                config_name, v_weight, g_weight,
-            )
-
-            if result:
-                dataset_results.append(result)
-                logger.info(f"    → EM={result.exact_match:.2%}, F1={result.f1_score:.3f}")
-
-        except Exception as e:
-            logger.error(f"    Failed: {e}")
-        
-        finally:
-            # CRITICAL: Cleanup pipeline and close database connections
-            if pipeline is not None:
-                # Close hybrid store if it exists
-                if hasattr(pipeline, 'hybrid_store') and pipeline.hybrid_store is not None:
-                    if hasattr(pipeline.hybrid_store, 'graph_db') and pipeline.hybrid_store.graph_db is not None:
-                        try:
-                            pipeline.hybrid_store.graph_db.close()
-                        except:
-                            pass
-                
-                # Delete pipeline object
-                del pipeline
-            
-            # Force garbage collection
-            import gc
-            gc.collect()
-            
-            # Give OS time to release file locks (important on Windows!)
-            import time
-            time.sleep(0.5)
-        
-        all_results[dataset] = dataset_results
-    
-    # Create final results object
-    ablation_results = AblationResults(
-        timestamp=datetime.now().isoformat(),
-        datasets=datasets,
-        configs=[c[0] for c in ABLATION_CONFIGS],
-        results=all_results,
+    # Create ablation config
+    ablation_config = AblationConfig(
+        name="hybrid_retrieval_ablation",
+        seed=getattr(args, 'seed', 42),
+        results_dir=Path("results"),
     )
     
-    # Print summary table
-    print_ablation_table(ablation_results)
+    # Initialize study
+    study = AblationStudy(
+        config=ablation_config,
+        pipeline_config=config,
+    )
     
-    # Save results
-    save_ablation_results(ablation_results)
+    # Load datasets
+    datasets = {}
+    for dataset_name in datasets_to_run:
+        logger.info(f"Loading {dataset_name}...")
+        
+        # Check if ingested
+        if not store_manager.dataset_exists(dataset_name):
+            logger.warning(f"  {dataset_name} not ingested, skipping")
+            logger.warning(f"  Run: python benchmark_datasets.py ingest --dataset {dataset_name}")
+            continue
+        
+        # Load questions
+        questions = store_manager.load_questions(dataset_name)
+        if not questions:
+            logger.warning(f"  No questions found for {dataset_name}")
+            continue
+        
+        # For ablation we don't need articles, just questions
+        datasets[dataset_name] = (questions, [])
+        logger.info(f"  Loaded {len(questions)} questions")
+    
+    if not datasets:
+        logger.error("No datasets available! Run ingest first.")
+        return
+    
+    # Create pipeline factory
+    def create_pipeline(vector_weight: float, graph_weight: float, dataset_name: str):
+        """Factory to create pipeline with specific weights."""
+        
+        # Get paths for this dataset
+        paths = store_manager.get_paths(dataset_name)
+        
+        # Update config with weights
+        pipeline_config = config.copy()
+        pipeline_config["retrieval"] = pipeline_config.get("retrieval", {})
+        pipeline_config["retrieval"]["vector_weight"] = vector_weight
+        pipeline_config["retrieval"]["graph_weight"] = graph_weight
+        
+        # Create pipeline (adapt to your AgenticRAGPipeline)
+        try:
+            from main_agentic import AgenticRAGPipeline
+            
+            pipeline = AgenticRAGPipeline(pipeline_config, logging.getLogger(__name__))
+            
+            # Override paths for this dataset
+            pipeline.config["paths"]["vector_db"] = str(paths["vector_db"])
+            pipeline.config["paths"]["graph_db"] = str(paths["knowledge_graph"])
+            
+            # Setup pipeline
+            pipeline.setup()
+            
+            # Set retrieval weights
+            if hasattr(pipeline, 'retriever') and pipeline.retriever:
+                pipeline.retriever.vector_weight = vector_weight
+                pipeline.retriever.graph_weight = graph_weight
+            
+            return pipeline
+            
+        except Exception as e:
+            logger.error(f"Pipeline creation failed: {e}")
+            raise
+    
+    # Run study
+    results = study.run(
+        datasets=datasets,
+        samples_per_dataset=samples,
+        pipeline_factory=create_pipeline,
+    )
+    
+    # Print final summary
+    print("\n" + "=" * 70)
+    print("  FINAL RESULTS")
+    print("=" * 70)
+    
+    for dataset_name, configs in results.items():
+        print(f"\n  Dataset: {dataset_name}")
+        print(f"  {'Config':<15} {'EM':<10} {'F1':<10} {'Time':<10} {'Iter':<8} {'Verified':<10}")
+        print(f"  {'-'*63}")
+        
+        for config_name, result in configs.items():
+            print(
+                f"  {config_name:<15} "
+                f"{result.exact_match_mean*100:>6.1f}%   "
+                f"{result.f1_mean:>6.3f}    "
+                f"{result.avg_time_ms/1000:>6.1f}s   "
+                f"{result.avg_iterations:>5.1f}    "
+                f"{result.verification_rate*100:>6.1f}%"
+            )
+        
+        # Best config
+        if configs:
+            best = max(configs.values(), key=lambda x: x.f1_mean)
+            print(f"\n  Best: {best.config_name} (F1={best.f1_mean:.3f})")
+    
+    print(f"\n  Results saved to: {study.run_dir}")
+    print("=" * 70 + "\n")
 
 
 def print_ablation_table(results: AblationResults):
@@ -1387,31 +1429,6 @@ Examples:
     
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
     
-    # === INGEST ===
-    ingest_p = subparsers.add_parser("ingest", help="Ingest dataset(s)")
-    ingest_p.add_argument(
-        "--dataset", "-d",
-        type=str,
-        default="hotpotqa",
-        help="Dataset: hotpotqa, 2wikimultihop, strategyqa, or 'all'"
-    )
-    ingest_p.add_argument(
-        "--samples", "-n",
-        type=int,
-        default=500,
-        help="Samples per dataset (default: 500)"
-    )
-    ingest_p.add_argument(
-        "--chunk-sentences",
-        type=int,
-        default=3,
-        help="Sentences per chunk (default: 3)"
-    )
-    ingest_p.add_argument(
-        "--clear",
-        action="store_true",
-        help="Clear existing data before ingesting"
-    )
     
     # === EVALUATE ===
     eval_p = subparsers.add_parser("evaluate", help="Evaluate single dataset")
@@ -1454,7 +1471,82 @@ Examples:
         default=100,
         help="Questions per dataset (default: 100)"
     )
+
     
+    # === INGEST ===
+    ingest_p = subparsers.add_parser("ingest", help="Ingest dataset(s)")
+    ingest_p.add_argument(
+        "--dataset", "-d",
+        type=str,
+        default="hotpotqa",
+        help="Dataset: hotpotqa, 2wikimultihop, strategyqa, or 'all'"
+    )
+    ingest_p.add_argument(
+        "--samples", "-n",
+        type=int,
+        default=10,
+        help="Samples per dataset (default: 500)"
+    )
+    ingest_p.add_argument(
+        "--chunk-sentences",
+        type=int,
+        default=3,
+        help="Sentences per chunk (default: 4)"
+    )
+    ingest_p.add_argument(
+        "--clear",
+        action="store_true",
+        help="Clear existing data before ingesting"
+    )
+
+
+    ingest_p.add_argument(
+        "--chunking-strategy",
+        type=str,
+        choices=["sentence", "semantic", "fixed", "recursive"],
+        default="sentence",
+        help="Chunking strategy (default: sentence)"
+    )
+    ingest_p.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=1,  # ← NEU: 1 Satz Überlappung
+        help="Sentence overlap between chunks (default: 1)"
+    )
+    ingest_p.add_argument(
+        "--min-chunk-size",
+        type=int,
+        default=50,  # ← NEU: Filtert kurze Chunks
+        help="Minimum chunk size in characters (default: 50)"
+    )
+    
+    # =============================================================================
+    # OPTIONAL: FÜGE DIESE CLI-ARGUMENTE ZUM PARSER HINZU
+    # =============================================================================
+
+
+    # In der argparse-Sektion für 'ablation' subcommand:
+
+    ablation_p.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility (default: 42)"
+    )
+
+    ablation_p.add_argument(
+        "--no-latex",
+        action="store_true",
+        help="Skip LaTeX table generation"
+    )
+
+    ablation_p.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Verbose output with debug info"
+    )
+
+
     # === STATUS ===
     subparsers.add_parser("status", help="Show ingestion status")
     
@@ -1464,29 +1556,7 @@ Examples:
         parser.print_help()
         return
     
-    # In der argparse-Sektion, füge hinzu:
 
-    parser.add_argument(
-        "--chunking-strategy",
-        type=str,
-        choices=["sentence", "semantic", "fixed", "recursive"],
-        default="sentence",
-        help="Chunking strategy to use (default: sentence)"
-    )
-
-    parser.add_argument(
-        "--chunk-sentences",
-        type=int,
-        default=3,
-        help="Sentences per chunk for sentence strategy (default: 3)"
-    )
-
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=1024,
-        help="Max chunk size in characters for other strategies (default: 1024)"
-)
 
     # Load config
     config = load_config_file()

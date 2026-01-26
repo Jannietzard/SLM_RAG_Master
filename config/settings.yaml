@@ -274,12 +274,14 @@ ingestion:
   #   - recursive: LangChain RecursiveCharacterTextSplitter
   
   chunking_strategy: "sentence"  # Empfohlen für Benchmark: "sentence"
-  
+  sentences_per_chunk: 3    # Nur für "sentence" Strategie
   # ──────────────────────────────────────────────────────────────────────────
   # CHUNK SIZE SETTINGS
   # ──────────────────────────────────────────────────────────────────────────
-  chunk_size: 1024          # Max Zeichen pro Chunk (für fixed/recursive/semantic)
-  chunk_overlap: 128        # Überlappung zwischen Chunks
+  min_chunk_size: 50        # Filtert Müll raus
+  max_chunk_size: 512       # Tokens! Nicht Zeichen
+  #chunk_size: 1024          # Max Zeichen pro Chunk (für fixed/recursive/semantic)
+  chunk_overlap: 1        # Überlappung zwischen Chunks
   min_chunk_size: 50        # Chunks kleiner als dies werden gefiltert
   
   # ──────────────────────────────────────────────────────────────────────────

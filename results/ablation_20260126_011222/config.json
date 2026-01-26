@@ -1,0 +1,178 @@
+{
+  "ablation_config": {
+    "name": "hybrid_retrieval_ablation",
+    "seed": 42,
+    "configurations": [
+      [
+        "vector_only",
+        1.0,
+        0.0
+      ],
+      [
+        "hybrid_80_20",
+        0.8,
+        0.2
+      ],
+      [
+        "hybrid_70_30",
+        0.7,
+        0.3
+      ],
+      [
+        "hybrid_50_50",
+        0.5,
+        0.5
+      ],
+      [
+        "hybrid_30_70",
+        0.3,
+        0.7
+      ],
+      [
+        "graph_only",
+        0.0,
+        1.0
+      ]
+    ],
+    "results_dir": "results",
+    "save_raw_results": true,
+    "generate_latex": true,
+    "verbose": false,
+    "log_every_n": 1
+  },
+  "pipeline_config": {
+    "embeddings": {
+      "model_name": "nomic-embed-text",
+      "base_url": "http://localhost:11434",
+      "embedding_dim": 768
+    },
+    "chunking": {
+      "mode": "standard",
+      "chunk_size": 512,
+      "chunk_overlap": 128,
+      "semantic": {
+        "min_chunk_size": 200,
+        "max_chunk_size": 1000,
+        "detect_structure": true,
+        "quality_filter": true
+      },
+      "filter_patterns": [
+        "^\\s*$",
+        "^Page \\d+$",
+        "^\\d+$"
+      ]
+    },
+    "vector_store": {
+      "provider": "lancedb",
+      "db_path": "./data/vector_db",
+      "index_type": "ivfflat",
+      "distance_metric": "cosine",
+      "normalize_embeddings": true,
+      "top_k_vectors": 10,
+      "similarity_threshold": 0.3
+    },
+    "graph": {
+      "enabled": true,
+      "backend": "kuzu",
+      "graph_path": "./data/knowledge_graph",
+      "max_hops": 2,
+      "top_k_entities": 5,
+      "expand_context": true,
+      "entity_extraction_method": "keyword",
+      "relation_types": [
+        "from_source",
+        "next_chunk",
+        "mentions",
+        "related_to"
+      ]
+    },
+    "rag": {
+      "retrieval_mode": "hybrid",
+      "vector_weight": 0.7,
+      "graph_weight": 0.3,
+      "reranking_enabled": false,
+      "query_expansion_enabled": false
+    },
+    "llm": {
+      "model_name": "phi3",
+      "base_url": "http://localhost:11434",
+      "temperature": 0.1,
+      "max_tokens": 300
+    },
+    "agent": {
+      "max_verification_iterations": 3,
+      "enable_verification": true
+    },
+    "quantization": {
+      "enabled": true,
+      "bits": 4,
+      "group_size": 128
+    },
+    "paths": {
+      "root": "./",
+      "data": "./data",
+      "documents": "./data/documents",
+      "vector_db": "./data/vector_db",
+      "graph_db": "./data/knowledge_graph",
+      "logs": "./logs",
+      "cache": "./cache"
+    },
+    "logging": {
+      "level": "INFO",
+      "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+      "file": "./logs/edge_rag.log"
+    },
+    "performance": {
+      "batch_size": 64,
+      "num_workers": 2,
+      "device": "cpu",
+      "cache_embeddings": true,
+      "max_cache_size_mb": 512
+    },
+    "benchmark": {
+      "datasets": [
+        "hotpotqa",
+        "2wikimultihop",
+        "strategyqa"
+      ],
+      "default_samples": 500,
+      "ablation_configs": [
+        {
+          "name": "vector_only",
+          "vector_weight": 1.0,
+          "graph_weight": 0.0
+        },
+        {
+          "name": "graph_only",
+          "vector_weight": 0.0,
+          "graph_weight": 1.0
+        },
+        {
+          "name": "hybrid_70_30",
+          "vector_weight": 0.7,
+          "graph_weight": 0.3
+        },
+        {
+          "name": "hybrid_50_50",
+          "vector_weight": 0.5,
+          "graph_weight": 0.5
+        }
+      ]
+    },
+    "ingestion": {
+      "chunking_strategy": "sentence",
+      "sentences_per_chunk": 3,
+      "min_chunk_size": 50,
+      "max_chunk_size": 512,
+      "chunk_overlap": 1,
+      "min_lexical_diversity": 0.3,
+      "min_information_density": 2.0,
+      "filter_short_chunks": true,
+      "filter_low_quality": false,
+      "extract_entities": true,
+      "add_source_metadata": true
+    }
+  },
+  "timestamp": "2026-01-26T01:12:22.639518",
+  "python_version": "3.12.3 | packaged by conda-forge | (main, Apr 15 2024, 18:20:11) [MSC v.1938 64 bit (AMD64)]"
+}

@@ -1,0 +1,41 @@
+{
+  "hotpotqa": {
+    "vector_only": {
+      "config_name": "vector_only",
+      "vector_weight": 1.0,
+      "graph_weight": 0.0,
+      "n_questions": 5,
+      "exact_match_mean": 0.0,
+      "f1_mean": 0.0472934472934473,
+      "avg_time_ms": 41748.179483413696,
+      "avg_iterations": 1,
+      "verification_rate": 1.0
+    }
+  },
+  "2wikimultihop": {
+    "vector_only": {
+      "config_name": "vector_only",
+      "vector_weight": 1.0,
+      "graph_weight": 0.0,
+      "n_questions": 5,
+      "exact_match_mean": 0.0,
+      "f1_mean": 0.0,
+      "avg_time_ms": 25706.360149383545,
+      "avg_iterations": 1,
+      "verification_rate": 1.0
+    }
+  },
+  "strategyqa": {
+    "vector_only": {
+      "config_name": "vector_only",
+      "vector_weight": 1.0,
+      "graph_weight": 0.0,
+      "n_questions": 5,
+      "exact_match_mean": 0.0,
+      "f1_mean": 0.014575374669409346,
+      "avg_time_ms": 50972.6194858551,
+      "avg_iterations": 1,
+      "verification_rate": 1.0
+    }
+  }
+}
