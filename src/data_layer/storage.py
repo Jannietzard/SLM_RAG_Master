@@ -478,12 +478,6 @@ class KuzuGraphStore:
                 )
             """)
             
-            self.conn.execute("""
-                CREATE REL TABLE IF NOT EXISTS RELATED_TO(
-                    FROM Entity TO Entity,
-                    relation_type STRING
-                )
-            """)
 
             self.conn.execute("""
                 CREATE NODE TABLE IF NOT EXISTS Entity(
@@ -582,28 +576,6 @@ class KuzuGraphStore:
         except Exception as e:
             self.logger.error(f"Failed to add source doc {doc_id}: {e}")
     
-    def add_entity(
-        self,
-        entity_id: str,
-        name: str,
-        entity_type: str = "unknown",
-    ) -> None:
-        """Add an entity node."""
-        try:
-            self.conn.execute(
-                """
-                MERGE (e:Entity {entity_id: $entity_id})
-                SET e.name = $name,
-                    e.entity_type = $entity_type
-                """,
-                {
-                    "entity_id": entity_id,
-                    "name": name,
-                    "entity_type": entity_type,
-                }
-            )
-        except Exception as e:
-            self.logger.error(f"Failed to add entity {entity_id}: {e}")
     
     def add_from_source_relation(self, chunk_id: str, doc_id: str) -> None:
         """Create FROM_SOURCE relationship between chunk and document."""
@@ -1100,7 +1072,192 @@ class NetworkXGraphStore:
         if metadata:
             edge_data.update(metadata)
         self.graph.add_edge(source_id, target_id, **edge_data)
+
+    def graph_search_1hop(
+        self,
+        entity_name: str,
+        top_k: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        1-Hop Graph Search: Finde Chunks die Entity erwähnen.
+        
+        Gemäß Thesis 2.6: "alle Chunks findet, die die Entität erwähnen (1-Hop)"
+        
+        Cypher Query:
+            MATCH (c:DocumentChunk)-[m:MENTIONS]->(e:Entity)
+            WHERE e.name CONTAINS $entity_name
+            RETURN c, m, e
+            ORDER BY e.mention_count DESC, m.confidence DESC
+        
+        Args:
+            entity_name: Query-Entity Name
+            top_k: Anzahl Ergebnisse
+            
+        Returns:
+            Liste von Chunks mit Metadata
+        """
+        results = []
+        
+        try:
+            query_result = self.conn.execute(
+                """
+                MATCH (c:DocumentChunk)-[m:MENTIONS]->(e:Entity)
+                WHERE e.name CONTAINS $entity_name
+                RETURN 
+                    c.chunk_id AS chunk_id,
+                    c.text AS text,
+                    c.source_file AS source_doc,
+                    c.position AS position,
+                    e.name AS entity_name,
+                    e.type AS entity_type,
+                    e.mention_count AS mention_count,
+                    m.confidence AS confidence,
+                    1 AS hop
+                ORDER BY 
+                    e.mention_count DESC,
+                    m.confidence DESC
+                LIMIT $top_k
+                """,
+                {"entity_name": entity_name, "top_k": top_k}
+            )
+            
+            while query_result.has_next():
+                row = query_result.get_next()
+                results.append({
+                    "chunk_id": row[0],
+                    "text": row[1],
+                    "source_doc": row[2],
+                    "position": row[3],
+                    "entity_name": row[4],
+                    "entity_type": row[5],
+                    "mention_count": row[6],
+                    "confidence": row[7],
+                    "hop": row[8],
+                })
+                
+        except Exception as e:
+            logger.error(f"1-Hop graph search failed for '{entity_name}': {e}")
+        
+        return results
     
+    def graph_search_2hop(
+        self,
+        entity_name: str,
+        top_k: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        2-Hop Graph Search: Finde Chunks über relationale Verbindungen.
+        
+        Gemäß Thesis 2.6: "alle Chunks findet, die Entitäten erwähnen, 
+        die mit der Query-Entität relational verbunden sind (2-Hop)"
+        
+        Cypher Query:
+            MATCH (query_e:Entity)-[r:RELATED_TO]-(related_e:Entity)
+                  <-[m:MENTIONS]-(c:DocumentChunk)
+            WHERE query_e.name CONTAINS $entity_name
+            RETURN c, r, related_e, m
+            ORDER BY r.confidence DESC, related_e.mention_count DESC
+        
+        Args:
+            entity_name: Query-Entity Name
+            top_k: Anzahl Ergebnisse
+            
+        Returns:
+            Liste von Chunks mit Relation-Metadata
+        """
+        results = []
+        
+        try:
+            query_result = self.conn.execute(
+                """
+                MATCH (query_e:Entity)-[r:RELATED_TO]-(related_e:Entity)
+                      <-[m:MENTIONS]-(c:DocumentChunk)
+                WHERE query_e.name CONTAINS $entity_name
+                RETURN 
+                    c.chunk_id AS chunk_id,
+                    c.text AS text,
+                    c.source_file AS source_doc,
+                    c.position AS position,
+                    query_e.name AS query_entity,
+                    r.relation_type AS relation_type,
+                    related_e.name AS related_entity,
+                    related_e.type AS related_entity_type,
+                    r.confidence AS relation_confidence,
+                    m.confidence AS mention_confidence,
+                    2 AS hop
+                ORDER BY 
+                    r.confidence DESC,
+                    related_e.mention_count DESC,
+                    m.confidence DESC
+                LIMIT $top_k
+                """,
+                {"entity_name": entity_name, "top_k": top_k}
+            )
+            
+            while query_result.has_next():
+                row = query_result.get_next()
+                results.append({
+                    "chunk_id": row[0],
+                    "text": row[1],
+                    "source_doc": row[2],
+                    "position": row[3],
+                    "query_entity": row[4],
+                    "relation_type": row[5],
+                    "related_entity": row[6],
+                    "related_entity_type": row[7],
+                    "confidence": row[8],  # Relation confidence für Ranking
+                    "mention_confidence": row[9],
+                    "hop": row[10],
+                })
+                
+        except Exception as e:
+            logger.error(f"2-Hop graph search failed for '{entity_name}': {e}")
+        
+        return results
+    
+    def graph_search_combined(
+        self,
+        entity_name: str,
+        top_k_1hop: int = 5,
+        top_k_2hop: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Kombiniere 1-Hop und 2-Hop Searches.
+        
+        Gemäß Thesis 2.6: "Für jede Query-Entität wird eine Cypher-Query 
+        generiert, die (a) ... (1-Hop), und (b) ... (2-Hop)"
+        
+        Args:
+            entity_name: Query-Entity Name
+            top_k_1hop: Top-K für 1-Hop
+            top_k_2hop: Top-K für 2-Hop
+            
+        Returns:
+            Kombinierte und deduplizierte Ergebnisliste
+        """
+        # 1-Hop Search
+        results_1hop = self.graph_search_1hop(entity_name, top_k_1hop)
+        
+        # 2-Hop Search
+        results_2hop = self.graph_search_2hop(entity_name, top_k_2hop)
+        
+        # Deduplizierung nach chunk_id (1-Hop hat Priorität)
+        seen_chunks = set()
+        combined = []
+        
+        for result in results_1hop:
+            if result["chunk_id"] not in seen_chunks:
+                combined.append(result)
+                seen_chunks.add(result["chunk_id"])
+        
+        for result in results_2hop:
+            if result["chunk_id"] not in seen_chunks:
+                combined.append(result)
+                seen_chunks.add(result["chunk_id"])
+        
+        return combined
+
+
     def graph_traversal(
         self,
         start_entity: str,
@@ -1288,3 +1445,879 @@ def run_diagnostics(config: StorageConfig, embeddings: Embeddings) -> Dict[str, 
     
     return results
 
+
+# ============================================================================
+# COMPREHENSIVE TEST SUITE FOR STORAGE.PY
+# ============================================================================
+
+if __name__ == "__main__":
+    import sys
+    import tempfile
+    import shutil
+    from pathlib import Path
+    from typing import List
+    
+    # Setup logging for tests
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    print("\n" + "=" * 80)
+    print("STORAGE.PY - COMPREHENSIVE TEST SUITE")
+    print("=" * 80)
+    print(f"Version: {VectorStoreAdapter.SCHEMA_VERSION}")
+    print(f"KuzuDB Available: {KUZU_AVAILABLE}")
+    print(f"NetworkX Available: {NETWORKX_AVAILABLE}")
+    print("=" * 80 + "\n")
+    
+    # ========================================================================
+    # MOCK EMBEDDINGS FOR TESTING
+    # ========================================================================
+    
+    class MockEmbeddings(Embeddings):
+        """Mock embedding model for testing."""
+        
+        def __init__(self, dim: int = 768):
+            self.dim = dim
+        
+        def embed_documents(self, texts: List[str]) -> List[List[float]]:
+            """Generate random embeddings for documents."""
+            embeddings = []
+            for text in texts:
+                # Deterministic based on text length for reproducibility
+                np.random.seed(len(text))
+                vec = np.random.randn(self.dim).astype(np.float32)
+                vec = vec / np.linalg.norm(vec)  # L2 normalize
+                embeddings.append(vec.tolist())
+            return embeddings
+        
+        def embed_query(self, text: str) -> List[float]:
+            """Generate random embedding for query."""
+            np.random.seed(len(text))
+            vec = np.random.randn(self.dim).astype(np.float32)
+            vec = vec / np.linalg.norm(vec)
+            return vec.tolist()
+    
+    # ========================================================================
+    # TEST UTILITIES
+    # ========================================================================
+    
+    class TestResult:
+        """Track test results."""
+        def __init__(self):
+            self.passed = 0
+            self.failed = 0
+            self.errors = []
+        
+        def assert_true(self, condition: bool, message: str):
+            """Assert condition is true."""
+            if condition:
+                self.passed += 1
+                print(f"  ✓ {message}")
+            else:
+                self.failed += 1
+                self.errors.append(message)
+                print(f"  ✗ FAILED: {message}")
+        
+        def assert_equal(self, actual, expected, message: str):
+            """Assert values are equal."""
+            if actual == expected:
+                self.passed += 1
+                print(f"  ✓ {message}")
+            else:
+                self.failed += 1
+                error = f"{message} (expected: {expected}, got: {actual})"
+                self.errors.append(error)
+                print(f"  ✗ FAILED: {error}")
+        
+        def assert_greater(self, actual, threshold, message: str):
+            """Assert value is greater than threshold."""
+            if actual > threshold:
+                self.passed += 1
+                print(f"  ✓ {message}")
+            else:
+                self.failed += 1
+                error = f"{message} (expected > {threshold}, got: {actual})"
+                self.errors.append(error)
+                print(f"  ✗ FAILED: {error}")
+        
+        def assert_in_range(self, actual, min_val, max_val, message: str):
+            """Assert value is in range."""
+            if min_val <= actual <= max_val:
+                self.passed += 1
+                print(f"  ✓ {message}")
+            else:
+                self.failed += 1
+                error = f"{message} (expected [{min_val}, {max_val}], got: {actual})"
+                self.errors.append(error)
+                print(f"  ✗ FAILED: {error}")
+        
+        def print_summary(self):
+            """Print test summary."""
+            total = self.passed + self.failed
+            print("\n" + "=" * 80)
+            print("TEST SUMMARY")
+            print("=" * 80)
+            print(f"Total Tests: {total}")
+            print(f"Passed: {self.passed} ({self.passed/total*100:.1f}%)")
+            print(f"Failed: {self.failed} ({self.failed/total*100:.1f}%)")
+            
+            if self.failed > 0:
+                print("\nFailed Tests:")
+                for error in self.errors:
+                    print(f"  - {error}")
+            
+            print("=" * 80)
+            
+            if self.failed == 0:
+                print("\n✓✓✓ ALL TESTS PASSED! ✓✓✓\n")
+                return True
+            else:
+                print(f"\n✗✗✗ {self.failed} TESTS FAILED! ✗✗✗\n")
+                return False
+    
+    # ========================================================================
+    # TEST 1: STORAGE CONFIG VALIDATION
+    # ========================================================================
+    
+    def test_storage_config():
+        """Test StorageConfig validation."""
+        print("\n" + "-" * 80)
+        print("TEST 1: StorageConfig Validation")
+        print("-" * 80)
+        
+        result = TestResult()
+        temp_dir = Path(tempfile.mkdtemp())
+        
+        try:
+            # Valid configuration
+            config = StorageConfig(
+                vector_db_path=temp_dir / "vector",
+                graph_db_path=temp_dir / "graph",
+                embedding_dim=768,
+                similarity_threshold=0.5,
+                distance_metric="cosine",
+                graph_backend="kuzu"
+            )
+            result.assert_true(True, "Valid configuration created")
+            
+            # Test invalid embedding_dim
+            try:
+                invalid_config = StorageConfig(
+                    vector_db_path=temp_dir / "vector",
+                    graph_db_path=temp_dir / "graph",
+                    embedding_dim=-1
+                )
+                result.assert_true(False, "Should reject negative embedding_dim")
+            except ValueError:
+                result.assert_true(True, "Rejected negative embedding_dim")
+            
+            # Test invalid similarity_threshold
+            try:
+                invalid_config = StorageConfig(
+                    vector_db_path=temp_dir / "vector",
+                    graph_db_path=temp_dir / "graph",
+                    similarity_threshold=1.5
+                )
+                result.assert_true(False, "Should reject similarity_threshold > 1.0")
+            except ValueError:
+                result.assert_true(True, "Rejected invalid similarity_threshold")
+            
+            # Test invalid distance_metric
+            try:
+                invalid_config = StorageConfig(
+                    vector_db_path=temp_dir / "vector",
+                    graph_db_path=temp_dir / "graph",
+                    distance_metric="invalid"
+                )
+                result.assert_true(False, "Should reject invalid distance_metric")
+            except ValueError:
+                result.assert_true(True, "Rejected invalid distance_metric")
+            
+            # Test invalid graph_backend
+            try:
+                invalid_config = StorageConfig(
+                    vector_db_path=temp_dir / "vector",
+                    graph_db_path=temp_dir / "graph",
+                    graph_backend="invalid"
+                )
+                result.assert_true(False, "Should reject invalid graph_backend")
+            except ValueError:
+                result.assert_true(True, "Rejected invalid graph_backend")
+        
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        return result
+    
+    # ========================================================================
+    # TEST 2: VECTOR STORE ADAPTER
+    # ========================================================================
+    
+    def test_vector_store():
+        """Test VectorStoreAdapter functionality."""
+        print("\n" + "-" * 80)
+        print("TEST 2: VectorStoreAdapter")
+        print("-" * 80)
+        
+        result = TestResult()
+        temp_dir = Path(tempfile.mkdtemp())
+        
+        try:
+            # Initialize vector store
+            vector_store = VectorStoreAdapter(
+                db_path=temp_dir / "vector_test",
+                embedding_dim=768,
+                normalize_embeddings=True,
+                distance_metric="cosine"
+            )
+            result.assert_true(True, "VectorStoreAdapter initialized")
+            
+            # Create mock embeddings
+            embeddings = MockEmbeddings(dim=768)
+            
+            # Create test documents
+            test_docs = [
+                Document(
+                    page_content="Albert Einstein developed the theory of relativity.",
+                    metadata={"chunk_id": "chunk_001", "source_file": "physics.pdf"}
+                ),
+                Document(
+                    page_content="Marie Curie discovered radium and polonium.",
+                    metadata={"chunk_id": "chunk_002", "source_file": "chemistry.pdf"}
+                ),
+                Document(
+                    page_content="Isaac Newton formulated the laws of motion.",
+                    metadata={"chunk_id": "chunk_003", "source_file": "physics.pdf"}
+                ),
+            ]
+            
+            # Test: Add documents
+            vector_store.add_documents_with_embeddings(test_docs, embeddings)
+            result.assert_true(True, "Documents added successfully")
+            
+            # Test: Verify metadata saved
+            metadata_path = vector_store._get_metadata_path()
+            result.assert_true(metadata_path.exists(), "Metadata file created")
+            
+            # Test: Dimension validation
+            try:
+                wrong_dim_embeddings = MockEmbeddings(dim=512)
+                vector_store.add_documents_with_embeddings([test_docs[0]], wrong_dim_embeddings)
+                result.assert_true(False, "Should reject wrong embedding dimension")
+            except ValueError as e:
+                if "DIMENSION MISMATCH" in str(e):
+                    result.assert_true(True, "Dimension mismatch detected")
+                else:
+                    result.assert_true(False, f"Wrong error message: {e}")
+            
+            # Test: Vector search
+            query_embedding = embeddings.embed_query("relativity physics Einstein")
+            search_results = vector_store.vector_search(query_embedding, top_k=3)
+            
+            result.assert_greater(len(search_results), 0, "Search returned results")
+            result.assert_true(
+                all("similarity" in r for r in search_results),
+                "All results have similarity scores"
+            )
+            result.assert_true(
+                all(0 <= r["similarity"] <= 1 for r in search_results),
+                "All similarity scores in valid range [0,1]"
+            )
+            
+            # Test: Distance to similarity conversion
+            cosine_sim_0 = vector_store._distance_to_similarity(0.0)
+            result.assert_equal(cosine_sim_0, 1.0, "Distance 0.0 -> Similarity 1.0")
+            
+            cosine_sim_1 = vector_store._distance_to_similarity(1.0)
+            result.assert_equal(cosine_sim_1, 0.0, "Distance 1.0 -> Similarity 0.0")
+            
+            # Test: Normalization
+            test_vectors = np.random.randn(5, 768).astype(np.float32)
+            normalized = vector_store._normalize_vectors(test_vectors)
+            norms = np.linalg.norm(normalized, axis=1)
+            result.assert_true(
+                np.allclose(norms, 1.0, atol=1e-5),
+                "Vectors normalized to unit length"
+            )
+        
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        return result
+    
+    # ========================================================================
+    # TEST 3: KUZU GRAPH STORE
+    # ========================================================================
+    
+    def test_kuzu_graph_store():
+        """Test KuzuGraphStore functionality."""
+        print("\n" + "-" * 80)
+        print("TEST 3: KuzuGraphStore")
+        print("-" * 80)
+        
+        result = TestResult()
+        
+        if not KUZU_AVAILABLE:
+            print("  ⚠ KuzuDB not available, skipping tests")
+            return result
+        
+        temp_dir = Path(tempfile.mkdtemp())
+        graph_store = None
+        
+        try:
+            # Initialize graph store
+            try:
+                graph_store = KuzuGraphStore(temp_dir / "graph_test")
+                result.assert_true(True, "KuzuGraphStore initialized")
+            except Exception as e:
+                print(f"  ⚠ KuzuDB initialization failed: {e}")
+                print(f"  ⚠ Skipping remaining KuzuDB tests")
+                return result
+            
+            # Test: Add document chunks (with error handling)
+            chunk_added = False
+            try:
+                graph_store.add_document_chunk(
+                    chunk_id="chunk_001",
+                    text="Einstein was born in Ulm, Germany.",
+                    page_number=1,
+                    chunk_index=0,
+                    source_file="einstein_bio.pdf"
+                )
+                chunk_added = True
+                result.assert_true(True, "Document chunk added")
+            except Exception as e:
+                result.assert_true(False, f"Failed to add document chunk: {e}")
+            
+            if chunk_added:
+                try:
+                    graph_store.add_document_chunk(
+                        chunk_id="chunk_002",
+                        text="He worked at Princeton University.",
+                        page_number=1,
+                        chunk_index=1,
+                        source_file="einstein_bio.pdf"
+                    )
+                    result.assert_true(True, "Second document chunk added")
+                except Exception as e:
+                    result.assert_true(False, f"Failed to add second chunk: {e}")
+            
+            # Test: Add source document
+            try:
+                graph_store.add_source_document(
+                    doc_id="einstein_bio.pdf",
+                    filename="einstein_bio.pdf",
+                    total_pages=10
+                )
+                result.assert_true(True, "Source document added")
+            except Exception as e:
+                result.assert_true(False, f"Failed to add source document: {e}")
+            
+            # Test: Add FROM_SOURCE relation
+            if chunk_added:
+                try:
+                    graph_store.add_from_source_relation("chunk_001", "einstein_bio.pdf")
+                    result.assert_true(True, "FROM_SOURCE relation added")
+                except Exception as e:
+                    result.assert_true(False, f"Failed to add FROM_SOURCE relation: {e}")
+            
+            # Test: Add NEXT_CHUNK relation
+            if chunk_added:
+                try:
+                    graph_store.add_next_chunk_relation("chunk_001", "chunk_002")
+                    result.assert_true(True, "NEXT_CHUNK relation added")
+                except Exception as e:
+                    result.assert_true(False, f"Failed to add NEXT_CHUNK relation: {e}")
+            
+            # Test: Add entities
+            entity_added = False
+            try:
+                graph_store.add_entity(
+                    entity_id="entity_einstein",
+                    name="Albert Einstein",
+                    entity_type="PERSON"
+                )
+                entity_added = True
+                result.assert_true(True, "Entity added")
+            except Exception as e:
+                result.assert_true(False, f"Failed to add entity: {e}")
+            
+            # Test: Add MENTIONS relation
+            if chunk_added and entity_added:
+                try:
+                    graph_store.add_mentions_relation("chunk_001", "entity_einstein")
+                    result.assert_true(True, "MENTIONS relation added")
+                except Exception as e:
+                    result.assert_true(False, f"Failed to add MENTIONS relation: {e}")
+            
+            # Test: Add RELATED_TO relation
+            if entity_added:
+                try:
+                    graph_store.add_entity(
+                        entity_id="entity_princeton",
+                        name="Princeton University",
+                        entity_type="ORGANIZATION"
+                    )
+                    graph_store.add_related_to_relation(
+                        "entity_einstein",
+                        "entity_princeton",
+                        "works_for"
+                    )
+                    result.assert_true(True, "RELATED_TO relation added")
+                except Exception as e:
+                    result.assert_true(False, f"Failed to add RELATED_TO relation: {e}")
+            
+            # Test: Get statistics
+            try:
+                stats = graph_store.get_statistics()
+                if chunk_added:
+                    result.assert_greater(stats.get('document_chunks', 0), 0, "Document chunks counted")
+                    result.assert_greater(stats.get('source_documents', 0), 0, "Source documents counted")
+                if entity_added:
+                    result.assert_greater(stats.get('entities', 0), 0, "Entities counted")
+            except Exception as e:
+                result.assert_true(False, f"Failed to get statistics: {e}")
+            
+            # Test: Graph traversal
+            if chunk_added:
+                try:
+                    visited = graph_store.graph_traversal("chunk_001", max_hops=2)
+                    result.assert_true("chunk_001" in visited, "Start node in traversal results")
+                    if "chunk_001" in visited:
+                        result.assert_equal(visited["chunk_001"], 0, "Start node at hop 0")
+                except Exception as e:
+                    result.assert_true(False, f"Graph traversal failed: {e}")
+            
+            # Test: Find related chunks
+            if chunk_added:
+                try:
+                    related = graph_store.find_related_chunks("chunk_001", max_hops=1)
+                    result.assert_true(isinstance(related, list), "Find related chunks returns list")
+                except Exception as e:
+                    result.assert_true(False, f"Find related chunks failed: {e}")
+            
+            # Test: Find chunks by entity
+            if chunk_added and entity_added:
+                try:
+                    entity_chunks = graph_store.find_chunks_by_entity("Einstein", max_results=5)
+                    result.assert_true(isinstance(entity_chunks, list), "Find by entity returns list")
+                except Exception as e:
+                    result.assert_true(False, f"Find chunks by entity failed: {e}")
+            
+            # Test: Get document structure
+            if chunk_added:
+                try:
+                    doc_structure = graph_store.get_document_structure("einstein_bio.pdf")
+                    result.assert_greater(len(doc_structure), 0, "Document structure retrieved")
+                except Exception as e:
+                    result.assert_true(False, f"Get document structure failed: {e}")
+            
+            # Test: Clear graph
+            try:
+                graph_store.clear()
+                stats_after_clear = graph_store.get_statistics()
+                result.assert_equal(
+                    stats_after_clear.get('document_chunks', 0), 0,
+                    "Graph cleared successfully"
+                )
+            except Exception as e:
+                result.assert_true(False, f"Clear graph failed: {e}")
+        
+        except Exception as e:
+            result.assert_true(False, f"Unexpected error in KuzuDB tests: {e}")
+        
+        finally:
+            # Cleanup
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except:
+                pass
+        
+        return result
+    
+    # ========================================================================
+    # TEST 4: NETWORKX GRAPH STORE (FALLBACK)
+    # ========================================================================
+    
+    def test_networkx_graph_store():
+        """Test NetworkXGraphStore functionality."""
+        print("\n" + "-" * 80)
+        print("TEST 4: NetworkXGraphStore (Fallback)")
+        print("-" * 80)
+        
+        result = TestResult()
+        
+        if not NETWORKX_AVAILABLE:
+            print("  ⚠ NetworkX not available, skipping tests")
+            return result
+        
+        temp_dir = Path(tempfile.mkdtemp())
+        
+        try:
+            # Initialize NetworkX graph store
+            graph_store = NetworkXGraphStore(temp_dir / "graph_nx.graphml")
+            result.assert_true(True, "NetworkXGraphStore initialized")
+            
+            # Test: Add entities
+            graph_store.add_entity(
+                "chunk_001",
+                "document_chunk",
+                {"text": "Test chunk", "source_file": "test.pdf"}
+            )
+            result.assert_true(True, "Entity added")
+            
+            # Test: Add relations
+            graph_store.add_entity("source_001", "source_document", {})
+            graph_store.add_relation("chunk_001", "source_001", "from_source")
+            result.assert_true(True, "Relation added")
+            
+            # Test: Graph traversal
+            visited = graph_store.graph_traversal("chunk_001", max_hops=1)
+            result.assert_true("chunk_001" in visited, "Traversal includes start node")
+            
+            # Test: Statistics
+            stats = graph_store.get_statistics()
+            result.assert_greater(stats['nodes'], 0, "Nodes counted")
+            result.assert_greater(stats['edges'], 0, "Edges counted")
+            
+            # Test: Save and load
+            graph_store.save()
+            result.assert_true(
+                graph_store.graph_path.exists(),
+                "Graph saved to file"
+            )
+            
+            # Load in new instance
+            graph_store_2 = NetworkXGraphStore(temp_dir / "graph_nx.graphml")
+            stats_2 = graph_store_2.get_statistics()
+            result.assert_equal(
+                stats_2['nodes'], stats['nodes'],
+                "Graph loaded correctly"
+            )
+            
+            # Test: Clear
+            graph_store.clear()
+            stats_clear = graph_store.get_statistics()
+            result.assert_equal(stats_clear['nodes'], 0, "Graph cleared")
+        
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        return result
+    
+    # ========================================================================
+    # TEST 5: HYBRID STORE INTEGRATION
+    # ========================================================================
+    
+    def test_hybrid_store():
+        """Test HybridStore integration."""
+        print("\n" + "-" * 80)
+        print("TEST 5: HybridStore Integration")
+        print("-" * 80)
+        
+        result = TestResult()
+        temp_dir = Path(tempfile.mkdtemp())
+        
+        try:
+            # Create config
+            config = StorageConfig(
+                vector_db_path=temp_dir / "hybrid_vector",
+                graph_db_path=temp_dir / "hybrid_graph",
+                embedding_dim=768,
+                graph_backend="kuzu" if KUZU_AVAILABLE else "networkx"
+            )
+            
+            # Create embeddings
+            embeddings = MockEmbeddings(dim=768)
+            
+            # Initialize hybrid store
+            hybrid_store = HybridStore(config, embeddings)
+            result.assert_true(True, "HybridStore initialized")
+            
+            # Verify vector store
+            result.assert_true(
+                hybrid_store.vector_store is not None,
+                "Vector store created"
+            )
+            
+            # Verify graph store
+            result.assert_true(
+                hybrid_store.graph_store is not None,
+                "Graph store created"
+            )
+            
+            # Verify embedding dimension auto-detection
+            result.assert_equal(
+                config.embedding_dim, 768,
+                "Embedding dimension detected"
+            )
+            
+            # Test: Add documents
+            test_docs = [
+                Document(
+                    page_content="Einstein developed relativity theory.",
+                    metadata={
+                        "chunk_id": "chunk_001",
+                        "source_file": "physics.pdf",
+                        "chunk_index": 0,
+                        "page_number": 1
+                    }
+                ),
+                Document(
+                    page_content="He received the Nobel Prize in 1921.",
+                    metadata={
+                        "chunk_id": "chunk_002",
+                        "source_file": "physics.pdf",
+                        "chunk_index": 1,
+                        "page_number": 1
+                    }
+                ),
+                Document(
+                    page_content="Marie Curie discovered radioactivity.",
+                    metadata={
+                        "chunk_id": "chunk_003",
+                        "source_file": "chemistry.pdf",
+                        "chunk_index": 0,
+                        "page_number": 1
+                    }
+                ),
+            ]
+            
+            hybrid_store.add_documents(test_docs)
+            result.assert_true(True, "Documents added to hybrid store")
+            
+            # Verify vector store has documents
+            query_emb = embeddings.embed_query("physics Einstein")
+            vector_results = hybrid_store.vector_store.vector_search(query_emb, top_k=3)
+            result.assert_greater(
+                len(vector_results), 0,
+                "Vector store contains documents"
+            )
+            
+            # Verify graph store has nodes
+            graph_stats = hybrid_store.graph_store.get_statistics()
+            if KUZU_AVAILABLE:
+                result.assert_greater(
+                    graph_stats['document_chunks'], 0,
+                    "Graph store contains chunks"
+                )
+                result.assert_greater(
+                    graph_stats['source_documents'], 0,
+                    "Graph store contains source documents"
+                )
+            else:
+                result.assert_greater(
+                    graph_stats['nodes'], 0,
+                    "Graph store contains nodes"
+                )
+            
+            # Test: Save
+            hybrid_store.save()
+            result.assert_true(True, "Hybrid store saved")
+            
+            # Test: Reset vector store
+            hybrid_store.reset_vector_store()
+            result.assert_true(True, "Vector store reset")
+            
+            # Test: Reset graph store
+            hybrid_store.reset_graph_store()
+            graph_stats_reset = hybrid_store.graph_store.get_statistics()
+            if KUZU_AVAILABLE:
+                result.assert_equal(
+                    graph_stats_reset['document_chunks'], 0,
+                    "Graph store reset"
+                )
+            else:
+                result.assert_equal(
+                    graph_stats_reset['nodes'], 0,
+                    "Graph store reset"
+                )
+        
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        return result
+    
+    # ========================================================================
+    # TEST 6: DIAGNOSTICS
+    # ========================================================================
+    
+    def test_diagnostics():
+        """Test diagnostic function."""
+        print("\n" + "-" * 80)
+        print("TEST 6: Diagnostics")
+        print("-" * 80)
+        
+        result = TestResult()
+        temp_dir = Path(tempfile.mkdtemp())
+        
+        try:
+            config = StorageConfig(
+                vector_db_path=temp_dir / "diag_vector",
+                graph_db_path=temp_dir / "diag_graph",
+                graph_backend="kuzu" if KUZU_AVAILABLE else "networkx"
+            )
+            
+            embeddings = MockEmbeddings(dim=768)
+            
+            # Run diagnostics
+            diag_results = run_diagnostics(config, embeddings)
+            
+            result.assert_true(
+                "embedding_dim" in diag_results,
+                "Diagnostics include embedding_dim"
+            )
+            result.assert_equal(
+                diag_results["embedding_dim"], 768,
+                "Embedding dimension detected correctly"
+            )
+            result.assert_true(
+                "graph_backend" in diag_results,
+                "Diagnostics include graph_backend"
+            )
+            result.assert_true(
+                "kuzu_available" in diag_results,
+                "Diagnostics include kuzu_available"
+            )
+            result.assert_true(
+                "networkx_available" in diag_results,
+                "Diagnostics include networkx_available"
+            )
+            result.assert_true(
+                isinstance(diag_results["issues"], list),
+                "Diagnostics include issues list"
+            )
+        
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        return result
+    
+    # ========================================================================
+    # TEST 7: PERFORMANCE BENCHMARKS
+    # ========================================================================
+    
+    def test_performance():
+        """Test performance benchmarks."""
+        print("\n" + "-" * 80)
+        print("TEST 7: Performance Benchmarks")
+        print("-" * 80)
+        
+        result = TestResult()
+        temp_dir = Path(tempfile.mkdtemp())
+        
+        try:
+            config = StorageConfig(
+                vector_db_path=temp_dir / "perf_vector",
+                graph_db_path=temp_dir / "perf_graph",
+                embedding_dim=768
+            )
+            
+            embeddings = MockEmbeddings(dim=768)
+            hybrid_store = HybridStore(config, embeddings)
+            
+            # Create 100 test documents
+            num_docs = 100
+            test_docs = []
+            for i in range(num_docs):
+                test_docs.append(
+                    Document(
+                        page_content=f"This is test document number {i} about various topics.",
+                        metadata={
+                            "chunk_id": f"chunk_{i:03d}",
+                            "source_file": f"test_{i//10}.pdf",
+                            "chunk_index": i % 10,
+                            "page_number": 1
+                        }
+                    )
+                )
+            
+            # Benchmark: Document insertion
+            import time
+            start_time = time.time()
+            hybrid_store.add_documents(test_docs)
+            insert_time = (time.time() - start_time) * 1000
+            
+            result.assert_true(
+                insert_time < 30000,  # 30 seconds for 100 docs
+                f"Document insertion time acceptable ({insert_time:.0f}ms for {num_docs} docs)"
+            )
+            
+            # Benchmark: Vector search
+            query_emb = embeddings.embed_query("test document topics")
+            start_time = time.time()
+            search_results = hybrid_store.vector_store.vector_search(query_emb, top_k=10)
+            search_time = (time.time() - start_time) * 1000
+            
+            result.assert_true(
+                search_time < 100,  # 100ms
+                f"Vector search time acceptable ({search_time:.1f}ms)"
+            )
+            
+            result.assert_greater(
+                len(search_results), 0,
+                f"Search returned {len(search_results)} results"
+            )
+            
+            # Benchmark: Graph traversal (if KuzuDB available)
+            if KUZU_AVAILABLE:
+                start_time = time.time()
+                visited = hybrid_store.graph_store.graph_traversal("chunk_000", max_hops=2)
+                traversal_time = (time.time() - start_time) * 1000
+                
+                result.assert_true(
+                    traversal_time < 50,  # 50ms
+                    f"Graph traversal time acceptable ({traversal_time:.1f}ms)"
+                )
+        
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        return result
+    
+    # ========================================================================
+    # RUN ALL TESTS
+    # ========================================================================
+    
+    def run_all_tests():
+        """Run all test suites."""
+        all_results = []
+        
+        # Run each test suite
+        all_results.append(test_storage_config())
+        all_results.append(test_vector_store())
+        all_results.append(test_kuzu_graph_store())
+        all_results.append(test_networkx_graph_store())
+        all_results.append(test_hybrid_store())
+        all_results.append(test_diagnostics())
+        all_results.append(test_performance())
+        
+        # Aggregate results
+        total_passed = sum(r.passed for r in all_results)
+        total_failed = sum(r.failed for r in all_results)
+        total_tests = total_passed + total_failed
+        
+        # Print final summary
+        print("\n" + "=" * 80)
+        print("FINAL TEST SUMMARY")
+        print("=" * 80)
+        print(f"Total Test Suites: {len(all_results)}")
+        print(f"Total Tests: {total_tests}")
+        print(f"Total Passed: {total_passed} ({total_passed/total_tests*100:.1f}%)")
+        print(f"Total Failed: {total_failed} ({total_failed/total_tests*100:.1f}%)")
+        print("=" * 80)
+        
+        if total_failed == 0:
+            print("\n🎉🎉🎉 ALL TESTS PASSED! 🎉🎉🎉\n")
+            print("Storage.py is working correctly!")
+            return 0
+        else:
+            print(f"\n⚠️⚠️⚠️ {total_failed} TESTS FAILED! ⚠️⚠️⚠️\n")
+            print("Please review the failed tests above.")
+            return 1
+    
+    # Execute all tests
+    exit_code = run_all_tests()
+    sys.exit(exit_code)

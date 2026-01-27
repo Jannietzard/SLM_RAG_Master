@@ -52,7 +52,23 @@ try:
 except ImportError:
     GLINER_AVAILABLE = False
     logger.warning("GLiNER not available. Install with: pip install gliner")
+# ============================================================================
+# ENTITY EXTRACTION PIPELINE
+# ============================================================================
+"""
+Entity Extraction -> Graph Store Integration
 
+Diese Komponente fehlt komplett in der aktuellen Implementierung!
+Sie ist essentiell für die Funktionsfähigkeit des Hybrid Index.
+"""
+
+from typing import List, Dict, Any
+from src.data_layer.entity_extraction import (
+    EntityExtractionPipeline,
+    ChunkExtractionResult,
+    ExtractionConfig
+)
+from src.data_layer.storage import KuzuGraphStore
 # ============================================================================
 # REBEL INTEGRATION (Transformers)
 # ============================================================================
@@ -163,7 +179,208 @@ class ExtractionConfig:
     # Selective RE
     selective_re: bool = True
 
-
+class EntityGraphIntegrator:
+    """
+    Integriert Entity Extraction Ergebnisse in den Knowledge Graph.
+    
+    KRITISCHE KOMPONENTE: Ohne diese Integration bleiben Entities
+    nur in der Extraction Pipeline, kommen aber nie in den Graph!
+    
+    Workflow:
+    1. Chunks werden durch EntityExtractionPipeline verarbeitet
+    2. EntityGraphIntegrator nimmt ChunkExtractionResults
+    3. Erstellt Entity-Nodes und MENTIONS/RELATED_TO Edges in KuzuDB
+    """
+    
+    def __init__(
+        self,
+        graph_store: KuzuGraphStore,
+        entity_pipeline: EntityExtractionPipeline = None
+    ):
+        self.graph_store = graph_store
+        self.entity_pipeline = entity_pipeline or EntityExtractionPipeline()
+        self.logger = logging.getLogger(__name__)
+        
+        # Statistiken
+        self.stats = {
+            "chunks_processed": 0,
+            "entities_added": 0,
+            "mentions_added": 0,
+            "relations_added": 0,
+        }
+    
+    def integrate_chunk_results(
+        self,
+        results: List[ChunkExtractionResult]
+    ) -> None:
+        """
+        Integriere Extraction-Ergebnisse in Graph.
+        
+        Args:
+            results: Liste von ChunkExtractionResult
+        """
+        for result in results:
+            self._integrate_single_chunk(result)
+    
+    def _integrate_single_chunk(
+        self,
+        result: ChunkExtractionResult
+    ) -> None:
+        """Integriere ein einzelnes ChunkExtractionResult."""
+        self.stats["chunks_processed"] += 1
+        
+        # 1. Entities als Nodes hinzufügen
+        for entity in result.entities:
+            try:
+                # Entity Node erstellen/updaten
+                self.graph_store.conn.execute(
+                    """
+                    MERGE (e:Entity {entity_id: $entity_id})
+                    SET e.name = $name,
+                        e.type = $type,
+                        e.mention_count = COALESCE(e.mention_count, 0) + 1
+                    """,
+                    {
+                        "entity_id": entity.entity_id,
+                        "name": entity.name,
+                        "type": entity.entity_type,
+                    }
+                )
+                self.stats["entities_added"] += 1
+                
+                # MENTIONS Edge erstellen
+                # Verbinde DocumentChunk -> Entity
+                self.graph_store.conn.execute(
+                    """
+                    MATCH (c:DocumentChunk {chunk_id: $chunk_id})
+                    MATCH (e:Entity {entity_id: $entity_id})
+                    MERGE (c)-[m:MENTIONS]->(e)
+                    SET m.mention_span = $mention_span,
+                        m.confidence = $confidence
+                    """,
+                    {
+                        "chunk_id": result.chunk_id,
+                        "entity_id": entity.entity_id,
+                        "mention_span": str(entity.mention_span),
+                        "confidence": entity.confidence,
+                    }
+                )
+                self.stats["mentions_added"] += 1
+                
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to add entity {entity.name} for chunk {result.chunk_id}: {e}"
+                )
+        
+        # 2. Relations als RELATED_TO Edges hinzufügen
+        for relation in result.relations:
+            try:
+                # Finde oder erstelle Subject Entity
+                subj_id = self._get_or_create_entity_id(
+                    relation.subject_entity,
+                    "CONCEPT"  # Default type
+                )
+                
+                # Finde oder erstelle Object Entity
+                obj_id = self._get_or_create_entity_id(
+                    relation.object_entity,
+                    "CONCEPT"
+                )
+                
+                # RELATED_TO Edge erstellen
+                self.graph_store.conn.execute(
+                    """
+                    MATCH (e1:Entity {entity_id: $subj_id})
+                    MATCH (e2:Entity {entity_id: $obj_id})
+                    MERGE (e1)-[r:RELATED_TO]->(e2)
+                    SET r.relation_type = $relation_type,
+                        r.confidence = $confidence,
+                        r.source_chunks = COALESCE(r.source_chunks, '') || ',' || $chunk_id
+                    """,
+                    {
+                        "subj_id": subj_id,
+                        "obj_id": obj_id,
+                        "relation_type": relation.relation_type,
+                        "confidence": relation.confidence,
+                        "chunk_id": result.chunk_id,
+                    }
+                )
+                self.stats["relations_added"] += 1
+                
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to add relation {relation.subject_entity} -> "
+                    f"{relation.object_entity} for chunk {result.chunk_id}: {e}"
+                )
+    
+    def _get_or_create_entity_id(
+        self,
+        entity_name: str,
+        entity_type: str
+    ) -> str:
+        """Hole Entity ID oder erstelle neue Entity."""
+        import hashlib
+        
+        # Generiere Entity ID (konsistent mit GLiNER)
+        entity_id = hashlib.md5(
+            f"{entity_name.lower()}:{entity_type}".encode()
+        ).hexdigest()[:12]
+        
+        # Erstelle Entity falls nicht existiert
+        try:
+            self.graph_store.conn.execute(
+                """
+                MERGE (e:Entity {entity_id: $entity_id})
+                SET e.name = $name,
+                    e.type = $type,
+                    e.mention_count = COALESCE(e.mention_count, 0) + 1
+                """,
+                {
+                    "entity_id": entity_id,
+                    "name": entity_name,
+                    "type": entity_type,
+                }
+            )
+        except Exception as e:
+            self.logger.warning(f"Failed to create entity {entity_name}: {e}")
+        
+        return entity_id
+    
+    def process_and_integrate_chunks(
+        self,
+        texts: List[str],
+        chunk_ids: List[str]
+    ) -> List[ChunkExtractionResult]:
+        """
+        End-to-End: Extraction + Graph Integration.
+        
+        Args:
+            texts: Chunk-Texte
+            chunk_ids: Chunk-IDs
+            
+        Returns:
+            Extraction-Ergebnisse
+        """
+        # Entity Extraction
+        self.logger.info(f"Extracting entities from {len(texts)} chunks...")
+        results = self.entity_pipeline.process_chunks_batch(texts, chunk_ids)
+        
+        # Graph Integration
+        self.logger.info("Integrating entities into graph...")
+        self.integrate_chunk_results(results)
+        
+        self.logger.info(
+            f"Integration complete: "
+            f"{self.stats['entities_added']} entities, "
+            f"{self.stats['mentions_added']} mentions, "
+            f"{self.stats['relations_added']} relations"
+        )
+        
+        return results
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Hole Integrations-Statistiken."""
+        return self.stats.copy()
 # ============================================================================
 # ENTITY CACHE (LRU + SQLite Persistent)
 # ============================================================================

@@ -13,6 +13,10 @@ Import directly from modules:
     from src.data_layer.storage import HybridStore, StorageConfig
     from src.data_layer.retrieval import HybridRetriever, RetrievalConfig
 """
+
+from .entity_extraction import EntityExtractionPipeline
+from .hybrid_retriever import HybridRetriever, RRFFusion
+
 # Sentence Chunking (SpaCy-basiert)
 try:
     from .sentence_chunking import (

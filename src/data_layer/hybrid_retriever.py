@@ -228,11 +228,13 @@ class RRFFusion:
         - Belohnt Dokumente, die in mehreren Listen hoch gerankt sind
     """
     
+class RRFFusion:
     def __init__(self, k: int = 60, cross_source_boost: float = 1.2):
         """
         Args:
-            k: RRF-Konstante (höher = gleichmäßigere Gewichtung)
-            cross_source_boost: Multiplikator für Chunks in beiden Quellen
+            k: RRF-Konstante
+            cross_source_boost: Additiver Bonus für Cross-Source Chunks
+                               (interpretiert als zusätzliche RRF-Punkte)
         """
         self.k = k
         self.cross_source_boost = cross_source_boost
@@ -244,17 +246,13 @@ class RRFFusion:
         final_top_k: int = 10
     ) -> List[RetrievalResult]:
         """
-        Fusioniere Vector und Graph Ergebnisse mit RRF.
+        RRF Fusion mit additiver Cross-Source Boost.
         
-        Args:
-            vector_results: Ergebnisse von Vector Retrieval (sortiert nach Score)
-            graph_results: Ergebnisse von Graph Retrieval (sortiert nach Score/Confidence)
-            final_top_k: Anzahl finale Ergebnisse
+        FORMEL:
+            RRF(d) = Σ 1/(k + rank_i(d)) + BONUS
             
-        Returns:
-            Fusionierte, nach RRF-Score sortierte Ergebnisse
+            wobei BONUS = cross_source_boost, falls d in beiden Sources
         """
-        # Score-Dictionaries
         rrf_scores = defaultdict(float)
         chunk_data = {}
         vector_ranks = {}
@@ -263,14 +261,13 @@ class RRFFusion:
         graph_scores = {}
         graph_metadata = {}
         
-        # Vector Ranks (1-basiert)
+        # Vector Ranks
         for rank, result in enumerate(vector_results, start=1):
             chunk_id = result.get("chunk_id")
             rrf_scores[chunk_id] += 1.0 / (self.k + rank)
             vector_ranks[chunk_id] = rank
             vector_scores[chunk_id] = result.get("relevance_score", 0)
             
-            # Store chunk data
             if chunk_id not in chunk_data:
                 chunk_data[chunk_id] = {
                     "chunk_id": chunk_id,
@@ -279,14 +276,13 @@ class RRFFusion:
                     "position": result.get("position", 0),
                 }
         
-        # Graph Ranks (1-basiert)
+        # Graph Ranks
         for rank, result in enumerate(graph_results, start=1):
             chunk_id = result.get("chunk_id")
             rrf_scores[chunk_id] += 1.0 / (self.k + rank)
             graph_ranks[chunk_id] = rank
             graph_scores[chunk_id] = result.get("confidence", 0)
             
-            # Graph-spezifische Metadata
             graph_metadata[chunk_id] = {
                 "hop_distance": result.get("hop", 1),
                 "matched_entities": [
@@ -296,7 +292,6 @@ class RRFFusion:
                 ],
             }
             
-            # Store chunk data
             if chunk_id not in chunk_data:
                 chunk_data[chunk_id] = {
                     "chunk_id": chunk_id,
@@ -305,10 +300,16 @@ class RRFFusion:
                     "position": result.get("position", 0),
                 }
         
-        # Cross-Source Boost
+        # ========================================================================
+        # CORRECTED: Additiver Cross-Source Boost
+        # ========================================================================
         in_both = set(vector_ranks.keys()) & set(graph_ranks.keys())
         for chunk_id in in_both:
-            rrf_scores[chunk_id] *= self.cross_source_boost
+            # ADDITIVE statt multiplikativ
+            # Interpretiere cross_source_boost als zusätzliche RRF-Punkte
+            # Typischer Wert: 0.02 - 0.05 (entspricht Rank-Verbesserung um ~3-5)
+            bonus = self.cross_source_boost / (self.k + 1)
+            rrf_scores[chunk_id] += bonus
         
         # Sort by RRF score
         sorted_chunks = sorted(
@@ -323,7 +324,6 @@ class RRFFusion:
             data = chunk_data.get(chunk_id, {})
             gm = graph_metadata.get(chunk_id, {})
             
-            # Determine retrieval method
             in_vector = chunk_id in vector_ranks
             in_graph = chunk_id in graph_ranks
             
@@ -351,7 +351,116 @@ class RRFFusion:
             results.append(result)
         
         return results
-
+#% ============================================================================
+# IMPROVED QUERY ENTITY EXTRACTOR   
+# ============================================================================
+class ImprovedQueryEntityExtractor:
+    """
+    Query Entity Extraction mit GLiNER-Konsistenz.
+    
+    Nutzt dasselbe GLiNER-Modell wie für Chunk-Entity-Extraction,
+    um Konsistenz zwischen Query-Entities und Graph-Entities zu gewährleisten.
+    """
+    
+    def __init__(self, gliner_model=None, spacy_model: str = "en_core_web_sm"):
+        self.gliner = gliner_model  # Shared GLiNER instance
+        self.nlp = None
+        self._load_spacy(spacy_model)
+        
+        # GLiNER Entity Types (konsistent mit Thesis 2.5)
+        self.entity_types = [
+            "PERSON", "ORGANIZATION", "LOCATION", "DATE", "EVENT", "CONCEPT"
+        ]
+    
+    def _load_spacy(self, model_name: str):
+        """Lade SpaCy als Fallback."""
+        try:
+            import spacy
+            self.nlp = spacy.load(model_name)
+            logger.info(f"SpaCy loaded for query analysis: {model_name}")
+        except Exception as e:
+            logger.warning(f"SpaCy not available: {e}")
+            self.nlp = None
+    
+    def extract(self, query: str, confidence_threshold: float = 0.5) -> List[str]:
+        """
+        Extrahiere Entitäten aus Query.
+        
+        Präferenz-Reihenfolge:
+        1. GLiNER (wenn verfügbar, für Konsistenz mit Chunk-Extraction)
+        2. SpaCy NER (Fallback)
+        3. Regex (letzter Fallback)
+        
+        Args:
+            query: User Query
+            confidence_threshold: Minimum Confidence (0.5 wie in Thesis 2.5)
+            
+        Returns:
+            Liste von Entity-Namen
+        """
+        # Methode 1: GLiNER (bevorzugt für Konsistenz)
+        if self.gliner is not None:
+            try:
+                entities = self.gliner.predict_entities(
+                    query,
+                    self.entity_types,
+                    threshold=confidence_threshold
+                )
+                return [ent["text"] for ent in entities]
+            except Exception as e:
+                logger.warning(f"GLiNER query extraction failed: {e}")
+        
+        # Methode 2: SpaCy NER (Fallback)
+        if self.nlp is not None:
+            return self._spacy_extract(query)
+        
+        # Methode 3: Regex (letzter Fallback)
+        return self._fallback_extract(query)
+    
+    def _spacy_extract(self, query: str) -> List[str]:
+        """SpaCy-basierte Extraktion mit GLiNER-Type-Mapping."""
+        doc = self.nlp(query)
+        entities = []
+        
+        # Type Mapping: SpaCy -> GLiNER (für Konsistenz)
+        type_map = {
+            "PERSON": "PERSON",
+            "ORG": "ORGANIZATION",
+            "GPE": "LOCATION",
+            "LOC": "LOCATION",
+            "DATE": "DATE",
+            "EVENT": "EVENT",
+        }
+        
+        for ent in doc.ents:
+            if ent.label_ in type_map and len(ent.text) > 2:
+                entities.append(ent.text)
+        
+        # Auch Proper Nouns (als CONCEPT)
+        for token in doc:
+            if token.pos_ == "PROPN" and token.text not in entities:
+                if len(token.text) > 2:
+                    entities.append(token.text)
+        
+        return entities
+    
+    def _fallback_extract(self, query: str) -> List[str]:
+        """Regex-basierte Fallback-Extraktion."""
+        import re
+        
+        entities = []
+        
+        # Capitalized words/phrases
+        for match in re.finditer(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', query):
+            entity = match.group(1)
+            if len(entity) > 2:
+                entities.append(entity)
+        
+        # Quoted strings
+        for match in re.finditer(r'"([^"]+)"', query):
+            entities.append(match.group(1))
+        
+        return entities
 
 # ============================================================================
 # HYBRID RETRIEVER
@@ -394,7 +503,14 @@ class HybridRetriever:
             k=self.config.rrf_k,
             cross_source_boost=self.config.cross_source_boost
         )
+        gliner_model = None
+        if hasattr(hybrid_store, 'entity_pipeline'):
+            gliner_model = hybrid_store.entity_pipeline.ner_extractor.model
         
+        self.entity_extractor = ImprovedQueryEntityExtractor(
+            gliner_model=gliner_model,
+            spacy_model=self.config.spacy_model
+        )
         logger.info(f"HybridRetriever initialized: mode={self.config.mode}")
     
     def retrieve(
