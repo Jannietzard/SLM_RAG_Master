@@ -38,6 +38,16 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Union, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
+from src.data_layer.sentence_chunking import SentenceBasedChunker
+from src.data_layer.entity_extraction import EntityExtractionPipeline
+
+
+try:
+    from src.data_layer.sentence_chunking import SpacySentenceChunker
+    SPACY_CHUNKER_AVAILABLE = True
+except ImportError:
+    SPACY_CHUNKER_AVAILABLE = False
+    logging.warning("SpacySentenceChunker not available")
 
 import yaml
 
@@ -51,6 +61,7 @@ logger = logging.getLogger(__name__)
 class ChunkingStrategy(Enum):
     """Verfügbare Chunking-Strategien."""
     SENTENCE = "sentence"       # N Sätze pro Chunk
+    SENTENCE_SPACY = "sentence_spacy"  # NEU
     SEMANTIC = "semantic"       # Semantische Grenzen
     FIXED = "fixed"             # Feste Zeichenanzahl
     RECURSIVE = "recursive"     # LangChain RecursiveCharacterTextSplitter
@@ -91,6 +102,11 @@ class IngestionConfig:
     # Sentence Strategy
     sentences_per_chunk: int = 3
     
+    # Sentence SpaCy Strategy (NEU)
+    spacy_model: str = "en_core_web_sm"
+    sentence_overlap: int = 1       # Overlap für Kontexterhaltung
+    entity_aware_chunking: bool = False
+
     # Semantic Strategy
     min_lexical_diversity: float = 0.3
     min_information_density: float = 2.0
@@ -494,6 +510,61 @@ class DocumentIngestionPipeline:
         # Or process LangChain Documents
         documents = pipeline.process_documents(docs)
     """
+    def _create_chunker_extended(self):
+        """Erweiterte Chunker-Erstellung mit SpaCy-Support."""
+        
+        strategy = self.config.chunking_strategy
+        
+        if strategy == "sentence":
+            # Existing regex-based chunker
+            from src.data_layer.ingestion import SentenceChunker
+            return SentenceChunker(
+                sentences_per_chunk=self.config.sentences_per_chunk,
+                min_chunk_size=self.config.min_chunk_size,
+            )
+        
+        elif strategy == "sentence_spacy":
+            # NEU: SpaCy-based 3-Satz-Fenster
+            if not SPACY_CHUNKER_AVAILABLE:
+                raise ImportError(
+                    "SpacySentenceChunker not available. "
+                    "Install with: pip install spacy && python -m spacy download en_core_web_sm"
+                )
+            
+            return SpacySentenceChunker(
+                sentences_per_chunk=self.config.sentences_per_chunk,
+                sentence_overlap=getattr(self.config, 'sentence_overlap', 1),
+                min_chunk_chars=self.config.min_chunk_size,
+                spacy_model=getattr(self.config, 'spacy_model', 'en_core_web_sm'),
+                entity_aware=getattr(self.config, 'entity_aware_chunking', False),
+            )
+        
+        elif strategy == "semantic":
+            # Existing semantic chunker
+            from src.data_layer.semantic_chunking import create_semantic_chunker
+            return create_semantic_chunker(
+                chunk_size=self.config.chunk_size,
+                chunk_overlap=self.config.chunk_overlap,
+                min_chunk_size=self.config.min_chunk_size,
+            )
+        
+        elif strategy == "fixed":
+            from src.data_layer.ingestion import FixedSizeChunker
+            return FixedSizeChunker(
+                chunk_size=self.config.chunk_size,
+                chunk_overlap=self.config.chunk_overlap,
+                min_chunk_size=self.config.min_chunk_size,
+            )
+        
+        elif strategy == "recursive":
+            from src.data_layer.ingestion import RecursiveChunker
+            return RecursiveChunker(
+                chunk_size=self.config.chunk_size,
+                chunk_overlap=self.config.chunk_overlap,
+            )
+        
+        else:
+            raise ValueError(f"Unknown chunking strategy: {strategy}")
     
     def __init__(self, config: IngestionConfig = None):
         """

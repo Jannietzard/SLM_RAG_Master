@@ -73,7 +73,7 @@ def test_retrieval_import():
     
     try:
         # ✅ FIX: Korrekter Import-Pfad
-        from src.data_layer.retrieval import (
+        from data_layer.hybrid_retriever import (
             HybridRetriever,
             RetrievalConfig,
             RetrievalMode,

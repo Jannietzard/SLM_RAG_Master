@@ -203,7 +203,7 @@ def import_data_layer():
         modules['load_ingestion_config'] = None
     
     try:
-        from src.data_layer.retrieval import HybridRetriever, RetrievalConfig, RetrievalMode
+        from data_layer.hybrid_retriever import HybridRetriever, RetrievalConfig, RetrievalMode
         modules['HybridRetriever'] = HybridRetriever
         modules['RetrievalConfig'] = RetrievalConfig
         modules['RetrievalMode'] = RetrievalMode

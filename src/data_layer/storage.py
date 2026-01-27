@@ -484,6 +484,33 @@ class KuzuGraphStore:
                     relation_type STRING
                 )
             """)
+
+            self.conn.execute("""
+                CREATE NODE TABLE IF NOT EXISTS Entity(
+                    entity_id STRING,
+                    name STRING,
+                    type STRING,
+                    mention_count INT64,
+                    PRIMARY KEY (entity_id)
+                )
+            """)
+
+            self.conn.execute("""
+                CREATE REL TABLE IF NOT EXISTS MENTIONS(
+                    FROM DocumentChunk TO Entity,
+                    mention_span STRING,
+                    confidence DOUBLE
+                )
+            """)
+
+            self.conn.execute("""
+                CREATE REL TABLE IF NOT EXISTS RELATED_TO(
+                    FROM Entity TO Entity,
+                    relation_type STRING,
+                    confidence DOUBLE,
+                    source_chunks STRING
+                )
+            """)
             
             self.logger.debug("Graph schema initialized")
             

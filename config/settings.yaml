@@ -343,3 +343,24 @@ ingestion:
 #   - config/chunk_small.yaml  (sentences_per_chunk: 2)
 #   - config/chunk_medium.yaml (sentences_per_chunk: 3)
 #   - config/chunk_large.yaml  (sentences_per_chunk: 5)
+
+# Füge zu deiner settings.yaml hinzu:
+
+ingestion:
+  chunking_strategy: "sentence_spacy"  # sentence | sentence_spacy | semantic | fixed | recursive
+  
+  # Für sentence und sentence_spacy
+  sentences_per_chunk: 3
+  sentence_overlap: 1                  # Nur für sentence_spacy
+  
+  # Für semantic, fixed, recursive
+  chunk_size: 1024
+  chunk_overlap: 128
+  
+  # SpaCy-spezifisch
+  spacy_model: "en_core_web_sm"
+  entity_aware_chunking: false
+  
+  # Quality
+  min_chunk_size: 50
+  filter_short_chunks: true

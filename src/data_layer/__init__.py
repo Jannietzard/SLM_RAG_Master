@@ -13,6 +13,18 @@ Import directly from modules:
     from src.data_layer.storage import HybridStore, StorageConfig
     from src.data_layer.retrieval import HybridRetriever, RetrievalConfig
 """
+# Sentence Chunking (SpaCy-basiert)
+try:
+    from .sentence_chunking import (
+        SpacySentenceChunker,
+        SentenceChunkingConfig,
+        SentenceChunk,
+        SentenceInfo,
+        create_sentence_chunker,
+    )
+except ImportError:
+    pass  # SpaCy not installed
+
 
 __version__ = "2.1.0"
 __author__ = "Edge-RAG Research Project"
