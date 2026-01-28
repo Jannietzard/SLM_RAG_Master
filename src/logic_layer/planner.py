@@ -338,8 +338,12 @@ class QueryClassifier:
         r"\bof\s+the\s+\w+\s+(that|which|who)\b",
         r"\bwhere\s+.+\s+(was|is|were|are)\b",
         r"\b\w+\s+of\s+the\s+\w+\s+of\b",
-        r"'s\s+\w+'s",  # Possessiv-Ketten: "John's sister's husband"
+        r"'s\s+\w+'s",  # Possessive chains
         r"\b(who|what)\s+\w+\s+(the|a)\s+\w+\s+(that|which)\b",
+        # NEW PATTERNS FOR HOTPOTQA / 2WIKI:
+        r"\b(starring|featuring|directed by|written by|authored by|composed by)\b",
+        r"\b(father|mother|son|daughter|wife|husband|creator|founder)\s+of\b",
+        r"\b(located|situated)\s+in\s+the\b",
     ]
     
     # Intersection-Indikatoren: Gemeinsame Eigenschaften
