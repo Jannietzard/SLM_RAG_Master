@@ -13,7 +13,7 @@ Import directly from modules:
     from src.data_layer.storage import HybridStore, StorageConfig
     from src.data_layer.retrieval import HybridRetriever, RetrievalConfig
 """
-
+from data_layer.chunking import SpacySentenceChunke
 from .entity_extraction import EntityExtractionPipeline
 from .hybrid_retriever import HybridRetriever, RRFFusion
 

@@ -125,6 +125,8 @@ class StorageConfig:
         normalize_embeddings: Whether to L2-normalize vectors
         distance_metric: Distance metric for vector search
         graph_backend: "kuzu" or "networkx" (fallback)
+        enable_entity_extraction: Enable GLiNER + REBEL entity extraction
+        entity_cache_path: Path to entity cache (None = auto-generate)
     """
     vector_db_path: Path
     graph_db_path: Path
@@ -133,6 +135,10 @@ class StorageConfig:
     normalize_embeddings: bool = True
     distance_metric: str = "cosine"
     graph_backend: str = "kuzu"  # NEW: "kuzu" or "networkx"
+    
+    # Entity Extraction (NEW in v3.1.0)
+    enable_entity_extraction: bool = False  # Default OFF (opt-in)
+    entity_cache_path: Optional[Path] = None
     
     def __post_init__(self):
         """Validate configuration parameters."""
@@ -398,7 +404,11 @@ class KuzuGraphStore:
         
         CRITICAL FIX for KuzuDB 0.11.3+:
             KuzuDB wants the PARENT directory to exist, but will create
-            the database directory itself. DO NOT create db_path!
+            the database directory itself.
+            # KLARSTELLUNG:
+# Code ist KORREKT! KuzuDB will:
+# 1. PARENT existiert (wir erstellen) ✅
+# 2. DB path NICHT existiert (KuzuDB erstellt) ✅
         """
         self.db_path = Path(db_path)
         self.logger = logging.getLogger(__name__)
@@ -588,7 +598,7 @@ class KuzuGraphStore:
                 """
                 MERGE (e:Entity {entity_id: $entity_id})
                 SET e.name = $name,
-                    e.entity_type = $entity_type
+                    e.type = $entity_type
                 """,
                 {
                     "entity_id": entity_id,
@@ -1062,192 +1072,7 @@ class NetworkXGraphStore:
         if metadata:
             edge_data.update(metadata)
         self.graph.add_edge(source_id, target_id, **edge_data)
-
-    def graph_search_1hop(
-        self,
-        entity_name: str,
-        top_k: int = 10
-    ) -> List[Dict[str, Any]]:
-        """
-        1-Hop Graph Search: Finde Chunks die Entity erwähnen.
-        
-        Gemäß Thesis 2.6: "alle Chunks findet, die die Entität erwähnen (1-Hop)"
-        
-        Cypher Query:
-            MATCH (c:DocumentChunk)-[m:MENTIONS]->(e:Entity)
-            WHERE e.name CONTAINS $entity_name
-            RETURN c, m, e
-            ORDER BY e.mention_count DESC, m.confidence DESC
-        
-        Args:
-            entity_name: Query-Entity Name
-            top_k: Anzahl Ergebnisse
-            
-        Returns:
-            Liste von Chunks mit Metadata
-        """
-        results = []
-        
-        try:
-            query_result = self.conn.execute(
-                """
-                MATCH (c:DocumentChunk)-[m:MENTIONS]->(e:Entity)
-                WHERE e.name CONTAINS $entity_name
-                RETURN 
-                    c.chunk_id AS chunk_id,
-                    c.text AS text,
-                    c.source_file AS source_doc,
-                    c.position AS position,
-                    e.name AS entity_name,
-                    e.type AS entity_type,
-                    e.mention_count AS mention_count,
-                    m.confidence AS confidence,
-                    1 AS hop
-                ORDER BY 
-                    e.mention_count DESC,
-                    m.confidence DESC
-                LIMIT $top_k
-                """,
-                {"entity_name": entity_name, "top_k": top_k}
-            )
-            
-            while query_result.has_next():
-                row = query_result.get_next()
-                results.append({
-                    "chunk_id": row[0],
-                    "text": row[1],
-                    "source_doc": row[2],
-                    "position": row[3],
-                    "entity_name": row[4],
-                    "entity_type": row[5],
-                    "mention_count": row[6],
-                    "confidence": row[7],
-                    "hop": row[8],
-                })
-                
-        except Exception as e:
-            logger.error(f"1-Hop graph search failed for '{entity_name}': {e}")
-        
-        return results
     
-    def graph_search_2hop(
-        self,
-        entity_name: str,
-        top_k: int = 10
-    ) -> List[Dict[str, Any]]:
-        """
-        2-Hop Graph Search: Finde Chunks über relationale Verbindungen.
-        
-        Gemäß Thesis 2.6: "alle Chunks findet, die Entitäten erwähnen, 
-        die mit der Query-Entität relational verbunden sind (2-Hop)"
-        
-        Cypher Query:
-            MATCH (query_e:Entity)-[r:RELATED_TO]-(related_e:Entity)
-                  <-[m:MENTIONS]-(c:DocumentChunk)
-            WHERE query_e.name CONTAINS $entity_name
-            RETURN c, r, related_e, m
-            ORDER BY r.confidence DESC, related_e.mention_count DESC
-        
-        Args:
-            entity_name: Query-Entity Name
-            top_k: Anzahl Ergebnisse
-            
-        Returns:
-            Liste von Chunks mit Relation-Metadata
-        """
-        results = []
-        
-        try:
-            query_result = self.conn.execute(
-                """
-                MATCH (query_e:Entity)-[r:RELATED_TO]-(related_e:Entity)
-                      <-[m:MENTIONS]-(c:DocumentChunk)
-                WHERE query_e.name CONTAINS $entity_name
-                RETURN 
-                    c.chunk_id AS chunk_id,
-                    c.text AS text,
-                    c.source_file AS source_doc,
-                    c.position AS position,
-                    query_e.name AS query_entity,
-                    r.relation_type AS relation_type,
-                    related_e.name AS related_entity,
-                    related_e.type AS related_entity_type,
-                    r.confidence AS relation_confidence,
-                    m.confidence AS mention_confidence,
-                    2 AS hop
-                ORDER BY 
-                    r.confidence DESC,
-                    related_e.mention_count DESC,
-                    m.confidence DESC
-                LIMIT $top_k
-                """,
-                {"entity_name": entity_name, "top_k": top_k}
-            )
-            
-            while query_result.has_next():
-                row = query_result.get_next()
-                results.append({
-                    "chunk_id": row[0],
-                    "text": row[1],
-                    "source_doc": row[2],
-                    "position": row[3],
-                    "query_entity": row[4],
-                    "relation_type": row[5],
-                    "related_entity": row[6],
-                    "related_entity_type": row[7],
-                    "confidence": row[8],  # Relation confidence für Ranking
-                    "mention_confidence": row[9],
-                    "hop": row[10],
-                })
-                
-        except Exception as e:
-            logger.error(f"2-Hop graph search failed for '{entity_name}': {e}")
-        
-        return results
-    
-    def graph_search_combined(
-        self,
-        entity_name: str,
-        top_k_1hop: int = 5,
-        top_k_2hop: int = 5
-    ) -> List[Dict[str, Any]]:
-        """
-        Kombiniere 1-Hop und 2-Hop Searches.
-        
-        Gemäß Thesis 2.6: "Für jede Query-Entität wird eine Cypher-Query 
-        generiert, die (a) ... (1-Hop), und (b) ... (2-Hop)"
-        
-        Args:
-            entity_name: Query-Entity Name
-            top_k_1hop: Top-K für 1-Hop
-            top_k_2hop: Top-K für 2-Hop
-            
-        Returns:
-            Kombinierte und deduplizierte Ergebnisliste
-        """
-        # 1-Hop Search
-        results_1hop = self.graph_search_1hop(entity_name, top_k_1hop)
-        
-        # 2-Hop Search
-        results_2hop = self.graph_search_2hop(entity_name, top_k_2hop)
-        
-        # Deduplizierung nach chunk_id (1-Hop hat Priorität)
-        seen_chunks = set()
-        combined = []
-        
-        for result in results_1hop:
-            if result["chunk_id"] not in seen_chunks:
-                combined.append(result)
-                seen_chunks.add(result["chunk_id"])
-        
-        for result in results_2hop:
-            if result["chunk_id"] not in seen_chunks:
-                combined.append(result)
-                seen_chunks.add(result["chunk_id"])
-        
-        return combined
-
-
     def graph_traversal(
         self,
         start_entity: str,
@@ -1331,6 +1156,45 @@ class HybridStore:
         else:
             raise ImportError("No graph backend available!")
         
+        # Initialize Entity Extraction Pipeline (optional, NEW in v3.1.0)
+        self.entity_pipeline = None
+        if config.enable_entity_extraction:
+            try:
+                # Lazy import to avoid hard dependency
+                from entity_extraction import EntityExtractionPipeline, ExtractionConfig
+                
+                # Auto-generate cache path if not provided
+                cache_path = config.entity_cache_path
+                if cache_path is None:
+                    cache_path = config.graph_db_path.parent / "entity_cache.db"
+                
+                extraction_config = ExtractionConfig(
+                    cache_enabled=True,
+                    cache_path=str(cache_path),
+                    # Thesis-compliant settings (Abschnitt 2.5)
+                    ner_confidence_threshold=0.5,
+                    re_confidence_threshold=0.7,
+                    ner_batch_size=16,
+                    re_batch_size=8,
+                    min_entities_for_re=2,
+                    selective_re=True,
+                )
+                
+                self.entity_pipeline = EntityExtractionPipeline(extraction_config)
+                self.logger.info(
+                    f"Entity extraction enabled (GLiNER + REBEL, cache: {cache_path})"
+                )
+                
+            except ImportError as e:
+                self.logger.warning(
+                    f"Entity extraction not available: {e}. "
+                    f"Install with: pip install gliner transformers"
+                )
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize entity pipeline: {e}")
+        else:
+            self.logger.debug("Entity extraction disabled")
+        
         self.logger.info(f"HybridStore initialized: dim={config.embedding_dim}")
     
     def add_documents(self, documents: List[Document]) -> None:
@@ -1374,13 +1238,128 @@ class HybridStore:
                 
             else:
                 # NetworkX fallback
-                self.graph_store.add_entity(chunk_id, "document_chunk", {"source_file": source_file})
-                self.graph_store.add_entity(source_file, "source_document", {})
+                self.graph_store.add_entity_from_metadata(chunk_id, "document_chunk", {"source_file": source_file})
+                self.graph_store.add_entity_from_metadata(source_file, "source_document", {})
                 self.graph_store.add_relation(chunk_id, source_file, "from_source")
             
             prev_chunk_id = chunk_id
         
+        # Entity Extraction & Graph Integration (NEW in v3.1.0)
+        if self.entity_pipeline and isinstance(self.graph_store, KuzuGraphStore):
+            try:
+                entity_stats = self._integrate_entities(documents)
+                self.logger.info(
+                    f"Entity integration: {entity_stats.get('unique_entities', 0)} entities, "
+                    f"{entity_stats.get('total_mentions', 0)} mentions, "
+                    f"{entity_stats.get('total_relations', 0)} relations"
+                )
+            except Exception as e:
+                self.logger.warning(f"Entity integration failed: {e}")
+        
         self.logger.info(f"Added {len(documents)} documents to hybrid store")
+    
+    def _integrate_entities(self, documents: List[Document]) -> Dict[str, Any]:
+        """
+        Integrate extracted entities into the Knowledge Graph.
+        
+        Pipeline (Masterthesis Abschnitt 2.5):
+        1. Entity Extraction with GLiNER (batch processing, 16 docs/batch)
+        2. Add Entities to Graph (unique entity_ids only)
+        3. Create MENTIONS relations (Chunk -> Entity)
+        4. Relation Extraction with REBEL (selective, min 2 entities)
+        5. Create RELATED_TO relations (Entity -> Entity)
+        
+        Args:
+            documents: List of LangChain Documents (already in vector/graph store)
+            
+        Returns:
+            Statistics dictionary with extraction metrics
+        """
+        if not self.entity_pipeline:
+            return {}
+        
+        stats = {
+            "total_chunks": len(documents),
+            "chunks_with_entities": 0,
+            "total_entities": 0,
+            "unique_entities": 0,
+            "total_mentions": 0,
+            "total_relations": 0,
+        }
+        
+        if not documents:
+            return stats
+        
+        # Prepare for batch processing
+        texts = [doc.page_content for doc in documents]
+        chunk_ids = [
+            str(doc.metadata.get("chunk_id", f"chunk_{i}")) 
+            for i, doc in enumerate(documents)
+        ]
+        
+        # STEP 1 & 2: Batch Entity Extraction (GLiNER)
+        self.logger.debug(f"Extracting entities from {len(documents)} chunks...")
+        extraction_results = self.entity_pipeline.process_chunks_batch(texts, chunk_ids)
+        
+        # Track unique entities
+        seen_entities = set()
+        entity_name_to_id = {}  # For relation mapping
+        
+        # STEP 3 & 4: Add Entities + MENTIONS relations
+        for result in extraction_results:
+            if not result.entities:
+                continue
+            
+            stats["chunks_with_entities"] += 1
+            
+            for entity in result.entities:
+                stats["total_entities"] += 1
+                
+                # Store name -> id mapping for relations
+                entity_name_to_id[entity.name.lower()] = entity.entity_id
+                
+                # Add entity to graph (only once per entity_id)
+                if entity.entity_id not in seen_entities:
+                    try:
+                        self.graph_store.add_entity(
+                            entity_id=entity.entity_id,
+                            name=entity.name,
+                            entity_type=entity.entity_type,
+                        )
+                        seen_entities.add(entity.entity_id)
+                        stats["unique_entities"] += 1
+                    except Exception as e:
+                        self.logger.debug(f"Entity add failed (may exist): {entity.entity_id}")
+                
+                # Create MENTIONS relation: Chunk -> Entity
+                try:
+                    self.graph_store.add_mentions_relation(
+                        chunk_id=result.chunk_id,
+                        entity_id=entity.entity_id,
+                    )
+                    stats["total_mentions"] += 1
+                except Exception as e:
+                    self.logger.debug(f"MENTIONS relation failed: {e}")
+        
+        # STEP 5: RELATED_TO relations (Entity -> Entity via REBEL)
+        for result in extraction_results:
+            for relation in result.relations:
+                try:
+                    # Map entity names to entity_ids
+                    subject_id = entity_name_to_id.get(relation.subject_entity.lower())
+                    object_id = entity_name_to_id.get(relation.object_entity.lower())
+                    
+                    if subject_id and object_id:
+                        self.graph_store.add_related_to_relation(
+                            entity1_id=subject_id,
+                            entity2_id=object_id,
+                            relation_type=relation.relation_type,
+                        )
+                        stats["total_relations"] += 1
+                except Exception as e:
+                    self.logger.debug(f"RELATED_TO relation failed: {e}")
+        
+        return stats
     
     def save(self) -> None:
         """Persist stores to disk."""
@@ -1959,7 +1938,7 @@ if __name__ == "__main__":
             result.assert_true(True, "Entity added")
             
             # Test: Add relations
-            graph_store.add_entity("source_001", "source_document", {})
+            graph_store.add_entity_from_metadata("source_001", "source_document", {})
             graph_store.add_relation("chunk_001", "source_001", "from_source")
             result.assert_true(True, "Relation added")
             
