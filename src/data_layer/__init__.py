@@ -19,7 +19,7 @@ from .hybrid_retriever import HybridRetriever, RRFFusion
 
 # Sentence Chunking (SpaCy-basiert)
 try:
-    from .sentence_chunking import (
+    from .chunking import (
         SpacySentenceChunker,
         SentenceChunkingConfig,
         SentenceChunk,

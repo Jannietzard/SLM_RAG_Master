@@ -1033,3 +1033,106 @@ class BatchedOllamaEmbeddings(Embeddings):
         if hasattr(self, 'cache') and self.cache is not None:
             self.cache.close()
 
+
+
+# ============================================================================
+# SELF-TEST / DIAGNOSTICS
+# ============================================================================
+
+if __name__ == "__main__":
+    import unittest
+    import tempfile
+    import shutil
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    # Configure logging for tests
+    logging.basicConfig(level=logging.INFO)
+
+    class TestEmbeddingsModule(unittest.TestCase):
+        """Self-contained tests for embeddings module."""
+
+        def setUp(self):
+            """Create temporary directory for cache DB."""
+            self.test_dir = tempfile.mkdtemp()
+            self.db_path = Path(self.test_dir) / "test_embeddings.db"
+            
+        def tearDown(self):
+            """Cleanup temporary directory."""
+            shutil.rmtree(self.test_dir)
+
+        def test_cache_operations(self):
+            """Test SQLite cache put/get mechanisms."""
+            print("\n  Testing Cache Operations...", end="")
+            cache = EmbeddingCache(self.db_path)
+            
+            # Test Data
+            text = "Test Vector"
+            vec = [0.1, 0.2, 0.3]
+            model = "test-model"
+            
+            # 1. Put
+            cache.put(text, vec, model)
+            
+            # 2. Get (Hit)
+            result = cache.get(text, model)
+            self.assertEqual(result, vec, "Cache retrieval failed")
+            
+            # 3. Get (Miss)
+            self.assertIsNone(cache.get("Unknown", model), "Cache should return None for miss")
+            
+            cache.close()
+            print(" OK")
+
+        @patch('requests.post')
+        def test_batched_embedding_flow(self, mock_post):
+            """Test full embedding flow with mocked API."""
+            print("  Testing Batching & API Flow...", end="")
+            
+            # Mock Ollama Response
+            # Simulates an API response for a batch of 2 texts
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {
+                "embeddings": [
+                    [0.1] * 768,  # Vector for text 1
+                    [0.2] * 768   # Vector for text 2
+                ]
+            }
+            mock_post.return_value = mock_response
+
+            # Initialize Embedder with small batch size
+            embedder = BatchedOllamaEmbeddings(
+                model_name="test-model",
+                batch_size=2,
+                cache_path=self.db_path
+            )
+            
+            # Force dimension to avoid init API call in test
+            embedder._embedding_dim = 768 
+
+            texts = ["Text A", "Text B"]
+            
+            # Run Embedding
+            embeddings = embedder.embed_documents(texts)
+            
+            # Verifications
+            self.assertEqual(len(embeddings), 2)
+            self.assertEqual(embeddings[0], [0.1] * 768)
+            self.assertEqual(embedder.metrics.cache_misses, 2)
+            self.assertEqual(embedder.metrics.batch_count, 1) # 2 texts fit in 1 batch of size 2
+            
+            print(" OK")
+            
+            # Test Cache Hit on second run
+            print("  Testing Cache Hit Logic...", end="")
+            embedder.embed_documents(texts)
+            self.assertEqual(embedder.metrics.cache_hits, 2)
+            print(" OK")
+
+    print("\n" + "="*60)
+    print("RUNNING EMBEDDINGS.PY SELF-TESTS")
+    print("="*60)
+    
+    # Run tests
+    unittest.main(argv=['first-arg-is-ignored'], exit=False)

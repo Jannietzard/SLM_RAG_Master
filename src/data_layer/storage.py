@@ -576,6 +576,28 @@ class KuzuGraphStore:
         except Exception as e:
             self.logger.error(f"Failed to add source doc {doc_id}: {e}")
     
+    def add_entity(
+        self,
+        entity_id: str,
+        name: str,
+        entity_type: str = "unknown",
+    ) -> None:
+        """Add an entity node."""
+        try:
+            self.conn.execute(
+                """
+                MERGE (e:Entity {entity_id: $entity_id})
+                SET e.name = $name,
+                    e.entity_type = $entity_type
+                """,
+                {
+                    "entity_id": entity_id,
+                    "name": name,
+                    "entity_type": entity_type,
+                }
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to add entity {entity_id}: {e}")
     
     def add_from_source_relation(self, chunk_id: str, doc_id: str) -> None:
         """Create FROM_SOURCE relationship between chunk and document."""
@@ -920,38 +942,6 @@ class KuzuGraphStore:
         Returns a minimal wrapper that provides basic graph interface.
         """
         return _KuzuGraphWrapper(self)
-    
-    def add_entity(
-        self,
-        entity_id: str,
-        entity_type: str,
-        metadata: Dict[str, Any],
-    ) -> None:
-        """
-        Compatibility method for KnowledgeGraphStore interface.
-        
-        Maps to appropriate KuzuDB node type.
-        """
-        if entity_type == "document_chunk":
-            self.add_document_chunk(
-                chunk_id=entity_id,
-                text=metadata.get("text", ""),
-                page_number=metadata.get("page_number", 0),
-                chunk_index=metadata.get("chunk_index", 0),
-                source_file=metadata.get("source_file", "unknown"),
-            )
-        elif entity_type == "source_document":
-            self.add_source_document(
-                doc_id=entity_id,
-                filename=metadata.get("filename", entity_id),
-                total_pages=metadata.get("total_pages", 0),
-            )
-        else:
-            self.add_entity(
-                entity_id=entity_id,
-                name=metadata.get("name", entity_id),
-                entity_type=entity_type,
-            )
     
     def add_relation(
         self,

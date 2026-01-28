@@ -460,7 +460,7 @@ class TestSentenceChunking:
     def test_spacy_sentence_chunker(self):
         """Test SpaCy-based sentence chunking (wenn verfügbar)."""
         try:
-            from src.data_layer.sentence_chunking import (
+            from data_layer.chunking import (
                 SentenceBasedChunker, 
                 SentenceChunkingConfig
             )
@@ -494,7 +494,7 @@ class TestSemanticChunking:
     def test_semantic_chunker(self):
         """Test semantic chunker with quality metrics."""
         try:
-            from src.data_layer.semantic_chunking import (
+            from data_layer.chunking import (
                 create_semantic_chunker
             )
             from langchain.schema import Document
@@ -531,7 +531,7 @@ class TestSemanticChunking:
     def test_header_extraction(self):
         """Test header/section extraction."""
         try:
-            from src.data_layer.semantic_chunking import HeaderExtractor
+            from data_layer.chunking import HeaderExtractor
         except ImportError:
             pytest.skip("semantic_chunking module not available")
         
@@ -873,7 +873,7 @@ class TestFullPipeline:
         """Verify implementation matches Thesis Abschnitt 2 specifications."""
         try:
             from src.data_layer.entity_extraction import ExtractionConfig
-            from src.data_layer.sentence_chunking import SentenceChunkingConfig
+            from data_layer.chunking import SentenceChunkingConfig
         except ImportError:
             pytest.skip("Required modules not available")
         

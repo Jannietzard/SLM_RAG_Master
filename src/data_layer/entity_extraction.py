@@ -62,12 +62,6 @@ Diese Komponente fehlt komplett in der aktuellen Implementierung!
 Sie ist essentiell für die Funktionsfähigkeit des Hybrid Index.
 """
 
-from typing import List, Dict, Any
-from src.data_layer.entity_extraction import (
-    EntityExtractionPipeline,
-    ChunkExtractionResult,
-    ExtractionConfig
-)
 from src.data_layer.storage import KuzuGraphStore
 # ============================================================================
 # REBEL INTEGRATION (Transformers)
@@ -160,14 +154,31 @@ class ExtractionConfig:
     # GLiNER
     gliner_model: str = "urchade/gliner_small-v2.1"
     entity_types: List[str] = field(default_factory=lambda: [
-        "PERSON", "ORGANIZATION", "LOCATION", "DATE", "EVENT", "CONCEPT"
+        "PERSON", 
+        "ORGANIZATION", 
+        "GPE",          # Geo-Political Entity (Länder, Städte) - präziser als LOCATION
+        "LOCATION",
+        "PLACE",
+        "DATE", 
+        "EVENT",
+        "CONCEPT",    # Basierend auf GLiNER-Paper und gängigen NER-Taxonomien 
+        "WORK_OF_ART", 
+        "STRUCTURE",
+        "NATURAL_OBJECT",
+        "LAW",      
+        # Hovy,2006
+        # Domänenspezifische Erweiterungen (Begründet durch Edge/IT-Kontext)
+        # Ersetzt das vage "CONCEPT" für bessere GLiNER-Performance
+        "TECHNOLOGY",   # Hardware, Software, Protokolle
+        "SCIENTIFIC_TERM", # Fachbegriffe, Theorien
+        "PRODUCT"
     ])
-    ner_confidence_threshold: float = 0.5
+    ner_confidence_threshold: float = 0.15
     ner_batch_size: int = 16
     
     # REBEL
     rebel_model: str = "Babelscape/rebel-large"
-    re_confidence_threshold: float = 0.7
+    re_confidence_threshold: float = 0.5
     re_batch_size: int = 8
     min_entities_for_re: int = 2  # Nur RE wenn >= 2 Entitäten
     
@@ -179,208 +190,7 @@ class ExtractionConfig:
     # Selective RE
     selective_re: bool = True
 
-class EntityGraphIntegrator:
-    """
-    Integriert Entity Extraction Ergebnisse in den Knowledge Graph.
-    
-    KRITISCHE KOMPONENTE: Ohne diese Integration bleiben Entities
-    nur in der Extraction Pipeline, kommen aber nie in den Graph!
-    
-    Workflow:
-    1. Chunks werden durch EntityExtractionPipeline verarbeitet
-    2. EntityGraphIntegrator nimmt ChunkExtractionResults
-    3. Erstellt Entity-Nodes und MENTIONS/RELATED_TO Edges in KuzuDB
-    """
-    
-    def __init__(
-        self,
-        graph_store: KuzuGraphStore,
-        entity_pipeline: EntityExtractionPipeline = None
-    ):
-        self.graph_store = graph_store
-        self.entity_pipeline = entity_pipeline or EntityExtractionPipeline()
-        self.logger = logging.getLogger(__name__)
-        
-        # Statistiken
-        self.stats = {
-            "chunks_processed": 0,
-            "entities_added": 0,
-            "mentions_added": 0,
-            "relations_added": 0,
-        }
-    
-    def integrate_chunk_results(
-        self,
-        results: List[ChunkExtractionResult]
-    ) -> None:
-        """
-        Integriere Extraction-Ergebnisse in Graph.
-        
-        Args:
-            results: Liste von ChunkExtractionResult
-        """
-        for result in results:
-            self._integrate_single_chunk(result)
-    
-    def _integrate_single_chunk(
-        self,
-        result: ChunkExtractionResult
-    ) -> None:
-        """Integriere ein einzelnes ChunkExtractionResult."""
-        self.stats["chunks_processed"] += 1
-        
-        # 1. Entities als Nodes hinzufügen
-        for entity in result.entities:
-            try:
-                # Entity Node erstellen/updaten
-                self.graph_store.conn.execute(
-                    """
-                    MERGE (e:Entity {entity_id: $entity_id})
-                    SET e.name = $name,
-                        e.type = $type,
-                        e.mention_count = COALESCE(e.mention_count, 0) + 1
-                    """,
-                    {
-                        "entity_id": entity.entity_id,
-                        "name": entity.name,
-                        "type": entity.entity_type,
-                    }
-                )
-                self.stats["entities_added"] += 1
-                
-                # MENTIONS Edge erstellen
-                # Verbinde DocumentChunk -> Entity
-                self.graph_store.conn.execute(
-                    """
-                    MATCH (c:DocumentChunk {chunk_id: $chunk_id})
-                    MATCH (e:Entity {entity_id: $entity_id})
-                    MERGE (c)-[m:MENTIONS]->(e)
-                    SET m.mention_span = $mention_span,
-                        m.confidence = $confidence
-                    """,
-                    {
-                        "chunk_id": result.chunk_id,
-                        "entity_id": entity.entity_id,
-                        "mention_span": str(entity.mention_span),
-                        "confidence": entity.confidence,
-                    }
-                )
-                self.stats["mentions_added"] += 1
-                
-            except Exception as e:
-                self.logger.error(
-                    f"Failed to add entity {entity.name} for chunk {result.chunk_id}: {e}"
-                )
-        
-        # 2. Relations als RELATED_TO Edges hinzufügen
-        for relation in result.relations:
-            try:
-                # Finde oder erstelle Subject Entity
-                subj_id = self._get_or_create_entity_id(
-                    relation.subject_entity,
-                    "CONCEPT"  # Default type
-                )
-                
-                # Finde oder erstelle Object Entity
-                obj_id = self._get_or_create_entity_id(
-                    relation.object_entity,
-                    "CONCEPT"
-                )
-                
-                # RELATED_TO Edge erstellen
-                self.graph_store.conn.execute(
-                    """
-                    MATCH (e1:Entity {entity_id: $subj_id})
-                    MATCH (e2:Entity {entity_id: $obj_id})
-                    MERGE (e1)-[r:RELATED_TO]->(e2)
-                    SET r.relation_type = $relation_type,
-                        r.confidence = $confidence,
-                        r.source_chunks = COALESCE(r.source_chunks, '') || ',' || $chunk_id
-                    """,
-                    {
-                        "subj_id": subj_id,
-                        "obj_id": obj_id,
-                        "relation_type": relation.relation_type,
-                        "confidence": relation.confidence,
-                        "chunk_id": result.chunk_id,
-                    }
-                )
-                self.stats["relations_added"] += 1
-                
-            except Exception as e:
-                self.logger.error(
-                    f"Failed to add relation {relation.subject_entity} -> "
-                    f"{relation.object_entity} for chunk {result.chunk_id}: {e}"
-                )
-    
-    def _get_or_create_entity_id(
-        self,
-        entity_name: str,
-        entity_type: str
-    ) -> str:
-        """Hole Entity ID oder erstelle neue Entity."""
-        import hashlib
-        
-        # Generiere Entity ID (konsistent mit GLiNER)
-        entity_id = hashlib.md5(
-            f"{entity_name.lower()}:{entity_type}".encode()
-        ).hexdigest()[:12]
-        
-        # Erstelle Entity falls nicht existiert
-        try:
-            self.graph_store.conn.execute(
-                """
-                MERGE (e:Entity {entity_id: $entity_id})
-                SET e.name = $name,
-                    e.type = $type,
-                    e.mention_count = COALESCE(e.mention_count, 0) + 1
-                """,
-                {
-                    "entity_id": entity_id,
-                    "name": entity_name,
-                    "type": entity_type,
-                }
-            )
-        except Exception as e:
-            self.logger.warning(f"Failed to create entity {entity_name}: {e}")
-        
-        return entity_id
-    
-    def process_and_integrate_chunks(
-        self,
-        texts: List[str],
-        chunk_ids: List[str]
-    ) -> List[ChunkExtractionResult]:
-        """
-        End-to-End: Extraction + Graph Integration.
-        
-        Args:
-            texts: Chunk-Texte
-            chunk_ids: Chunk-IDs
-            
-        Returns:
-            Extraction-Ergebnisse
-        """
-        # Entity Extraction
-        self.logger.info(f"Extracting entities from {len(texts)} chunks...")
-        results = self.entity_pipeline.process_chunks_batch(texts, chunk_ids)
-        
-        # Graph Integration
-        self.logger.info("Integrating entities into graph...")
-        self.integrate_chunk_results(results)
-        
-        self.logger.info(
-            f"Integration complete: "
-            f"{self.stats['entities_added']} entities, "
-            f"{self.stats['mentions_added']} mentions, "
-            f"{self.stats['relations_added']} relations"
-        )
-        
-        return results
-    
-    def get_stats(self) -> Dict[str, int]:
-        """Hole Integrations-Statistiken."""
-        return self.stats.copy()
+
 # ============================================================================
 # ENTITY CACHE (LRU + SQLite Persistent)
 # ============================================================================
@@ -699,100 +509,78 @@ class GLiNERExtractor:
 # REBEL RELATION EXTRACTOR
 # ============================================================================
 
+# Ersetzen Sie die gesamte REBELExtractor Klasse in entity_extraction.py hiermit:
+
 class REBELExtractor:
     """
     Relation Extraction mit REBEL.
-    
-    REBEL (Relation Extraction By End-to-end Language generation) ist ein
-    Seq2Seq-Modell, das Tripel (Subject, Relation, Object) aus Text extrahiert.
-    
-    Optimierung: Nur auf Chunks mit >= 2 Entitäten anwenden (60% weniger Aufrufe).
-    
-    Referenz: Cabot & Navigli (2021). "REBEL: Relation Extraction By 
-    End-to-end Language generation"
+    Implementierung via model.generate() statt pipeline(), um Task-Fehler zu vermeiden.
     """
     
     def __init__(self, config: ExtractionConfig):
         self.config = config
-        self.pipeline = None
+        self.model = None
+        self.tokenizer = None
+        self.device = "cpu"  # Oder "cuda" wenn verfügbar
         self._load_model()
     
     def _load_model(self):
-        """Lade REBEL Pipeline."""
         if not TRANSFORMERS_AVAILABLE:
             logger.warning("Transformers not available, REBEL disabled")
             return
         
         try:
             logger.info(f"Loading REBEL model: {self.config.rebel_model}")
-            
-            # Tokenizer und Model laden
             self.tokenizer = AutoTokenizer.from_pretrained(self.config.rebel_model)
             self.model = AutoModelForSeq2SeqLM.from_pretrained(self.config.rebel_model)
-            
-            self.pipeline = pipeline(
-                "text2text-generation",
-                model=self.model,
-                tokenizer=self.tokenizer,
-                device=-1,  # CPU
-            )
-            
+            self.model.to(self.device)
             logger.info("REBEL model loaded successfully")
-            
         except Exception as e:
             logger.error(f"Failed to load REBEL: {e}")
-            self.pipeline = None
+            self.model = None
     
-    def extract(
-        self, 
-        text: str, 
-        entities: List[ExtractedEntity],
-        chunk_id: str
-    ) -> List[ExtractedRelation]:
-        """
-        Extrahiere Relationen aus Text.
-        
-        Args:
-            text: Input-Text
-            entities: Bereits extrahierte Entitäten
-            chunk_id: ID des Chunks
-            
-        Returns:
-            Liste von ExtractedRelation Objekten
-        """
-        # Optimierung: Nur wenn >= min_entities_for_re Entitäten
+    def extract(self, text: str, entities: List[ExtractedEntity], chunk_id: str) -> List[ExtractedRelation]:
+        # Optimization: Skip if not enough entities (Thesis 2.5)
         if len(entities) < self.config.min_entities_for_re:
             return []
         
-        if self.pipeline is None:
+        if self.model is None:
             return []
         
         try:
-            # REBEL Output generieren
-            output = self.pipeline(
-                text,
+            # Tokenize & Generate
+            inputs = self.tokenizer(
+                text, max_length=256, padding=True, truncation=True, return_tensors="pt"
+            ).to(self.device)
+
+            generated_ids = self.model.generate(
+                inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
                 max_length=256,
                 num_beams=5,
                 num_return_sequences=1,
             )
-            
-            # Tripel aus Output parsen
-            raw_text = output[0]["generated_text"]
+
+            # Decode
+            raw_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=False)
+            # Cleanup special tokens that might break parsing
+            raw_text = raw_text.replace("<s>", "").replace("</s>", "").replace("<pad>", "")
+
             triplets = self._parse_triplets(raw_text)
             
-            # Entity-Namen für Filterung
+            # Filter: Keep only relations connecting known entities
             entity_names = {e.name.lower() for e in entities}
-            
             results = []
+            
             for subj, rel, obj in triplets:
-                # Nur Relationen zwischen bekannten Entitäten
-                if (subj.lower() in entity_names or 
-                    any(subj.lower() in e.lower() for e in entity_names)):
-                    
+                # Check if subject or object matches any extracted entity (fuzzy match)
+                is_relevant = any(e in subj.lower() or e in obj.lower() for e in entity_names)
+                
+                if is_relevant:
                     relation = ExtractedRelation(
-                        subject_entity=subj,
-                        relation_type=rel,
-                        object_entity=obj,
+                        subject_entity=subj.strip(),
+                        relation_type=rel.strip(),
+                        object_entity=obj.strip(),
                         confidence=self.config.re_confidence_threshold,
                         source_chunk_ids=[chunk_id],
                     )
@@ -803,113 +591,35 @@ class REBELExtractor:
         except Exception as e:
             logger.error(f"REBEL extraction failed: {e}")
             return []
-    
-    def _parse_triplets(self, text: str) -> List[Tuple[str, str, str]]:
-        """
-        Parse REBEL Output in Tripel.
-        
-        REBEL Output Format: 
-        "<triplet> Subject <subj> Relation <obj> Object <triplet> ..."
-        """
-        triplets = []
-        
-        # Split by triplet markers
-        parts = text.split("<triplet>")
-        
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-            
-            try:
-                # Parse: "Subject <subj> Relation <obj> Object"
-                if "<subj>" in part and "<obj>" in part:
-                    subj_split = part.split("<subj>")
-                    subject = subj_split[0].strip()
-                    
-                    rest = subj_split[1] if len(subj_split) > 1 else ""
-                    obj_split = rest.split("<obj>")
-                    relation = obj_split[0].strip()
-                    obj = obj_split[1].strip() if len(obj_split) > 1 else ""
-                    
-                    if subject and relation and obj:
-                        triplets.append((subject, relation, obj))
-                        
-            except Exception as e:
-                logger.debug(f"Failed to parse triplet: {part}, error: {e}")
-        
-        return triplets
-    
-    def extract_batch(
-        self,
-        texts: List[str],
-        entities_per_text: List[List[ExtractedEntity]],
-        chunk_ids: List[str]
-    ) -> List[List[ExtractedRelation]]:
-        """
-        Batch Relation Extraction.
-        
-        Selective RE: Nur Texte mit >= min_entities_for_re werden verarbeitet.
-        """
-        all_results = []
-        
-        # Filter Texte mit genug Entitäten
-        indices_to_process = []
-        texts_to_process = []
-        
-        for i, (text, entities) in enumerate(zip(texts, entities_per_text)):
-            if len(entities) >= self.config.min_entities_for_re:
-                indices_to_process.append(i)
-                texts_to_process.append(text)
-            else:
-                all_results.append([])
-        
-        if not texts_to_process or self.pipeline is None:
-            return [[] for _ in texts]
-        
-        # Batch Processing
-        batch_size = self.config.re_batch_size
-        processed_results = []
-        
-        for i in range(0, len(texts_to_process), batch_size):
-            batch = texts_to_process[i:i + batch_size]
-            
-            try:
-                outputs = self.pipeline(
-                    batch,
-                    max_length=256,
-                    num_beams=5,
-                    num_return_sequences=1,
-                    batch_size=len(batch),
-                )
-                
-                for output in outputs:
-                    raw_text = output[0]["generated_text"] if isinstance(output, list) else output["generated_text"]
-                    triplets = self._parse_triplets(raw_text)
-                    
-                    relations = [
-                        ExtractedRelation(
-                            subject_entity=subj,
-                            relation_type=rel,
-                            object_entity=obj,
-                            confidence=self.config.re_confidence_threshold,
-                            source_chunk_ids=[],
-                        )
-                        for subj, rel, obj in triplets
-                    ]
-                    processed_results.append(relations)
-                    
-            except Exception as e:
-                logger.error(f"Batch RE failed: {e}")
-                processed_results.extend([[] for _ in batch])
-        
-        # Merge results in correct order
-        final_results = [[] for _ in texts]
-        for idx, rels in zip(indices_to_process, processed_results):
-            final_results[idx] = rels
-        
-        return final_results
 
+    def _parse_triplets(self, text: str) -> List[Tuple[str, str, str]]:
+        triplets = []
+        try:
+            # REBEL Format ist oft: Subject <subj> Object <obj> Relation
+            parts = text.split("<triplet>")
+            for part in parts:
+                if "<subj>" in part and "<obj>" in part:
+                    subj_parts = part.split("<subj>")
+                    subject = subj_parts[0]
+                    
+                    # Split nach Object und Relation
+                    obj_rel_parts = subj_parts[1].split("<obj>")
+                    object_ = obj_rel_parts[0]  # Das ist das Objekt (z.B. Bill Gates)
+                    relation = obj_rel_parts[1] # Das ist die Relation (z.B. founded by)
+                    
+                    if subject and relation and object_:
+                        triplets.append((subject.strip(), relation.strip(), object_.strip()))
+        except Exception:
+            pass
+        return triplets
+
+    def extract_batch(self, texts, entities_per_text, chunk_ids):
+        # Fallback to sequential for stability if batching is complex with manual generate
+        # Or implement manual batching similar to extract() but with padded inputs
+        results = []
+        for t, e, c in zip(texts, entities_per_text, chunk_ids):
+            results.append(self.extract(t, e, c))
+        return results
 
 # ============================================================================
 # UNIFIED EXTRACTION PIPELINE
@@ -1265,7 +975,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     
     # Test Pipeline
-    pipeline = create_extraction_pipeline()
+    pipeline = create_extraction_pipeline(cache_enabled=False)
     
     test_texts = [
         "Albert Einstein was born in Ulm, Germany in 1879. He worked at Princeton University.",

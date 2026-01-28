@@ -210,23 +210,6 @@ class QueryEntityExtractor:
 # ============================================================================
 # RRF FUSION
 # ============================================================================
-
-class RRFFusion:
-    """
-    Reciprocal Rank Fusion (RRF) für Score-Kombination.
-    
-    Formel: RRF(d) = Σ 1/(k + rank_i(d))
-    
-    Wobei:
-        - d = Dokument
-        - k = Konstante (typisch 60)
-        - rank_i(d) = Rang von d in Retriever i (1-basiert)
-    
-    Eigenschaften:
-        - Rank-basiert, nicht Score-basiert
-        - Robust gegenüber Score-Verteilungsunterschieden
-        - Belohnt Dokumente, die in mehreren Listen hoch gerankt sind
-    """
     
 class RRFFusion:
     def __init__(self, k: int = 60, cross_source_boost: float = 1.2):
