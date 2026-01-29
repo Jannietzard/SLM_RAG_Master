@@ -325,6 +325,16 @@ class EmbeddingCache:
         
         self._init_db()
 
+    @property
+    def db_path(self) -> Path:
+        """
+        Alias for cache_path for API compatibility.
+        
+        Returns:
+            Path to the SQLite database file
+        """
+        return self.cache_path
+
     def _init_db(self) -> None:
         """
         Initialize SQLite database schema.

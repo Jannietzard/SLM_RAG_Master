@@ -77,7 +77,7 @@ import json
 import shutil
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
 import numpy as np
@@ -609,6 +609,40 @@ class KuzuGraphStore:
         except Exception as e:
             self.logger.error(f"Failed to add entity {entity_id}: {e}")
     
+    def add_entity_from_metadata(
+        self,
+        entity_id: str,
+        entity_type: str,
+        metadata: Dict[str, Any],
+    ) -> None:
+        """
+        Add an entity node from metadata (compatibility wrapper).
+        
+        Routes to appropriate add method based on entity_type.
+        Provides API compatibility with hybrid store interface.
+        """
+        if entity_type == "document_chunk":
+            self.add_document_chunk(
+                chunk_id=entity_id,
+                text=metadata.get("text", ""),
+                page_number=metadata.get("page_number", 0),
+                chunk_index=metadata.get("chunk_index", 0),
+                source_file=metadata.get("source_file", ""),
+            )
+        elif entity_type == "source_document":
+            self.add_source_document(
+                doc_id=entity_id,
+                filename=metadata.get("filename", entity_id),
+                total_pages=metadata.get("total_pages", 0),
+            )
+        else:
+            # Generic entity
+            self.add_entity(
+                entity_id=entity_id,
+                name=metadata.get("name", entity_id),
+                entity_type=entity_type,
+            )
+    
     def add_from_source_relation(self, chunk_id: str, doc_id: str) -> None:
         """Create FROM_SOURCE relationship between chunk and document."""
         try:
@@ -794,6 +828,66 @@ class KuzuGraphStore:
             self.logger.error(f"find_related_chunks failed: {e}")
         
         return related
+    
+    def get_context_chunks(
+        self,
+        chunk_id: str,
+        window: int = 2,
+    ) -> List[str]:
+        """
+        Get context chunks within a window using NEXT_CHUNK relations.
+        
+        Retrieves neighboring chunks both before and after the given chunk
+        by traversing NEXT_CHUNK relationships.
+        
+        Args:
+            chunk_id: Center chunk ID
+            window: Number of chunks before/after to include
+            
+        Returns:
+            List of chunk IDs in sequential order
+        """
+        context_chunks = [chunk_id]
+        
+        try:
+            # Get forward chunks (following NEXT_CHUNK direction)
+            result = self.conn.execute(
+                f"""
+                MATCH path = (start:DocumentChunk {{chunk_id: $chunk_id}})-[:NEXT_CHUNK*1..{window}]->(next:DocumentChunk)
+                RETURN next.chunk_id AS chunk_id, length(path) AS distance
+                ORDER BY distance ASC
+                """,
+                {"chunk_id": chunk_id}
+            )
+            
+            while result.has_next():
+                row = result.get_next()
+                if row[0] and row[0] not in context_chunks:
+                    context_chunks.append(row[0])
+            
+            # Get backward chunks (reverse NEXT_CHUNK direction)
+            result = self.conn.execute(
+                f"""
+                MATCH path = (prev:DocumentChunk)-[:NEXT_CHUNK*1..{window}]->(end:DocumentChunk {{chunk_id: $chunk_id}})
+                RETURN prev.chunk_id AS chunk_id, length(path) AS distance
+                ORDER BY distance DESC
+                """,
+                {"chunk_id": chunk_id}
+            )
+            
+            backward_chunks = []
+            while result.has_next():
+                row = result.get_next()
+                if row[0] and row[0] not in context_chunks:
+                    backward_chunks.append(row[0])
+            
+            # Prepend backward chunks to maintain order
+            context_chunks = backward_chunks + context_chunks
+                
+        except Exception as e:
+            self.logger.debug(f"get_context_chunks note: {e}")
+        
+        return context_chunks
     
     def find_chunks_by_entity(
         self,
@@ -1061,6 +1155,19 @@ class NetworkXGraphStore:
     ) -> None:
         self.graph.add_node(entity_id, entity_type=entity_type, **metadata)
     
+    def add_entity_from_metadata(
+        self,
+        entity_id: str,
+        entity_type: str,
+        metadata: Dict[str, Any],
+    ) -> None:
+        """
+        Add an entity node from metadata (alias for add_entity).
+        
+        Provides API compatibility with hybrid store interface.
+        """
+        self.add_entity(entity_id, entity_type, metadata)
+    
     def add_relation(
         self,
         source_id: str,
@@ -1100,6 +1207,59 @@ class NetworkXGraphStore:
                         queue.append((neighbor, hops + 1))
         
         return visited
+    
+    def get_context_chunks(
+        self,
+        chunk_id: str,
+        window: int = 2,
+    ) -> List[str]:
+        """
+        Get context chunks within a window using next_chunk relations.
+        
+        Args:
+            chunk_id: Center chunk ID
+            window: Number of chunks before/after to include
+            
+        Returns:
+            List of chunk IDs in sequential order
+        """
+        if chunk_id not in self.graph:
+            return []
+        
+        context_chunks = [chunk_id]
+        
+        # Forward traversal (following next_chunk edges)
+        current = chunk_id
+        for _ in range(window):
+            found_next = False
+            for neighbor in self.graph.neighbors(current):
+                edge_data = self.graph.get_edge_data(current, neighbor)
+                if edge_data and edge_data.get("relation_type") == "next_chunk":
+                    if neighbor not in context_chunks:
+                        context_chunks.append(neighbor)
+                        current = neighbor
+                        found_next = True
+                        break
+            if not found_next:
+                break
+        
+        # Backward traversal (reverse next_chunk edges)
+        current = chunk_id
+        backward_chunks = []
+        for _ in range(window):
+            found_prev = False
+            for predecessor in self.graph.predecessors(current):
+                edge_data = self.graph.get_edge_data(predecessor, current)
+                if edge_data and edge_data.get("relation_type") == "next_chunk":
+                    if predecessor not in context_chunks and predecessor not in backward_chunks:
+                        backward_chunks.insert(0, predecessor)
+                        current = predecessor
+                        found_prev = True
+                        break
+            if not found_prev:
+                break
+        
+        return backward_chunks + context_chunks
     
     def save(self) -> None:
         self.graph_path.parent.mkdir(parents=True, exist_ok=True)

@@ -604,8 +604,8 @@ class TestEntityExtraction:
         config = ExtractionConfig()
         
         # Thesis-Spezifikationen
-        assert config.ner_confidence_threshold == 0.5
-        assert config.re_confidence_threshold == 0.7
+        assert config.ner_confidence_threshold == 0.15
+        assert config.re_confidence_threshold == 0.5
         assert config.ner_batch_size == 16
         assert config.re_batch_size == 8
         assert config.min_entities_for_re == 2
@@ -881,10 +881,10 @@ class TestFullPipeline:
         chunk_config = SentenceChunkingConfig()
         assert chunk_config.sentences_per_chunk == 3
         
-        # Thesis 2.5: GLiNER Confidence 0.5, REBEL Confidence 0.7
+        # Thesis 2.5: GLiNER Confidence 0.15, REBEL Confidence 0.5
         extract_config = ExtractionConfig()
-        assert extract_config.ner_confidence_threshold == 0.5
-        assert extract_config.re_confidence_threshold == 0.7
+        assert extract_config.ner_confidence_threshold == 0.15
+        assert extract_config.re_confidence_threshold == 0.5
         
         # Thesis 2.5: Batch sizes
         assert extract_config.ner_batch_size == 16

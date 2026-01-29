@@ -35,9 +35,8 @@ Latenz-Budgets:
 import logging
 import time
 import json
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -181,24 +180,26 @@ class AgentPipeline:
     def _lazy_init_agents(self):
         """Lazy initialization der Agenten wenn noch nicht vorhanden."""
         if self.planner is None:
-            from ..logic_layer.planner import QueryPlanner
-            self.planner = QueryPlanner()
+            from ..logic_layer.planner import Planner
+            self.planner = Planner()
             logger.info("Planner (S_P) lazy-initialized")
         
         if self.navigator is None:
-            from ..logic_layer.navigator import Navigator, StandaloneNavigator
+            from ..logic_layer.Agent import Navigator, ControllerConfig
+            nav_config = ControllerConfig()
             if self.hybrid_retriever is not None:
-                self.navigator = Navigator(self.hybrid_retriever, self.config)
+                self.navigator = Navigator(nav_config)
+                self.navigator.set_retriever(self.hybrid_retriever)
             else:
-                self.navigator = StandaloneNavigator(self.config)
+                self.navigator = Navigator(nav_config)
             logger.info("Navigator (S_N) lazy-initialized")
         
         if self.verifier is None:
-            from ..logic_layer.verifier import Verifier
+            from ..logic_layer.verifier import Verifier, VerifierConfig
+            verifier_config = VerifierConfig()
             self.verifier = Verifier(
-                graph_store=self.graph_store,
-                use_mock_generator=True,  # Default to mock for safety
-                config=self.config
+                config=verifier_config,
+                graph_store=self.graph_store
             )
             logger.info("Verifier (S_V) lazy-initialized")
     
@@ -242,7 +243,7 @@ class AgentPipeline:
         )
         
         # Early Exit check
-        if self.enable_early_exit and plan.is_trivial:
+        if self.enable_early_exit and plan.query_type.value == "single_hop" and plan.confidence > 0.95:
             self._stats["early_exits"] += 1
             logger.info(f"Early exit for trivial query: {query[:50]}...")
             
@@ -503,7 +504,7 @@ def create_pipeline(
     
     Args:
         config: Konfiguration aus settings.yaml
-        use_mock: True für MockGenerator (Tests ohne GPU)
+        use_mock: True für MockGenerator (Tests ohne GPU) - Note: currently unused
     
     Returns:
         Konfigurierte AgentPipeline
@@ -511,17 +512,16 @@ def create_pipeline(
     config = config or {}
     
     # Import agents
-    from ..logic_layer.planner import QueryPlanner, create_planner
-    from ..logic_layer.navigator import StandaloneNavigator
-    from ..logic_layer.verifier import Verifier
+    from logic_layer.planner import Planner, create_planner
+    from logic_layer.Agent import Navigator, ControllerConfig
+    from logic_layer.verifier import Verifier, VerifierConfig
     
     # Create agents
     planner = create_planner(config)
-    navigator = StandaloneNavigator(config)
-    verifier = Verifier(
-        use_mock_generator=use_mock,
-        config=config
-    )
+    nav_config = ControllerConfig()
+    navigator = Navigator(nav_config)
+    verifier_config = VerifierConfig()
+    verifier = Verifier(config=verifier_config)
     
     return AgentPipeline(
         planner=planner,
@@ -544,7 +544,7 @@ def create_full_pipeline(
         hybrid_retriever: HybridRetriever Instanz
         graph_store: KnowledgeGraphStore Instanz
         config: Konfiguration
-        use_mock_generator: True für MockGenerator
+        use_mock_generator: True für MockGenerator - Note: currently unused
     
     Returns:
         Vollständig konfigurierte Pipeline
@@ -552,15 +552,18 @@ def create_full_pipeline(
     config = config or {}
     
     from ..logic_layer.planner import create_planner
-    from ..logic_layer.navigator import Navigator
-    from ..logic_layer.verifier import Verifier
+    from ..logic_layer.Agent import Navigator, ControllerConfig
+    from ..logic_layer.verifier import Verifier, VerifierConfig
     
     planner = create_planner(config)
-    navigator = Navigator(hybrid_retriever, config)
+    nav_config = ControllerConfig()
+    navigator = Navigator(nav_config)
+    navigator.set_retriever(hybrid_retriever)
+    
+    verifier_config = VerifierConfig()
     verifier = Verifier(
-        graph_store=graph_store,
-        use_mock_generator=use_mock_generator,
-        config=config
+        config=verifier_config,
+        graph_store=graph_store
     )
     
     return AgentPipeline(
@@ -591,15 +594,18 @@ if __name__ == "__main__":
     print("="*70)
     
     # Direkte Imports für Test
-    from src.logic_layer.planner import QueryPlanner
-    from src.logic_layer.navigator import StandaloneNavigator
-    from src.logic_layer.verifier import Verifier
+    from src.logic_layer.planner import Planner
+    from src.logic_layer.Agent import Navigator, ControllerConfig
+    from src.logic_layer.verifier import Verifier, VerifierConfig
     
     # Create pipeline mit Mock-Komponenten
+    nav_config = ControllerConfig()
+    verifier_config = VerifierConfig()
+    
     pipeline = AgentPipeline(
-        planner=QueryPlanner(),
-        navigator=StandaloneNavigator(),
-        verifier=Verifier(use_mock_generator=True),
+        planner=Planner(),
+        navigator=Navigator(nav_config),
+        verifier=Verifier(config=verifier_config),
         enable_early_exit=True,
         enable_caching=True
     )

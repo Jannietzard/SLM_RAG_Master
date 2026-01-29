@@ -77,6 +77,23 @@ class RetrievalConfig:
     
     # SpaCy für Query Entity Extraction
     spacy_model: str = "en_core_web_sm"
+    
+    # Alias parameters for API compatibility
+    top_k_vector: int = None  # Alias for vector_top_k
+    top_k_graph: int = None   # Alias for graph_top_k
+    vector_weight: float = 0.7  # Weight for vector results in fusion
+    graph_weight: float = 0.3   # Weight for graph results in fusion
+    
+    def __post_init__(self):
+        """Handle alias parameters."""
+        # If alias parameters provided, use them
+        if self.top_k_vector is not None:
+            self.vector_top_k = self.top_k_vector
+        if self.top_k_graph is not None:
+            self.graph_top_k = self.top_k_graph
+        # Set aliases to actual values for consistency
+        self.top_k_vector = self.vector_top_k
+        self.top_k_graph = self.graph_top_k
 
 
 @dataclass
@@ -754,7 +771,7 @@ class PreGenerativeFilter:
             
             for accepted in filtered:
                 sim = jaccard_similarity(candidate.text, accepted.text)
-                if sim > self.jaccard_threshold:
+                if sim >= self.jaccard_threshold:
                     is_redundant = True
                     break
             
