@@ -58,7 +58,7 @@ import logging
 import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum
 
 logger = logging.getLogger(__name__)
@@ -224,7 +224,7 @@ def load_ingestion_config(config_path: Union[str, Path] = None) -> IngestionConf
         config_dict = config_dict["chunking"]
     
     # Filter to only valid fields
-    valid_fields = {f.name for f in IngestionConfig.__dataclass_fields__.values()}
+    valid_fields = {f.name for f in fields(IngestionConfig)}
     filtered_dict = {k: v for k, v in config_dict.items() if k in valid_fields}
     
     logger.info(f"Loaded ingestion config from: {config_path}")

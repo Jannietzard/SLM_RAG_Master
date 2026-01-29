@@ -1521,6 +1521,92 @@ class HybridStore:
         
         return stats
     
+    def vector_search(
+        self,
+        query_embedding: List[float],
+        top_k: int = 5,
+        threshold: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Perform vector similarity search.
+        
+        Wrapper method that delegates to VectorStoreAdapter.
+        
+        Args:
+            query_embedding: Query embedding vector
+            top_k: Number of results to return
+            threshold: Minimum similarity threshold
+            
+        Returns:
+            List of search results with text, similarity, and metadata
+        """
+        return self.vector_store.vector_search(
+            query_embedding=query_embedding,
+            top_k=top_k,
+            threshold=threshold,
+        )
+    
+    def graph_search(
+        self,
+        entities: List[str],
+        max_hops: int = 2,
+        top_k: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Perform graph-based search using entity mentions.
+        
+        Finds chunks that mention the given entities and related chunks.
+        
+        Args:
+            entities: List of entity names to search for
+            max_hops: Maximum hops for graph traversal
+            top_k: Maximum results to return
+            
+        Returns:
+            List of chunks with entity matches and hop distances
+        """
+        results = []
+        seen_chunks = set()
+        
+        for entity_name in entities:
+            # Find chunks mentioning this entity
+            if isinstance(self.graph_store, KuzuGraphStore):
+                entity_chunks = self.graph_store.find_chunks_by_entity(
+                    entity_name=entity_name,
+                    max_results=top_k,
+                )
+            else:
+                # NetworkX fallback - basic node search
+                entity_chunks = []
+                for node in self.graph_store.graph.nodes():
+                    if entity_name.lower() in str(node).lower():
+                        neighbors = self.graph_store.graph_traversal(node, max_hops=max_hops)
+                        for neighbor, hops in neighbors.items():
+                            if neighbor not in seen_chunks:
+                                entity_chunks.append({
+                                    "chunk_id": neighbor,
+                                    "text": "",
+                                    "source_file": "",
+                                    "entity": entity_name,
+                                    "hops": hops,
+                                })
+            
+            for chunk in entity_chunks:
+                chunk_id = chunk.get("chunk_id")
+                if chunk_id and chunk_id not in seen_chunks:
+                    seen_chunks.add(chunk_id)
+                    results.append({
+                        "chunk_id": chunk_id,
+                        "text": chunk.get("text", ""),
+                        "source_file": chunk.get("source_file", ""),
+                        "matched_entity": entity_name,
+                        "hops": chunk.get("hops", 0),
+                    })
+        
+        # Sort by hops (closer = better) and limit results
+        results.sort(key=lambda x: x.get("hops", 999))
+        return results[:top_k]
+    
     def save(self) -> None:
         """Persist stores to disk."""
         self.graph_store.save()

@@ -38,6 +38,7 @@ import json
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
 from pathlib import Path
+from dataclasses import asdict
 
 logger = logging.getLogger(__name__)
 
@@ -267,13 +268,17 @@ class AgentPipeline:
         # Stage 2: S_N (Navigator)
         navigator_start = time.time()
         
-        # Navigator expects RetrievalPlan object
-        nav_result = self.navigator.navigate(query, plan)
+        # Navigator expects: (retrieval_plan with to_dict(), sub_queries as List[str])
+        # Extract sub_queries from hop_sequence or use original query
+        # Wir greifen direkt auf das Attribut .query des HopStep-Objekts zu
+        sub_queries = [h.sub_query for h in plan.hop_sequence] if hasattr(plan, 'hop_sequence') and plan.hop_sequence else [query]
+        nav_result = self.navigator.navigate(plan, sub_queries)
         navigator_time = (time.time() - navigator_start) * 1000
-        
-        navigator_result = nav_result.to_dict()
+
+
+        navigator_result = asdict(nav_result)
         logger.debug(
-            f"S_N completed: {nav_result.final_count} chunks "
+            f"S_N completed: {len(nav_result.filtered_context)} chunks "
             f"({navigator_time:.2f}ms)"
         )
         
@@ -283,22 +288,20 @@ class AgentPipeline:
         # Build hop sequence for verifier
         hop_sequence = [
             {
-                "step_number": h.step_number,
-                "source_entity": h.source_entity,
-                "target_entity": h.target_entity,
-                "relation_hint": h.relation_hint
+                "step_number": h.step_id,
+                "target_entity": h.target_entities,
+                #"relation_hint": h.relation_hint
             }
             for h in plan.hop_sequence
         ]
         
-        gen_result = self.verifier.verify_and_generate(
-            navigator_result=nav_result,
-            hop_sequence=hop_sequence,
-            query_type=plan.query_type.value
+        gen_result = self.verifier.generate_and_verify(
+            query=query,
+            context=nav_result.filtered_context,
         )
         verifier_time = (time.time() - verifier_start) * 1000
         
-        verifier_result = gen_result.to_dict()
+        verifier_result = asdict(gen_result)
         logger.debug(
             f"S_V completed: confidence={gen_result.confidence.value} "
             f"({verifier_time:.2f}ms)"
@@ -595,7 +598,7 @@ if __name__ == "__main__":
     
     # Direkte Imports für Test
     from src.logic_layer.planner import Planner
-    from src.logic_layer.Agent import Navigator, ControllerConfig
+    from src.logic_layer.agent import Navigator, ControllerConfig
     from src.logic_layer.verifier import Verifier, VerifierConfig
     
     # Create pipeline mit Mock-Komponenten

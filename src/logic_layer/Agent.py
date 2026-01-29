@@ -357,12 +357,12 @@ class Navigator:
         
         for sub_query in sub_queries:
             try:
-                # Nutze HybridRetriever.retrieve()
-                results = self.retriever.retrieve(sub_query)
+                # Nutze HybridRetriever.retrieve() - returns (results, metrics) tuple
+                results, _metrics = self.retriever.retrieve(sub_query)
                 
                 for res in results[:10]:  # Top-10 pro Sub-Query
                     text = res.text if hasattr(res, 'text') else str(res)
-                    score = res.score if hasattr(res, 'score') else 1.0
+                    score = res.rrf_score if hasattr(res, 'rrf_score') else (res.score if hasattr(res, 'score') else 1.0)
                     
                     # Track höchsten Score pro Text
                     if text not in retrieval_scores or score > retrieval_scores[text]:
@@ -371,7 +371,7 @@ class Navigator:
                     all_results.append({
                         "text": text,
                         "score": score,
-                        "source": res.source if hasattr(res, 'source') else "unknown",
+                        "source": res.source_doc if hasattr(res, 'source_doc') else (res.source if hasattr(res, 'source') else "unknown"),
                         "sub_query": sub_query
                     })
                     

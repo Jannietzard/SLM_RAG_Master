@@ -504,7 +504,7 @@ class HybridRetriever:
             cross_source_boost=self.config.cross_source_boost
         )
         gliner_model = None
-        if hasattr(hybrid_store, 'entity_pipeline'):
+        if hasattr(hybrid_store, 'entity_pipeline') and hybrid_store.entity_pipeline is not None:
             gliner_model = hybrid_store.entity_pipeline.ner_extractor.model
         
         self.entity_extractor = ImprovedQueryEntityExtractor(

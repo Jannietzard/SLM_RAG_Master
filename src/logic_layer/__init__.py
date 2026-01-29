@@ -69,7 +69,7 @@ from .verifier import (
 # =============================================================================
 # AGENT (S_N + Controller) - Navigation & Orchestration
 # =============================================================================
-from .Agent import (
+from .agent import (
     # Main classes
     Navigator,
     AgenticController,

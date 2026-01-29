@@ -625,15 +625,16 @@ class IngestionPipeline:
     def _init_chunker(self):
         """Initialize Sentence-Based Chunker."""
         try:
-            from ..data_layer.chunking import SentenceBasedChunker, SentenceChunkingConfig
+            # FIX: Richtigen Klassennamen importieren
+            from ..data_layer.chunking import SpacySentenceChunker
             
-            chunking_config = SentenceChunkingConfig(
+            # FIX: Klasse direkt mit Parametern initialisieren (kein Config-Objekt nötig)
+            return SpacySentenceChunker(
                 sentences_per_chunk=self.config.sentences_per_chunk,
                 sentence_overlap=self.config.sentence_overlap,
-                min_chunk_length=self.config.min_chunk_length,
-                max_chunk_length=self.config.max_chunk_length
+                min_chunk_chars=self.config.min_chunk_length,  # Achtung: Parameter heißt in chunking.py anders!
+                max_chunk_chars=self.config.max_chunk_length
             )
-            return SentenceBasedChunker(chunking_config)
         except ImportError as e:
             logger.warning(f"Could not import chunker: {e}")
             return None
@@ -784,7 +785,7 @@ class IngestionPipeline:
             return chunks
         
         # Use actual chunker
-        chunk_objects = self.chunker.chunk(text)
+        chunk_objects = self.chunker.chunk_text(text)
         
         chunks = []
         for i, chunk in enumerate(chunk_objects):
@@ -920,11 +921,16 @@ if __name__ == "__main__":
         Apple launched the Apple Watch and expanded its services business.
         """
         
-        # Save test file
-        test_file = Path("/tmp/test_doc.txt")
-        test_file.write_text(test_text)
-        
-        metrics = pipeline.ingest(str(test_file))
+# Save test file
+    # Einfach als "test_doc.txt" im aktuellen Ordner speichern
+    test_file = Path("test_doc.txt")
+    
+    test_file.write_text(test_text, encoding="utf-8")
+    
+    # .absolute() zeigt dir genau, wo die Datei jetzt liegt
+    print(f"Test file created at: {test_file.absolute()}") 
+    
+    metrics = pipeline.ingest(str(test_file))
     
     print("\n" + "-"*70)
     print("INGESTION METRICS")
