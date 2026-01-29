@@ -59,19 +59,57 @@ from datetime import datetime
 from abc import ABC, abstractmethod
 
 import yaml
+
+# ============================================================================
+# INGESTION IMPORTS - Mit Fallback-Logik
+# ============================================================================
+# benchmark_datasets hat seine EIGENE Ingestion-Logik (create_langchain_documents,
+# run_ingestion), daher ist die externe Pipeline-Ingestion OPTIONAL.
+# ============================================================================
+
+INGESTION_AVAILABLE = False
+IngestionConfig = None
+DocumentIngestionPipeline = None
+
+# Versuch 1: Neue Pipeline-Struktur (ingestion_pipeline.py)
 try:
-    from src.data_layer.ingestion import (
-        DocumentIngestionPipeline, 
+    from src.pipeline.ingestion_pipeline import (
+        IngestionPipeline as DocumentIngestionPipeline,
         IngestionConfig,
-        load_ingestion_config,
-        create_pipeline,
     )
     INGESTION_AVAILABLE = True
-except ImportError as e:
-    print(f"[WARNING] Ingestion module not available: {e}")
-    INGESTION_AVAILABLE = False
+except ImportError:
+    pass
 
-# Nach den anderen Imports:
+# Versuch 2: Alte data_layer Struktur mit IngestionPipeline
+if not INGESTION_AVAILABLE:
+    try:
+        from src.data_layer.ingestion import (
+            IngestionPipeline as DocumentIngestionPipeline,
+            IngestionConfig,
+        )
+        INGESTION_AVAILABLE = True
+    except ImportError:
+        pass
+
+# Versuch 3: Alte Struktur mit DocumentIngestionPipeline (legacy name)
+if not INGESTION_AVAILABLE:
+    try:
+        from src.data_layer.ingestion import (
+            DocumentIngestionPipeline,
+            IngestionConfig,
+        )
+        INGESTION_AVAILABLE = True
+    except ImportError:
+        pass
+
+# Kein Problem wenn nicht verfügbar - benchmark_datasets hat eigene Logik!
+if not INGESTION_AVAILABLE:
+    print("[INFO] External ingestion module not found - using built-in chunking logic")
+else:
+    print(f"[INFO] External ingestion available: {DocumentIngestionPipeline.__module__}")
+
+# Ablation Study Import
 try:
     from ablation_study import AblationStudy, AblationConfig
     ABLATION_MODULE_AVAILABLE = True
@@ -81,7 +119,7 @@ except ImportError:
         ABLATION_MODULE_AVAILABLE = True
     except ImportError:
         ABLATION_MODULE_AVAILABLE = False
-        print("[WARNING] Ablation module not found. Using legacy ablation.")
+        print("[INFO] Ablation module not found - using legacy ablation")
 
 # ============================================================================
 # LOGGING
@@ -637,10 +675,15 @@ def create_langchain_documents(
     articles: List[Article], 
     chunk_sentences: int = 3,
     chunking_strategy: str = "sentence",
-    config: Optional[Any]= None,
+    config: Optional[Any] = None,
 ) -> List:
     '''
     Convert articles to LangChain Document objects with configurable chunking.
+    
+    WICHTIG: Diese Funktion hat eine EIGENE Chunking-Logik als Fallback.
+    Die externe IngestionPipeline ist optional und wird nur verwendet wenn:
+    - Sie verfügbar ist UND
+    - Sie die erwartete API hat (process_articles Methode)
     
     Args:
         articles: List of Article objects
@@ -651,27 +694,37 @@ def create_langchain_documents(
     Returns:
         List of LangChain Document objects
     '''
-    if not INGESTION_AVAILABLE:
-        # Fallback to old implementation
-        return _create_langchain_documents_legacy(articles, chunk_sentences)
+    # Versuch: Externe Ingestion Pipeline nutzen
+    if INGESTION_AVAILABLE and DocumentIngestionPipeline is not None:
+        try:
+            # Erstelle Config falls nicht gegeben
+            if config is None and IngestionConfig is not None:
+                # Prüfe welche Parameter die Config akzeptiert
+                try:
+                    config = IngestionConfig(
+                        sentences_per_chunk=chunk_sentences,
+                    )
+                except TypeError:
+                    # Config hat andere Parameter - nutze defaults
+                    config = IngestionConfig()
+            
+            # Erstelle Pipeline und verarbeite
+            pipeline = DocumentIngestionPipeline(config) if config else DocumentIngestionPipeline()
+            
+            # Prüfe ob die erwartete Methode existiert
+            if hasattr(pipeline, 'process_articles'):
+                documents, _ = pipeline.process_articles(articles)
+                logger.info(f"Created {len(documents)} chunks using external pipeline")
+                return documents
+            else:
+                logger.info("External pipeline has no 'process_articles' method - using built-in")
+                
+        except Exception as e:
+            logger.warning(f"External ingestion failed: {e} - using built-in chunking")
     
-    # Use new ingestion pipeline
-    if config is None:
-        config = IngestionConfig(
-            chunking_strategy=chunking_strategy,
-            sentences_per_chunk=chunk_sentences,
-            min_chunk_size=50,
-            extract_entities=True,
-        )
-    
-    pipeline = DocumentIngestionPipeline(config)
-    documents, _ = pipeline.process_articles(articles)
-    
-    logger.info(
-        f"Created {len(documents)} chunks using '{chunking_strategy}' strategy"
-    )
-    
-    return documents
+    # Fallback: Eigene Implementierung (IMMER verfügbar)
+    logger.info("Using built-in sentence-based chunking")
+    return _create_langchain_documents_legacy(articles, chunk_sentences)
 
 
 def _create_langchain_documents_legacy(articles: List[Article], chunk_sentences: int = 3) -> List:
@@ -848,8 +901,39 @@ def create_pipeline(
     Create pipeline for specific dataset with given weights.
     
     WICHTIG: Nutzt NUR den Store dieses Datasets!
+    
+    Pipeline-Suche (in dieser Reihenfolge):
+    1. main_agentic.AgenticRAGPipeline (Hauptpipeline)
+    2. src.pipeline.agent_pipeline.AgentPipeline (Alternative)
+    3. Fehler wenn nichts gefunden
     """
-    from main_agentic import AgenticRAGPipeline
+    AgenticRAGPipeline = None
+    
+    # Versuch 1: main_agentic (primär)
+    try:
+        from main_agentic import AgenticRAGPipeline
+    except ImportError:
+        pass
+    
+    # Versuch 2: pipeline.agent_pipeline
+    if AgenticRAGPipeline is None:
+        try:
+            from src.pipeline.agent_pipeline import AgentPipeline as AgenticRAGPipeline
+        except ImportError:
+            pass
+    
+    # Versuch 3: Direkt aus pipeline
+    if AgenticRAGPipeline is None:
+        try:
+            from src.pipeline import AgentPipeline as AgenticRAGPipeline
+        except ImportError:
+            pass
+    
+    if AgenticRAGPipeline is None:
+        raise ImportError(
+            "Keine RAG-Pipeline gefunden! Erwartet: main_agentic.AgenticRAGPipeline "
+            "oder src.pipeline.AgentPipeline"
+        )
     
     # Get paths for THIS dataset only
     paths = store_manager.get_paths(dataset)
@@ -1370,6 +1454,439 @@ def cmd_status(args, config: Dict, store_manager: StoreManager):
     print("="*50 + "\n")
 
 
+
+# ============================================================================
+# SELF-TEST COMMAND
+# ============================================================================
+
+def cmd_test(args, config: Dict, store_manager: StoreManager):
+    """
+    Comprehensive self-test for all benchmark_datasets.py functions.
+    
+    Tests:
+        1. Import-Tests (Module verfügbar?)
+        2. DataClass-Tests (TestQuestion, Article, etc.)
+        3. StoreManager-Tests (Pfade, CRUD)
+        4. Chunking-Tests (create_langchain_documents)
+        5. Metrik-Tests (compute_exact_match, compute_f1)
+        6. Loader-Tests (DatasetLoader Struktur)
+        7. Mini-Integration-Test (wenn nicht --quick)
+    
+    Usage:
+        python benchmark_datasets.py test
+        python benchmark_datasets.py test --verbose
+        python benchmark_datasets.py test --quick
+    """
+    import tempfile
+    import traceback
+    
+    verbose = getattr(args, 'verbose', False)
+    quick = getattr(args, 'quick', False)
+    
+    print("\n" + "="*70)
+    print("🧪 BENCHMARK_DATASETS.PY - SELF-TEST")
+    print("="*70)
+    print(f"Mode: {'QUICK' if quick else 'FULL'} | Verbose: {verbose}")
+    print("="*70 + "\n")
+    
+    results = {
+        "passed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "errors": []
+    }
+    
+    def test_result(name: str, success: bool, error: str = None, skipped: bool = False):
+        """Helper to record test results."""
+        if skipped:
+            results["skipped"] += 1
+            status = "⏭️  SKIP"
+        elif success:
+            results["passed"] += 1
+            status = "✅ PASS"
+        else:
+            results["failed"] += 1
+            status = "❌ FAIL"
+            if error:
+                results["errors"].append(f"{name}: {error}")
+        
+        print(f"  {status}: {name}")
+        if verbose and error:
+            print(f"         → {error}")
+    
+    # =========================================================================
+    # TEST 1: Imports
+    # =========================================================================
+    print("\n" + "-"*50)
+    print("TEST 1: Import-Checks")
+    print("-"*50)
+    
+    # Core imports
+    try:
+        from langchain.schema import Document
+        test_result("langchain.schema.Document", True)
+    except ImportError as e:
+        test_result("langchain.schema.Document", False, str(e))
+    
+    # Check INGESTION_AVAILABLE flag
+    test_result(
+        f"INGESTION_AVAILABLE={INGESTION_AVAILABLE}", 
+        True,  # Just report status, not a failure
+    )
+    
+    # Check ABLATION_MODULE_AVAILABLE flag
+    test_result(
+        f"ABLATION_MODULE_AVAILABLE={ABLATION_MODULE_AVAILABLE}",
+        True,
+    )
+    
+    # =========================================================================
+    # TEST 2: DataClasses
+    # =========================================================================
+    print("\n" + "-"*50)
+    print("TEST 2: DataClass-Konstruktoren")
+    print("-"*50)
+    
+    try:
+        q = TestQuestion(
+            id="test_1",
+            question="What is the capital of France?",
+            answer="Paris",
+            dataset="test",
+            question_type="single_hop"
+        )
+        test_result("TestQuestion erstellen", q.id == "test_1" and q.answer == "Paris")
+    except Exception as e:
+        test_result("TestQuestion erstellen", False, str(e))
+    
+    try:
+        a = Article(
+            id="article_1",
+            title="Test Article",
+            text="This is a test article with multiple sentences. It has content.",
+            sentences=["This is a test article with multiple sentences.", "It has content."],
+            dataset="test"
+        )
+        test_result("Article erstellen", a.title == "Test Article" and len(a.sentences) == 2)
+    except Exception as e:
+        test_result("Article erstellen", False, str(e))
+    
+    try:
+        er = EvalResult(
+            question_id="q1",
+            question="Test?",
+            gold_answer="yes",
+            predicted_answer="yes",
+            exact_match=True,
+            f1_score=1.0,
+            retrieval_count=3,
+            time_ms=150.0,
+            dataset="test",
+            question_type="boolean"
+        )
+        test_result("EvalResult erstellen", er.exact_match == True and er.f1_score == 1.0)
+    except Exception as e:
+        test_result("EvalResult erstellen", False, str(e))
+    
+    try:
+        cr = ConfigResult(
+            dataset="hotpotqa",
+            config_name="hybrid_70_30",
+            vector_weight=0.7,
+            graph_weight=0.3,
+            n_questions=100,
+            exact_match=0.65,
+            f1_score=0.72,
+            avg_time_ms=250.0,
+            coverage=0.95
+        )
+        test_result("ConfigResult erstellen", cr.f1_score == 0.72)
+    except Exception as e:
+        test_result("ConfigResult erstellen", False, str(e))
+    
+    # =========================================================================
+    # TEST 3: StoreManager
+    # =========================================================================
+    print("\n" + "-"*50)
+    print("TEST 3: StoreManager")
+    print("-"*50)
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            tmp_manager = StoreManager(Path(tmpdir))
+            
+            # Test get_paths
+            paths = tmp_manager.get_paths("hotpotqa")
+            test_result(
+                "get_paths() returns dict",
+                isinstance(paths, dict) and "vector_db" in paths and "questions" in paths
+            )
+            
+            # Test ensure_dirs
+            tmp_manager.ensure_dirs("testdataset")
+            test_result(
+                "ensure_dirs() creates directory",
+                (Path(tmpdir) / "testdataset").exists()
+            )
+            
+            # Test save/load questions
+            test_questions = [
+                TestQuestion(id="t1", question="Q1?", answer="A1", dataset="test"),
+                TestQuestion(id="t2", question="Q2?", answer="A2", dataset="test"),
+            ]
+            tmp_manager.save_questions(test_questions, "testdataset")
+            loaded = tmp_manager.load_questions("testdataset")
+            test_result(
+                "save/load_questions() roundtrip",
+                len(loaded) == 2 and loaded[0].id == "t1"
+            )
+            
+            # Test get_status
+            status = tmp_manager.get_status()
+            test_result(
+                "get_status() returns dict",
+                isinstance(status, dict)
+            )
+            
+        except Exception as e:
+            test_result("StoreManager tests", False, str(e))
+    
+    # =========================================================================
+    # TEST 4: Chunking / Document Creation
+    # =========================================================================
+    print("\n" + "-"*50)
+    print("TEST 4: Chunking (create_langchain_documents)")
+    print("-"*50)
+    
+    try:
+        test_articles = [
+            Article(
+                id="a1",
+                title="Test Doc 1",
+                text="First sentence here. Second sentence follows. Third one too. Fourth for good measure.",
+                sentences=[
+                    "First sentence here.",
+                    "Second sentence follows.",
+                    "Third one too.",
+                    "Fourth for good measure."
+                ],
+                dataset="test"
+            ),
+            Article(
+                id="a2",
+                title="Test Doc 2",
+                text="Another document with content. It has multiple sentences. For testing purposes.",
+                sentences=[
+                    "Another document with content.",
+                    "It has multiple sentences.",
+                    "For testing purposes."
+                ],
+                dataset="test"
+            )
+        ]
+        
+        # Test legacy chunking (always available)
+        docs_legacy = _create_langchain_documents_legacy(test_articles, chunk_sentences=2)
+        test_result(
+            "_create_langchain_documents_legacy()",
+            len(docs_legacy) > 0 and hasattr(docs_legacy[0], 'page_content')
+        )
+        
+        # Test main function (may use external or fallback)
+        docs_main = create_langchain_documents(test_articles, chunk_sentences=2)
+        test_result(
+            "create_langchain_documents()",
+            len(docs_main) > 0
+        )
+        
+        if verbose:
+            print(f"         → Legacy: {len(docs_legacy)} chunks")
+            print(f"         → Main:   {len(docs_main)} chunks")
+            
+    except Exception as e:
+        test_result("Chunking tests", False, str(e))
+        if verbose:
+            traceback.print_exc()
+    
+    # =========================================================================
+    # TEST 5: Evaluation Metrics
+    # =========================================================================
+    print("\n" + "-"*50)
+    print("TEST 5: Evaluation Metrics")
+    print("-"*50)
+    
+    # Test normalize_answer
+    try:
+        norm1 = normalize_answer("  The Answer  ")
+        norm2 = normalize_answer("the answer")
+        test_result(
+            "normalize_answer() whitespace + articles",
+            norm1 == norm2 == "answer"
+        )
+    except Exception as e:
+        test_result("normalize_answer()", False, str(e))
+    
+    # Test compute_exact_match
+    try:
+        em1 = compute_exact_match("Paris", "paris")
+        em2 = compute_exact_match("The capital is Paris", "Paris")
+        em3 = compute_exact_match("Berlin", "Paris")
+        em4 = compute_exact_match("yes", "yes")
+        em5 = compute_exact_match("Yes, that is correct", "yes")
+        
+        test_result(
+            "compute_exact_match() basic",
+            em1 == True and em3 == False
+        )
+        test_result(
+            "compute_exact_match() substring",
+            em2 == True  # Gold contained in prediction
+        )
+        test_result(
+            "compute_exact_match() yes/no",
+            em4 == True and em5 == True
+        )
+    except Exception as e:
+        test_result("compute_exact_match()", False, str(e))
+    
+    # Test compute_f1
+    try:
+        f1_perfect = compute_f1("Paris", "Paris")
+        f1_partial = compute_f1("Paris France", "Paris")
+        f1_zero = compute_f1("Berlin", "Paris")
+        
+        test_result(
+            "compute_f1() perfect match",
+            f1_perfect == 1.0
+        )
+        test_result(
+            "compute_f1() partial match",
+            0 < f1_partial < 1
+        )
+        test_result(
+            "compute_f1() no match",
+            f1_zero == 0.0
+        )
+        
+        if verbose:
+            print(f"         → Perfect: {f1_perfect:.3f}")
+            print(f"         → Partial: {f1_partial:.3f}")
+            print(f"         → Zero:    {f1_zero:.3f}")
+            
+    except Exception as e:
+        test_result("compute_f1()", False, str(e))
+    
+    # =========================================================================
+    # TEST 6: Dataset Loaders (Struktur-Check)
+    # =========================================================================
+    print("\n" + "-"*50)
+    print("TEST 6: Dataset Loaders")
+    print("-"*50)
+    
+    for loader_name, loader in LOADERS.items():
+        try:
+            test_result(
+                f"LOADERS['{loader_name}'] exists",
+                hasattr(loader, 'load') and hasattr(loader, 'name')
+            )
+            test_result(
+                f"LOADERS['{loader_name}'].name == '{loader_name}'",
+                loader.name == loader_name
+            )
+        except Exception as e:
+            test_result(f"LOADERS['{loader_name}']", False, str(e))
+    
+    # =========================================================================
+    # TEST 7: Config Loading
+    # =========================================================================
+    print("\n" + "-"*50)
+    print("TEST 7: Configuration")
+    print("-"*50)
+    
+    try:
+        cfg = load_config_file(Path("./nonexistent_config.yaml"))
+        test_result(
+            "load_config_file() with missing file → defaults",
+            isinstance(cfg, dict) and "embeddings" in cfg
+        )
+    except Exception as e:
+        test_result("load_config_file()", False, str(e))
+    
+    test_result(
+        "AVAILABLE_DATASETS defined",
+        len(AVAILABLE_DATASETS) == 3 and "hotpotqa" in AVAILABLE_DATASETS
+    )
+    
+    test_result(
+        "ABLATION_CONFIGS defined",
+        len(ABLATION_CONFIGS) >= 6
+    )
+    
+    # =========================================================================
+    # TEST 8: Integration Test (optional)
+    # =========================================================================
+    if not quick:
+        print("\n" + "-"*50)
+        print("TEST 8: Mini-Integration (HuggingFace Load)")
+        print("-"*50)
+        print("         → Loading 2 samples from HotpotQA...")
+        
+        try:
+            loader = HotpotQALoader()
+            articles, questions = loader.load(n_samples=2)
+            
+            test_result(
+                "HotpotQALoader.load(n_samples=2)",
+                len(questions) == 2 and len(articles) > 0
+            )
+            
+            if verbose and questions:
+                print(f"         → Q: {questions[0].question[:60]}...")
+                print(f"         → A: {questions[0].answer}")
+                print(f"         → Articles: {len(articles)}")
+                
+        except Exception as e:
+            test_result("HotpotQALoader.load()", False, f"{type(e).__name__}: {str(e)[:50]}")
+            if verbose:
+                traceback.print_exc()
+    else:
+        print("\n" + "-"*50)
+        print("TEST 8: Mini-Integration")
+        print("-"*50)
+        test_result("HuggingFace loading", False, skipped=True)
+    
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+    print("\n" + "="*70)
+    print("📊 TEST SUMMARY")
+    print("="*70)
+    
+    total = results["passed"] + results["failed"] + results["skipped"]
+    
+    print(f"""
+    ✅ Passed:  {results['passed']:3d}
+    ❌ Failed:  {results['failed']:3d}
+    ⏭️  Skipped: {results['skipped']:3d}
+    ─────────────────
+    📋 Total:   {total:3d}
+    """)
+    
+    if results["errors"]:
+        print("ERRORS:")
+        for err in results["errors"]:
+            print(f"  • {err}")
+    
+    # Exit code
+    if results["failed"] > 0:
+        print("\n❌ Some tests FAILED!")
+        print("="*70 + "\n")
+        return 1
+    else:
+        print("\n✅ All tests PASSED!")
+        print("="*70 + "\n")
+        return 0
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -1550,6 +2067,19 @@ Examples:
     # === STATUS ===
     subparsers.add_parser("status", help="Show ingestion status")
     
+    # === TEST ===
+    test_p = subparsers.add_parser("test", help="Run comprehensive self-tests")
+    test_p.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Verbose test output"
+    )
+    test_p.add_argument(
+        "--quick",
+        action="store_true",
+        help="Quick tests only (skip slow operations)"
+    )
+    
     args = parser.parse_args()
     
     if not args.command:
@@ -1573,6 +2103,8 @@ Examples:
         cmd_ablation(args, config, store_manager)
     elif args.command == "status":
         cmd_status(args, config, store_manager)
+    elif args.command == "test":
+        cmd_test(args, config, store_manager)
 
 
 

@@ -160,19 +160,17 @@
       ]
     },
     "ingestion": {
-      "chunking_strategy": "sentence",
+      "chunking_strategy": "sentence_spacy",
       "sentences_per_chunk": 3,
+      "sentence_overlap": 1,
+      "chunk_size": 1024,
+      "chunk_overlap": 128,
+      "spacy_model": "en_core_web_sm",
+      "entity_aware_chunking": false,
       "min_chunk_size": 50,
-      "max_chunk_size": 512,
-      "chunk_overlap": 1,
-      "min_lexical_diversity": 0.3,
-      "min_information_density": 2.0,
-      "filter_short_chunks": true,
-      "filter_low_quality": false,
-      "extract_entities": true,
-      "add_source_metadata": true
+      "filter_short_chunks": true
     }
   },
-  "timestamp": "2026-01-26T01:12:22.639518",
+  "timestamp": "2026-01-29T19:21:05.251090",
   "python_version": "3.12.3 | packaged by conda-forge | (main, Apr 15 2024, 18:20:11) [MSC v.1938 64 bit (AMD64)]"
 }

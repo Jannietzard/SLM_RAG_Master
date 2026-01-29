@@ -1,5 +1,5 @@
 # Ablation Study Results
-**Generated:** 2026-01-26 01:12:27
+**Generated:** 2026-01-29 19:21:05
 **Study:** hybrid_retrieval_ablation
 **Seed:** 42
 
