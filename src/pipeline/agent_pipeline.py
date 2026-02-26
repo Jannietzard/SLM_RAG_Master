@@ -186,7 +186,7 @@ class AgentPipeline:
             logger.info("Planner (S_P) lazy-initialized")
         
         if self.navigator is None:
-            from ..logic_layer.Agent import Navigator, ControllerConfig
+            from ..logic_layer.navigator import Navigator, ControllerConfig
             nav_config = ControllerConfig()
             if self.hybrid_retriever is not None:
                 self.navigator = Navigator(nav_config)
@@ -516,7 +516,7 @@ def create_pipeline(
     
     # Import agents
     from logic_layer.planner import Planner, create_planner
-    from logic_layer.Agent import Navigator, ControllerConfig
+    from logic_layer.navigator import Navigator, ControllerConfig
     from logic_layer.verifier import Verifier, VerifierConfig
     
     # Create agents
@@ -555,7 +555,7 @@ def create_full_pipeline(
     config = config or {}
     
     from ..logic_layer.planner import create_planner
-    from ..logic_layer.Agent import Navigator, ControllerConfig
+    from ..logic_layer.navigator import Navigator, ControllerConfig
     from ..logic_layer.verifier import Verifier, VerifierConfig
     
     planner = create_planner(config)
@@ -598,7 +598,7 @@ if __name__ == "__main__":
     
     # Direkte Imports für Test
     from src.logic_layer.planner import Planner
-    from src.logic_layer.agent import Navigator, ControllerConfig
+    from src.logic_layer.navigator import Navigator, ControllerConfig
     from src.logic_layer.verifier import Verifier, VerifierConfig
     
     # Create pipeline mit Mock-Komponenten
