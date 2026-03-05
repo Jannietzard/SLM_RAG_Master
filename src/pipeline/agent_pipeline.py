@@ -249,7 +249,7 @@ class AgentPipeline:
             logger.info(f"Early exit for trivial query: {query[:50]}...")
             
             result = PipelineResult(
-                answer=plan.cached_answer or "This is a simple factual question that requires database lookup.",
+                answer="This is a simple factual question that requires database lookup.",
                 confidence="high" if plan.confidence > 0.9 else "medium",
                 query=query,
                 planner_result=planner_result,
@@ -284,24 +284,14 @@ class AgentPipeline:
         
         # Stage 3: S_V (Verifier)
         verifier_start = time.time()
-        
-        # Build hop sequence for verifier
-        hop_sequence = [
-            {
-                "step_number": h.step_id,
-                "target_entity": h.target_entities,
-                #"relation_hint": h.relation_hint
-            }
-            for h in plan.hop_sequence
-        ]
-        
+
         gen_result = self.verifier.generate_and_verify(
             query=query,
             context=nav_result.filtered_context,
         )
         verifier_time = (time.time() - verifier_start) * 1000
         
-        verifier_result = asdict(gen_result)
+        verifier_result = {**asdict(gen_result), "confidence": gen_result.confidence.value}
         logger.debug(
             f"S_V completed: confidence={gen_result.confidence.value} "
             f"({verifier_time:.2f}ms)"
@@ -515,9 +505,9 @@ def create_pipeline(
     config = config or {}
     
     # Import agents
-    from logic_layer.planner import Planner, create_planner
-    from logic_layer.navigator import Navigator, ControllerConfig
-    from logic_layer.verifier import Verifier, VerifierConfig
+    from src.logic_layer.planner import Planner, create_planner
+    from src.logic_layer.navigator import Navigator, ControllerConfig
+    from src.logic_layer.verifier import Verifier, VerifierConfig
     
     # Create agents
     planner = create_planner(config)
@@ -591,7 +581,6 @@ if __name__ == "__main__":
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    
     print("\n" + "="*70)
     print("AGENT PIPELINE TEST")
     print("="*70)

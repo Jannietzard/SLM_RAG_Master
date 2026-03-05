@@ -96,9 +96,9 @@ except ImportError:
 
 # Chunking module support (from chunking.py)
 try:
-    from chunking import (
-        SpacySentenceChunker, 
-        create_sentence_chunker, 
+    from .chunking import (
+        SpacySentenceChunker,
+        create_sentence_chunker,
         create_semantic_chunker,
         SemanticChunker
     )

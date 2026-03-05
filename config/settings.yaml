@@ -253,114 +253,31 @@ benchmark:
       vector_weight: 0.5
       graph_weight: 0.5
 
-      # ============================================================================
+
+# ============================================================================
 # INGESTION CONFIGURATION
 # ============================================================================
-# 
-# Dieses Template zeigt alle verfügbaren Chunking-Optionen.
-# Kopiere die relevanten Teile in deine config/settings.yaml
-#
-# ============================================================================
-
-# Füge diesen Block zu deiner settings.yaml hinzu:
 ingestion:
-  # ──────────────────────────────────────────────────────────────────────────
-  # CHUNKING STRATEGY
-  # ──────────────────────────────────────────────────────────────────────────
-  # Verfügbare Strategien:
-  #   - sentence:  Gruppiert N Sätze pro Chunk (schnell, einfach)
-  #   - semantic:  Semantische Grenzen mit Quality Filtering (beste Qualität)
-  #   - fixed:     Feste Zeichenanzahl mit Overlap
-  #   - recursive: LangChain RecursiveCharacterTextSplitter
-  
-  chunking_strategy: "sentence"  # Empfohlen für Benchmark: "sentence"
-  sentences_per_chunk: 3    # Nur für "sentence" Strategie
-  # ──────────────────────────────────────────────────────────────────────────
-  # CHUNK SIZE SETTINGS
-  # ──────────────────────────────────────────────────────────────────────────
-  min_chunk_size: 50        # Filtert Müll raus
-  max_chunk_size: 512       # Tokens! Nicht Zeichen
-  #chunk_size: 1024          # Max Zeichen pro Chunk (für fixed/recursive/semantic)
-  chunk_overlap: 1        # Überlappung zwischen Chunks
-  min_chunk_size: 50        # Chunks kleiner als dies werden gefiltert
-  
-  # ──────────────────────────────────────────────────────────────────────────
-  # SENTENCE STRATEGY SETTINGS
-  # ──────────────────────────────────────────────────────────────────────────
-  sentences_per_chunk: 3    # Anzahl Sätze pro Chunk
-  
-  # ──────────────────────────────────────────────────────────────────────────
-  # SEMANTIC STRATEGY SETTINGS (nur wenn chunking_strategy: "semantic")
-  # ──────────────────────────────────────────────────────────────────────────
-  min_lexical_diversity: 0.3      # TTR threshold (0.0-1.0)
-  min_information_density: 2.0    # Shannon Entropy threshold
-  
-  # ──────────────────────────────────────────────────────────────────────────
-  # QUALITY FILTERING
-  # ──────────────────────────────────────────────────────────────────────────
-  filter_short_chunks: true       # Kurze Chunks entfernen
-  filter_low_quality: false       # Low-quality Chunks entfernen (nur semantic)
-  
-  # ──────────────────────────────────────────────────────────────────────────
-  # METADATA & ENTITY EXTRACTION
-  # ──────────────────────────────────────────────────────────────────────────
-  extract_entities: true          # Named Entities für Knowledge Graph
-  add_source_metadata: true       # Quellinformationen hinzufügen
+  # Verfügbare Strategien: sentence | sentence_spacy | semantic | fixed | recursive
+  chunking_strategy: "sentence_spacy"
 
-
-# ============================================================================
-# BEISPIEL-KONFIGURATIONEN FÜR VERSCHIEDENE USE CASES
-# ============================================================================
-
-# --- BENCHMARK (Schnell, reproduzierbar) ---
-# ingestion:
-#   chunking_strategy: "sentence"
-#   sentences_per_chunk: 3
-#   min_chunk_size: 50
-#   extract_entities: true
-
-# --- PRODUCTION (Beste Qualität) ---
-# ingestion:
-#   chunking_strategy: "semantic"
-#   chunk_size: 1024
-#   chunk_overlap: 128
-#   min_chunk_size: 200
-#   min_lexical_diversity: 0.3
-#   min_information_density: 2.0
-#   filter_low_quality: true
-#   extract_entities: true
-
-# --- LANGE DOKUMENTE (PDFs, Papers) ---
-# ingestion:
-#   chunking_strategy: "recursive"
-#   chunk_size: 2048
-#   chunk_overlap: 256
-#   min_chunk_size: 100
-#   extract_entities: true
-
-# --- ABLATION STUDY (Verschiedene Chunk-Größen testen) ---
-# Für Ablation: Erstelle mehrere Config-Dateien:
-#   - config/chunk_small.yaml  (sentences_per_chunk: 2)
-#   - config/chunk_medium.yaml (sentences_per_chunk: 3)
-#   - config/chunk_large.yaml  (sentences_per_chunk: 5)
-
-# Füge zu deiner settings.yaml hinzu:
-
-ingestion:
-  chunking_strategy: "sentence_spacy"  # sentence | sentence_spacy | semantic | fixed | recursive
-  
-  # Für sentence und sentence_spacy
+  # Sentence-Strategie
   sentences_per_chunk: 3
-  sentence_overlap: 1                  # Nur für sentence_spacy
-  
-  # Für semantic, fixed, recursive
+  sentence_overlap: 1       # Überlappende Sätze (nur sentence_spacy)
+
+  # Fixed/Recursive/Semantic-Strategie
   chunk_size: 1024
   chunk_overlap: 128
-  
+  min_chunk_size: 50
+
+  # Semantic-Strategie
+  min_lexical_diversity: 0.3
+  min_information_density: 2.0
+
   # SpaCy-spezifisch
   spacy_model: "en_core_web_sm"
   entity_aware_chunking: false
-  
-  # Quality
-  min_chunk_size: 50
-  filter_short_chunks: true
+
+  # Metadata & Entity Extraction
+  extract_entities: true
+  add_source_metadata: true

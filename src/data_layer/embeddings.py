@@ -512,29 +512,34 @@ class EmbeddingCache:
         if not texts:
             return {}
         
-        # Compute hashes for all texts
-        hash_to_idx = {self._hash_text(t): i for i, t in enumerate(texts)}
-        hashes = list(hash_to_idx.keys())
-        
+        # Compute hashes for all texts, tracking ALL indices per hash
+        # (dict comprehension would drop duplicate texts — use setdefault instead)
+        hash_to_idxs: Dict[str, List[int]] = {}
+        for i, t in enumerate(texts):
+            h = self._hash_text(t)
+            hash_to_idxs.setdefault(h, []).append(i)
+        hashes = list(hash_to_idxs.keys())
+
         # Query for all hashes at once
         placeholders = ','.join(['?'] * len(hashes))
         cursor = self.conn.cursor()
-        
+
         try:
             cursor.execute(
                 f"""
-                SELECT text_hash, embedding FROM embeddings 
+                SELECT text_hash, embedding FROM embeddings
                 WHERE model_name = ? AND text_hash IN ({placeholders})
                 """,
                 [model_name] + hashes
             )
-            
+
             results = {}
             for row in cursor.fetchall():
                 text_hash, embedding_json = row
-                idx = hash_to_idx[text_hash]
-                results[idx] = json.loads(embedding_json)
-            
+                embedding = json.loads(embedding_json)
+                for idx in hash_to_idxs[text_hash]:
+                    results[idx] = embedding
+
             return results
             
         except Exception as e:

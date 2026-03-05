@@ -769,7 +769,8 @@ class IngestionPipeline:
             sentences = re.split(r'(?<=[.!?])\s+', text)
             chunks = []
             
-            for i in range(0, len(sentences), self.config.sentences_per_chunk - self.config.sentence_overlap):
+            step = max(1, self.config.sentences_per_chunk - self.config.sentence_overlap)
+            for i in range(0, len(sentences), step):
                 chunk_sents = sentences[i:i + self.config.sentences_per_chunk]
                 chunk_text = " ".join(chunk_sents)
                 
@@ -920,17 +921,13 @@ if __name__ == "__main__":
         Tim Cook became the CEO of Apple after Steve Jobs. Under his leadership,
         Apple launched the Apple Watch and expanded its services business.
         """
-        
-# Save test file
-    # Einfach als "test_doc.txt" im aktuellen Ordner speichern
-    test_file = Path("test_doc.txt")
-    
-    test_file.write_text(test_text, encoding="utf-8")
-    
-    # .absolute() zeigt dir genau, wo die Datei jetzt liegt
-    print(f"Test file created at: {test_file.absolute()}") 
-    
-    metrics = pipeline.ingest(str(test_file))
+
+        # Save test file
+        test_file = Path("test_doc.txt")
+        test_file.write_text(test_text, encoding="utf-8")
+        print(f"Test file created at: {test_file.absolute()}")
+
+        metrics = pipeline.ingest(str(test_file))
     
     print("\n" + "-"*70)
     print("INGESTION METRICS")

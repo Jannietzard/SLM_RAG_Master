@@ -252,7 +252,7 @@ class VectorStoreAdapter:
         if self.distance_metric == "cosine":
             return max(0.0, min(1.0, 1.0 - distance))
         elif self.distance_metric == "l2":
-            return 1.0 / (1.0 + distance)
+            return max(0.0, min(1.0, 1.0 / (1.0 + distance)))
         else:
             raise ValueError(f"Unknown distance metric: {self.distance_metric}")
 
@@ -464,46 +464,27 @@ class KuzuGraphStore:
                 CREATE NODE TABLE IF NOT EXISTS Entity(
                     entity_id STRING,
                     name STRING,
-                    entity_type STRING,
+                    type STRING,
                     PRIMARY KEY (entity_id)
                 )
             """)
-            
+
             # Relationship Tables
             self.conn.execute("""
                 CREATE REL TABLE IF NOT EXISTS FROM_SOURCE(
                     FROM DocumentChunk TO SourceDocument
                 )
             """)
-            
+
             self.conn.execute("""
                 CREATE REL TABLE IF NOT EXISTS NEXT_CHUNK(
                     FROM DocumentChunk TO DocumentChunk
                 )
             """)
-            
+
             self.conn.execute("""
                 CREATE REL TABLE IF NOT EXISTS MENTIONS(
                     FROM DocumentChunk TO Entity
-                )
-            """)
-            
-
-            self.conn.execute("""
-                CREATE NODE TABLE IF NOT EXISTS Entity(
-                    entity_id STRING,
-                    name STRING,
-                    type STRING,
-                    mention_count INT64,
-                    PRIMARY KEY (entity_id)
-                )
-            """)
-
-            self.conn.execute("""
-                CREATE REL TABLE IF NOT EXISTS MENTIONS(
-                    FROM DocumentChunk TO Entity,
-                    mention_span STRING,
-                    confidence DOUBLE
                 )
             """)
 
@@ -732,12 +713,12 @@ class KuzuGraphStore:
         visited = {start_entity: 0}
         
         try:
-            # Try as DocumentChunk first - FIXED: Use undirected pattern
+            # Try as DocumentChunk first - traverse via NEXT_CHUNK and FROM_SOURCE
             result = self.conn.execute(
                 f"""
                 MATCH (start:DocumentChunk {{chunk_id: $start_id}})
-                MATCH path = (start)-[*1..{max_hops}]-(connected:DocumentChunk)
-                RETURN DISTINCT 
+                MATCH path = (start)-[*1..{max_hops}]->(connected:DocumentChunk)
+                RETURN DISTINCT
                     connected.chunk_id AS node_id,
                     length(path) AS hops
                 """,
@@ -1102,26 +1083,6 @@ class _KuzuGraphWrapper:
             stats.get("related_to_edges", 0)
         )
     
-    def nodes(self, data: bool = False):
-        """Get all node IDs."""
-        nodes = []
-        try:
-            for label in ["DocumentChunk", "SourceDocument", "Entity"]:
-                id_field = {
-                    "DocumentChunk": "chunk_id",
-                    "SourceDocument": "doc_id",
-                    "Entity": "entity_id",
-                }[label]
-                
-                result = self._store.conn.execute(
-                    f"MATCH (n:{label}) RETURN n.{id_field}"
-                )
-                while result.has_next():
-                    nodes.append(result.get_next()[0])
-        except:
-            pass
-        return nodes
-
 
 # ============================================================================
 # NETWORKX FALLBACK (for systems without KuzuDB)
@@ -1147,26 +1108,14 @@ class NetworkXGraphStore:
             except Exception as e:
                 self.logger.error(f"Failed to load graph: {e}")
     
-    def add_entity(
-        self,
-        entity_id: str,
-        entity_type: str,
-        metadata: Dict[str, Any],
-    ) -> None:
-        self.graph.add_node(entity_id, entity_type=entity_type, **metadata)
-    
     def add_entity_from_metadata(
         self,
         entity_id: str,
         entity_type: str,
         metadata: Dict[str, Any],
     ) -> None:
-        """
-        Add an entity node from metadata (alias for add_entity).
-        
-        Provides API compatibility with hybrid store interface.
-        """
-        self.add_entity(entity_id, entity_type, metadata)
+        """Add an entity node from metadata. API-compatible with KuzuGraphStore."""
+        self.graph.add_node(entity_id, entity_type=entity_type, **metadata)
     
     def add_relation(
         self,
@@ -2176,7 +2125,7 @@ if __name__ == "__main__":
             result.assert_true(True, "NetworkXGraphStore initialized")
             
             # Test: Add entities
-            graph_store.add_entity(
+            graph_store.add_entity_from_metadata(
                 "chunk_001",
                 "document_chunk",
                 {"text": "Test chunk", "source_file": "test.pdf"}

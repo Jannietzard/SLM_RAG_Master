@@ -173,11 +173,9 @@ class HotpotQAEvaluator:
         self.config["rag"]["retrieval_mode"] = retrieval_mode
         
         # Import and initialize
-        from main_agentic import AgenticRAGPipeline, setup_logging as setup_main_logging
-        
-        main_logger = setup_main_logging("WARNING")  # Reduce noise
-        self.pipeline = AgenticRAGPipeline(self.config, main_logger)
-        self.pipeline.setup()
+        from src.pipeline.agent_pipeline import create_pipeline
+
+        self.pipeline = create_pipeline()
         
         self.logger.info("Pipeline ready")
     
@@ -208,7 +206,7 @@ class HotpotQAEvaluator:
         
         # Run pipeline
         start_time = time.time()
-        result = self.pipeline.query(q_text)
+        result = self.pipeline.process(q_text)
         elapsed_ms = (time.time() - start_time) * 1000
         
         # Extract answer
@@ -225,7 +223,7 @@ class HotpotQAEvaluator:
             predicted_answer=predicted,
             exact_match=em,
             f1_score=f1,
-            retrieval_count=len(result.context_docs),
+            retrieval_count=len(result.navigator_result.get("filtered_context", [])),
             total_time_ms=elapsed_ms,
             question_type=question.get("question_type", "unknown"),
             level=question.get("level", "unknown"),

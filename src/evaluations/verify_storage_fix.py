@@ -93,7 +93,7 @@ def verify_storage_module():
     print("=" * 70)
     
     try:
-        from src.storage import StorageConfig, VectorStoreAdapter
+        from src.data_layer.storage import StorageConfig, VectorStoreAdapter
         
         # Check StorageConfig has distance_metric parameter
         import inspect
@@ -228,7 +228,7 @@ def verify_vector_search():
     
     try:
         from src.data_layer.embeddings import BatchedOllamaEmbeddings
-        from src.storage import HybridStore, StorageConfig
+        from src.data_layer.storage import HybridStore, StorageConfig
         
         config_path = Path("./config/settings.yaml")
         with open(config_path, "r", encoding="utf-8") as f:

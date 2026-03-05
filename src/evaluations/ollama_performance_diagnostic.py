@@ -7,10 +7,10 @@ import yaml
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.data_layer.embeddings import BatchedOllamaEmbeddings
-from src.storage import HybridStore, StorageConfig
+from src.data_layer.storage import HybridStore, StorageConfig
 
 
 def diagnose_embedding_dimensions():

@@ -267,11 +267,18 @@ class VerifierConfig:
     stop_on_first_success: bool = True
 
 
+class ConfidenceLevel(Enum):
+    """Konfidenz-Level basierend auf dem Anteil verifizierter Claims."""
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
 @dataclass
 class VerificationResult:
     """
     Ergebnis der Verification Stage.
-    
+
     Attributes:
         answer: Generierte (und ggf. korrigierte) Antwort
         iterations: Anzahl durchgeführter Iterationen
@@ -290,6 +297,19 @@ class VerificationResult:
     pre_validation: Optional[PreValidationResult] = None
     timing_ms: float = 0.0
     iteration_history: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def confidence(self) -> ConfidenceLevel:
+        """Konfidenz basierend auf dem Anteil verifizierter Claims."""
+        total = len(self.verified_claims) + len(self.violated_claims)
+        if total == 0:
+            return ConfidenceLevel.LOW
+        ratio = len(self.verified_claims) / total
+        if ratio >= 0.8:
+            return ConfidenceLevel.HIGH
+        elif ratio >= 0.5:
+            return ConfidenceLevel.MEDIUM
+        return ConfidenceLevel.LOW
 
 
 # =============================================================================

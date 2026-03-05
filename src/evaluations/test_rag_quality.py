@@ -16,11 +16,11 @@ from pathlib import Path
 import sys
 
 # Add project to path
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.data_layer.embeddings import BatchedOllamaEmbeddings
-from src.storage import HybridStore, StorageConfig
-from src.retrieval import HybridRetriever, RetrievalConfig, RetrievalMode
+from src.data_layer.storage import HybridStore, StorageConfig
+from src.data_layer.hybrid_retriever import HybridRetriever, RetrievalConfig, RetrievalMode
 
 
 def load_and_verify_config(config_path: Path = Path("./config/settings.yaml")):

@@ -62,7 +62,7 @@ Diese Komponente fehlt komplett in der aktuellen Implementierung!
 Sie ist essentiell für die Funktionsfähigkeit des Hybrid Index.
 """
 
-from src.data_layer.storage import KuzuGraphStore
+from .storage import KuzuGraphStore
 # ============================================================================
 # REBEL INTEGRATION (Transformers)
 # ============================================================================

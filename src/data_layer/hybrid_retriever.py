@@ -262,41 +262,44 @@ class RRFFusion:
         graph_metadata = {}
         
         # Vector Ranks
+        # storage.VectorStoreAdapter.vector_search() returns:
+        #   {"text": ..., "similarity": ..., "document_id": ..., "metadata": {...}}
         for rank, result in enumerate(vector_results, start=1):
-            chunk_id = result.get("chunk_id")
+            chunk_id = result.get("document_id")           # storage key: "document_id"
             rrf_scores[chunk_id] += 1.0 / (self.k + rank)
             vector_ranks[chunk_id] = rank
-            vector_scores[chunk_id] = result.get("relevance_score", 0)
-            
+            vector_scores[chunk_id] = result.get("similarity", 0)  # storage key: "similarity"
+
             if chunk_id not in chunk_data:
                 chunk_data[chunk_id] = {
                     "chunk_id": chunk_id,
                     "text": result.get("text", ""),
-                    "source_doc": result.get("source_doc", "unknown"),
+                    "source_doc": result.get("metadata", {}).get("source_file", "unknown"),
                     "position": result.get("position", 0),
                 }
-        
+
         # Graph Ranks
+        # storage.HybridStore.graph_search() returns:
+        #   {"chunk_id": ..., "text": ..., "source_file": ..., "matched_entity": ..., "hops": ...}
         for rank, result in enumerate(graph_results, start=1):
             chunk_id = result.get("chunk_id")
             rrf_scores[chunk_id] += 1.0 / (self.k + rank)
             graph_ranks[chunk_id] = rank
-            graph_scores[chunk_id] = result.get("confidence", 0)
-            
+            hops = result.get("hops", 1)
+            graph_scores[chunk_id] = 1.0 / (hops + 1)     # derive confidence from hop distance
+
             graph_metadata[chunk_id] = {
-                "hop_distance": result.get("hop", 1),
+                "hop_distance": hops,                       # storage key: "hops"
                 "matched_entities": [
-                    result.get("entity_name", ""),
-                    result.get("entity_from", ""),
-                    result.get("entity_to", ""),
+                    result.get("matched_entity", ""),       # storage key: "matched_entity"
                 ],
             }
-            
+
             if chunk_id not in chunk_data:
                 chunk_data[chunk_id] = {
                     "chunk_id": chunk_id,
                     "text": result.get("text", ""),
-                    "source_doc": result.get("source_doc", "unknown"),
+                    "source_doc": result.get("source_file", "unknown"),  # storage key: "source_file"
                     "position": result.get("position", 0),
                 }
         

@@ -98,11 +98,8 @@ def sample_texts():
 @pytest.fixture
 def sample_documents():
     """Sample LangChain-style documents."""
-    try:
-        from langchain.schema import Document
-    except ImportError:
-        pytest.skip("LangChain not installed")
-    
+    from langchain.schema import Document
+
     return [
         Document(
             page_content="Einstein developed E=mc². This equation relates mass and energy.",
@@ -214,11 +211,8 @@ class TestKuzuGraphStore:
     
     def test_initialization(self, temp_dir):
         """Test graph store initialization."""
-        try:
-            from src.data_layer.storage import KuzuGraphStore
-        except ImportError:
-            pytest.skip("KuzuDB not installed")
-        
+        from src.data_layer.storage import KuzuGraphStore
+
         db_path = temp_dir / "graph_test"
         store = KuzuGraphStore(db_path)
         
@@ -227,11 +221,8 @@ class TestKuzuGraphStore:
     
     def test_add_document_chunk(self, temp_dir):
         """Test adding document chunks."""
-        try:
-            from src.data_layer.storage import KuzuGraphStore
-        except ImportError:
-            pytest.skip("KuzuDB not installed")
-        
+        from src.data_layer.storage import KuzuGraphStore
+
         db_path = temp_dir / "graph_chunks"
         store = KuzuGraphStore(db_path)
         
@@ -253,11 +244,8 @@ class TestKuzuGraphStore:
     
     def test_add_source_document(self, temp_dir):
         """Test adding source documents."""
-        try:
-            from src.data_layer.storage import KuzuGraphStore
-        except ImportError:
-            pytest.skip("KuzuDB not installed")
-        
+        from src.data_layer.storage import KuzuGraphStore
+
         db_path = temp_dir / "graph_source"
         store = KuzuGraphStore(db_path)
         
@@ -275,11 +263,8 @@ class TestKuzuGraphStore:
     
     def test_graph_traversal(self, temp_dir):
         """Test multi-hop graph traversal."""
-        try:
-            from src.data_layer.storage import KuzuGraphStore
-        except ImportError:
-            pytest.skip("KuzuDB not installed")
-        
+        from src.data_layer.storage import KuzuGraphStore
+
         db_path = temp_dir / "graph_traversal"
         store = KuzuGraphStore(db_path)
         
@@ -303,11 +288,8 @@ class TestKuzuGraphStore:
     
     def test_statistics(self, temp_dir):
         """Test graph statistics."""
-        try:
-            from src.data_layer.storage import KuzuGraphStore
-        except ImportError:
-            pytest.skip("KuzuDB not installed")
-        
+        from src.data_layer.storage import KuzuGraphStore
+
         db_path = temp_dir / "graph_stats"
         store = KuzuGraphStore(db_path)
         
@@ -365,11 +347,8 @@ class TestBatchedOllamaEmbeddings:
     
     def test_cache_initialization(self, temp_dir):
         """Test embedding cache initialization."""
-        try:
-            from src.data_layer.embeddings import EmbeddingCache
-        except ImportError:
-            pytest.skip("Embeddings module not available")
-        
+        from src.data_layer.embeddings import EmbeddingCache
+
         cache_path = temp_dir / "embed_cache.db"
         cache = EmbeddingCache(cache_path)
         
@@ -380,11 +359,8 @@ class TestBatchedOllamaEmbeddings:
     
     def test_cache_put_get(self, temp_dir):
         """Test cache put and get operations."""
-        try:
-            from src.data_layer.embeddings import EmbeddingCache
-        except ImportError:
-            pytest.skip("Embeddings module not available")
-        
+        from src.data_layer.embeddings import EmbeddingCache
+
         cache_path = temp_dir / "embed_cache_ops.db"
         cache = EmbeddingCache(cache_path)
         
@@ -404,11 +380,8 @@ class TestBatchedOllamaEmbeddings:
     
     def test_cache_miss(self, temp_dir):
         """Test cache miss returns None."""
-        try:
-            from src.data_layer.embeddings import EmbeddingCache
-        except ImportError:
-            pytest.skip("Embeddings module not available")
-        
+        from src.data_layer.embeddings import EmbeddingCache
+
         cache_path = temp_dir / "embed_cache_miss.db"
         cache = EmbeddingCache(cache_path)
         
@@ -419,11 +392,8 @@ class TestBatchedOllamaEmbeddings:
     
     def test_metrics_tracking(self):
         """Test embedding metrics."""
-        try:
-            from src.data_layer.embeddings import EmbeddingMetrics
-        except ImportError:
-            pytest.skip("Embeddings module not available")
-        
+        from src.data_layer.embeddings import EmbeddingMetrics
+
         metrics = EmbeddingMetrics()
         metrics.total_texts = 100
         metrics.cache_hits = 80
@@ -444,11 +414,8 @@ class TestSentenceChunking:
     
     def test_sentence_chunker_basic(self):
         """Test basic sentence chunking."""
-        try:
-            from src.data_layer.ingestion import SentenceChunker
-        except ImportError:
-            pytest.skip("Ingestion module not available")
-        
+        from src.data_layer.ingestion import SentenceChunker
+
         chunker = SentenceChunker(sentences_per_chunk=2, min_chunk_size=20)
         
         text = "First sentence. Second sentence. Third sentence. Fourth sentence."
@@ -459,19 +426,9 @@ class TestSentenceChunking:
     
     def test_spacy_sentence_chunker(self):
         """Test SpaCy-based sentence chunking (wenn verfügbar)."""
-        try:
-            from data_layer.chunking import (
-                SentenceBasedChunker, 
-                SentenceChunkingConfig
-            )
-        except ImportError:
-            pytest.skip("sentence_chunking module not available")
-        
-        config = SentenceChunkingConfig(
-            sentences_per_chunk=3,
-            sentence_overlap=1
-        )
-        chunker = SentenceBasedChunker(config)
+        from src.data_layer.chunking import SpacySentenceChunker
+
+        chunker = SpacySentenceChunker(sentences_per_chunk=3, sentence_overlap=1)
         
         text = """
         Albert Einstein was born in 1879. He was a theoretical physicist.
@@ -493,13 +450,8 @@ class TestSemanticChunking:
     
     def test_semantic_chunker(self):
         """Test semantic chunker with quality metrics."""
-        try:
-            from data_layer.chunking import (
-                create_semantic_chunker
-            )
-            from langchain.schema import Document
-        except ImportError:
-            pytest.skip("semantic_chunking module not available")
+        from src.data_layer.chunking import create_semantic_chunker
+        from langchain.schema import Document
         
         chunker = create_semantic_chunker(
             chunk_size=300,
@@ -530,10 +482,7 @@ class TestSemanticChunking:
     
     def test_header_extraction(self):
         """Test header/section extraction."""
-        try:
-            from data_layer.chunking import HeaderExtractor
-        except ImportError:
-            pytest.skip("semantic_chunking module not available")
+        from src.data_layer.chunking import HeaderExtractor
         
         extractor = HeaderExtractor()
         
@@ -552,10 +501,7 @@ class TestEntityExtraction:
     
     def test_extracted_entity_dataclass(self):
         """Test ExtractedEntity dataclass."""
-        try:
-            from src.data_layer.entity_extraction import ExtractedEntity
-        except ImportError:
-            pytest.skip("entity_extraction module not available")
+        from src.data_layer.entity_extraction import ExtractedEntity
         
         entity = ExtractedEntity(
             entity_id="e001",
@@ -575,10 +521,7 @@ class TestEntityExtraction:
     
     def test_extracted_relation_dataclass(self):
         """Test ExtractedRelation dataclass."""
-        try:
-            from src.data_layer.entity_extraction import ExtractedRelation
-        except ImportError:
-            pytest.skip("entity_extraction module not available")
+        from src.data_layer.entity_extraction import ExtractedRelation
         
         relation = ExtractedRelation(
             subject_entity="Einstein",
@@ -596,10 +539,7 @@ class TestEntityExtraction:
     
     def test_extraction_config(self):
         """Test ExtractionConfig defaults."""
-        try:
-            from src.data_layer.entity_extraction import ExtractionConfig
-        except ImportError:
-            pytest.skip("entity_extraction module not available")
+        from src.data_layer.entity_extraction import ExtractionConfig
         
         config = ExtractionConfig()
         
@@ -614,10 +554,7 @@ class TestEntityExtraction:
     
     def test_entity_cache(self, temp_dir):
         """Test entity caching."""
-        try:
-            from src.data_layer.entity_extraction import EntityCache
-        except ImportError:
-            pytest.skip("entity_extraction module not available")
+        from src.data_layer.entity_extraction import EntityCache
         
         cache = EntityCache(temp_dir / "entity_cache.db", max_size=100)
         
@@ -640,10 +577,7 @@ class TestRRFFusion:
     
     def test_rrf_formula(self):
         """Test RRF score calculation."""
-        try:
-            from src.data_layer.hybrid_retriever import RRFFusion
-        except ImportError:
-            pytest.skip("hybrid_retriever module not available")
+        from src.data_layer.hybrid_retriever import RRFFusion
         
         fusion = RRFFusion(k=60, cross_source_boost=1.2)
         
@@ -653,21 +587,18 @@ class TestRRFFusion:
     
     def test_rrf_fusion_basic(self):
         """Test basic RRF fusion."""
-        try:
-            from src.data_layer.hybrid_retriever import RRFFusion
-        except ImportError:
-            pytest.skip("hybrid_retriever module not available")
+        from src.data_layer.hybrid_retriever import RRFFusion
         
         fusion = RRFFusion(k=60, cross_source_boost=1.2)
         
         vector_results = [
-            {"chunk_id": "c1", "text": "Text 1", "relevance_score": 0.9, "source_doc": "a", "position": 0},
-            {"chunk_id": "c2", "text": "Text 2", "relevance_score": 0.8, "source_doc": "a", "position": 1},
+            {"document_id": "c1", "text": "Text 1", "similarity": 0.9, "metadata": {"source_file": "a"}, "position": 0},
+            {"document_id": "c2", "text": "Text 2", "similarity": 0.8, "metadata": {"source_file": "a"}, "position": 1},
         ]
-        
+
         graph_results = [
-            {"chunk_id": "c1", "text": "Text 1", "confidence": 0.85, "hop": 1, "source_doc": "a", "position": 0},
-            {"chunk_id": "c3", "text": "Text 3", "confidence": 0.7, "hop": 2, "source_doc": "b", "position": 0},
+            {"chunk_id": "c1", "text": "Text 1", "hops": 1, "source_file": "a", "matched_entity": "", "position": 0},
+            {"chunk_id": "c3", "text": "Text 3", "hops": 2, "source_file": "b", "matched_entity": "", "position": 0},
         ]
         
         results = fusion.fuse(vector_results, graph_results, final_top_k=3)
@@ -679,19 +610,16 @@ class TestRRFFusion:
     
     def test_cross_source_boost(self):
         """Test cross-source boost for hybrid results."""
-        try:
-            from src.data_layer.hybrid_retriever import RRFFusion
-        except ImportError:
-            pytest.skip("hybrid_retriever module not available")
+        from src.data_layer.hybrid_retriever import RRFFusion
         
         fusion = RRFFusion(k=60, cross_source_boost=1.5)
         
         # Same chunk in both sources
         vector_results = [
-            {"chunk_id": "c1", "text": "T1", "relevance_score": 0.9, "source_doc": "a", "position": 0},
+            {"document_id": "c1", "text": "T1", "similarity": 0.9, "metadata": {"source_file": "a"}, "position": 0},
         ]
         graph_results = [
-            {"chunk_id": "c1", "text": "T1", "confidence": 0.9, "hop": 1, "source_doc": "a", "position": 0},
+            {"chunk_id": "c1", "text": "T1", "hops": 1, "source_file": "a", "matched_entity": "", "position": 0},
         ]
         
         results = fusion.fuse(vector_results, graph_results)
@@ -712,13 +640,10 @@ class TestPreGenerativeFilter:
     
     def test_relevance_filter(self):
         """Test relevance threshold filtering."""
-        try:
-            from src.data_layer.hybrid_retriever import (
-                PreGenerativeFilter, 
-                RetrievalResult
-            )
-        except ImportError:
-            pytest.skip("hybrid_retriever module not available")
+        from src.data_layer.hybrid_retriever import (
+            PreGenerativeFilter,
+            RetrievalResult,
+        )
         
         pf = PreGenerativeFilter(relevance_threshold_factor=0.5)
         
@@ -737,13 +662,10 @@ class TestPreGenerativeFilter:
     
     def test_redundancy_filter(self):
         """Test redundancy (duplicate) filtering."""
-        try:
-            from src.data_layer.hybrid_retriever import (
-                PreGenerativeFilter, 
-                RetrievalResult
-            )
-        except ImportError:
-            pytest.skip("hybrid_retriever module not available")
+        from src.data_layer.hybrid_retriever import (
+            PreGenerativeFilter,
+            RetrievalResult,
+        )
         
         pf = PreGenerativeFilter(jaccard_threshold=0.8)
         
@@ -764,15 +686,12 @@ class TestHybridRetriever:
     
     def test_retrieval_modes(self, temp_dir, mock_embeddings):
         """Test different retrieval modes."""
-        try:
-            from data_layer.hybrid_retriever import (
-                HybridRetriever, 
-                RetrievalConfig, 
-                RetrievalMode
-            )
-            from src.data_layer.storage import HybridStore, StorageConfig
-        except ImportError:
-            pytest.skip("Retrieval module not available")
+        from src.data_layer.hybrid_retriever import (
+            HybridRetriever,
+            RetrievalConfig,
+            RetrievalMode,
+        )
+        from src.data_layer.storage import HybridStore, StorageConfig
         
         # Setup store
         storage_config = StorageConfig(
@@ -812,17 +731,14 @@ class TestFullPipeline:
     
     def test_ingestion_to_retrieval(self, temp_dir, sample_texts, mock_embeddings):
         """Test full pipeline from ingestion to retrieval."""
-        try:
-            from src.data_layer.storage import HybridStore, StorageConfig
-            from src.data_layer.ingestion import DocumentIngestionPipeline, IngestionConfig
-            from data_layer.hybrid_retriever import (
-                HybridRetriever, 
-                RetrievalConfig, 
-                RetrievalMode
-            )
-            from langchain.schema import Document
-        except ImportError:
-            pytest.skip("Required modules not available")
+        from src.data_layer.storage import HybridStore, StorageConfig
+        from src.data_layer.ingestion import DocumentIngestionPipeline, IngestionConfig
+        from src.data_layer.hybrid_retriever import (
+            HybridRetriever,
+            RetrievalConfig,
+            RetrievalMode,
+        )
+        from langchain.schema import Document
         
         # 1. Setup
         storage_config = StorageConfig(
@@ -873,11 +789,8 @@ class TestFullPipeline:
     
     def test_thesis_compliance(self):
         """Verify implementation matches Thesis Abschnitt 2 specifications."""
-        try:
-            from src.data_layer.entity_extraction import ExtractionConfig
-            from data_layer.chunking import SentenceChunkingConfig
-        except ImportError:
-            pytest.skip("Required modules not available")
+        from src.data_layer.entity_extraction import ExtractionConfig
+        from src.data_layer.chunking import SentenceChunkingConfig
         
         # Thesis 2.2: 3-Satz-Fenster
         chunk_config = SentenceChunkingConfig()
