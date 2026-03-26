@@ -160,3 +160,7 @@ Zusatz/
 
 # Beispiel-Outputs
 examples/output/
+
+# Windows reserved device name (kann nicht als Datei existieren)
+nul
+graph_preview.html

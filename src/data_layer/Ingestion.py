@@ -401,7 +401,10 @@ class RecursiveChunker:
                     separators=["\n\n", "\n", ". ", " ", ""],
                 )
             else:
-                # Simple fallback splitter
+                logger.warning(
+                    "FALLBACK: LangChain nicht verfügbar "
+                    "→ einfacher Fallback-Splitter wird verwendet"
+                )
                 self._splitter = self._fallback_split
         return self._splitter
     

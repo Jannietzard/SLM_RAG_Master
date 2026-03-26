@@ -166,14 +166,14 @@ llm:
   
   base_url: "http://localhost:11434"
   temperature: 0.1    # Low for factual responses
-  max_tokens: 300     # Response length limit
+  max_tokens: 50      # Kurze Antworten; 50 tok @ 2 tok/s = 25s
 
 # ============================================================================
 # AGENTIC CONTROLLER (Artifact B)
 # ============================================================================
 agent:
   # Maximum verification iterations in self-correction loop
-  max_verification_iterations: 3
+  max_verification_iterations: 1
   
   # Enable/disable verification stage
   enable_verification: true

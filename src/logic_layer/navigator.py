@@ -227,7 +227,7 @@ class ControllerConfig:
     temperature: float = 0.1
     
     # Pipeline Settings
-    max_verification_iterations: int = 3
+    max_verification_iterations: int = 1
     enable_early_exit: bool = True
     cache_enabled: bool = False
     
@@ -396,25 +396,36 @@ class Navigator:
         # ─────────────────────────────────────────────────────────────────────
         # STUFE 3: PRE-GENERATIVE FILTERING
         # ─────────────────────────────────────────────────────────────────────
-        
+
         self.logger.info("[Navigator] Pre-Generative Filtering")
-        
+
         filter_start = time.time()
-        
+
         # Filter 1: Relevance Filter
         relevance_filtered = self._relevance_filter(fused_results)
         result.metadata["after_relevance_filter"] = len(relevance_filtered)
-        
-        # Filter 2: Redundancy Filter
+
+        # Filter 2: Redundancy Filter (Jaccard-Deduplication)
         redundancy_filtered = self._redundancy_filter(relevance_filtered)
         result.metadata["after_redundancy_filter"] = len(redundancy_filtered)
-        
+
+        # Filter 3: Contradiction Filter (heuristisch)
+        contradiction_filtered = self._contradiction_filter(redundancy_filtered)
+        result.metadata["after_contradiction_filter"] = len(contradiction_filtered)
+
+        # Filter 4: Entity Overlap Pruning
+        entity_pruned = self._entity_overlap_pruning(contradiction_filtered)
+        result.metadata["after_entity_overlap_pruning"] = len(entity_pruned)
+
         # Limitiere auf max_context_chunks
-        final_results = redundancy_filtered[:self.config.max_context_chunks]
-        
-        result.filtered_context = [r["text"] for r in final_results]
-        result.scores = [r["rrf_score"] for r in final_results]
-        
+        top_results = entity_pruned[:self.config.max_context_chunks]
+
+        # Filter 5: Context Shrinkage (Edge-Optimierung: weniger Input-Tokens)
+        shrunk_results = self._context_shrinkage(top_results)
+
+        result.filtered_context = [r["text"] for r in shrunk_results]
+        result.scores = [r["rrf_score"] for r in shrunk_results]
+
         result.metadata["filter_time_ms"] = (time.time() - filter_start) * 1000
         result.metadata["total_time_ms"] = (time.time() - start_time) * 1000
         
@@ -590,22 +601,178 @@ class Navigator:
     def _jaccard_similarity(self, text1: str, text2: str) -> float:
         """
         Berechne Jaccard-Similarity zwischen zwei Texten.
-        
+
         Jaccard = |A ∩ B| / |A ∪ B|
-        
+
         wobei A und B die Wort-Mengen sind.
         """
         # Tokenisierung: Einfaches Wort-Splitting
         words1 = set(text1.lower().split())
         words2 = set(text2.lower().split())
-        
+
         if not words1 or not words2:
             return 0.0
-        
+
         intersection = len(words1 & words2)
         union = len(words1 | words2)
-        
+
         return intersection / union if union > 0 else 0.0
+
+    def _contradiction_filter(
+        self,
+        results: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Contradiction Filter (heuristisch): Entferne Chunks mit widersprüchlichen
+        Zahlenwerten zum gleichen Topic.
+
+        Gemäß Masterarbeit Abschnitt 3.3:
+        Zwei Chunks mit hohem Wort-Overlap aber stark abweichenden Zahlenwerten
+        (Faktor > 2) gelten als widersprüchlich. Der Chunk mit dem niedrigeren
+        RRF-Score wird verworfen.
+
+        NLI-basierte Detection (cross-encoder/nli-distilroberta-base) wird in
+        S_V PreGenerationValidator genutzt; hier greift die schnelle Heuristik.
+        """
+        import re
+
+        if len(results) < 2:
+            return results
+
+        def extract_numbers(text: str) -> List[float]:
+            return [float(n) for n in re.findall(r"\b\d{4}\b|\b\d+(?:\.\d+)?\b", text)]
+
+        contradicting: set = set()
+        for i in range(len(results)):
+            for j in range(i + 1, len(results)):
+                nums_i = extract_numbers(results[i]["text"])
+                nums_j = extract_numbers(results[j]["text"])
+                if not nums_i or not nums_j:
+                    continue
+
+                words_i = set(results[i]["text"].lower().split())
+                words_j = set(results[j]["text"].lower().split())
+                overlap = len(words_i & words_j) / max(len(words_i | words_j), 1)
+
+                if overlap > 0.3:
+                    for n1 in nums_i:
+                        for n2 in nums_j:
+                            if n1 > 0 and n2 > 0:
+                                ratio = max(n1, n2) / min(n1, n2)
+                                if ratio > 2.0 and min(n1, n2) > 10:
+                                    lower_idx = i if results[i]["rrf_score"] < results[j]["rrf_score"] else j
+                                    contradicting.add(lower_idx)
+                                    break
+
+        filtered = [r for idx, r in enumerate(results) if idx not in contradicting]
+
+        if contradicting:
+            self.logger.debug(
+                f"[Navigator] Contradiction Filter: "
+                f"{len(contradicting)} Chunks entfernt, {len(filtered)}/{len(results)} behalten"
+            )
+
+        return filtered if filtered else results
+
+    def _entity_overlap_pruning(
+        self,
+        results: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Entity Overlap Pruning: Entferne Chunks, deren Named-Entity-Menge
+        vollständig von einem höher-gerankten Chunk abgedeckt wird.
+
+        Gemäß Masterarbeit Abschnitt 3.3:
+        Wenn entities(Chunk_B) ⊆ entities(Chunk_A) und score(A) > score(B),
+        ist Chunk B redundant und wird entfernt.
+
+        Heuristik: Großgeschriebene Mehrwort-Phrasen als Named Entity Proxy.
+        """
+        import re
+
+        if len(results) < 2:
+            return results
+
+        def extract_entities(text: str) -> set:
+            tokens = re.findall(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b", text)
+            return {t.lower() for t in tokens if len(t) > 2}
+
+        entity_sets = [extract_entities(r["text"]) for r in results]
+
+        kept = []
+        pruned: set = set()
+
+        for i, r_i in enumerate(results):
+            if i in pruned:
+                continue
+            if not entity_sets[i]:
+                kept.append(r_i)
+                continue
+
+            is_subset = any(
+                j not in pruned and entity_sets[i].issubset(entity_sets[j])
+                for j in range(i)  # höher gerankter Chunk (Index < i nach Score-Sortierung)
+            )
+
+            if not is_subset:
+                kept.append(r_i)
+            else:
+                pruned.add(i)
+
+        if pruned:
+            self.logger.debug(
+                f"[Navigator] Entity Overlap Pruning: "
+                f"{len(pruned)} Chunks entfernt, {len(kept)}/{len(results)} behalten"
+            )
+
+        return kept if kept else results
+
+    def _context_shrinkage(
+        self,
+        results: List[Dict[str, Any]],
+        max_chars_per_chunk: int = 400
+    ) -> List[Dict[str, Any]]:
+        """
+        Context Shrinkage: Kürze jeden Chunk auf die relevantesten Sätze.
+
+        Gemäß Masterarbeit Abschnitt 3.3 / Edge-Optimierung:
+        Kleinerer Kontext = weniger Input-Tokens = schnellere LLM-Inferenz auf CPU.
+
+        Strategie:
+        1. Splitze in Sätze
+        2. Priorisiere Sätze mit Named Entities (Großbuchstaben-Heuristik)
+        3. Füge Sätze zusammen bis max_chars_per_chunk erreicht
+        """
+        import re
+
+        if not results:
+            return results
+
+        def has_entity(s: str) -> bool:
+            return bool(re.search(r"\b[A-Z][a-zA-Z]{2,}", s))
+
+        shrunk = []
+        for r in results:
+            text = r["text"]
+            if len(text) <= max_chars_per_chunk:
+                shrunk.append(r)
+                continue
+
+            sentences = re.split(r"(?<=[.!?])\s+", text)
+            priority = [s for s in sentences if has_entity(s)]
+            rest = [s for s in sentences if not has_entity(s)]
+
+            result_text = ""
+            for sent in priority + rest:
+                if len(result_text) + len(sent) + 1 > max_chars_per_chunk:
+                    break
+                result_text = (result_text + " " + sent).strip()
+
+            new_r = dict(r)
+            new_r["text"] = result_text if result_text else text[:max_chars_per_chunk]
+            shrunk.append(new_r)
+
+        return shrunk
 
 
 # =============================================================================
@@ -1022,7 +1189,7 @@ class AgenticController:
 def create_controller(
     model_name: str = "phi3",
     base_url: str = "http://localhost:11434",
-    max_iterations: int = 3,
+    max_iterations: int = 1,
     relevance_threshold: float = 0.6,
     redundancy_threshold: float = 0.8,
 ) -> AgenticController:

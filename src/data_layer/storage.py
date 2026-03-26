@@ -193,8 +193,19 @@ class VectorStoreAdapter:
             f"VectorStoreAdapter initialized: "
             f"path={db_path}, metric={distance_metric}"
         )
-        
+
         self._load_metadata()
+
+        # Open existing table if it exists
+        try:
+            table_names = self.db.table_names()
+            if self.TABLE_NAME in table_names:
+                self.table = self.db.open_table(self.TABLE_NAME)
+                self.logger.info(
+                    f"Opened existing table '{self.TABLE_NAME}' with {len(self.table)} rows"
+                )
+        except Exception as e:
+            self.logger.debug(f"Could not open existing table: {e}")
 
     def _get_metadata_path(self) -> Path:
         return self.db_path.parent / "vector_store_metadata.json"
@@ -465,6 +476,7 @@ class KuzuGraphStore:
                     entity_id STRING,
                     name STRING,
                     type STRING,
+                    confidence DOUBLE,
                     PRIMARY KEY (entity_id)
                 )
             """)
@@ -572,6 +584,7 @@ class KuzuGraphStore:
         entity_id: str,
         name: str,
         entity_type: str = "unknown",
+        confidence: float = 0.0,
     ) -> None:
         """Add an entity node."""
         try:
@@ -579,12 +592,14 @@ class KuzuGraphStore:
                 """
                 MERGE (e:Entity {entity_id: $entity_id})
                 SET e.name = $name,
-                    e.type = $entity_type
+                    e.type = $entity_type,
+                    e.confidence = $confidence
                 """,
                 {
                     "entity_id": entity_id,
                     "name": name,
                     "entity_type": entity_type,
+                    "confidence": confidence,
                 }
             )
         except Exception as e:
@@ -911,7 +926,118 @@ class KuzuGraphStore:
             self.logger.error(f"find_chunks_by_entity failed: {e}")
         
         return chunks
-    
+
+    def find_chunks_by_entity_multihop(
+        self,
+        entity_name: str,
+        max_results: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        3-Hop Suche: direkte Treffer (hops=0) + 2-Hop via RELATED_TO (hops=2)
+        + 3-Hop via zwei RELATED_TO-Kanten (hops=3).
+
+        Beispiel Bridge-Query:
+          e1 -[RELATED_TO]-> e2 -[RELATED_TO]-> e3 <-[MENTIONS]- Chunk
+
+        Returns:
+            List of dicts with chunk_id, text, source_file, matched_entity,
+            hops, bridge_entity, relation_type
+        """
+        chunks: List[Dict[str, Any]] = []
+        seen: set = set()
+
+        try:
+            # ── 1-Hop: direkte MENTIONS ────────────────────────────────────
+            res = self.conn.execute(
+                """
+                MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity)
+                WHERE e.name CONTAINS $entity_name
+                RETURN c.chunk_id, c.text, c.source_file, e.name
+                LIMIT $limit
+                """,
+                {"entity_name": entity_name, "limit": max_results},
+            )
+            while res.has_next():
+                row = res.get_next()
+                cid = row[0]
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    chunks.append({
+                        "chunk_id": cid,
+                        "text": row[1],
+                        "source_file": row[2],
+                        "matched_entity": row[3],
+                        "hops": 0,
+                        "bridge_entity": None,
+                        "relation_type": None,
+                    })
+
+            # ── 2-Hop: via RELATED_TO (beide Richtungen) ──────────────────
+            remaining = max_results - len(chunks)
+            if remaining > 0:
+                res = self.conn.execute(
+                    """
+                    MATCH (e1:Entity)-[r:RELATED_TO]-(e2:Entity)
+                    WHERE e1.name CONTAINS $entity_name
+                    WITH e2, r.relation_type AS rel
+                    MATCH (c:DocumentChunk)-[:MENTIONS]->(e2)
+                    RETURN c.chunk_id, c.text, c.source_file,
+                           e2.name AS bridge, rel
+                    LIMIT $limit
+                    """,
+                    {"entity_name": entity_name, "limit": remaining},
+                )
+                while res.has_next():
+                    row = res.get_next()
+                    cid = row[0]
+                    if cid and cid not in seen:
+                        seen.add(cid)
+                        chunks.append({
+                            "chunk_id": cid,
+                            "text": row[1],
+                            "source_file": row[2],
+                            "matched_entity": entity_name,
+                            "hops": 2,
+                            "bridge_entity": row[3],
+                            "relation_type": row[4],
+                        })
+
+            # ── 3-Hop: e1 -[REL]-> e2 -[REL]-> e3 <-[MENTIONS]- Chunk ───
+            remaining = max_results - len(chunks)
+            if remaining > 0:
+                res = self.conn.execute(
+                    """
+                    MATCH (e1:Entity)-[:RELATED_TO]-(e2:Entity)-[r2:RELATED_TO]-(e3:Entity)
+                    WHERE e1.name CONTAINS $entity_name
+                      AND e3.name <> e1.name
+                    WITH e3, e2.name AS mid_entity, r2.relation_type AS rel
+                    MATCH (c:DocumentChunk)-[:MENTIONS]->(e3)
+                    RETURN c.chunk_id, c.text, c.source_file,
+                           e3.name AS bridge, mid_entity, rel
+                    LIMIT $limit
+                    """,
+                    {"entity_name": entity_name, "limit": remaining},
+                )
+                while res.has_next():
+                    row = res.get_next()
+                    cid = row[0]
+                    if cid and cid not in seen:
+                        seen.add(cid)
+                        chunks.append({
+                            "chunk_id": cid,
+                            "text": row[1],
+                            "source_file": row[2],
+                            "matched_entity": entity_name,
+                            "hops": 3,
+                            "bridge_entity": row[3],
+                            "relation_type": row[5],
+                        })
+
+        except Exception as e:
+            self.logger.error(f"find_chunks_by_entity_multihop failed: {e}")
+
+        return chunks
+
     def get_document_structure(self, source_file: str) -> List[Dict[str, Any]]:
         """
         Get ordered chunks for a document (for context expansion).
@@ -1260,8 +1386,13 @@ class HybridStore:
             self.graph_store = KuzuGraphStore(config.graph_db_path)
             self.logger.info("Using KuzuDB for graph storage")
         elif NETWORKX_AVAILABLE:
+            if config.graph_backend == "kuzu":
+                self.logger.warning(
+                    "FALLBACK: KuzuDB konfiguriert aber nicht verfügbar "
+                    "→ NetworkX wird verwendet. Installiere mit: pip install kuzu"
+                )
             self.graph_store = NetworkXGraphStore(config.graph_db_path)
-            self.logger.info("Using NetworkX for graph storage (fallback)")
+            self.logger.info("Using NetworkX for graph storage")
         else:
             raise ImportError("No graph backend available!")
         
@@ -1270,25 +1401,24 @@ class HybridStore:
         if config.enable_entity_extraction:
             try:
                 # Lazy import to avoid hard dependency
-                from entity_extraction import EntityExtractionPipeline, ExtractionConfig
-                
+                from src.data_layer.entity_extraction import EntityExtractionPipeline, ExtractionConfig
+
                 # Auto-generate cache path if not provided
+                from pathlib import Path as _Path
                 cache_path = config.entity_cache_path
                 if cache_path is None:
-                    cache_path = config.graph_db_path.parent / "entity_cache.db"
-                
+                    cache_path = _Path(config.graph_db_path).parent / "entity_cache.db"
+
                 extraction_config = ExtractionConfig(
                     cache_enabled=True,
                     cache_path=str(cache_path),
-                    # Thesis-compliant settings (Abschnitt 2.5)
-                    ner_confidence_threshold=0.5,
-                    re_confidence_threshold=0.7,
+                    # Defaults aus ExtractionConfig verwenden (threshold=0.15, lowercase types)
                     ner_batch_size=16,
                     re_batch_size=8,
                     min_entities_for_re=2,
                     selective_re=True,
                 )
-                
+
                 self.entity_pipeline = EntityExtractionPipeline(extraction_config)
                 self.logger.info(
                     f"Entity extraction enabled (GLiNER + REBEL, cache: {cache_path})"
@@ -1434,6 +1564,7 @@ class HybridStore:
                             entity_id=entity.entity_id,
                             name=entity.name,
                             entity_type=entity.entity_type,
+                            confidence=entity.confidence,
                         )
                         seen_entities.add(entity.entity_id)
                         stats["unique_entities"] += 1
@@ -1450,14 +1581,12 @@ class HybridStore:
                 except Exception as e:
                     self.logger.debug(f"MENTIONS relation failed: {e}")
         
-        # STEP 5: RELATED_TO relations (Entity -> Entity via REBEL)
+        # STEP 5a: RELATED_TO relations via REBEL (falls vorhanden)
         for result in extraction_results:
             for relation in result.relations:
                 try:
-                    # Map entity names to entity_ids
                     subject_id = entity_name_to_id.get(relation.subject_entity.lower())
                     object_id = entity_name_to_id.get(relation.object_entity.lower())
-                    
                     if subject_id and object_id:
                         self.graph_store.add_related_to_relation(
                             entity1_id=subject_id,
@@ -1467,7 +1596,7 @@ class HybridStore:
                         stats["total_relations"] += 1
                 except Exception as e:
                     self.logger.debug(f"RELATED_TO relation failed: {e}")
-        
+
         return stats
     
     def vector_search(
@@ -1518,14 +1647,14 @@ class HybridStore:
         seen_chunks = set()
         
         for entity_name in entities:
-            # Find chunks mentioning this entity
             if isinstance(self.graph_store, KuzuGraphStore):
-                entity_chunks = self.graph_store.find_chunks_by_entity(
+                # Multi-Hop: 1-Hop direkte MENTIONS + 2-Hop via RELATED_TO
+                entity_chunks = self.graph_store.find_chunks_by_entity_multihop(
                     entity_name=entity_name,
                     max_results=top_k,
                 )
             else:
-                # NetworkX fallback - basic node search
+                # NetworkX fallback
                 entity_chunks = []
                 for node in self.graph_store.graph.nodes():
                     if entity_name.lower() in str(node).lower():
@@ -1536,10 +1665,12 @@ class HybridStore:
                                     "chunk_id": neighbor,
                                     "text": "",
                                     "source_file": "",
-                                    "entity": entity_name,
+                                    "matched_entity": entity_name,
                                     "hops": hops,
+                                    "bridge_entity": None,
+                                    "relation_type": None,
                                 })
-            
+
             for chunk in entity_chunks:
                 chunk_id = chunk.get("chunk_id")
                 if chunk_id and chunk_id not in seen_chunks:
@@ -1548,8 +1679,10 @@ class HybridStore:
                         "chunk_id": chunk_id,
                         "text": chunk.get("text", ""),
                         "source_file": chunk.get("source_file", ""),
-                        "matched_entity": entity_name,
+                        "matched_entity": chunk.get("matched_entity", entity_name),
                         "hops": chunk.get("hops", 0),
+                        "bridge_entity": chunk.get("bridge_entity"),
+                        "relation_type": chunk.get("relation_type"),
                     })
         
         # Sort by hops (closer = better) and limit results

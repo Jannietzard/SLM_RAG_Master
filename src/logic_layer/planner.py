@@ -321,6 +321,8 @@ class QueryClassifier:
         r"\bwhich\s+(is|was|are|were)\s+\w*(er|est)\b",
         r"\b(better|worse|best|worst)\b.*\bor\b",
         r"\bor\b.*\?(which|what)\s+(is|was)\s+\w*(er|est)",
+        r"\bsame\s+\w+\b",          # "same nationality", "same country", "same field"
+        r"\bboth\s+.+\s+(born|from|have|had|were|are)\b",  # "both born in", "both from"
     ]
     
     # Temporal-Indikatoren: Zeitbezüge und temporale Strukturen
@@ -1000,9 +1002,54 @@ class PlanGenerator:
         hop_sequence = []
         sub_queries = []
         
+        # Ansatz 4: Template Substitution — Query-Struktur erhalten
+        # Finde den Span der alle Entities abdeckt und ersetze ihn pro Entity
+        # Beispiel: "Were Scott Derrickson and Ed Wood of the same nationality?"
+        #   → "Were Scott Derrickson of the same nationality?"
+        #   → "Were Ed Wood of the same nationality?"
+
+        # Nur echte NER-Entities (SpaCy), keine Regex-PROPN (enthalten Satzanfang)
+        _NER_LABELS = {
+            "PERSON", "GPE", "ORG", "LOC", "PRODUCT",
+            "EVENT", "WORK_OF_ART", "NORP", "DATE", "FAC",
+        }
+        ner_entities = [e for e in entities if e.label in _NER_LABELS]
+
+        if len(ner_entities) >= 2:
+            comparison_entities = ner_entities[:2]
+        else:
+            # Fallback: greedily select non-overlapping entities
+            selected: List[EntityInfo] = list(ner_entities)
+            for e in entities:
+                if len(selected) >= 2:
+                    break
+                overlaps = any(
+                    not (e.end_char <= sel.start_char or e.start_char >= sel.end_char)
+                    for sel in selected
+                )
+                if not overlaps and e not in selected:
+                    selected.append(e)
+            comparison_entities = selected[:2]
+        sub_query_templates = []
+
+        if len(comparison_entities) >= 2:
+            idx = [query.find(e.text) for e in comparison_entities]
+            if all(i >= 0 for i in idx):
+                span_start = min(idx)
+                span_end   = max(idx[j] + len(comparison_entities[j].text)
+                                 for j in range(len(comparison_entities)))
+                prefix = query[:span_start]
+                suffix = query[span_end:]
+                for e in comparison_entities:
+                    sq = re.sub(r'\s+', ' ', (prefix + e.text + suffix).strip())
+                    sub_query_templates.append((e, sq))
+
+        if not sub_query_templates:
+            # Fallback: keine Positionsinfo → generisches Template
+            sub_query_templates = [(e, f"What is {e.text}?") for e in comparison_entities]
+
         # Schritt für jede Entity (können parallel laufen)
-        for i, entity in enumerate(entities[:2]):  # Max 2 für Comparison
-            sub_query = f"What is {entity.text}?"
+        for i, (entity, sub_query) in enumerate(sub_query_templates):
             hop_sequence.append(HopStep(
                 step_id=i,
                 sub_query=sub_query,

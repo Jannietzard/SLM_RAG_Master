@@ -549,8 +549,8 @@ class TestEntityExtraction:
         assert config.ner_batch_size == 16
         assert config.re_batch_size == 8
         assert config.min_entities_for_re == 2
-        assert "PERSON" in config.entity_types
-        assert "ORGANIZATION" in config.entity_types
+        assert "person" in config.entity_types        # lowercase seit GLiNER-Umstellung
+        assert "organization" in config.entity_types  # lowercase seit GLiNER-Umstellung
     
     def test_entity_cache(self, temp_dir):
         """Test entity caching."""

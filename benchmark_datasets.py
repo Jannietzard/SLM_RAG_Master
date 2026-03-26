@@ -688,10 +688,11 @@ def run_ingestion(
         similarity_threshold=vector_config.get("similarity_threshold", 0.3),
         normalize_embeddings=vector_config.get("normalize_embeddings", True),
         distance_metric=vector_config.get("distance_metric", "cosine"),
+        enable_entity_extraction=True,   # GLiNER + REBEL → Entity-Nodes in KuzuDB
     )
-    
+
     hybrid_store = HybridStore(config=storage_config, embeddings=embeddings)
-    
+
     # Ingest in batches
     start_time = time.time()
     batch_size = 100
@@ -701,8 +702,19 @@ def run_ingestion(
               disable=not TQDM_AVAILABLE) as pbar:
         for i in range(0, len(documents), batch_size):
             batch = documents[i:i + batch_size]
+            batch_start = time.time()
             hybrid_store.add_documents(batch)
+            batch_elapsed = time.time() - batch_start
             pbar.update(len(batch))
+            done = i + len(batch)
+            pct = 100 * done / len(documents)
+            elapsed_total = time.time() - start_time
+            remaining = (elapsed_total / done) * (len(documents) - done) if done > 0 else 0
+            logger.info(
+                f"  [{pct:5.1f}%] Batch {i // batch_size + 1}/{n_batches} "
+                f"| {batch_elapsed:.0f}s/batch "
+                f"| verbleibend ~{remaining/3600:.1f}h"
+            )
             pbar.set_postfix(batch=f"{i // batch_size + 1}/{n_batches}")
     
     hybrid_store.save()
@@ -909,7 +921,7 @@ def evaluate_dataset(
             ))
             
         except Exception as e:
-            logger.warning(f"    Error on Q{i}: {str(e)[:50]}")
+            logger.warning(f"    Error on Q{q.id}: {str(e)[:50]}")
     
     if not results:
         return None

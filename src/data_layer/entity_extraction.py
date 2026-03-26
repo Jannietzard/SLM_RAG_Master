@@ -154,24 +154,14 @@ class ExtractionConfig:
     # GLiNER
     gliner_model: str = "urchade/gliner_small-v2.1"
     entity_types: List[str] = field(default_factory=lambda: [
-        "PERSON", 
-        "ORGANIZATION", 
-        "GPE",          # Geo-Political Entity (Länder, Städte) - präziser als LOCATION
-        "LOCATION",
-        "PLACE",
-        "DATE", 
-        "EVENT",
-        "CONCEPT",    # Basierend auf GLiNER-Paper und gängigen NER-Taxonomien 
-        "WORK_OF_ART", 
-        "STRUCTURE",
-        "NATURAL_OBJECT",
-        "LAW",      
-        # Hovy,2006
-        # Domänenspezifische Erweiterungen (Begründet durch Edge/IT-Kontext)
-        # Ersetzt das vage "CONCEPT" für bessere GLiNER-Performance
-        "TECHNOLOGY",   # Hardware, Software, Protokolle
-        "SCIENTIFIC_TERM", # Fachbegriffe, Theorien
-        "PRODUCT"
+        # Lowercase natural-language names → bessere zero-shot performance bei GLiNER
+        "person",           # Personen (ersetzt PERSON)
+        "organization",     # Unternehmen, Studios, Institutionen (ersetzt ORGANIZATION)
+        "city",             # Städte — besser als GPE/LOCATION (verhindert Merge)
+        "country",          # Länder, Nationalitäten-Kontext
+        "film",             # Filme (ersetzt WORK_OF_ART — höhere Konfidenz)
+        "movie",            # Synonym für film (doppelte Abdeckung)
+        "event",            # Historische Ereignisse (ersetzt EVENT)
     ])
     ner_confidence_threshold: float = 0.15
     ner_batch_size: int = 16
@@ -316,14 +306,33 @@ class EntityCache:
 class GLiNERExtractor:
     """
     Named Entity Recognition mit GLiNER-small.
-    
+
     GLiNER ist ein Zero-Shot NER Modell, das beliebige Entitätstypen
     ohne domänenspezifisches Fine-Tuning extrahieren kann.
-    
-    Referenz: Zaratiana et al. (2023). "GLiNER: Generalist Model for 
+
+    Referenz: Zaratiana et al. (2023). "GLiNER: Generalist Model for
     Named Entity Recognition using Bidirectional Transformer"
     """
-    
+
+    # Normalisierung: natürlichsprachige Typnamen → kanonische Typen
+    _LABEL_MAP: dict = {
+        "person": "PERSON", "director": "PERSON", "actor": "PERSON",
+        "politician": "PERSON", "scientist": "PERSON", "athlete": "PERSON",
+        "organization": "ORGANIZATION", "company": "ORGANIZATION",
+        "studio": "ORGANIZATION", "institution": "ORGANIZATION",
+        "city": "GPE", "country": "GPE", "state": "GPE", "gpe": "GPE",
+        "location": "LOCATION", "place": "LOCATION",
+        "film": "WORK_OF_ART", "movie": "WORK_OF_ART", "book": "WORK_OF_ART",
+        "album": "WORK_OF_ART", "song": "WORK_OF_ART", "work_of_art": "WORK_OF_ART",
+        "event": "EVENT",
+        "product": "PRODUCT", "technology": "TECHNOLOGY",
+    }
+
+    @classmethod
+    def _normalize_label(cls, label: str) -> str:
+        """Mappe GLiNER-Typname auf kanonischen Typ; unbekannte Typen uppercase."""
+        return cls._LABEL_MAP.get(label.lower(), label.upper())
+
     def __init__(self, config: ExtractionConfig):
         self.config = config
         self.model = None
@@ -359,6 +368,12 @@ class GLiNERExtractor:
             Liste von ExtractedEntity Objekten
         """
         if self.model is None:
+            if not getattr(self, '_fallback_warned', False):
+                logger.warning(
+                    "FALLBACK: GLiNER-Modell nicht geladen "
+                    "→ SpaCy/Regex-Extraktion wird verwendet"
+                )
+                self._fallback_warned = True
             return self._fallback_extract(text, chunk_id)
         
         try:
@@ -371,18 +386,19 @@ class GLiNERExtractor:
             
             results = []
             for ent in entities:
+                canonical_type = self._normalize_label(ent["label"])
                 entity = ExtractedEntity(
-                    entity_id=self._generate_entity_id(ent["text"], ent["label"]),
+                    entity_id=self._generate_entity_id(ent["text"], canonical_type),
                     name=ent["text"],
-                    entity_type=ent["label"],
+                    entity_type=canonical_type,
                     confidence=ent["score"],
                     mention_span=(ent["start"], ent["end"]),
                     source_chunk_id=chunk_id,
                 )
                 results.append(entity)
-            
+
             return results
-            
+
         except Exception as e:
             logger.error(f"GLiNER extraction failed: {e}")
             return self._fallback_extract(text, chunk_id)
@@ -418,10 +434,11 @@ class GLiNERExtractor:
                 for text_entities, chunk_id in zip(batch_entities, batch_ids):
                     results = []
                     for ent in text_entities:
+                        canonical_type = self._normalize_label(ent["label"])
                         entity = ExtractedEntity(
-                            entity_id=self._generate_entity_id(ent["text"], ent["label"]),
+                            entity_id=self._generate_entity_id(ent["text"], canonical_type),
                             name=ent["text"],
-                            entity_type=ent["label"],
+                            entity_type=canonical_type,
                             confidence=ent["score"],
                             mention_span=(ent["start"], ent["end"]),
                             source_chunk_id=chunk_id,
@@ -609,8 +626,8 @@ class REBELExtractor:
                     
                     if subject and relation and object_:
                         triplets.append((subject.strip(), relation.strip(), object_.strip()))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Triplet-Parsing fehlgeschlagen (übersprungen): {e}")
         return triplets
 
     def extract_batch(self, texts, entities_per_text, chunk_ids):
@@ -908,6 +925,134 @@ class EntityExtractionPipeline:
         """Cleanup."""
         if self.cache:
             self.cache.close()
+
+
+# ============================================================================
+# SPACY ENTITY PIPELINE (Edge-optimiert, kein GLiNER/REBEL)
+# ============================================================================
+
+class SpacyEntityPipeline:
+    """
+    Lightweight Entity Extraction Pipeline auf Basis von SpaCy.
+
+    Ersetzt GLiNER + REBEL für Edge-Devices:
+    - Modell: en_core_web_sm (12 MB, bereits für Chunking installiert)
+    - Latenz: 3-5 ms pro Chunk (vs. 80-120 ms mit GLiNER)
+    - Kein Modell-Download erforderlich
+
+    Implementiert dieselbe Schnittstelle wie EntityExtractionPipeline:
+    - process_chunks_batch(texts, chunk_ids) → List[ChunkExtractionResult]
+
+    Erkannte Entity-Typen (SpaCy → interne Bezeichnung):
+    - PERSON  → PERSON
+    - ORG     → ORGANIZATION
+    - GPE     → LOCATION   (Länder, Städte, Bundesstaaten)
+    - LOC     → LOCATION   (geografische Orte)
+    - DATE    → DATE
+    - EVENT   → EVENT
+    """
+
+    # SpaCy-Label → interner Entity-Typ
+    _LABEL_MAP = {
+        "PERSON":  "PERSON",
+        "ORG":     "ORGANIZATION",
+        "GPE":     "LOCATION",
+        "LOC":     "LOCATION",
+        "DATE":    "DATE",
+        "EVENT":   "EVENT",
+        "WORK_OF_ART": "WORK_OF_ART",
+        "FAC":     "LOCATION",
+        "NORP":    "PERSON",    # Nationalities / religious groups
+    }
+
+    def __init__(self, spacy_model: str = "en_core_web_sm", batch_size: int = 64):
+        """
+        Args:
+            spacy_model: SpaCy-Modell (muss installiert sein)
+            batch_size:  Chunks pro nlp.pipe()-Batch
+        """
+        import spacy as _spacy
+        self.nlp = _spacy.load(spacy_model)
+        self.batch_size = batch_size
+        logger.info(f"SpacyEntityPipeline initialisiert: model={spacy_model}")
+
+    # ------------------------------------------------------------------
+    # Öffentliche Schnittstelle (kompatibel mit EntityExtractionPipeline)
+    # ------------------------------------------------------------------
+
+    def process_chunks_batch(
+        self,
+        texts: List[str],
+        chunk_ids: List[str],
+    ) -> List[ChunkExtractionResult]:
+        """
+        Extrahiere Named Entities aus einer Liste von Chunk-Texten.
+
+        Args:
+            texts:     Chunk-Texte
+            chunk_ids: Eindeutige IDs (parallel zu texts)
+
+        Returns:
+            List[ChunkExtractionResult] — selbes Format wie EntityExtractionPipeline
+        """
+        results: List[ChunkExtractionResult] = []
+
+        for doc, chunk_id, text in zip(
+            self.nlp.pipe(texts, batch_size=self.batch_size),
+            chunk_ids,
+            texts,
+        ):
+            t0 = time.time()
+            entities = self._extract_from_doc(doc, chunk_id)
+            elapsed = (time.time() - t0) * 1000
+            results.append(ChunkExtractionResult(
+                chunk_id=chunk_id,
+                text=text,
+                entities=entities,
+                relations=[],        # SpaCy macht keine Relation Extraction
+                extraction_time_ms=elapsed,
+            ))
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Interne Hilfsmethoden
+    # ------------------------------------------------------------------
+
+    def _extract_from_doc(self, doc, chunk_id: str) -> List[ExtractedEntity]:
+        """Erstelle ExtractedEntity-Objekte aus einem SpaCy Doc."""
+        entities: List[ExtractedEntity] = []
+        seen_ids: set = set()
+
+        for ent in doc.ents:
+            ent_type = self._LABEL_MAP.get(ent.label_)
+            if ent_type is None:
+                continue  # CARDINAL, ORDINAL, MONEY etc. überspringen
+
+            entity_id = self._generate_entity_id(ent.text, ent_type)
+
+            # Pro Chunk: jede entity_id nur einmal als ExtractedEntity
+            # (MENTIONS-Relation wird trotzdem angelegt)
+            if entity_id in seen_ids:
+                continue
+            seen_ids.add(entity_id)
+
+            entities.append(ExtractedEntity(
+                entity_id=entity_id,
+                name=ent.text,
+                entity_type=ent_type,
+                confidence=0.8,   # SpaCy gibt keine numerische Confidence
+                mention_span=(ent.start_char, ent.end_char),
+                source_chunk_id=chunk_id,
+            ))
+
+        return entities
+
+    @staticmethod
+    def _generate_entity_id(name: str, entity_type: str) -> str:
+        """Stabiler Hash-ID (identisch mit GLiNERExtractor._generate_entity_id)."""
+        combined = f"{name.lower().strip()}:{entity_type}"
+        return hashlib.md5(combined.encode()).hexdigest()[:12]
 
 
 # ============================================================================

@@ -59,7 +59,7 @@ class RetrievalConfig:
     mode: RetrievalMode = RetrievalMode.HYBRID
     
     # Vector Retrieval
-    vector_top_k: int = 20
+    vector_top_k: int = 10
     
     # Graph Retrieval
     graph_top_k: int = 10

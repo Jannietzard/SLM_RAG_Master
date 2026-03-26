@@ -247,23 +247,23 @@ class VerifierConfig:
     model_name: str = "phi3"
     base_url: str = "http://localhost:11434"
     temperature: float = 0.1
-    max_tokens: int = 200
-    timeout: int = 300  # 5 Minuten für CPU
-    
-    # Context Settings (optimiert für Edge)
-    max_context_chars: int = 2000   # ~500 tokens
-    max_docs: int = 5               # Top-5 aus Hybrid Retrieval
-    max_chars_per_doc: int = 350    # Pro Chunk
-    
+    max_tokens: int = 50             # Kurze Antworten; 50 tok @ 2 tok/s = 25s
+    timeout: int = 60               # 30s LLM + Overhead
+
+    # Context Settings (optimiert für Edge, <30s Ziel)
+    max_context_chars: int = 800    # ~200 tokens Input
+    max_docs: int = 3               # Top-3 aus Hybrid Retrieval
+    max_chars_per_doc: int = 200    # Pro Chunk (~50 tokens)
+
     # Pre-Validation Settings (gemäß Masterarbeit)
     enable_entity_path_validation: bool = True
-    enable_contradiction_detection: bool = True
+    enable_contradiction_detection: bool = False  # NLI-Download deaktiviert (5-10 Min first load)
     contradiction_threshold: float = 0.85  # NLI-Confidence > 0.85
     enable_credibility_scoring: bool = True
     min_credibility_score: float = 0.5     # Minimum für Inklusion
     
     # Agentic Loop Settings
-    max_iterations: int = 3
+    max_iterations: int = 1
     stop_on_first_success: bool = True
 
 
@@ -740,31 +740,33 @@ class Verifier:
     # PROMPT TEMPLATES
     # ─────────────────────────────────────────────────────────────────────────
     
-    ANSWER_PROMPT = """You are a factual question-answering assistant.
-Answer the question based ONLY on the provided context.
-If the context doesn't contain enough information, say "I cannot answer based on the given context."
+    ANSWER_PROMPT = """You are a factual QA assistant. Answer based ONLY on the context below.
+
+Rules:
+- Give the shortest possible answer: a name, place, date, or yes/no.
+- Do NOT explain or add sentences beyond the direct answer.
+- If the answer is a person, place, or thing: reply with just that name.
+- If the answer is yes/no: reply with just "yes" or "no".
+- If the context does not contain the answer: reply with "I don't know."
 
 Context:
 {context}
 
 Question: {query}
 
-Provide a concise, factual answer (2-3 sentences max):"""
+Answer (as short as possible):"""
 
-    CORRECTION_PROMPT = """Your previous answer contained claims that could not be verified against the knowledge base.
+    CORRECTION_PROMPT = """Your previous answer contained unverified claims.
 
 Unverified claims:
 {violations}
 
-Please provide a corrected answer that only includes facts that can be verified from the context.
-Avoid making claims that go beyond what the context explicitly states.
-
 Context:
 {context}
 
 Question: {query}
 
-Corrected answer (only verified facts):"""
+Give the shortest correct answer (name, place, date, or yes/no only):"""
 
     INSUFFICIENT_EVIDENCE_PROMPT = """Based on the available context, I could not find sufficient evidence to fully answer your question.
 
@@ -1297,10 +1299,10 @@ Please provide a partial answer based on the available evidence, clearly indicat
 def create_verifier(
     model_name: str = "phi3",
     base_url: str = "http://localhost:11434",
-    max_iterations: int = 3,
-    max_context_chars: int = 2000,
+    max_iterations: int = 1,
+    max_context_chars: int = 800,
     graph_store=None,
-    enable_pre_validation: bool = True,
+    enable_pre_validation: bool = False,
 ) -> Verifier:
     """
     Factory-Funktion für Verifier.
