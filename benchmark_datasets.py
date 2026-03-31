@@ -183,6 +183,16 @@ ABLATION_CONFIGS = [
     ("graph_only", 0.0, 1.0),
 ]
 
+# Component ablation: (name, enable_planner, enable_verifier, max_iterations)
+# Verwendet mit --component-ablation Flag (Hybrid 50/50 Gewichte als Baseline)
+COMPONENT_CONFIGS = [
+    ("full",        True,  True,  1),
+    ("no_planner",  False, True,  1),
+    ("no_verifier", True,  False, 1),
+    ("iter_2",      True,  True,  2),
+    ("iter_3",      True,  True,  3),
+]
+
 # ============================================================================
 # DATA STRUCTURES
 # ============================================================================
@@ -783,6 +793,10 @@ def create_pipeline(
     store_manager: StoreManager,
     vector_weight: float = 0.7,
     graph_weight: float = 0.3,
+    model_name: str = None,
+    enable_planner: bool = True,
+    enable_verifier: bool = True,
+    max_iterations: int = 1,
 ):
     """
     Create pipeline for specific dataset.
@@ -805,7 +819,18 @@ def create_pipeline(
     pipeline_config["paths"] = pipeline_config.get("paths", {}).copy()
     pipeline_config["paths"]["vector_db"] = str(paths["vector_db"])
     pipeline_config["paths"]["graph_db"] = str(paths["knowledge_graph"])
-    
+
+    # Model override (--model flag) — all model names live in settings.yaml
+    if model_name is not None:
+        pipeline_config["llm"] = pipeline_config.get("llm", {}).copy()
+        pipeline_config["llm"]["model_name"] = model_name
+
+    # Component ablation flags
+    pipeline_config["agent"] = pipeline_config.get("agent", {}).copy()
+    pipeline_config["agent"]["enable_planner"] = enable_planner
+    pipeline_config["agent"]["enable_verifier"] = enable_verifier
+    pipeline_config["agent"]["max_verification_iterations"] = max_iterations
+
     # Set retrieval weights
     pipeline_config["rag"] = pipeline_config.get("rag", {}).copy()
     pipeline_config["rag"]["vector_weight"] = vector_weight
@@ -1011,7 +1036,23 @@ def cmd_ingest(args, config: Dict, store_manager: StoreManager):
                 sentence_overlap=args.chunk_overlap,
             )
             logger.info(f"  Created {len(documents)} document chunks")
-            
+
+            # --chunks-only: JSON exportieren und stoppen (Decoupled Ingestion Part 1)
+            if getattr(args, "chunks_only", False):
+                out_dir = Path("./data") / dataset
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / "chunks_export.json"
+                chunks_data = [
+                    {"text": doc.page_content, "metadata": {k: str(v) for k, v in doc.metadata.items()}}
+                    for doc in documents
+                ]
+                with open(out_path, "w", encoding="utf-8") as f:
+                    import json as _json
+                    _json.dump(chunks_data, f, ensure_ascii=False, indent=2)
+                logger.info(f"  [chunks-only] Exportiert: {out_path}  ({out_path.stat().st_size/1024/1024:.1f} MB)")
+                logger.info(f"  [chunks-only] Naechster Schritt: Datei in Google Colab hochladen.")
+                continue
+
             paths = store_manager.get_paths(dataset)
             run_ingestion(
                 documents,
@@ -1054,18 +1095,27 @@ def cmd_evaluate(args, config: Dict, store_manager: StoreManager):
     if args.samples:
         questions = questions[:args.samples]
     
+    model_name = getattr(args, "model", None) or config.get("llm", {}).get("model_name", "phi3")
+    enable_planner = not getattr(args, "no_planner", False)
+    enable_verifier = not getattr(args, "no_verifier", False)
+    max_iterations = getattr(args, "iterations", 1) or 1
     logger.info(f"Questions: {len(questions)}")
-    logger.info(f"Config: vector={args.vector_weight}, graph={args.graph_weight}")
-    
+    logger.info(f"Config: vector={args.vector_weight}, graph={args.graph_weight}, model={model_name}")
+    logger.info(f"Components: planner={enable_planner}, verifier={enable_verifier}, iter={max_iterations}")
+
     # Create pipeline
     pipeline = create_pipeline(
         dataset, config, store_manager,
         vector_weight=args.vector_weight,
         graph_weight=args.graph_weight,
+        model_name=model_name,
+        enable_planner=enable_planner,
+        enable_verifier=enable_verifier,
+        max_iterations=max_iterations,
     )
-    
+
     try:
-        config_name = f"v{args.vector_weight}_g{args.graph_weight}"
+        config_name = f"v{args.vector_weight}_g{args.graph_weight}_{model_name}"
         result = evaluate_dataset(
             dataset, questions, pipeline,
             config_name, args.vector_weight, args.graph_weight,
@@ -1113,60 +1163,109 @@ def cmd_ablation(args, config: Dict, store_manager: StoreManager):
             logger.error(f"Run: python benchmark_datasets.py ingest --dataset {dataset}")
             return
     
+    model_name = getattr(args, "model", None) or config.get("llm", {}).get("model_name", "phi3")
+    do_component = getattr(args, "component_ablation", False)
     logger.info(f"Datasets: {datasets}")
     logger.info(f"Samples per dataset: {args.samples}")
-    logger.info(f"Configurations: {len(ABLATION_CONFIGS)}")
+    logger.info(f"Model: {model_name}")
+    logger.info(f"Retrieval configs: {len(ABLATION_CONFIGS)}")
+    logger.info(f"Component ablation: {do_component}")
     logger.info("="*70)
-    
+
     # Run ablation
-    all_results = {}
-    
+    all_results: Dict[str, List] = {}
+    used_run_names: List[str] = []
+
     for dataset in datasets:
         logger.info(f"\n{'='*70}")
         logger.info(f"DATASET: {dataset.upper()}")
         logger.info(f"{'='*70}")
-        
+
         questions = store_manager.load_questions(dataset)
         if args.samples:
             questions = questions[:args.samples]
-        
+
         logger.info(f"Questions: {len(questions)}")
-        
+
         dataset_results = []
-        
-        for config_name, vector_weight, graph_weight in ABLATION_CONFIGS:
-            logger.info(f"\n  Config: {config_name} (v={vector_weight}, g={graph_weight})")
-            
+
+        # ── Retrieval-weight ablation ──────────────────────────────────────
+        for cfg_name, vector_weight, graph_weight in ABLATION_CONFIGS:
+            run_name = f"{cfg_name}_{model_name}"
+            logger.info(f"\n  [Retrieval] {run_name} (v={vector_weight}, g={graph_weight})")
+
             try:
                 pipeline = create_pipeline(
                     dataset, config, store_manager,
                     vector_weight=vector_weight,
                     graph_weight=graph_weight,
+                    model_name=model_name,
                 )
-                
+
                 result = evaluate_dataset(
                     dataset, questions, pipeline,
-                    config_name, vector_weight, graph_weight,
+                    run_name, vector_weight, graph_weight,
                 )
-                
+
                 if result:
                     dataset_results.append(result)
-                    logger.info(f"    EM: {result.exact_match:.2%}, F1: {result.f1_score:.3f}")
-                
+                    if run_name not in used_run_names:
+                        used_run_names.append(run_name)
+                    logger.info(f"    EM: {result.exact_match:.2%}, F1: {result.f1_score:.3f}, "
+                                f"Latency: {result.avg_time_ms:.0f}ms")
+
                 del pipeline
                 import gc
                 gc.collect()
-                
+
             except Exception as e:
                 logger.error(f"    Failed: {e}")
-        
+
+        # ── Component ablation (optional) ─────────────────────────────────
+        if do_component:
+            logger.info(f"\n  {'─'*60}")
+            logger.info(f"  COMPONENT ABLATION (hybrid 50/50)")
+            logger.info(f"  {'─'*60}")
+            for comp_name, enable_p, enable_v, max_iter in COMPONENT_CONFIGS:
+                run_name = f"comp_{comp_name}_{model_name}"
+                logger.info(f"\n  [Component] {run_name} "
+                            f"(planner={enable_p}, verifier={enable_v}, iter={max_iter})")
+
+                try:
+                    pipeline = create_pipeline(
+                        dataset, config, store_manager,
+                        vector_weight=0.5, graph_weight=0.5,
+                        model_name=model_name,
+                        enable_planner=enable_p,
+                        enable_verifier=enable_v,
+                        max_iterations=max_iter,
+                    )
+
+                    result = evaluate_dataset(
+                        dataset, questions, pipeline,
+                        run_name, 0.5, 0.5,
+                    )
+
+                    if result:
+                        dataset_results.append(result)
+                        if run_name not in used_run_names:
+                            used_run_names.append(run_name)
+                        logger.info(f"    EM: {result.exact_match:.2%}, F1: {result.f1_score:.3f}, "
+                                    f"Latency: {result.avg_time_ms:.0f}ms")
+
+                    del pipeline
+                    gc.collect()
+
+                except Exception as e:
+                    logger.error(f"    Failed: {e}")
+
         all_results[dataset] = dataset_results
-    
+
     # Save results
     ablation_results = AblationResults(
         timestamp=datetime.now().isoformat(),
         datasets=datasets,
-        configs=[name for name, _, _ in ABLATION_CONFIGS],
+        configs=used_run_names,
         results=all_results,
     )
     
@@ -1184,57 +1283,106 @@ def cmd_ablation(args, config: Dict, store_manager: StoreManager):
     # Print summary table
     print_ablation_table(ablation_results)
 
+def _compute_mur(ds_results: List) -> Dict[str, Optional[float]]:
+    """
+    MUR = ΔF1 / ΔLatency(s)  —  Marginal Utility Ratio.
+
+    Baseline = erster Eintrag (vector_only oder full).
+    Positiv = Verbesserung pro Sekunde Mehrlatenz.
+    None = Latenz-Unterschied zu klein für zuverlässige Messung.
+    """
+    if not ds_results:
+        return {}
+    baseline = ds_results[0]
+    mur: Dict[str, Optional[float]] = {baseline.config_name: None}
+    for r in ds_results[1:]:
+        delta_f1 = r.f1_score - baseline.f1_score
+        delta_s = (r.avg_time_ms - baseline.avg_time_ms) / 1000.0
+        if abs(delta_s) < 0.001:          # < 1ms Unterschied → nicht messbar
+            mur[r.config_name] = None
+        elif delta_s > 0:
+            mur[r.config_name] = delta_f1 / delta_s
+        else:                              # Schneller als Baseline
+            mur[r.config_name] = float("inf") if delta_f1 > 0 else delta_f1 / delta_s
+    return mur
+
+
 def print_ablation_table(results: AblationResults):
-    """Print formatted ablation results."""
-    
-    print("\n" + "="*90)
+    """Print formatted ablation results with MUR metric."""
+
+    col_w = 14
+    n_cols = len(results.configs)
+    total_w = 16 + col_w * n_cols
+
+    print("\n" + "="*total_w)
     print("ABLATION STUDY RESULTS")
-    print("="*90)
-    
-    header = f"{'Dataset':<15}"
+    print("="*total_w)
+
+    # Header
+    header = f"{'Dataset':<16}"
     for cfg in results.configs:
-        header += f"{cfg:>12}"
+        short = cfg[:col_w-1]
+        header += f"{short:>{col_w}}"
     print(header)
-    print("─"*90)
-    
+    print("─"*total_w)
+
     for dataset in results.datasets:
         ds_results = results.results.get(dataset, [])
-        
+
         if not ds_results:
-            print(f"{dataset:<15} (no results)")
+            print(f"{dataset:<16} (no results)")
             continue
-        
+
+        mur_scores = _compute_mur(ds_results)
+
         # EM row
-        row_em = f"{dataset:<15}"
+        row = f"{dataset + ' (EM)':<16}"
         for cfg_name in results.configs:
             r = next((r for r in ds_results if r.config_name == cfg_name), None)
-            if r:
-                row_em += f"{r.exact_match:>11.1%} "
-            else:
-                row_em += f"{'N/A':>12}"
-        print(row_em)
-        
+            row += f"{r.exact_match:>{col_w}.1%}" if r else f"{'N/A':>{col_w}}"
+        print(row)
+
         # F1 row
-        row_f1 = f"{'  (F1)':<15}"
+        row = f"{'  (F1)':<16}"
         for cfg_name in results.configs:
             r = next((r for r in ds_results if r.config_name == cfg_name), None)
-            if r:
-                row_f1 += f"{r.f1_score:>11.3f} "
+            row += f"{r.f1_score:>{col_w}.3f}" if r else f"{'':>{col_w}}"
+        print(row)
+
+        # Latency row
+        row = f"{'  (ms)':<16}"
+        for cfg_name in results.configs:
+            r = next((r for r in ds_results if r.config_name == cfg_name), None)
+            row += f"{r.avg_time_ms:>{col_w}.0f}" if r else f"{'':>{col_w}}"
+        print(row)
+
+        # MUR row  (ΔF1 / ΔLatency_s)
+        row = f"{'  (MUR)':<16}"
+        for cfg_name in results.configs:
+            mur_val = mur_scores.get(cfg_name)
+            if mur_val is None:
+                row += f"{'—':>{col_w}}"
+            elif mur_val == float("inf"):
+                row += f"{'∞':>{col_w}}"
             else:
-                row_f1 += f"{'':>12}"
-        print(row_f1)
+                row += f"{mur_val:>{col_w}.3f}"
+        print(row)
         print()
-    
-    print("="*90)
-    
-    print("\nBEST CONFIGURATION PER DATASET:")
+
+    print("="*total_w)
+
+    print("\nBEST CONFIGURATION PER DATASET (by F1):")
     for dataset in results.datasets:
         ds_results = results.results.get(dataset, [])
         if ds_results:
             best = max(ds_results, key=lambda r: r.f1_score)
-            print(f"  {dataset:<15}: {best.config_name} (F1={best.f1_score:.3f})")
-    
-    print("="*90 + "\n")
+            mur_val = _compute_mur(ds_results).get(best.config_name)
+            mur_str = f", MUR={mur_val:.3f}" if mur_val is not None and mur_val != float("inf") else ""
+            print(f"  {dataset:<15}: {best.config_name}  (F1={best.f1_score:.3f}{mur_str})")
+
+    print("="*total_w + "\n")
+    print("MUR = ΔF1 / ΔLatency(s) vs. baseline (first config).")
+    print("Higher MUR = better accuracy-per-second trade-off.\n")
 
 def cmd_status(args, config: Dict, store_manager: StoreManager):
     """Show status command."""
@@ -1368,6 +1516,8 @@ def main():
     ingest_p.add_argument("--chunk-sentences", type=int, default=3)
     ingest_p.add_argument("--chunk-overlap", type=int, default=1)
     ingest_p.add_argument("--clear", action="store_true")
+    ingest_p.add_argument("--chunks-only", action="store_true",
+                          help="Nur Chunks erstellen und als JSON exportieren, keine Ingestion")
     
     # EVALUATE
     eval_p = subparsers.add_parser("evaluate", help="Evaluate single dataset")
@@ -1375,11 +1525,23 @@ def main():
     eval_p.add_argument("--samples", "-n", type=int, default=100)
     eval_p.add_argument("--vector-weight", type=float, default=0.7)
     eval_p.add_argument("--graph-weight", type=float, default=0.3)
-    
+    eval_p.add_argument("--model", "-m", type=str, default=None,
+                        help="Modellname (z.B. phi3, llama3.2:3b). Default: aus settings.yaml")
+    eval_p.add_argument("--no-planner", action="store_true",
+                        help="S_P überspringen (Ablation: kein Planner)")
+    eval_p.add_argument("--no-verifier", action="store_true",
+                        help="S_V überspringen (Ablation: kein Verifier)")
+    eval_p.add_argument("--iterations", type=int, default=1,
+                        help="Anzahl Verifier-Iterationen (1/2/3). Default: 1")
+
     # ABLATION
     ablation_p = subparsers.add_parser("ablation", help="Run ablation study")
     ablation_p.add_argument("--dataset", "-d", type=str, default="all")
     ablation_p.add_argument("--samples", "-n", type=int, default=100)
+    ablation_p.add_argument("--model", "-m", type=str, default=None,
+                            help="Modellname (z.B. phi3, llama3.2:3b). Default: aus settings.yaml")
+    ablation_p.add_argument("--component-ablation", action="store_true",
+                            help="Zusätzlich Planner/Verifier/Iterations-Ablation durchführen")
     
     # STATUS
     subparsers.add_parser("status", help="Show ingestion status")

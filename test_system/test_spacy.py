@@ -1,3 +1,8 @@
+import sys
+from pathlib import Path
+# Projektverzeichnis zu sys.path hinzufügen (damit src.* Imports funktionieren)
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import time, warnings, logging
 warnings.filterwarnings('ignore')
 logging.disable(logging.CRITICAL)

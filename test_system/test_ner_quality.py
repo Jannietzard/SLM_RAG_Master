@@ -2,6 +2,11 @@
 NER Qualitätstest: 10 typische HotpotQA-Sätze.
 Zeigt was extrahiert wird vs. was erwartet wird.
 """
+import sys
+from pathlib import Path
+# Projektverzeichnis zu sys.path hinzufügen (damit src.* Imports funktionieren)
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import os, warnings, logging
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 warnings.filterwarnings('ignore')
@@ -9,7 +14,6 @@ logging.disable(logging.CRITICAL)
 
 from src.data_layer.entity_extraction import EntityExtractionPipeline, ExtractionConfig
 
-# 10 typische HotpotQA-Sätze + was wir erwarten (Typ: Name)
 TESTS = [
     {
         "text": "Scott Derrickson is an American filmmaker. He directed Doctor Strange for Marvel Studios.",

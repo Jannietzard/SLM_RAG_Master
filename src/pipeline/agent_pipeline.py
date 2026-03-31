@@ -44,6 +44,38 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# HELPERS
+# ============================================================================
+
+def _verifier_config_from_cfg(config: Dict[str, Any]):
+    """Build VerifierConfig from settings dict — no hardcoded model names."""
+    from ..logic_layer.verifier import VerifierConfig
+    llm_cfg = config.get("llm", {})
+    agent_cfg = config.get("agent", {})
+    return VerifierConfig(
+        model_name=llm_cfg.get("model_name", "phi3"),
+        base_url=llm_cfg.get("base_url", "http://localhost:11434"),
+        temperature=llm_cfg.get("temperature", 0.1),
+        max_tokens=llm_cfg.get("max_tokens", 200),
+        max_iterations=1,  # Inner self-correction loop bleibt 1; outer loop in pipeline steuert Ablation
+        max_context_chars=llm_cfg.get("max_context_chars", 2400),
+        max_docs=llm_cfg.get("max_docs", 6),
+        max_chars_per_doc=llm_cfg.get("max_chars_per_doc", 400),
+    )
+
+
+def _create_passthrough_plan(query: str):
+    """Minimal RetrievalPlan für --no-planner Modus (kein LLM-Aufruf)."""
+    from ..logic_layer.planner import RetrievalPlan, QueryType, RetrievalStrategy
+    return RetrievalPlan(
+        original_query=query,
+        query_type=QueryType.MULTI_HOP,
+        strategy=RetrievalStrategy.HYBRID,
+        confidence=1.0,
+    )
+
+
+# ============================================================================
 # PIPELINE RESULT
 # ============================================================================
 
@@ -147,16 +179,22 @@ class AgentPipeline:
             config: Konfiguration aus settings.yaml
         """
         self.config = config or {}
-        
+
+        # Agent ablation flags (read from config["agent"])
+        agent_cfg = self.config.get("agent", {})
+        self.enable_planner = agent_cfg.get("enable_planner", True)
+        self.enable_verifier = agent_cfg.get("enable_verifier", True)
+        self.max_verification_iterations = agent_cfg.get("max_verification_iterations", 1)
+
         # Initialize agents
         self.planner = planner
         self.navigator = navigator
         self.verifier = verifier
-        
+
         # Store dependencies
         self.hybrid_retriever = hybrid_retriever
         self.graph_store = graph_store
-        
+
         # Optimization settings
         self.enable_early_exit = enable_early_exit
         self.enable_caching = enable_caching
@@ -180,11 +218,11 @@ class AgentPipeline:
     
     def _lazy_init_agents(self):
         """Lazy initialization der Agenten wenn noch nicht vorhanden."""
-        if self.planner is None:
+        if self.planner is None and self.enable_planner:
             from ..logic_layer.planner import Planner
             self.planner = Planner()
             logger.info("Planner (S_P) lazy-initialized")
-        
+
         if self.navigator is None:
             from ..logic_layer.navigator import Navigator, ControllerConfig
             nav_config = ControllerConfig()
@@ -194,10 +232,10 @@ class AgentPipeline:
             else:
                 self.navigator = Navigator(nav_config)
             logger.info("Navigator (S_N) lazy-initialized")
-        
-        if self.verifier is None:
-            from ..logic_layer.verifier import Verifier, VerifierConfig
-            verifier_config = VerifierConfig()
+
+        if self.verifier is None and self.enable_verifier:
+            from ..logic_layer.verifier import Verifier
+            verifier_config = _verifier_config_from_cfg(self.config)
             self.verifier = Verifier(
                 config=verifier_config,
                 graph_store=self.graph_store
@@ -234,17 +272,21 @@ class AgentPipeline:
         
         # Stage 1: S_P (Planner)
         planner_start = time.time()
-        plan = self.planner.plan(query)
+        if self.enable_planner:
+            plan = self.planner.plan(query)
+            planner_result = plan.to_dict()
+            logger.debug(
+                f"S_P completed: {plan.query_type.value} / {plan.strategy.value} "
+                f"({(time.time() - planner_start)*1000:.2f}ms)"
+            )
+        else:
+            plan = _create_passthrough_plan(query)
+            planner_result = {"planner_skipped": True, "query_type": "multi_hop", "strategy": "hybrid"}
+            logger.debug("S_P skipped (--no-planner)")
         planner_time = (time.time() - planner_start) * 1000
-        
-        planner_result = plan.to_dict()
-        logger.debug(
-            f"S_P completed: {plan.query_type.value} / {plan.strategy.value} "
-            f"({planner_time:.2f}ms)"
-        )
-        
-        # Early Exit check
-        if self.enable_early_exit and plan.query_type.value == "single_hop" and plan.confidence > 0.95:
+
+        # Early Exit check (only meaningful when planner ran)
+        if self.enable_early_exit and self.enable_planner and plan.query_type.value == "single_hop" and plan.confidence > 0.95:
             self._stats["early_exits"] += 1
             logger.info(f"Early exit for trivial query: {query[:50]}...")
             
@@ -284,29 +326,44 @@ class AgentPipeline:
         
         # Stage 3: S_V (Verifier)
         verifier_start = time.time()
-
-        gen_result = self.verifier.generate_and_verify(
-            query=query,
-            context=nav_result.filtered_context,
-        )
+        if self.enable_verifier:
+            gen_result = None
+            for _iter in range(max(1, self.max_verification_iterations)):
+                gen_result = self.verifier.generate_and_verify(
+                    query=query,
+                    context=nav_result.filtered_context,
+                )
+                if gen_result.confidence.value in ("high", "verified"):
+                    break  # Early stop — already confident
+            verifier_result = {
+                **asdict(gen_result),
+                "confidence": gen_result.confidence.value,
+                "iterations": _iter + 1,
+            }
+            answer = gen_result.answer
+            confidence_val = gen_result.confidence.value
+            logger.debug(
+                f"S_V completed: confidence={confidence_val} "
+                f"({(time.time() - verifier_start)*1000:.2f}ms)"
+            )
+        else:
+            # No verifier: return best retrieved chunk as answer
+            answer = nav_result.filtered_context[0].strip() if nav_result.filtered_context else "No answer found."
+            confidence_val = "low"
+            verifier_result = {"verifier_skipped": True, "answer": answer, "confidence": "low"}
+            logger.debug("S_V skipped (--no-verifier)")
         verifier_time = (time.time() - verifier_start) * 1000
-        
-        verifier_result = {**asdict(gen_result), "confidence": gen_result.confidence.value}
-        logger.debug(
-            f"S_V completed: confidence={gen_result.confidence.value} "
-            f"({verifier_time:.2f}ms)"
-        )
-        
+
         total_time = (time.time() - start_time) * 1000
-        
+
         # Update average latency
         n = self._stats["total_queries"]
         old_avg = self._stats["avg_latency_ms"]
         self._stats["avg_latency_ms"] = old_avg + (total_time - old_avg) / n
-        
+
         result = PipelineResult(
-            answer=gen_result.answer,
-            confidence=gen_result.confidence.value,
+            answer=answer,
+            confidence=confidence_val,
             query=query,
             planner_result=planner_result,
             navigator_result=navigator_result,
@@ -507,13 +564,13 @@ def create_pipeline(
     # Import agents
     from src.logic_layer.planner import Planner, create_planner
     from src.logic_layer.navigator import Navigator, ControllerConfig
-    from src.logic_layer.verifier import Verifier, VerifierConfig
-    
+    from src.logic_layer.verifier import Verifier
+
     # Create agents
     planner = create_planner(config)
     nav_config = ControllerConfig()
     navigator = Navigator(nav_config)
-    verifier_config = VerifierConfig()
+    verifier_config = _verifier_config_from_cfg(config)
     verifier = Verifier(config=verifier_config)
     
     return AgentPipeline(
@@ -546,14 +603,14 @@ def create_full_pipeline(
     
     from ..logic_layer.planner import create_planner
     from ..logic_layer.navigator import Navigator, ControllerConfig
-    from ..logic_layer.verifier import Verifier, VerifierConfig
-    
+    from ..logic_layer.verifier import Verifier
+
     planner = create_planner(config)
     nav_config = ControllerConfig()
     navigator = Navigator(nav_config)
     navigator.set_retriever(hybrid_retriever)
-    
-    verifier_config = VerifierConfig()
+
+    verifier_config = _verifier_config_from_cfg(config)
     verifier = Verifier(
         config=verifier_config,
         graph_store=graph_store

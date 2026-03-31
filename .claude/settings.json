@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \":*)",
+      "Bash(./venv/Scripts/python.exe -c \"import gliner; print\\(''GLiNER OK:'', gliner.__version__\\)\")"
+    ]
+  }
+}

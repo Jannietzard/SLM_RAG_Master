@@ -2,6 +2,11 @@
 Teste welche Entity-Type-Namen GLiNER am besten funktionieren.
 GLiNER ist zero-shot: der Typname beeinflusst direkt die Erkennung.
 """
+import sys
+from pathlib import Path
+# Projektverzeichnis zu sys.path hinzufügen (für konsistente Umgebung)
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import time, warnings, logging, os
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 warnings.filterwarnings('ignore')

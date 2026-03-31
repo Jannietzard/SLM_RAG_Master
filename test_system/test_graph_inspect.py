@@ -2,6 +2,11 @@
 Graph Inspektion: Was landet wirklich im KuzuDB nach Ingestion?
 Testet Entity-Nodes, MENTIONS- und RELATED_TO-Kanten direkt in der DB.
 """
+import sys
+from pathlib import Path
+# Projektverzeichnis zu sys.path hinzufügen (damit src.* Imports funktionieren)
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import os, warnings, logging, tempfile, shutil
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 warnings.filterwarnings('ignore')
@@ -12,9 +17,6 @@ from langchain.schema import Document
 from src.data_layer.storage import HybridStore, StorageConfig
 
 # ── Beispieltexte (typisch HotpotQA Bridge-Fragen) ────────────────────────
-# Bridge-Frage: "Welche Nationalität teilen Scott Derrickson und Ed Wood?"
-# Dafür muss der Graph: Derrickson→American, Ed Wood→American verbinden
-
 DOCS = [
     Document(
         page_content=(
@@ -46,11 +48,10 @@ DOCS = [
     ),
 ]
 
-# Bridge-Fragen: was soll der Graph beantworten können?
 BRIDGE_QUERIES = [
     {
         "question": "Both Scott Derrickson and Ed Wood are _ filmmakers.",
-        "bridge_entity": "American",   # beide Chunks müssen dieses Entity erwähnen
+        "bridge_entity": "American",
         "chunk_ids": ["c1", "c2"],
     },
     {
@@ -80,14 +81,13 @@ def section(title):
     print(f"{'='*65}")
 
 
-# ── Setup ──────────────────────────────────────────────────────────────────
 tmp = tempfile.mkdtemp(prefix="graph_inspect_")
 try:
     cfg = StorageConfig(
         vector_db_path=f"{tmp}/vec",
         graph_db_path=f"{tmp}/graph",
         embedding_dim=768,
-        enable_entity_extraction=True,   # <-- das ist der entscheidende Flag
+        enable_entity_extraction=True,
     )
 
     print("Lade Modelle und ingestiere Texte...")
@@ -97,7 +97,6 @@ try:
 
     conn = store.graph_store.conn
 
-    # ── 1. Entity Nodes ───────────────────────────────────────────────────
     section("1. ENTITY NODES im Graphen (mit Confidence)")
     res = conn.execute("MATCH (e:Entity) RETURN e.name, e.type, e.confidence ORDER BY e.type, e.name")
     entities_in_graph = []
@@ -109,7 +108,6 @@ try:
     if not entities_in_graph:
         print("  (keine Entity-Nodes gefunden!)")
 
-    # ── 2. MENTIONS (Chunk -> Entity) ──────────────────────────────────────
     section("2. MENTIONS  (Chunk -> Entity)")
     res = conn.execute(
         "MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity) "
@@ -123,7 +121,6 @@ try:
     if not mentions:
         print("  (keine MENTIONS-Kanten gefunden!)")
 
-    # ── 3. RELATED_TO (Entity -> Entity) ──────────────────────────────────
     section("3. RELATED_TO  (Entity -> Entity, via REBEL)")
     res = conn.execute(
         "MATCH (e1:Entity)-[r:RELATED_TO]->(e2:Entity) "
@@ -137,16 +134,10 @@ try:
     if not relations:
         print("  (keine RELATED_TO-Kanten gefunden!)")
 
-    # ── 4a. Multi-Hop Test (neu) ───────────────────────────────────────────
     section("4a. MULTI-HOP TEST: graph_search() mit 2-Hop Traversal")
     multi_hop_queries = [
-        # "Wer ist der Regisseur von Doctor Strange?"
-        # graph_search("Doctor Strange") -> 1-hop: c1
-        # 2-hop: Doctor Strange -[director]-> Scott Derrickson -> andere Chunks
         ("Doctor Strange", ["c1"]),
-        # "In welchem Film spielt Tom Hanks?"
         ("Tom Hanks", ["c3"]),
-        # "Wer baute den Eiffelturm?"
         ("Gustave Eiffel", ["c4"]),
     ]
     for query_entity, expected_direct in multi_hop_queries:
@@ -161,13 +152,10 @@ try:
         else:
             print(f"    2-Hop: (keine)")
 
-    # ── 4. Bridge-Test: Findet der Graph die Verbindung? ──────────────────
     section("4b. BRIDGE-TEST: Chunks ueber gemeinsame Entity verbunden?")
     for bq in BRIDGE_QUERIES:
         entity_name = bq["bridge_entity"]
         expected_chunks = set(bq["chunk_ids"])
-
-        # Welche Chunks erwähnen das Bridge-Entity?
         res = conn.execute(
             "MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity) "
             "WHERE e.name = $name "
@@ -177,7 +165,6 @@ try:
         found_chunks = set()
         while res.has_next():
             found_chunks.add(res.get_next()[0])
-
         ok = expected_chunks.issubset(found_chunks)
         status = "OK " if ok else "---"
         print(f"\n  [{status}] '{bq['question']}'")
@@ -188,7 +175,6 @@ try:
             missing = expected_chunks - found_chunks
             print(f"         FEHLT in:      {sorted(missing)}")
 
-    # ── 5. Zusammenfassung ─────────────────────────────────────────────────
     section("5. ZUSAMMENFASSUNG")
     stats = store.graph_store.get_statistics()
     print(f"  DocumentChunks:  {stats.get('document_chunks', 0)}")
@@ -198,10 +184,7 @@ try:
     bridge_ok = sum(
         1 for bq in BRIDGE_QUERIES
         if set(bq["chunk_ids"]).issubset(
-            {
-                r[0] for r in mentions
-                if r[1] == bq["bridge_entity"]
-            }
+            {r[0] for r in mentions if r[1] == bq["bridge_entity"]}
         )
     )
     print(f"  Bridge-Tests:    {bridge_ok}/{len(BRIDGE_QUERIES)} bestanden")

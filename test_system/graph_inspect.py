@@ -1,6 +1,12 @@
+import sys
+from pathlib import Path
+# Projektverzeichnis zu sys.path hinzufügen (für konsistente Umgebung)
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import kuzu
 
-db = kuzu.Database("./data/hotpotqa/knowledge_graph")
+PROJECT_ROOT = Path(__file__).parent.parent
+db = kuzu.Database(str(PROJECT_ROOT / "data/hotpotqa/knowledge_graph"))
 conn = kuzu.Connection(db)
 
 # Knotenanzahl

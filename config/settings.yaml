@@ -154,26 +154,49 @@ rag:
 # LLM CONFIGURATION (for Artifact B - Logic Layer)
 # ============================================================================
 llm:
-  # Model name (Ollama)
+  # Active model — override with --model flag on CLI
   model_name: "phi3"
-  
-  # Alternative models (ordered by speed):
-  # - "phi3:mini"      # Fastest, ~3.8B params
-  # - "phi3"           # Standard, ~3.8B params
-  # - "qwen2:1.5b"     # Very fast, good quality
-  # - "llama3.1:8b"    # Larger, better quality
-  # - "mistral"        # 7B, good balance
-  
+
   base_url: "http://localhost:11434"
   temperature: 0.1    # Low for factual responses
-  max_tokens: 50      # Kurze Antworten; 50 tok @ 2 tok/s = 25s
+  max_tokens: 200     # Ausreichend für vollständige Antworten
+
+  # Context Budget für Verifier (S_V)
+  # Default war 800 chars / 3 docs / 200 chars/doc → zu wenig für HotpotQA
+  max_context_chars: 2400   # ~600 tokens Input (HotpotQA braucht 2 Supporting Docs)
+  max_docs: 6               # Mehr Chunks → mehr Chance relevante Docs zu treffen
+  max_chars_per_doc: 400    # Pro Chunk ~100 tokens
+
+# ============================================================================
+# AVAILABLE MODELS (für Multi-Modell-Evaluation und Ablation)
+# Hier zentral pflegen — nirgendwo im Code hardcoded.
+# Alle Modelle müssen via `ollama pull <name>` installiert sein.
+# ============================================================================
+available_models:
+  - name: "phi3"
+    description: "Phi-3 Mini 3.8B — Default, schnell, edge-optimiert"
+    params_b: 3.8
+    quantization: "Q4_K_M"
+  - name: "llama3.2:3b"
+    description: "Llama 3.2 3B — gute Qualität, etwas langsamer"
+    params_b: 3.0
+    quantization: "Q4_K_M"
+  - name: "gemma2:2b"
+    description: "Gemma 2 2B — sehr kompakt, Google"
+    params_b: 2.0
+    quantization: "Q4_K_M"
+  - name: "qwen2:1.5b"
+    description: "Qwen 2 1.5B — kleinste Option, sehr schnell"
+    params_b: 1.5
+    quantization: "Q4_K_M"
 
 # ============================================================================
 # AGENTIC CONTROLLER (Artifact B)
 # ============================================================================
 agent:
   # Maximum verification iterations in self-correction loop
-  max_verification_iterations: 1
+  # 1 = kein Self-Correction (Baseline), 2 = Thesis-Default (1 Korrektur-Runde)
+  max_verification_iterations: 2
   
   # Enable/disable verification stage
   enable_verification: true
