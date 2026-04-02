@@ -114,7 +114,11 @@ try:
         PreValidationResult
     )
 except ModuleNotFoundError:
-    # Wenn direkt ausgeführt (python agent.py)
+    # Wenn direkt ausgeführt (python navigator.py) — relativer Import-Pfad-Fallback
+    logging.warning(
+        "⚠ FALLBACK AKTIV: src.logic_layer-Import fehlgeschlagen → relativer Import "
+        "(direkte Ausführung). Modul-Kontext funktioniert möglicherweise nicht korrekt."
+    )
     from planner import (
         Planner, 
         create_planner, 
@@ -235,6 +239,9 @@ class ControllerConfig:
     relevance_threshold_factor: float = 0.6  # 0.6 × max_score
     redundancy_threshold: float = 0.8        # Jaccard > 0.8 = redundant
     max_context_chunks: int = 10             # Max Chunks nach Filtering
+    rrf_k: int = 60                          # RRF-Konstante (Standard: 60)
+    top_k_per_subquery: int = 10             # Top-K Ergebnisse pro Sub-Query
+    max_chars_per_doc: int = 400             # Context Shrinkage: max Zeichen pro Chunk
 
 
 @dataclass
@@ -360,7 +367,7 @@ class Navigator:
                 # Nutze HybridRetriever.retrieve() - returns (results, metrics) tuple
                 results, _metrics = self.retriever.retrieve(sub_query)
                 
-                for res in results[:10]:  # Top-10 pro Sub-Query
+                for res in results[:self.config.top_k_per_subquery]:
                     text = res.text if hasattr(res, 'text') else str(res)
                     score = res.rrf_score if hasattr(res, 'rrf_score') else (res.score if hasattr(res, 'score') else 1.0)
                     
@@ -417,10 +424,15 @@ class Navigator:
         entity_pruned = self._entity_overlap_pruning(contradiction_filtered)
         result.metadata["after_entity_overlap_pruning"] = len(entity_pruned)
 
-        # Limitiere auf max_context_chunks
-        top_results = entity_pruned[:self.config.max_context_chunks]
+        # Filter 5: Entity-Mention Filter (entferne Chunks ohne Query-Entity-Bezug)
+        query_entity_names = [e.text for e in retrieval_plan.entities] if (retrieval_plan and retrieval_plan.entities) else []
+        mention_filtered = self._entity_mention_filter(entity_pruned, query_entity_names)
+        result.metadata["after_entity_mention_filter"] = len(mention_filtered)
 
-        # Filter 5: Context Shrinkage (Edge-Optimierung: weniger Input-Tokens)
+        # Limitiere auf max_context_chunks
+        top_results = mention_filtered[:self.config.max_context_chunks]
+
+        # Filter 6: Context Shrinkage (Edge-Optimierung: weniger Input-Tokens)
         shrunk_results = self._context_shrinkage(top_results)
 
         result.filtered_context = [r["text"] for r in shrunk_results]
@@ -440,7 +452,7 @@ class Navigator:
     def _rrf_fusion(
         self,
         results: List[Dict[str, Any]],
-        k: int = 60
+        k: int = None
     ) -> List[Dict[str, Any]]:
         """
         Reciprocal Rank Fusion (RRF) der Retrieval-Ergebnisse.
@@ -455,11 +467,13 @@ class Navigator:
         
         Args:
             results: Liste von Retrieval-Ergebnissen
-            k: RRF-Konstante (default 60)
-            
+            k: RRF-Konstante (None = aus self.config.rrf_k lesen)
+
         Returns:
             Fusionierte und sortierte Ergebnisse
         """
+        if k is None:
+            k = self.config.rrf_k
         # Gruppiere nach Text
         text_groups = {}
         for r in results:
@@ -727,10 +741,67 @@ class Navigator:
 
         return kept if kept else results
 
+    def _entity_mention_filter(
+        self,
+        results: List[Dict[str, Any]],
+        entity_names: List[str],
+    ) -> List[Dict[str, Any]]:
+        """
+        Entity-Mention Filter: Entferne Chunks, die keine der Query-Entities erwähnen.
+
+        Heuristik: Ein Chunk ist relevant, wenn er mindestens einen Token (≥4 Zeichen)
+        aus einem der Entity-Namen als ganzes Wort enthält.
+
+        Beispiel: "British people, or Britons…" enthält weder "Scott" noch "Derrickson"
+        noch "Wood" als isoliertes Wort → wird entfernt.
+
+        Safety: Wenn alle Chunks gefiltert würden, behalte alle (kein leerer Context).
+
+        Gemäß Masterarbeit: Pre-Generative Filtering (Abschnitt 3.3)
+        """
+        if not entity_names:
+            return results
+
+        def mentions_any(text: str) -> bool:
+            text_lower = text.lower()
+            for name in entity_names:
+                tokens = name.split()
+                # Mehrteilige Entities: Phrase prüfen (z.B. "Scott Derrickson", "Ed Wood")
+                if len(tokens) >= 2:
+                    if name.lower() in text_lower:
+                        return True
+                    # Fallback: einzelne lange Token als Wort (≥5 Zeichen)
+                    for token in tokens:
+                        if len(token) >= 5:
+                            if re.search(r'\b' + re.escape(token.lower()) + r'\b', text_lower):
+                                return True
+                else:
+                    # Einzel-Token: nur prüfen wenn lang genug (≥5 Zeichen) — kurze Wörter
+                    # wie "Were", "Wood" sind zu generisch
+                    if len(name) >= 5:
+                        if re.search(r'\b' + re.escape(name.lower()) + r'\b', text_lower):
+                            return True
+            return False
+
+        filtered = [r for r in results if mentions_any(r["text"])]
+
+        if filtered:
+            removed = len(results) - len(filtered)
+            if removed:
+                self.logger.debug(
+                    f"[Navigator] Entity-Mention Filter: "
+                    f"{removed} Chunks entfernt, {len(filtered)}/{len(results)} behalten"
+                )
+            return filtered
+
+        # Safety: wenn alle Chunks rausgefiltert → behalte alle
+        self.logger.debug("[Navigator] Entity-Mention Filter: alle Chunks gefiltert → behalte alle")
+        return results
+
     def _context_shrinkage(
         self,
         results: List[Dict[str, Any]],
-        max_chars_per_chunk: int = 400
+        max_chars_per_chunk: int = None
     ) -> List[Dict[str, Any]]:
         """
         Context Shrinkage: Kürze jeden Chunk auf die relevantesten Sätze.
@@ -744,6 +815,10 @@ class Navigator:
         3. Füge Sätze zusammen bis max_chars_per_chunk erreicht
         """
         import re
+
+        if max_chars_per_chunk is None:
+            # Nutze config-Wert (entspricht llm.max_chars_per_doc in settings.yaml)
+            max_chars_per_chunk = getattr(self.config, "max_chars_per_doc", 400)
 
         if not results:
             return results

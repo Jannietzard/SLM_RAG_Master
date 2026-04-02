@@ -39,6 +39,25 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Modul-Level Cache: GLiNER wird nur einmal pro Prozess geladen
+_GLINER_MODEL_CACHE = None
+
+
+def _get_gliner_model():
+    """Lade GLiNER einmal und cachet es für den gesamten Prozess."""
+    global _GLINER_MODEL_CACHE
+    if _GLINER_MODEL_CACHE is None:
+        try:
+            from gliner import GLiNER
+            _GLINER_MODEL_CACHE = GLiNER.from_pretrained("urchade/gliner_small-v2.1")
+            logger.info("GLiNER (small-v2.1) geladen und gecacht.")
+        except Exception as e:
+            logger.warning(
+                "⚠ FALLBACK AKTIV: GLiNER konnte nicht geladen werden (%s)"
+                " → SpaCy-/Regex-Extraktion für Query-Entities.", e
+            )
+    return _GLINER_MODEL_CACHE
+
 
 # ============================================================================
 # CONFIGURATION
@@ -172,55 +191,70 @@ class QueryEntityExtractor:
             logger.warning(f"SpaCy not available: {e}")
             self.nlp = None
     
+    # WH-question words and stopwords that are never valid graph entities
+    _QUERY_STOPWORDS = frozenset({
+        "what", "who", "when", "where", "why", "how", "which", "whose", "whom",
+        "the", "this", "that", "these", "those", "there",
+    })
+
     def extract(self, query: str, confidence_threshold: float = 0.7) -> List[str]:
         """
         Extrahiere Entitäten aus Query.
-        
+
         Args:
             query: User Query
             confidence_threshold: Minimum Confidence
-            
+
         Returns:
             Liste von Entity-Namen
         """
         if self.nlp is None:
+            logger.warning(
+                "⚠ FALLBACK AKTIV: SpaCy nicht geladen → Regex-Extraktion für Query-Entities. "
+                "Installiere SpaCy: pip install spacy && python -m spacy download en_core_web_sm"
+            )
             return self._fallback_extract(query)
-        
+
         doc = self.nlp(query)
         entities = []
-        
+
         for ent in doc.ents:
             # SpaCy gibt keine explizite Confidence, nutze Heuristiken
             # Längere Entities und bekannte Types sind typischerweise zuverlässiger
             if len(ent.text) > 2 and ent.label_ in [
                 "PERSON", "ORG", "GPE", "LOC", "EVENT", "WORK_OF_ART", "PRODUCT"
             ]:
-                entities.append(ent.text)
-        
+                if ent.text.lower() not in self._QUERY_STOPWORDS:
+                    entities.append(ent.text)
+
         # Auch Proper Nouns ohne NER-Label
+        # Skip tokens that are already covered by a multi-word entity
+        entity_texts_lower = [e.lower() for e in entities]
         for token in doc:
             if token.pos_ == "PROPN" and token.text not in entities:
-                if len(token.text) > 2:
-                    entities.append(token.text)
-        
+                if len(token.text) > 2 and token.text.lower() not in self._QUERY_STOPWORDS:
+                    # Skip if this token is a substring of an already-found multi-word entity
+                    if not any(token.text.lower() in e for e in entity_texts_lower):
+                        entities.append(token.text)
+
         return entities
-    
+
     def _fallback_extract(self, query: str) -> List[str]:
         """Regex-basierte Fallback-Extraktion."""
         import re
-        
+
         entities = []
-        
-        # Capitalized words/phrases
+
+        # Capitalized words/phrases — skip sentence-initial question words
         for match in re.finditer(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', query):
             entity = match.group(1)
-            if len(entity) > 2:
+            if len(entity) > 2 and entity.lower() not in self._QUERY_STOPWORDS:
                 entities.append(entity)
-        
+
         # Quoted strings
         for match in re.finditer(r'"([^"]+)"', query):
             entities.append(match.group(1))
-        
+
         return entities
 
 
@@ -260,7 +294,22 @@ class RRFFusion:
         vector_scores = {}
         graph_scores = {}
         graph_metadata = {}
-        
+
+        # ── Deduplizierung: gleiche Texte nur einmal in die RRF-Berechnung ────
+        # Problem: Bei Ingestion-Duplikaten oder überlappenden Chunks bekommt
+        # derselbe Inhalt mehrere RRF-Punkte (z.B. "Madtown" 3× in Top-3 →
+        # akkumuliert 0.048 RRF statt 0.016, verdrängt korrekte Docs).
+        # Fix: Vor dem Ranking nach Text-Fingerprint (erste 80 Zeichen)
+        # deduplizieren — nur der best-gerankede Chunk pro Fingerprint bleibt.
+        seen_fps: set = set()
+        deduped_vector = []
+        for r in vector_results:
+            fp = r.get("text", "")[:80]
+            if fp not in seen_fps:
+                seen_fps.add(fp)
+                deduped_vector.append(r)
+        vector_results = deduped_vector
+
         # Vector Ranks
         # storage.VectorStoreAdapter.vector_search() returns:
         #   {"text": ..., "similarity": ..., "document_id": ..., "metadata": {...}}
@@ -369,12 +418,23 @@ class ImprovedQueryEntityExtractor:
         self.gliner = gliner_model  # Shared GLiNER instance
         self.nlp = None
         self._load_spacy(spacy_model)
-        
-        # GLiNER Entity Types (konsistent mit Thesis 2.5)
+
+        # Wenn kein GLiNER-Modell übergeben wurde, selbst laden (Query-Zeit-Konsistenz)
+        if self.gliner is None:
+            self._load_gliner()
+
+        # GLiNER Entity Types — Obermenge der Ingestion-Types für Query-Coverage
+        # Ingestion: person, organization, city, country, film, movie, event
+        # Extra für Queries: work of art (deckt Buchtitel, Songname etc. ab)
         self.entity_types = [
-            "PERSON", "ORGANIZATION", "LOCATION", "DATE", "EVENT", "CONCEPT"
+            "person", "organization", "city", "country",
+            "film", "movie", "work of art", "event",
         ]
-    
+
+    def _load_gliner(self):
+        """Nutze gecachten GLiNER — wird pro Prozess nur einmal geladen."""
+        self.gliner = _get_gliner_model()
+
     def _load_spacy(self, model_name: str):
         """Lade SpaCy als Fallback."""
         try:
@@ -384,8 +444,8 @@ class ImprovedQueryEntityExtractor:
         except Exception as e:
             logger.warning(f"SpaCy not available: {e}")
             self.nlp = None
-    
-    def extract(self, query: str, confidence_threshold: float = 0.5) -> List[str]:
+
+    def extract(self, query: str, confidence_threshold: float = 0.2) -> List[str]:
         """
         Extrahiere Entitäten aus Query.
         
@@ -413,11 +473,18 @@ class ImprovedQueryEntityExtractor:
             except Exception as e:
                 logger.warning(f"GLiNER query extraction failed: {e}")
         
-        # Methode 2: SpaCy NER (Fallback)
+        # Methode 2: SpaCy NER (Fallback, da GLiNER nicht verfügbar/fehlgeschlagen)
         if self.nlp is not None:
+            logger.warning(
+                "⚠ FALLBACK AKTIV: GLiNER nicht verfügbar → SpaCy-Extraktion für Query-Entities."
+            )
             return self._spacy_extract(query)
-        
-        # Methode 3: Regex (letzter Fallback)
+
+        # Methode 3: Regex (letzter Fallback — weder GLiNER noch SpaCy verfügbar)
+        logger.warning(
+            "⚠ FALLBACK AKTIV: Weder GLiNER noch SpaCy verfügbar → Regex-Extraktion für Query-Entities. "
+            "Graph-Retrieval stark eingeschränkt!"
+        )
         return self._fallback_extract(query)
     
     def _spacy_extract(self, query: str) -> List[str]:
@@ -857,15 +924,23 @@ class PreGenerativeFilter:
 def create_hybrid_retriever(
     hybrid_store,
     embeddings,
-    mode: str = "hybrid",
-    rrf_k: int = 60,
-    **kwargs
+    cfg: dict = None,
 ) -> HybridRetriever:
-    """Factory für HybridRetriever."""
+    """Factory für HybridRetriever. Liest alle Parameter aus cfg (settings.yaml-Dict)."""
+    cfg = cfg or {}
+    rag_cfg = cfg.get("rag", {})
+    vs_cfg = cfg.get("vector_store", {})
+    graph_cfg = cfg.get("graph", {})
+
     config = RetrievalConfig(
-        mode=RetrievalMode(mode),
-        rrf_k=rrf_k,
-        **kwargs
+        mode=RetrievalMode(rag_cfg.get("retrieval_mode", "hybrid")),
+        vector_top_k=vs_cfg.get("top_k_vectors", 10),
+        graph_top_k=graph_cfg.get("top_k_entities", 10),
+        max_hops=graph_cfg.get("max_hops", 2),
+        rrf_k=rag_cfg.get("rrf_k", 60),
+        final_top_k=vs_cfg.get("top_k_vectors", 10),
+        cross_source_boost=rag_cfg.get("cross_source_boost", 1.2),
+        similarity_threshold=vs_cfg.get("similarity_threshold", 0.3),
     )
     return HybridRetriever(hybrid_store, embeddings, config)
 

@@ -57,10 +57,43 @@ def _verifier_config_from_cfg(config: Dict[str, Any]):
         base_url=llm_cfg.get("base_url", "http://localhost:11434"),
         temperature=llm_cfg.get("temperature", 0.1),
         max_tokens=llm_cfg.get("max_tokens", 200),
-        max_iterations=1,  # Inner self-correction loop bleibt 1; outer loop in pipeline steuert Ablation
+        timeout=llm_cfg.get("timeout", 60),
+        max_iterations=agent_cfg.get("max_verification_iterations", 1),
         max_context_chars=llm_cfg.get("max_context_chars", 2400),
         max_docs=llm_cfg.get("max_docs", 6),
         max_chars_per_doc=llm_cfg.get("max_chars_per_doc", 400),
+    )
+
+
+def _navigator_config_from_cfg(config: Dict[str, Any]):
+    """Build ControllerConfig (Navigator) from settings dict."""
+    from ..logic_layer.navigator import ControllerConfig
+    nav_cfg = config.get("navigator", {})
+    llm_cfg = config.get("llm", {})
+    agent_cfg = config.get("agent", {})
+    return ControllerConfig(
+        model_name=llm_cfg.get("model_name", "phi3"),
+        base_url=llm_cfg.get("base_url", "http://localhost:11434"),
+        temperature=llm_cfg.get("temperature", 0.1),
+        max_verification_iterations=agent_cfg.get("max_verification_iterations", 1),
+        relevance_threshold_factor=nav_cfg.get("relevance_threshold_factor", 0.6),
+        redundancy_threshold=nav_cfg.get("redundancy_threshold", 0.8),
+        max_context_chunks=nav_cfg.get("max_context_chunks", 10),
+        rrf_k=nav_cfg.get("rrf_k", 60),
+        top_k_per_subquery=nav_cfg.get("top_k_per_subquery", 10),
+        max_chars_per_doc=llm_cfg.get("max_chars_per_doc", 400),
+    )
+
+
+def _planner_config_from_cfg(config: Dict[str, Any]):
+    """Build PlannerConfig from settings dict."""
+    from ..logic_layer.planner import PlannerConfig
+    planner_cfg = config.get("planner", {})
+    return PlannerConfig(
+        min_entity_confidence=planner_cfg.get("min_entity_confidence", 0.7),
+        max_entities=planner_cfg.get("max_entities", 10),
+        enable_bridge_detection=planner_cfg.get("enable_bridge_detection", True),
+        enable_temporal_parsing=planner_cfg.get("enable_temporal_parsing", True),
     )
 
 
@@ -181,10 +214,11 @@ class AgentPipeline:
         self.config = config or {}
 
         # Agent ablation flags (read from config["agent"])
+        # max_verification_iterations wird NUR in _verifier_config_from_cfg gelesen
+        # und an VerifierConfig.max_iterations weitergegeben (innerer Self-Correction Loop)
         agent_cfg = self.config.get("agent", {})
         self.enable_planner = agent_cfg.get("enable_planner", True)
         self.enable_verifier = agent_cfg.get("enable_verifier", True)
-        self.max_verification_iterations = agent_cfg.get("max_verification_iterations", 1)
 
         # Initialize agents
         self.planner = planner
@@ -220,12 +254,13 @@ class AgentPipeline:
         """Lazy initialization der Agenten wenn noch nicht vorhanden."""
         if self.planner is None and self.enable_planner:
             from ..logic_layer.planner import Planner
-            self.planner = Planner()
+            planner_config = _planner_config_from_cfg(self.config)
+            self.planner = Planner(config=planner_config)
             logger.info("Planner (S_P) lazy-initialized")
 
         if self.navigator is None:
-            from ..logic_layer.navigator import Navigator, ControllerConfig
-            nav_config = ControllerConfig()
+            from ..logic_layer.navigator import Navigator
+            nav_config = _navigator_config_from_cfg(self.config)
             if self.hybrid_retriever is not None:
                 self.navigator = Navigator(nav_config)
                 self.navigator.set_retriever(self.hybrid_retriever)
@@ -285,27 +320,8 @@ class AgentPipeline:
             logger.debug("S_P skipped (--no-planner)")
         planner_time = (time.time() - planner_start) * 1000
 
-        # Early Exit check (only meaningful when planner ran)
-        if self.enable_early_exit and self.enable_planner and plan.query_type.value == "single_hop" and plan.confidence > 0.95:
-            self._stats["early_exits"] += 1
-            logger.info(f"Early exit for trivial query: {query[:50]}...")
-            
-            result = PipelineResult(
-                answer="This is a simple factual question that requires database lookup.",
-                confidence="high" if plan.confidence > 0.9 else "medium",
-                query=query,
-                planner_result=planner_result,
-                navigator_result={},
-                verifier_result={},
-                planner_time_ms=planner_time,
-                navigator_time_ms=0,
-                verifier_time_ms=0,
-                total_time_ms=planner_time,
-                early_exit_used=True
-            )
-            
-            self._update_cache(query, result)
-            return result
+        # Early Exit deaktiviert: Placeholder-Antwort ohne DB-Abfrage würde EM/F1 auf 0 setzen.
+        # Alle Queries durchlaufen vollständig S_N + S_V.
         
         # Stage 2: S_N (Navigator)
         navigator_start = time.time()
@@ -325,25 +341,25 @@ class AgentPipeline:
         )
         
         # Stage 3: S_V (Verifier)
+        # Iterations werden ausschließlich von VerifierConfig.max_iterations gesteuert
+        # (innerer Self-Correction Loop mit CORRECTION_PROMPT+Violation-Feedback).
+        # Ein äußerer Retry-Loop wäre nutzlos, da derselbe Input dieselbe Antwort liefert.
         verifier_start = time.time()
         if self.enable_verifier:
-            gen_result = None
-            for _iter in range(max(1, self.max_verification_iterations)):
-                gen_result = self.verifier.generate_and_verify(
-                    query=query,
-                    context=nav_result.filtered_context,
-                )
-                if gen_result.confidence.value in ("high", "verified"):
-                    break  # Early stop — already confident
+            gen_result = self.verifier.generate_and_verify(
+                query=query,
+                context=nav_result.filtered_context,
+            )
             verifier_result = {
                 **asdict(gen_result),
                 "confidence": gen_result.confidence.value,
-                "iterations": _iter + 1,
+                "iterations": gen_result.iterations,
             }
             answer = gen_result.answer
             confidence_val = gen_result.confidence.value
             logger.debug(
-                f"S_V completed: confidence={confidence_val} "
+                f"S_V completed: confidence={confidence_val}, "
+                f"iterations={gen_result.iterations} "
                 f"({(time.time() - verifier_start)*1000:.2f}ms)"
             )
         else:
@@ -560,19 +576,19 @@ def create_pipeline(
         Konfigurierte AgentPipeline
     """
     config = config or {}
-    
+
     # Import agents
     from src.logic_layer.planner import Planner, create_planner
-    from src.logic_layer.navigator import Navigator, ControllerConfig
+    from src.logic_layer.navigator import Navigator
     from src.logic_layer.verifier import Verifier
 
-    # Create agents
+    # Create agents — alle Configs aus settings.yaml
     planner = create_planner(config)
-    nav_config = ControllerConfig()
+    nav_config = _navigator_config_from_cfg(config)
     navigator = Navigator(nav_config)
     verifier_config = _verifier_config_from_cfg(config)
     verifier = Verifier(config=verifier_config)
-    
+
     return AgentPipeline(
         planner=planner,
         navigator=navigator,
@@ -602,11 +618,11 @@ def create_full_pipeline(
     config = config or {}
     
     from ..logic_layer.planner import create_planner
-    from ..logic_layer.navigator import Navigator, ControllerConfig
+    from ..logic_layer.navigator import Navigator
     from ..logic_layer.verifier import Verifier
 
     planner = create_planner(config)
-    nav_config = ControllerConfig()
+    nav_config = _navigator_config_from_cfg(config)
     navigator = Navigator(nav_config)
     navigator.set_retriever(hybrid_retriever)
 

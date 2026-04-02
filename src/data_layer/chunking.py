@@ -68,6 +68,10 @@ try:
     LANGCHAIN_AVAILABLE = True
 except ImportError:
     LANGCHAIN_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "⚠ FALLBACK AKTIV: LangChain nicht installiert → RecursiveCharacterTextSplitter "
+        "nicht verfügbar. Installiere mit: pip install langchain"
+    )
     
     class Document:
         """Mock Document class for when langchain is not available."""

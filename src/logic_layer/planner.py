@@ -323,6 +323,8 @@ class QueryClassifier:
         r"\bor\b.*\?(which|what)\s+(is|was)\s+\w*(er|est)",
         r"\bsame\s+\w+\b",          # "same nationality", "same country", "same field"
         r"\bboth\s+.+\s+(born|from|have|had|were|are)\b",  # "both born in", "both from"
+        # "Who is older/taller/..., X or Y?" — kein "than" erforderlich
+        r"\b(older|younger|taller|shorter|bigger|smaller|larger|higher|lower|richer|poorer)\b.{0,60}\bor\b",
     ]
     
     # Temporal-Indikatoren: Zeitbezüge und temporale Strukturen
@@ -337,15 +339,20 @@ class QueryClassifier:
     
     # Multi-Hop Indikatoren: Verschachtelte Strukturen
     MULTI_HOP_PATTERNS = [
-        r"\bof\s+the\s+\w+\s+(that|which|who)\b",
+        r"\bof\s+(a|an|the)\s+\w+\s+(that|which|who)\b",   # "of a/the X that/who" (Bridge)
         r"\bwhere\s+.+\s+(was|is|were|are)\b",
         r"\b\w+\s+of\s+the\s+\w+\s+of\b",
         r"'s\s+\w+'s",  # Possessive chains
         r"\b(who|what)\s+\w+\s+(the|a)\s+\w+\s+(that|which)\b",
-        # NEW PATTERNS FOR HOTPOTQA / 2WIKI:
+        # Bridge-Relation Patterns (HotpotQA / 2WikiMultiHop):
         r"\b(starring|featuring|directed by|written by|authored by|composed by)\b",
         r"\b(father|mother|son|daughter|wife|husband|creator|founder)\s+of\b",
         r"\b(located|situated)\s+in\s+the\b",
+        r"\b(formed|created|founded|established|organized|produced|released)\s+by\b",
+        r"\b\w+\s+(group|band|company|team|studio|label)\s+(that|which|who)\b",
+        r"\bformed\s+by\b",                     # "group that was formed by who?"
+        r"\bwas\s+\w+ed\s+by\b",               # "was founded/formed/created by"
+        r"\b(debut|first|second)\s+(album|single|film|movie|show)\s+of\b",
     ]
     
     # Intersection-Indikatoren: Gemeinsame Eigenschaften
@@ -488,11 +495,14 @@ class QueryClassifier:
             return QueryType.SINGLE_HOP, 0.8
         
         # Wähle den Query-Typ mit dem höchsten Score
-        # Bei Gleichstand: Priorisiere spezifischere Typen
+        # Bei Gleichstand: Priorisiere spezifischere Typen.
+        # WICHTIG: MULTI_HOP vor TEMPORAL, da Jahreszahlen in Bridge-Fragen
+        # ("2014 S/S is the debut album of ... formed by who?") sonst fälschlich
+        # als TEMPORAL klassifiziert werden.
         priority = [
             QueryType.COMPARISON,
-            QueryType.TEMPORAL,
             QueryType.MULTI_HOP,
+            QueryType.TEMPORAL,
             QueryType.INTERSECTION,
             QueryType.AGGREGATE,
         ]
@@ -953,19 +963,76 @@ class PlanGenerator:
             parts = [p.strip() for p in new_parts if p.strip() and len(p.strip()) > 5]
         
         if len(parts) > 1:
+            reversed_parts = list(reversed(parts))
+
             # Erstelle abhängige Schritte
-            for i, part in enumerate(reversed(parts)):
+            for i, part in enumerate(reversed_parts):
                 # Abhängigkeits-Liste: Alle vorherigen Schritte
                 depends = list(range(i)) if i > 0 else []
-                
+
                 # Finde Entities für diesen Teil
                 part_entities = [
-                    e.text for e in entities 
+                    e.text for e in entities
                     if e.text.lower() in part.lower()
                 ]
-                
-                sub_query = self._form_sub_query(part, i == len(parts) - 1)
-                
+
+                # Sub-Queries ohne ausreichende Entities anreichern.
+                #
+                # Fall A — Bridge-Step ohne Entities:
+                #   "was formed by who?" → "2014 S/S was formed by who?"
+                #   Entities kommen aus den Anker-Teilen.
+                #
+                # Fall B — Finaler Step mit vagen Pronomen/Generika:
+                #   "What position was held by the woman?" → "...by Shirley Temple?"
+                #   Entities kommen aus den Bridge-Teilen.
+                enriched_part = part
+                is_bridge_step = (i < len(parts) - 1)
+                is_final_step = (i == len(parts) - 1)
+
+                # Vage Pronomen und Generika im finalen Schritt erkennen
+                VAGUE_REFS = re.compile(
+                    r'\b(the\s+(?:woman|man|person|actor|actress|director|author|artist'
+                    r'|president|player|team|group|band|company|film|movie|show|song|book))\b',
+                    re.IGNORECASE
+                )
+
+                if is_bridge_step and not part_entities:
+                    # Fall A: Bridge ohne bekannte Entities
+                    other_parts = reversed_parts[1:]
+                    donor_entity_texts = [
+                        e.text for e in entities
+                        if any(e.text.lower() in ap.lower() for ap in other_parts)
+                        and e.text.lower() not in part.lower()
+                    ]
+                    # Fallback: Noun-Phrase aus Anker-Teil extrahieren
+                    if not donor_entity_texts:
+                        for op in other_parts:
+                            m = re.search(
+                                r'\b(?:a|an|the)\s+((?:\w+\s+){1,3}'
+                                r'(?:group|band|company|team|label|artist|person|film|movie|show))\b',
+                                op, re.IGNORECASE
+                            )
+                            if m:
+                                donor_entity_texts.append(m.group(1).strip())
+                                break
+                    if donor_entity_texts:
+                        ctx = " ".join(donor_entity_texts[:2])
+                        enriched_part = f"{ctx} {part}"
+
+                elif is_final_step and VAGUE_REFS.search(part) and not part_entities:
+                    # Fall B: Finaler Step enthält nur vage Referenz, kein Eigenname
+                    bridge_parts = reversed_parts[:i]
+                    donor_entity_texts = [
+                        e.text for e in entities
+                        if any(e.text.lower() in bp.lower() for bp in bridge_parts)
+                        and e.text.lower() not in part.lower()
+                    ]
+                    if donor_entity_texts:
+                        ctx = " ".join(donor_entity_texts[:2])
+                        enriched_part = VAGUE_REFS.sub(ctx, part, count=1)
+
+                sub_query = self._form_sub_query(enriched_part, i == len(parts) - 1)
+
                 hop_sequence.append(HopStep(
                     step_id=i,
                     sub_query=sub_query,
@@ -1047,6 +1114,26 @@ class PlanGenerator:
         if not sub_query_templates:
             # Fallback: keine Positionsinfo → generisches Template
             sub_query_templates = [(e, f"What is {e.text}?") for e in comparison_entities]
+
+        # Attribute-Rewriting: "Were X of the same nationality?" → "What is the nationality of X?"
+        # Verbessert Vektor-Ähnlichkeit zu Fakten-Chunks (z.B. "X is an American filmmaker")
+        _ATTR_MAP = [
+            (re.compile(r'\bsame\s+nationality\b', re.IGNORECASE),  "What is the nationality of {entity}?"),
+            (re.compile(r'\bsame\s+(?:birth\s*place|birthplace|hometown)\b', re.IGNORECASE), "Where was {entity} born?"),
+            (re.compile(r'\bborn\s+in\s+the\s+same\b', re.IGNORECASE),  "Where was {entity} born?"),
+            (re.compile(r'\bsame\s+(?:profession|occupation|job)\b', re.IGNORECASE), "What is the profession of {entity}?"),
+            (re.compile(r'\bsame\s+(?:genre|style)\b', re.IGNORECASE),   "What genre is {entity}?"),
+            (re.compile(r'\bsame\s+(?:age|birth\s*year)\b', re.IGNORECASE), "When was {entity} born?"),
+            (re.compile(r'\bsame\s+(?:country|state|city)\b', re.IGNORECASE), "What country is {entity} from?"),
+            (re.compile(r'\bsame\s+(?:religion|faith|belief)\b', re.IGNORECASE), "What is the religion of {entity}?"),
+        ]
+        rewritten = []
+        for pattern, template in _ATTR_MAP:
+            if pattern.search(query):
+                rewritten = [(e, template.format(entity=e.text)) for e, _ in sub_query_templates]
+                break
+        if rewritten:
+            sub_query_templates = rewritten
 
         # Schritt für jede Entity (können parallel laufen)
         for i, (entity, sub_query) in enumerate(sub_query_templates):

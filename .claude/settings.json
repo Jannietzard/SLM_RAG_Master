@@ -2,7 +2,20 @@
   "permissions": {
     "allow": [
       "Bash(python3 -c \":*)",
-      "Bash(./venv/Scripts/python.exe -c \"import gliner; print\\(''GLiNER OK:'', gliner.__version__\\)\")"
+      "Bash(./venv/Scripts/python.exe -c \"import gliner; print\\(''GLiNER OK:'', gliner.__version__\\)\")",
+      "Bash(./venv/Scripts/python.exe -c \"import matplotlib; import networkx; print\\(''matplotlib:'', matplotlib.__version__\\); print\\(''networkx:'', networkx.__version__\\)\")",
+      "Bash(./venv/Scripts/pip install matplotlib networkx --quiet)",
+      "Bash(./venv/Scripts/python.exe test_system/graph_3d.py --no-html)",
+      "Bash(set PYTHONIOENCODING=utf-8)",
+      "Bash(python diagnose.py --layer planner --idx 5)",
+      "Bash(PYTHONIOENCODING=utf-8 python diagnose.py --layer planner --idx 5)",
+      "Bash(PYTHONIOENCODING=utf-8 python diagnose.py --idx 5)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c \":*)",
+      "Read(//c/Users/Jan Nietzard/OneDrive/Dokumente/**)",
+      "Bash(PYTHONIOENCODING=utf-8 python benchmark_datasets.py ingest --dataset hotpotqa --samples 500 --chunks-only)",
+      "Bash(python -c \":*)",
+      "Bash(python -X utf8 -c \":*)",
+      "Bash(python -X utf8 diagnose.py --idx 0 --layer navigator)"
     ]
   }
 }

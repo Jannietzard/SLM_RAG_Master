@@ -19,15 +19,18 @@
 embeddings:
   # Model name (must match Ollama installed model)
   model_name: "nomic-embed-text"
-  
+
   # Ollama API endpoint
   base_url: "http://localhost:11434"
-  
+
   # Embedding dimensionality
   # nomic-embed-text: 768
   # all-MiniLM-L6-v2: 384
   # bge-base-en: 768
   embedding_dim: 768
+
+  # SQLite Cache für Embedding-Ergebnisse (persistiert über Runs hinweg)
+  cache_path: "./cache/embeddings.db"
 
 # ============================================================================
 # DOCUMENT CHUNKING
@@ -145,7 +148,11 @@ rag:
   # =========================================================================
   vector_weight: 0.7
   graph_weight: 0.3
-  
+
+  # RRF Fusion Parameter
+  rrf_k: 60                    # Reciprocal Rank Fusion Konstante (Standard: 60)
+  cross_source_boost: 1.2      # Boost für Chunks, die in beiden Retrieval-Pfaden auftauchen
+
   # Future work options
   reranking_enabled: false
   query_expansion_enabled: false
@@ -160,12 +167,61 @@ llm:
   base_url: "http://localhost:11434"
   temperature: 0.1    # Low for factual responses
   max_tokens: 200     # Ausreichend für vollständige Antworten
+  timeout: 60         # Ollama API Timeout in Sekunden
+                      # Modellwahl entscheidet ob 60s reicht — siehe available_models.
+                      # phi3 (3.8B): grenzwertig (~45-80s), gemma2:2b: sicher (~20-35s),
+                      # qwen2:1.5b: sehr sicher (~10-20s).
 
   # Context Budget für Verifier (S_V)
-  # Default war 800 chars / 3 docs / 200 chars/doc → zu wenig für HotpotQA
-  max_context_chars: 2400   # ~600 tokens Input (HotpotQA braucht 2 Supporting Docs)
-  max_docs: 6               # Mehr Chunks → mehr Chance relevante Docs zu treffen
-  max_chars_per_doc: 400    # Pro Chunk ~100 tokens
+  #
+  # Der Navigator filtert 10 → max. 8 Chunks (beste nach Relevanz).
+  # Der Verifier nimmt daraus nur max_docs Chunks und kürzt jeden auf
+  # max_chars_per_doc Zeichen — das ist die eigentliche Kontextreduktion.
+  #
+  # Warum 3 Docs à 300 chars (= 900 chars total)?
+  #   - Navigator hat bereits die relevantesten Chunks ausgewählt
+  #   - 300 chars (~75 Wörter) enthält den entscheidenden Fakt für HotpotQA
+  #   - 200 chars/doc (alte Einstellung) war zu wenig → Fakt oft abgeschnitten
+  #   - 900 chars Gesamtkontext ≈ 225 Tokens Input → phi3 sicher in <55s
+  #   - Prompt-Overhead (~150 chars) → ~1050 chars Gesamtinput ans LLM
+  max_context_chars: 900    # Gesamtbudget (Sicherheitsnetz)
+  max_docs: 3               # Navigator wählt vor, Verifier nimmt Top-3
+  max_chars_per_doc: 300    # Pro Chunk ~75 Wörter — enthält relevante Fakten
+
+# ============================================================================
+# NAVIGATOR (S_N) — Pre-Generative Filtering
+# ============================================================================
+navigator:
+  # Relevance Filter: behalte Chunks mit Score >= factor × max_score
+  relevance_threshold_factor: 0.6
+
+  # Redundancy Filter: Jaccard-Similarity-Schwelle für Deduplizierung
+  redundancy_threshold: 0.8
+
+  # Maximale Chunk-Anzahl nach Filtering (vor Context Shrinkage)
+  max_context_chunks: 10
+
+  # Reciprocal Rank Fusion Konstante (Standard: 60)
+  rrf_k: 60
+
+  # Top-K Ergebnisse pro Sub-Query aus Retriever
+  top_k_per_subquery: 10
+
+# ============================================================================
+# PLANNER (S_P) — Query-Analyse und Plan-Generierung
+# ============================================================================
+planner:
+  # Minimale NER-Confidence für Entity-Extraktion
+  min_entity_confidence: 0.7
+
+  # Maximale Anzahl zu extrahierender Entities pro Query
+  max_entities: 10
+
+  # Bridge Entity Detection aktivieren (für Multi-Hop)
+  enable_bridge_detection: true
+
+  # Temporale Constraints parsen
+  enable_temporal_parsing: true
 
 # ============================================================================
 # AVAILABLE MODELS (für Multi-Modell-Evaluation und Ablation)
@@ -173,22 +229,37 @@ llm:
 # Alle Modelle müssen via `ollama pull <name>` installiert sein.
 # ============================================================================
 available_models:
-  - name: "phi3"
-    description: "Phi-3 Mini 3.8B — Default, schnell, edge-optimiert"
-    params_b: 3.8
-    quantization: "Q4_K_M"
-  - name: "llama3.2:3b"
-    description: "Llama 3.2 3B — gute Qualität, etwas langsamer"
-    params_b: 3.0
-    quantization: "Q4_K_M"
-  - name: "gemma2:2b"
-    description: "Gemma 2 2B — sehr kompakt, Google"
-    params_b: 2.0
-    quantization: "Q4_K_M"
+  # ── Thesis-Vergleichsmodelle (Accuracy-vs-Latency Tradeoff auf Edge-CPU) ──────
+  # Alle 4 Modelle decken die SLM-Bandbreite 1.5B–3.8B ab.
+  # install: ollama pull <name>
+
   - name: "qwen2:1.5b"
-    description: "Qwen 2 1.5B — kleinste Option, sehr schnell"
+    description: "Qwen 2 1.5B — schnellstes Modell, sehr sicher in 60s"
     params_b: 1.5
     quantization: "Q4_K_M"
+    expected_latency_s: 10   # ~10-20s für 500 Tokens auf CPU
+    60s_safe: true
+
+  - name: "gemma2:2b"
+    description: "Gemma 2 2B — gutes Qualitäts-/Speed-Verhältnis, Google"
+    params_b: 2.0
+    quantization: "Q4_K_M"
+    expected_latency_s: 25   # ~20-35s für 500 Tokens auf CPU
+    60s_safe: true
+
+  - name: "llama3.2:3b"
+    description: "Llama 3.2 3B — Meta-Referenz für 3B-Klasse, knapp"
+    params_b: 3.0
+    quantization: "Q4_K_M"
+    expected_latency_s: 45   # ~35-55s für 500 Tokens auf CPU
+    60s_safe: true           # meist, bei kleinem Kontext (800 chars)
+
+  - name: "phi3"
+    description: "Phi-3 Mini 3.8B — Microsoft Edge-Flaggschiff, grenzwertig bei 60s"
+    params_b: 3.8
+    quantization: "Q4_K_M"
+    expected_latency_s: 55   # ~45-80s für 500 Tokens auf CPU — bei 800 chars meist ok
+    60s_safe: false          # bei größerem Kontext riskant
 
 # ============================================================================
 # AGENTIC CONTROLLER (Artifact B)
@@ -297,6 +368,11 @@ ingestion:
   min_lexical_diversity: 0.3
   min_information_density: 2.0
 
+  # Fixed Chunking: Wortgrenzen-Heuristik
+  # Brich am letzten Leerzeichen, wenn es in den letzten (1 - factor) * chunk_size Zeichen liegt.
+  # 0.8 = brich am Wort, sofern das Leerzeichen im letzten 20% des Chunks liegt.
+  word_boundary_factor: 0.8
+
   # SpaCy-spezifisch
   spacy_model: "en_core_web_sm"
   entity_aware_chunking: false
@@ -304,3 +380,38 @@ ingestion:
   # Metadata & Entity Extraction
   extract_entities: true
   add_source_metadata: true
+
+# ============================================================================
+# ENTITY EXTRACTION (GLiNER + REBEL)
+# ============================================================================
+entity_extraction:
+
+  # GLiNER Named Entity Recognition
+  gliner:
+    model_name: "urchade/gliner_small-v2.1"
+    entity_types:
+      - "person"
+      - "organization"
+      - "city"
+      - "country"
+      - "film"
+      - "movie"
+      - "event"
+    confidence_threshold: 0.15   # Niedrig für hohen Recall (HotpotQA)
+    batch_size: 16
+
+  # REBEL Relation Extraction
+  rebel:
+    model_name: "Babelscape/rebel-large"
+    confidence_threshold: 0.5
+    batch_size: 8
+    min_entities_for_re: 2       # RE nur wenn >= 2 Entitäten im Chunk
+
+  # Entity Caching (LRU + SQLite)
+  caching:
+    enabled: true
+    cache_path: "./data/entity_cache.db"
+    lru_cache_size: 10000
+
+  # Selective RE: RE nur auf Chunks mit Co-Occurring Entities
+  selective_re: true

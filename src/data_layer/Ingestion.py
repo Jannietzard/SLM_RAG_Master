@@ -163,7 +163,12 @@ class IngestionConfig:
     # Semantic Strategy
     min_lexical_diversity: float = 0.3
     min_information_density: float = 2.0
-    
+
+    # Fixed Chunking: Wortgrenze
+    # Wenn ein Chunk-Ende innerhalb der letzten (1 - word_boundary_factor) * chunk_size
+    # Zeichen liegt, wird am letzten Leerzeichen gebrochen.
+    word_boundary_factor: float = 0.8
+
     # Metadata Enrichment
     extract_entities: bool = False  # Default False für Performance
     add_source_metadata: bool = True
@@ -318,14 +323,16 @@ class FixedSizeChunker:
     """
     
     def __init__(
-        self, 
-        chunk_size: int = 1024, 
+        self,
+        chunk_size: int = 1024,
         chunk_overlap: int = 128,
         min_chunk_size: int = 50,
+        word_boundary_factor: float = 0.8,
     ):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.min_chunk_size = min_chunk_size
+        self.word_boundary_factor = word_boundary_factor
     
     def chunk(self, text: str, metadata: Dict = None) -> List[Dict]:
         """Chunk text into fixed-size pieces with overlap."""
@@ -346,7 +353,7 @@ class FixedSizeChunker:
             # Try to break at word boundary
             if end < len(text):
                 last_space = chunk_text.rfind(' ')
-                if last_space > self.chunk_size * 0.8:
+                if last_space > self.chunk_size * self.word_boundary_factor:
                     chunk_text = chunk_text[:last_space]
                     end = start + last_space
             
@@ -727,6 +734,7 @@ class DocumentIngestionPipeline:
                 chunk_size=self.config.chunk_size,
                 chunk_overlap=self.config.chunk_overlap,
                 min_chunk_size=self.config.min_chunk_size,
+                word_boundary_factor=self.config.word_boundary_factor,
             )
         
         elif strategy == ChunkingStrategy.RECURSIVE.value:

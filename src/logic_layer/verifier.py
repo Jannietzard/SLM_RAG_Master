@@ -247,13 +247,13 @@ class VerifierConfig:
     model_name: str = "phi3"
     base_url: str = "http://localhost:11434"
     temperature: float = 0.1
-    max_tokens: int = 50             # Kurze Antworten; 50 tok @ 2 tok/s = 25s
+    max_tokens: int = 200            # Ausreichend für vollständige Antworten
     timeout: int = 60               # 30s LLM + Overhead
 
-    # Context Settings (optimiert für Edge, <30s Ziel)
-    max_context_chars: int = 800    # ~200 tokens Input
-    max_docs: int = 3               # Top-3 aus Hybrid Retrieval
-    max_chars_per_doc: int = 200    # Pro Chunk (~50 tokens)
+    # Context Settings — konsistent mit settings.yaml
+    max_context_chars: int = 2400   # ~600 tokens Input (2 Supporting Docs für HotpotQA)
+    max_docs: int = 6               # Mehr Chunks → bessere Abdeckung
+    max_chars_per_doc: int = 400    # Pro Chunk ~100 tokens
 
     # Pre-Validation Settings (gemäß Masterarbeit)
     enable_entity_path_validation: bool = True
@@ -579,11 +579,16 @@ class PreGenerationValidator:
                             )
                             
             except Exception as e:
-                self.logger.debug(f"NLI Detection Error: {e}")
-                # Fallback zu heuristischer Detection
+                self.logger.warning(
+                    f"⚠ FALLBACK AKTIV: NLI-Detection fehlgeschlagen ({e}) "
+                    f"→ heuristische Widerspruchserkennung wird verwendet."
+                )
                 contradictions = self._heuristic_contradiction_detection(context)
         else:
-            # Fallback ohne Transformers
+            self.logger.warning(
+                "⚠ FALLBACK AKTIV: Transformers nicht verfügbar "
+                "→ heuristische Widerspruchserkennung statt NLI."
+            )
             contradictions = self._heuristic_contradiction_detection(context)
         
         return contradictions
@@ -1277,7 +1282,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
         )
         
         return VerificationResult(
-            answer=best_answer or "[Error: Keine valide Antwort generiert]",
+            answer=best_answer if best_answer is not None else "[Error: Keine valide Antwort generiert]",
             iterations=self.config.max_iterations,
             verified_claims=best_verified,
             violated_claims=best_violated,
@@ -1297,32 +1302,38 @@ Please provide a partial answer based on the available evidence, clearly indicat
 # =============================================================================
 
 def create_verifier(
-    model_name: str = "phi3",
-    base_url: str = "http://localhost:11434",
-    max_iterations: int = 1,
-    max_context_chars: int = 800,
+    cfg: dict = None,
     graph_store=None,
     enable_pre_validation: bool = False,
 ) -> Verifier:
     """
-    Factory-Funktion für Verifier.
-    
+    Factory-Funktion für Verifier — liest alle Werte aus einem settings.yaml-Dict.
+
     Args:
-        model_name: Ollama-Modell
-        base_url: Ollama API URL
-        max_iterations: Max Self-Correction Iterations
-        max_context_chars: Max Context-Größe
+        cfg: settings.yaml-Dict (oder Teil davon). Relevante Schlüssel:
+             llm.model_name, llm.base_url, llm.temperature, llm.max_tokens,
+             llm.timeout, llm.max_context_chars, llm.max_docs, llm.max_chars_per_doc,
+             agent.max_verification_iterations
         graph_store: Optional KnowledgeGraphStore
         enable_pre_validation: Pre-Generation Validation aktivieren
-        
+
     Returns:
         Konfigurierte Verifier-Instanz
     """
+    cfg = cfg or {}
+    llm_cfg = cfg.get("llm", {})
+    agent_cfg = cfg.get("agent", {})
+
     config = VerifierConfig(
-        model_name=model_name,
-        base_url=base_url,
-        max_iterations=max_iterations,
-        max_context_chars=max_context_chars,
+        model_name=llm_cfg.get("model_name", "phi3"),
+        base_url=llm_cfg.get("base_url", "http://localhost:11434"),
+        temperature=llm_cfg.get("temperature", 0.1),
+        max_tokens=llm_cfg.get("max_tokens", 200),
+        timeout=llm_cfg.get("timeout", 60),
+        max_iterations=agent_cfg.get("max_verification_iterations", 1),
+        max_context_chars=llm_cfg.get("max_context_chars", 2400),
+        max_docs=llm_cfg.get("max_docs", 6),
+        max_chars_per_doc=llm_cfg.get("max_chars_per_doc", 400),
         enable_entity_path_validation=enable_pre_validation,
         enable_contradiction_detection=enable_pre_validation,
         enable_credibility_scoring=enable_pre_validation,

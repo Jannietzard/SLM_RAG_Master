@@ -3,8 +3,8 @@
 **Project:** Enhancing Reasoning Fidelity in Quantized Small Language Models on Edge Devices via Hybrid Retrieval-Augmented Generation
 **Author:** Jan Nietzard
 **Institution:** FOM Hochschule, Master of Science
-**Version:** 3.1.0
-**Last Updated:** 2026-02-26
+**Version:** 3.3.0
+**Last Updated:** 2026-04-02
 
 ---
 
@@ -33,6 +33,7 @@
    - 9.2 [Query Processing Flow](#92-query-processing-flow)
 10. [Performance Characteristics](#10-performance-characteristics)
 11. [Design Decisions & Trade-offs](#11-design-decisions--trade-offs)
+12. [Änderungen & Alternativen](#12-änderungen--alternativen)
 
 ---
 
@@ -99,8 +100,9 @@ Entwicklungfolder/
 │
 ├── data/                           # Runtime data (gitignored)
 │   ├── hotpotqa/
-│   │   ├── vector_db/              # LanceDB vector store
-│   │   ├── knowledge_graph/        # KuzuDB graph database
+│   │   ├── vector_db/              # LanceDB vector store (directory)
+│   │   ├── knowledge_graph         # KuzuDB graph database (SINGLE FILE, not directory)
+│   │   ├── extraction_metadata.json# Graph ingestion stats (GLiNER model, entity counts)
 │   │   ├── questions.json          # Benchmark questions
 │   │   └── articles_info.json
 │   ├── 2wikimultihop/              # (same structure)
@@ -113,6 +115,10 @@ Entwicklungfolder/
 ├── evaluation_results/             # JSON ablation results
 ├── logs/                           # Structured log output
 ├── benchmark_datasets.py           # CLI entry point for all experiments
+├── diagnose.py                     # Layer-by-layer diagnostic tool (graph quality, vector scores)
+├── test_system/
+│   ├── graph_3d.py                 # Graph visualisation: matplotlib PNG + pyvis HTML
+│   └── graph_preview.html          # Generated interactive visualisation (gitignored)
 └── requirements.txt
 ```
 
@@ -303,12 +309,15 @@ Entity extraction populates the knowledge graph with named entities and their re
 class ExtractionConfig:
     gliner_model: str = "urchade/gliner_small-v2.1"
     entity_types: List[str] = [
-        "PERSON", "ORGANIZATION", "GPE", "LOCATION",
-        "DATE", "EVENT", "CONCEPT", "PRODUCT",
+        # Lowercase natural-language names → bessere zero-shot performance bei GLiNER
+        "person", "organization", "city", "country",
+        "film", "movie", "event",
     ]
-    ner_confidence_threshold: float = 0.15   # Low threshold for recall
+    ner_confidence_threshold: float = 0.5   # Filterung von Rausch-Entitäten (Stand 2026-04-02)
     ner_batch_size: int = 16
 ```
+
+> **Änderungshistorie:** Bis 2026-04-01 war `ner_confidence_threshold=0.15` und die Entity Types waren UPPERCASE (`PERSON`, `ORGANIZATION` etc.). Der niedrige Threshold führte zu Hub-Kontamination durch generische Tokens ("American" 898 Chunks, "He" 737). Seit 2026-04-02: Threshold=0.5, lowercase Types — Unique Entities reduziert von 36.996 → 23.858 (−35%). Siehe Abschnitt 12.6.
 
 **`ExtractedEntity`** (output dataclass):
 
@@ -563,7 +572,25 @@ Three sequential filter stages:
 
 3. **Contradiction filter** — Applies a lightweight NLI classifier to detect conflicting factual claims. Conflicted pairs are resolved by retaining the higher-scoring result.
 
-#### 3.5.4 HybridRetriever
+#### 3.5.4 ImprovedQueryEntityExtractor
+
+Extrahiert Entitäten aus der Query konsistent mit der Ingestion-Zeit-Extraktion.
+
+```python
+class ImprovedQueryEntityExtractor:
+    def __init__(self, gliner_model=None, spacy_model: str = "en_core_web_sm")
+    def extract(self, query: str, confidence_threshold: float = 0.2) -> List[str]
+```
+
+**Wichtige Designentscheidungen (Stand 2026-04-02):**
+- Lädt `gliner_small-v2.1` **eigenständig** via `_get_gliner_model()` wenn kein Modell übergeben wird (Prozess-Level-Cache)
+- Verwendet **identische Entity Types wie Ingestion**: `["person", "organization", "city", "country", "film", "movie", "work of art", "event"]`
+- **Threshold 0.2** (nicht 0.5): Queries sind kurze Sätze → GLiNER-Scores systematisch niedriger als bei langen Chunk-Texten
+- **Modul-Level-Cache** `_GLINER_MODEL_CACHE`: Modell wird pro Prozess nur einmal geladen (7.5s cold start, danach <1ms)
+
+> **Kritisches Problem bis 2026-04-02:** `StorageConfig(enable_entity_extraction=False)` ist der Default. `ImprovedQueryEntityExtractor` bekam dadurch `gliner_model=None` und fiel auf SpaCy zurück — obwohl GLiNER installiert ist. Symptom: `"Were Scott Derrickson"` statt `"Scott Derrickson"` als extrahierte Entität. Behoben durch eigenständiges Laden in `_load_gliner()`. Siehe Abschnitt 12.7.
+
+#### 3.5.5 HybridRetriever
 
 ```python
 class HybridRetriever:
@@ -747,14 +774,17 @@ The Verifier receives the filtered context window and is responsible for generat
 ```python
 @dataclass
 class VerifierConfig:
-    max_verification_iterations: int = 3
-    enable_verification: bool = True
-    llm_model: str = "phi3"
-    llm_base_url: str = "http://localhost:11434"
+    model_name: str = "phi3"
+    base_url: str = "http://localhost:11434"
     temperature: float = 0.1
-    max_tokens: int = 300
-    context_max_chars: int = 4000
+    max_tokens: int = 200            # Increased from 50; prevents answer truncation
+    max_iterations: int = 2          # Initial generation + 1 correction round
+    max_context_chars: int = 2400    # Total chars fed to LLM (~600 tokens)
+    max_docs: int = 6                # Maximum number of context documents
+    max_chars_per_doc: int = 400     # Characters per individual document
 ```
+
+> **Wichtig:** Alle `VerifierConfig`-Werte werden durch `_verifier_config_from_cfg()` in `agent_pipeline.py` aus `config/settings.yaml` gelesen. Die Klassen-Defaults sind Fallback-Werte und sollten nie direkt im Code überschrieben werden.
 
 #### 4.3.2 ValidationStatus
 
@@ -768,22 +798,34 @@ class ValidationStatus(Enum):
 
 #### 4.3.3 Self-Correction Loop
 
+Der Self-Correction-Loop befindet sich **vollständig innerhalb von `Verifier.generate_and_verify()`** und ist der wissenschaftliche Kernbeitrag von Artifact B.
+
 ```
+# Verifier.generate_and_verify(query, context)
+
 pre_validate(context) → PreValidationResult
 
 if status == INSUFFICIENT:
     return fallback_answer("I cannot determine the answer from the provided context.")
 
-answer = generate(query, context)    # Call phi3 via Ollama
+# Schritt 1: Initiale Antwortgenerierung
+context_str = build_context(context, max_chars=max_context_chars,
+                            max_docs=max_docs, max_chars_per_doc=max_chars_per_doc)
+answer = call_llm(GENERATION_PROMPT, query, context_str)   # phi3 via Ollama
 
-for iteration in range(max_iterations):
-    valid = verify(query, answer, context)   # NLI consistency check
-    if valid:
+# Schritt 2: Bis zu (max_iterations - 1) Korrektur-Runden
+# Bei max_iterations=2: maximal 1 Korrektur-Runde
+for iteration in range(1, max_iterations):
+    is_valid, violations = verify(query, answer, context)  # NLI consistency check
+    if is_valid:
         break
-    answer = self_correct(query, context, iteration)
+    # Korrektur-Prompt enthält konkrete Verletzungen als Feedback
+    answer = call_llm(CORRECTION_PROMPT, query, context_str, violations)
 
-return VerificationResult(answer, confidence, iterations)
+return VerificationResult(answer, confidence, iterations_used)
 ```
+
+> **Architekturentscheidung (2026-03-31):** Ein früherer äußerer Wiederholungs-Loop in `AgentPipeline.process()` wurde entfernt. Dieser rief `generate_and_verify()` mehrfach mit identischem Input auf, was keine echte Selbstkorrektur darstellte. Die Selbstkorrektur findet ausschließlich im inneren Loop des Verifiers statt, der bei jeder Iteration konkrete Verletzungen als Feedback übergibt (CORRECTION_PROMPT).
 
 **`VerificationResult`** (output dataclass):
 
@@ -856,6 +898,8 @@ class AgentPipeline:
 | Early Exit | Detects trivial queries with confidence > 0.95 | Skips S_N and S_V |
 | Result Cache | LRU cache (size=1000) keyed on query string | Zero-cost repeated queries |
 | Lazy Init | Agents are instantiated on first `process()` call | Reduced startup time |
+
+> **Architekturhinweis:** `AgentPipeline.process()` ruft `verifier.generate_and_verify()` **genau einmal** auf. Es gibt keinen äußeren Wiederholungs-Loop auf Pipeline-Ebene. Der Self-Correction-Mechanismus (Thesis-Beitrag) findet ausschließlich **innerhalb des Verifiers** statt. `max_verification_iterations` in `settings.yaml` steuert die Anzahl der Korrektur-Runden *im Verifier*, nicht die Anzahl der Pipeline-Durchläufe.
 
 **Factory function:**
 
@@ -941,7 +985,7 @@ vector_store:
 # ── KNOWLEDGE GRAPH ────────────────────────────────────────────────────────
 graph:
   backend: "kuzu"                   # Primary: KuzuDB (Cypher-native)
-  graph_path: "./data/knowledge_graph"
+  graph_path: "./data/knowledge_graph"  # KuzuDB Single-File (kein Verzeichnis!)
   max_hops: 2
   top_k_entities: 5
   entity_extraction_method: "keyword"   # keyword | spacy | gliner
@@ -957,11 +1001,14 @@ llm:
   model_name: "phi3"
   base_url: "http://localhost:11434"
   temperature: 0.1
-  max_tokens: 300
+  max_tokens: 200              # Erhöht von 50 auf 200; verhindert Antwort-Truncation
+  max_context_chars: 2400      # Gesamt-Zeichen für den LLM-Kontext (~600 Tokens)
+  max_docs: 6                  # Maximale Anzahl Kontext-Dokumente
+  max_chars_per_doc: 400       # Maximale Zeichen pro Kontext-Dokument
 
 # ── AGENTIC CONTROLLER ─────────────────────────────────────────────────────
 agent:
-  max_verification_iterations: 3
+  max_verification_iterations: 2   # 1 initiale Antwort + 1 Korrektur-Runde
   enable_verification: true
 
 # ── INGESTION ──────────────────────────────────────────────────────────────
@@ -1073,17 +1120,38 @@ python benchmark_datasets.py ingest \
   --chunk-sentences 3 \
   --chunk-overlap 1
 
+# Nur Chunks ingestieren, ohne Embeddings neu zu berechnen (schneller bei Re-Ingest)
+python benchmark_datasets.py ingest \
+  --dataset hotpotqa \
+  --samples 500 \
+  --chunks-only
+
 # Single configuration evaluation
 python benchmark_datasets.py evaluate \
   --dataset hotpotqa \
   --samples 100 \
+  --model phi3 \
   --vector-weight 0.7 \
   --graph-weight 0.3
 
-# Ablation study (all configurations)
+# Evaluation mit deaktivierten Komponenten (Ablation der Pipeline-Stufen)
+python benchmark_datasets.py evaluate \
+  --dataset hotpotqa \
+  --samples 100 \
+  --no-planner \     # S_P deaktiviert
+  --no-verifier \    # S_V deaktiviert
+  --iterations 1     # Keine Selbstkorrektur
+
+# Ablation study (alle Gewichtungskombinationen)
 python benchmark_datasets.py ablation \
   --dataset hotpotqa \
   --samples 100
+
+# Komponenten-Ablation (Planner, Verifier, Iterationen)
+python benchmark_datasets.py ablation \
+  --dataset hotpotqa \
+  --samples 100 \
+  --component-ablation
 
 # Ingestion status check
 python benchmark_datasets.py status
@@ -1093,6 +1161,76 @@ python benchmark_datasets.py test
 ```
 
 Results of the ablation study are persisted to `evaluation_results/ablation_<timestamp>.json`.
+
+### 7.5 Graph Quality Diagnostics
+
+**File:** `diagnose.py`
+
+Das Diagnoseskript testet jeden Pipeline-Layer einzeln und bietet einen spezialisierten Graph-Qualitäts-Modus.
+
+```bash
+# Alle Layer testen (eine Beispiel-Frage)
+python diagnose.py --idx 5
+
+# Graph-Qualitäts-Analyse (Hub-Kontamination, Answer Coverage)
+python diagnose.py --graph-quality 20
+
+# Vector-Score-Analyse für N Fragen (kein LLM nötig)
+python diagnose.py --multi 50
+
+# Nur bestimmten Layer testen
+python diagnose.py --layer retrieval
+python diagnose.py --layer verifier --skip-llm
+```
+
+**Graph-Quality Output (--graph-quality N)** zeigt pro Frage:
+
+| Spalte | Bedeutung |
+|---|---|
+| `KW-H` | Anzahl Graph-Chunks per Keyword-Extraktion |
+| `Top-Entity` | Welche Entität tatsächlich gematcht hat |
+| `Hub` | `HUB` wenn generische/Pronomen-Entität gematcht hat |
+| `GrAns` | ✓ wenn Gold-Antwort in Graph-Chunks vorkommt |
+| `VecH` | Anzahl Vector-Chunks |
+| `VecAns` | ✓ wenn Gold-Antwort in Vector-Chunks vorkommt |
+
+**Empirische Ergebnisse:**
+
+*Stand 2026-04-01 (threshold=0.15, UPPERCASE types, 15 Fragen):*
+
+| Metrik | Wert |
+|---|---|
+| Hub-Kontamination (Keyword-Regex) | 0% |
+| Graph Answer Coverage | 33% (5/15) |
+| Vector Answer Coverage | 40% (6/15) |
+| Union Coverage (Graph ODER Vector) | 60% (9/15) |
+| GLiNER Answer Coverage | 13% (2/15) — schlechter als Keyword-Regex |
+
+*Stand 2026-04-02 (threshold=0.5, lowercase types, Re-Ingestion, 10 Fragen):*
+
+| Metrik | Wert | vs. vorher |
+|---|---|---|
+| Hub-Kontamination | 10% | ↓ besser |
+| Graph Answer Coverage | 20% (2/10) | ↓ schlechter (aber N zu klein) |
+| Vector Answer Coverage | 50% (5/10) | ↑ besser |
+| Unique Entities | 23.858 | −35% (von 36.996) |
+| MENTIONS | 50.096 | −33% (von 74.741) |
+
+> **Interpretation:** Der Rückgang der Graph Answer Coverage ist auf (a) zu kleine Stichprobe (N=10 vs. N=15) und (b) Entity-Name-Disambiguation-Problem zurückzuführen (Chunk 7 "Edward Davis Wood Jr." nicht via "Ed Wood"-Query erreichbar). Statistisch nicht vergleichbar. Für belastbaren Vergleich: `python diagnose.py --graph-quality 50`.
+
+Der Graph fügt für ≥3 Fragen exklusiven Mehrwert hinzu (GrAns=✓, VecAns=✗), was die Hybrid-Hypothese stützt.
+
+**Graph-Visualisierung** (`test_system/graph_3d.py`):
+
+```bash
+# PNG für Thesis generieren (Hub-Entities gefiltert)
+python test_system/graph_3d.py --top 80 --no-html
+
+# Mit interaktiver HTML-Ansicht (pyvis)
+python test_system/graph_3d.py --top 80
+```
+
+Erzeugt `test_system/graph_preview.png` mit matplotlib (dpi=200). Für Druckqualität: `dpi=300` setzen.
 
 ---
 
@@ -1203,9 +1341,10 @@ Both Ollama models run entirely on CPU and require no GPU. `phi3` is loaded as a
         │
         ▼
   Persisted to ./data/hotpotqa/
-    vector_db/         (LanceDB)
-    knowledge_graph/   (KuzuDB)
-    questions.json     (500 test questions)
+    vector_db/              (LanceDB, Verzeichnis)
+    knowledge_graph         (KuzuDB, Single File)
+    extraction_metadata.json(Entity/Relation-Stats)
+    questions.json          (500 test questions)
 ```
 
 ### 9.2 Query Processing Flow
@@ -1283,7 +1422,7 @@ Both Ollama models run entirely on CPU and require no GPU. `phi3` is loaded as a
   │      Answer:"                                           │
   │                                                         │
   │  3. POST /api/generate → phi3 (Ollama)                  │
-  │     temperature: 0.1, max_tokens: 300                   │
+  │     temperature: 0.1, max_tokens: 200                   │
   │     → initial_answer: "[director] was born in [city]"  │
   │                                                         │
   │  4. NLI consistency check:                              │
@@ -1389,6 +1528,167 @@ The Jaccard redundancy threshold of 0.8 is conservative: two chunks sharing 80 %
 
 ---
 
+---
+
+## 12. Änderungen & Alternativen
+
+Dieser Abschnitt dokumentiert signifikante Änderungen gegenüber früheren Versionen, verworfene Ansätze und die Begründung für getroffene Entscheidungen. Er dient als Entscheidungsprotokoll für die Masterarbeit.
+
+---
+
+### 12.1 LLM-Konfiguration: max_tokens und Context-Budget
+
+**Problem:** In der initialen Konfiguration war `max_tokens: 50` gesetzt. Das führte dazu, dass Antworten des phi3-Modells mitten im Satz abgeschnitten wurden, da HotpotQA-Antworten häufig 10–30 Tokens benötigen, aber der Kontext-Aufbau (CoT-Reasoning) des Modells mehr Token-Budget erforderte.
+
+**Symptom:** Ablation mit 10 Samples (2026-03-31) zeigte EM=20% für alle drei Konfigurationen (vector_only, hybrid, graph_only) — identische Ergebnisse trotz unterschiedlicher Retrieval-Methoden. Ursache: Alle Antworten wurden truncated, bevor sie die Gold-Antwort enthielten.
+
+**Lösung:** `max_tokens: 200` (Faktor 4 Erhöhung). Zusätzlich wurden drei neue Context-Budget-Parameter eingeführt, die die Menge an Text steuern die dem LLM übergeben wird:
+- `max_context_chars: 2400` — Verhindert Out-of-Context-Fehler bei phi3 (4k Context Window)
+- `max_docs: 6` — Mehr Chunks erhöhen die Chance, beide Supporting Facts zu treffen (HotpotQA braucht 2)
+- `max_chars_per_doc: 400` — Balanciert Breite (mehr Docs) vs. Tiefe (mehr Text pro Doc)
+
+**Verworfene Alternative:** `max_tokens: 500` — getestet, führt zu längeren Antworten mit Halluzinationen ("According to the context, the answer is X, however it should be noted that..."). phi3 neigt bei mehr Token-Budget zu redundantem Output.
+
+---
+
+### 12.2 Entfernung des äußeren Pipeline-Retry-Loops
+
+**Problem:** In einer früheren Version enthielt `AgentPipeline.process()` einen äußeren Loop der `verifier.generate_and_verify()` bis zu `max_verification_iterations` mal aufrief. Dieser Loop wurde unter der Annahme eingebaut, dass Wiederholungen mit identischem Input zu besseren Antworten führen.
+
+**Erkenntnis:** Ein LLM mit identischem Prompt und `temperature=0.1` (fast-deterministisch) produziert bei jeder Iteration nahezu identische Outputs. Der äußere Loop war damit faktisch eine teure No-Op-Operation (mehrfache LLM-Calls ohne inhaltliche Verbesserung).
+
+**Lösung (2026-03-31):** Äußerer Loop entfernt. `AgentPipeline.process()` ruft `generate_and_verify()` jetzt genau einmal auf. Der echte Self-Correction-Mechanismus ist der innere Loop im Verifier, der bei jeder Iteration **konkrete Verletzungen als Feedback** übergibt (CORRECTION_PROMPT mit spezifischen `violations`). Das ist der tatsächliche Thesis-Beitrag.
+
+**Konfigurationskonsolidierung:** `max_verification_iterations` wird ausschließlich in `settings.yaml` unter `agent:` konfiguriert und von `_verifier_config_from_cfg()` gelesen. Es gibt keine weitere Stelle im Code wo dieser Wert festgelegt wird.
+
+---
+
+### 12.3 Graph-Visualisierung: pyvis → matplotlib
+
+**Problem:** Das ursprüngliche `test_system/graph_3d.py` verwendete pyvis mit `LIMIT 200` für MENTIONS und `LIMIT 100` für RELATED_TO. Bei 66.585 MENTIONS und 14.445 RELATED_TO-Kanten im HotpotQA-Graph entsprach das 0,3% der Daten — der Graph sah leer und unstrukturiert aus.
+
+**Lösung:** Komplette Neuentwicklung mit matplotlib + networkx:
+- Lädt bis zu 2000 RELATED_TO-Kanten, filtert Hub-Entitäten (Pronomen, generische Terme)
+- Wählt Top-N Entitäten nach Verbindungsgrad aus (konfigurierbares `--top N`)
+- Speichert direkt als PNG (dpi=200, für Thesis dpi=300)
+- Erzeugt optional weiterhin interaktives pyvis-HTML
+
+**Erkenntnisse durch Analyse:**
+- Keyword-Regex-Extraktion funktioniert gut (Hub-Kontamination: 0%)
+- Graph Answer Coverage: 33% vs. Vector: 40% — Graph hat echten Mehrwert
+- GLiNER Answer Coverage: 13% — schlechter als einfaches Keyword-Regex. Kein Re-Ingest erforderlich.
+
+---
+
+### 12.4 Graph-Qualität: REBEL-Relation-Extraktion
+
+**Befund:** REBEL (`Babelscape/rebel-large`) extrahiert hauptsächlich Wikipedia-Infobox-Style-Relationen:
+`publication_date`, `country`, `date_of_birth`, `genre`, `performer`
+
+Diese Relationstypen sind für HotpotQA-Bridge-Fragen weitgehend nutzlos. HotpotQA benötigt narrative Relationen wie `directed_by`, `portrayed_by`, `held_position`.
+
+**Kennzahlen HotpotQA-Graph:**
+
+*Stand 2026-04-01 (threshold=0.15):*
+- 9.412 DocumentChunks, 36.996 unique Entities, 74.741 MENTIONS, 17.221 RELATED_TO
+- Hub-Entitäten: "American" (898 Chunks), "He" (737), "United States" (699), "She" (283)
+
+*Stand 2026-04-02 (threshold=0.5, Re-Ingestion):*
+- 9.412 DocumentChunks, 23.858 unique Entities, 50.096 MENTIONS, 15.766 RELATED_TO
+- Hub-Kontamination deutlich reduziert (10% vs. zuvor hoch)
+
+**Entscheidung für die Masterarbeit:** Keine Re-Ingestion mit anderem RE-Modell (Zeitaufwand GPU > 1h, unsicherer Gewinn). Stattdessen:
+1. Graph-Limitierung als dokumentierte Limitation in der Thesis
+2. Union-Coverage (60%) als Argument für Hybrid-Ansatz: Graph findet 3 Fragen die Vector verfehlt
+3. Der Mehrwert des Graphs liegt in MENTIONS (66.585 Kanten), nicht in RELATED_TO
+
+---
+
+### 12.5 Benchmark-Stichprobengröße
+
+**Problem:** Erste Ablation mit nur 10 Samples lieferte statistisch bedeutungslose Ergebnisse (EM=20% für alle Configs — könnte Zufall sein, N zu klein für Konfidenzintervalle).
+
+**Mindestanforderung für Masterarbeit:** N≥50 für erste orientierendem Ergebnisse, N≥200 für belastbare Konfidenzintervalle (95% CI ≈ ±7pp bei N=200, ±14pp bei N=50).
+
+**Empfohlene Konfiguration für finale Thesis-Ergebnisse:**
+```bash
+python benchmark_datasets.py ablation --dataset hotpotqa --samples 200
+```
+
+---
+
+### 12.6 Entity Confidence Threshold: 0.15 → 0.5 (Re-Ingestion 2026-04-02)
+
+**Problem:** Bei `ner_confidence_threshold=0.15` dominierten generische Tokens den Graphen:
+- "American" (898 Chunks), "He" (737), "United States" (699), "She" (283)
+Diese Entitäten wurden als Hub-Nodes mit hunderten MENTIONS-Kanten im Graphen gespeichert. Bei Graph-Traversal wurden sie als "matched entity" zurückgegeben, obwohl sie keinen semantischen Mehrwert liefern.
+
+**Lösung:** `entity_confidence_threshold=0.5` in `local_importingestion.py`. Der Filter wird beim Import angewendet (nicht bei der Extraktion), sodass `extraction_results.json` unverändert bleibt und bei Bedarf mit anderem Threshold neu importiert werden kann.
+
+**Datenvorfall:** Der erste `--clear`-Lauf verwendete `shutil.rmtree(base_path)` und löschte `data/hotpotqa/` vollständig (inkl. `chunks_export.json`, `questions.json`). `extraction_results.json` überlebte nur weil es im IDE geöffnet war. Behoben: `--clear` löscht jetzt nur `vector_db/` und `knowledge_graph/`, niemals Source-JSON-Dateien.
+
+**Ergebnis:** 36.996 → 23.858 unique Entities (−35%), 74.741 → 50.096 MENTIONS (−33%).
+
+---
+
+### 12.7 GLiNER Query-Zeit-Konsistenz (2026-04-02)
+
+**Problem:** `ImprovedQueryEntityExtractor` erhielt `gliner_model=None` weil `StorageConfig(enable_entity_extraction=False)` der Default ist. Folge: Jede Query lief mit SpaCy-Fallback statt GLiNER — obwohl GLiNER installiert und der Graph mit GLiNER gebaut ist.
+
+**Symptom:** SpaCy extrahierte `"Were Scott Derrickson"` (Verb + Name) statt `"Scott Derrickson"`. Außerdem: SpaCy-Entity-Types (`PERSON`, `ORG`, `GPE`) stimmen nicht mit Graph-Entity-Types (`person`, `film`, `city`) überein → Name-Mismatch bei Graph-Lookup.
+
+**Lösung:**
+1. `_get_gliner_model()` — Modul-Level-Cache, lädt `gliner_small-v2.1` einmal pro Prozess
+2. `_load_gliner()` nutzt Cache statt `GLiNER.from_pretrained()` direkt aufzurufen
+3. Entity Types in `ImprovedQueryEntityExtractor` auf Ingestion-Types angeglichen: `["person", "organization", "city", "country", "film", "movie", "work of art", "event"]`
+4. Default-Threshold: `0.5 → 0.2` (Queries kurz → niedrigere GLiNER-Scores als bei langen Chunk-Texten)
+5. `diagnose.py` Layer 3: Regex-Extraktion durch `ImprovedQueryEntityExtractor` ersetzt
+
+**Performance-Hinweis:** GLiNER cold start: ~7.5s, cached: <1ms. Beim ersten Aufruf pro Prozess einmalige Verzögerung.
+
+---
+
+### 12.8 Fallback-Sichtbarkeit: ⚠ FALLBACK AKTIV Warnings
+
+**Motivation:** Fallbacks sind immer Symptome — sie bedeuten, dass die primäre Implementierung nicht funktioniert. Stille Fallbacks verbergen Fehler.
+
+**Implementierung (2026-04-02):** Alle bekannten Fallback-Pfade emittieren jetzt `logger.warning("⚠ FALLBACK AKTIV: ...")`:
+
+| Datei | Fallback-Pfad |
+|---|---|
+| `hybrid_retriever.py` | SpaCy/Regex statt GLiNER für Query-Entities |
+| `entity_extraction.py` | SpaCy/Regex statt GLiNER für Batch-Extraction |
+| `ingestion_pipeline.py` | MockEntityExtractor / MockEmbeddingGenerator (use_mocks=True) |
+| `verifier.py` | Heuristische Widerspruchserkennung statt NLI |
+| `navigator.py` | Relativer Import-Fallback |
+| `chunking.py` | LangChain nicht installiert |
+
+---
+
+### 12.9 Bekannte Limitierungen: Entity Name Disambiguation
+
+**Befund (2026-04-02):** Das System versagt bei Fragen wo die Query eine Entität als Kurzname verwendet, der Graph sie aber unter dem vollständigen Namen gespeichert hat.
+
+**Konkretes Beispiel:**
+- Query: "Were Scott Derrickson and **Ed Wood** of the same nationality?"
+- GLiNER extrahiert: `"Ed Wood"` → Graph-Lookup findet Entity "Ed Wood" → FILM-Artikel (1994 Tim-Burton-Film)
+- Korrekte Chunk 7: `"Edward Davis Wood Jr. was an American filmmaker"` → hängt an Entity `"Edward Davis Wood Jr."` → wird **nicht** gefunden
+
+**Ursache:** KuzuDB-Graph-Lookup ist **exaktes String-Matching**. Keine Alias-Auflösung, keine Coreference.
+
+**Mögliche Lösungen (für Thesis-Ausblick):**
+
+| Ansatz | Aufwand | Wirkung |
+|---|---|---|
+| Entity-Linking (z.B. BLINK, REL) | hoch | Normalisiert Entitäten auf Wikidata-IDs |
+| Alias-Tabelle bei Ingestion | mittel | `"Ed Wood"` ↔ `"Edward Davis Wood Jr."` als Alias-Node |
+| Fuzzy Graph-Lookup | niedrig | Levenshtein-Abstand bei Graph-Suche erlauben |
+| Sub-Query-Reformulierung | niedrig | "What is the nationality of Ed Wood?" statt "Were Ed Wood of same nationality?" |
+
+Für die Masterarbeit wird diese Limitierung als dokumentierte Known Issue behandelt. Sie ist in der Union-Coverage-Metrik sichtbar und motiviert den Hybrid-Ansatz.
+
+---
+
 *End of Technical Architecture Documentation*
 
 ---
@@ -1402,3 +1702,8 @@ The Jaccard redundancy threshold of 0.8 is conservative: two chunks sharing 80 %
 | 2.1.0 | 2026-01-25 | Distance metric fix (L2 → cosine) |
 | 3.0.0 | 2026-01-30 | Three-agent pipeline (S_P, S_N, S_V) |
 | 3.1.0 | 2026-02-26 | Comprehensive review; all bugs resolved |
+| 3.1.1 | 2026-03-15 | LLM-Config-Fixes: max_tokens=200, neue Context-Budget-Felder |
+| 3.1.2 | 2026-03-31 | Äußerer Retry-Loop aus AgentPipeline entfernt; Self-Correction nur im Verifier |
+| 3.1.3 | 2026-03-31 | Graph-Qualitäts-Diagnose (diagnose.py --graph-quality); Graph-Visualisierung (graph_3d.py) |
+| 3.2.0 | 2026-04-01 | Vollständige Dokumentationsüberarbeitung; Abschnitt 12 (Änderungen & Alternativen) hinzugefügt |
+| 3.3.0 | 2026-04-02 | Threshold 0.15→0.5 (Re-Ingestion); GLiNER Query-Konsistenz-Fix; Fallback-Warnings; Entity-Disambiguierung dokumentiert |

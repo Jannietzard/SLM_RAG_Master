@@ -1051,6 +1051,35 @@ class BatchedOllamaEmbeddings(Embeddings):
 
 
 # ============================================================================
+# FACTORY
+# ============================================================================
+
+def create_embeddings(cfg: dict = None) -> BatchedOllamaEmbeddings:
+    """
+    Factory für BatchedOllamaEmbeddings. Liest alle Parameter aus cfg (settings.yaml-Dict).
+
+    Args:
+        cfg: Settings-Dict (aus settings.yaml geladen). None → Defaults.
+
+    Returns:
+        Konfigurierte BatchedOllamaEmbeddings-Instanz.
+    """
+    cfg = cfg or {}
+    emb_cfg = cfg.get("embeddings", {})
+    perf_cfg = cfg.get("performance", {})
+    llm_cfg = cfg.get("llm", {})
+
+    return BatchedOllamaEmbeddings(
+        model_name=emb_cfg.get("model_name", "nomic-embed-text"),
+        base_url=emb_cfg.get("base_url", "http://localhost:11434"),
+        batch_size=perf_cfg.get("batch_size", 32),
+        cache_path=Path(emb_cfg.get("cache_path", "./cache/embeddings.db")),
+        device=perf_cfg.get("device", "cpu"),
+        timeout=llm_cfg.get("timeout", 60),
+    )
+
+
+# ============================================================================
 # SELF-TEST / DIAGNOSTICS
 # ============================================================================
 

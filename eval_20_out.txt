@@ -1,0 +1,18 @@
+
+======================================================================
+HOTPOTQA BENCHMARK EVALUATION
+======================================================================
+Mode: HYBRID
+Samples: 20
+======================================================================
+
+2026-04-02 02:58:39,270 - INFO - Loaded 20 test questions
+2026-04-02 02:58:39,270 - INFO - Setting up pipeline (mode=hybrid)...
+Traceback (most recent call last):
+  File "C:\Users\Jan Nietzard\Documents\FOM\FOM Masterarbeit\Masterarbeit Edge\Entwicklungfolder\src\evaluations\evaluate_hotpotqa.py", line 483, in <module>
+    main()
+  File "C:\Users\Jan Nietzard\Documents\FOM\FOM Masterarbeit\Masterarbeit Edge\Entwicklungfolder\src\evaluations\evaluate_hotpotqa.py", line 474, in main
+    evaluator.setup_pipeline(retrieval_mode=args.mode)
+  File "C:\Users\Jan Nietzard\Documents\FOM\FOM Masterarbeit\Masterarbeit Edge\Entwicklungfolder\src\evaluations\evaluate_hotpotqa.py", line 176, in setup_pipeline
+    from src.pipeline.agent_pipeline import create_pipeline
+ModuleNotFoundError: No module named 'src'

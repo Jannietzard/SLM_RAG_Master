@@ -1,0 +1,65 @@
+C:\Users\Jan Nietzard\Documents\FOM\FOM Masterarbeit\Masterarbeit Edge\Entwicklungfolder\venv\Lib\site-packages\huggingface_hub\utils\_validators.py:186: UserWarning: The `resume_download` argument is deprecated and ignored in `snapshot_download`. Downloads always resume whenever possible.
+  warnings.warn(
+
+[1m══════════════════════════════════════════════════════════════════════
+  EDGE-RAG DIAGNOSE
+══════════════════════════════════════════════════════════════════════[0m
+  [94m→[0m Frage (0): "Were Scott Derrickson and Ed Wood of the same nationality?"
+  [94m→[0m Gold-Antwort:   "yes"
+
+
+[1m──────────────────────────────────────────────────────────────────────
+  LAYER 1 — Embedding (nomic-embed-text via Ollama)
+──────────────────────────────────────────────────────────────────────[0m
+  [92m✓[0m Ollama erreichbar (2605ms)
+  [92m✓[0m Embedding erzeugt: dim=768, Zeit=1ms
+  [94m→[0m Erste 5 Werte: [0.0072, -0.0035, -0.1595, 0.0404, 0.0595]
+
+[1m──────────────────────────────────────────────────────────────────────
+  LAYER 2 — Vector Search (LanceDB direkt)
+──────────────────────────────────────────────────────────────────────[0m
+  [92m✓[0m HybridStore geladen (263ms)
+  [94m→[0m Berechne Query-Embedding...
+  [92m✓[0m Vector Search: 5 Treffer in 21ms
+  [94m→[0m   #1 score=0.786: "John MacGregor, John Macgregor or John McGregor may refer to:..."
+  [94m→[0m   #2 score=0.758: "The Gerald R. Ford Freeway refers to Interstate Highways named for former Presid..."
+  [94m→[0m   #3 score=0.747: "Lost Youth") by Pietro Germi. It was made by Vandyke Productions...."
+
+[1m──────────────────────────────────────────────────────────────────────
+  LAYER 4 — HybridRetriever (RRF Fusion)
+──────────────────────────────────────────────────────────────────────[0m
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]Fetching 4 files: 100%|██████████| 4/4 [00:00<?, ?it/s]
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+  [92m✓[0m HybridRetriever initialisiert
+  [92m✓[0m HybridRetriever: 10 Treffer in 421ms
+  [94m→[0m Metriken: vector=10, graph=10, fused=10
+  [94m→[0m   #1 rrf_score=0.0164: "John MacGregor, John Macgregor or John McGregor may refer to:..."
+  [94m→[0m   #2 rrf_score=0.0164: "Scott Derrickson (born July 16, 1966) is an American director, screenwriter and ..."
+  [94m→[0m   #3 rrf_score=0.0161: "The Gerald R. Ford Freeway refers to Interstate Highways named for former Presid..."
+
+[1m──────────────────────────────────────────────────────────────────────
+  LAYER 5 — Planner / S_P (Query Decomposition, kein LLM)
+──────────────────────────────────────────────────────────────────────[0m
+  [92m✓[0m Planner ausgeführt (18ms)
+  [94m→[0m   Query-Typ:  comparison
+  [94m→[0m   Strategie:  hybrid
+  [94m→[0m   Konfidenz:  0.75
+  [94m→[0m   Sub-Queries (3):
+  [94m→[0m     - "What is the nationality of Scott Derrickson?"
+  [94m→[0m     - "What is the nationality of Ed Wood?"
+  [94m→[0m     - "Were Scott Derrickson and Ed Wood of the same nationality?"
+
+[1m──────────────────────────────────────────────────────────────────────
+  LAYER 6 — Navigator / S_N (Retrieval + Pre-Gen Filtering)
+──────────────────────────────────────────────────────────────────────[0m
+  [92m✓[0m Navigator initialisiert, Retriever gesetzt
+  [94m→[0m Sub-Queries: ['What is the nationality of Scott Derrickson?', 'What is the nationality of Ed Wood?', 'Were Scott Derrickson and Ed Wood of the same nationality?']
+  [92m✓[0m Navigator: 20 raw → 5 gefilterte Chunks (626ms)
+  [94m→[0m   Chunk #1: "Scott Derrickson (born July 16, 1966) is an American director, screenwriter and producer. He lives i..."
+  [94m→[0m   Chunk #2: "Tyler Bates (born June 5, 1965) is an American musician, music producer, and composer for films, tel..."
+  [94m→[0m   Chunk #3: "He has collaborated with directors like Zack Snyder, Rob Zombie, Neil Marshall, William Friedkin, Sc..."
+
+[1m══════════════════════════════════════════════════════════════════════
+  DIAGNOSE ABGESCHLOSSEN
+══════════════════════════════════════════════════════════════════════[0m
+

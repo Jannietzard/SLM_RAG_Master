@@ -163,7 +163,7 @@ class ExtractionConfig:
         "movie",            # Synonym für film (doppelte Abdeckung)
         "event",            # Historische Ereignisse (ersetzt EVENT)
     ])
-    ner_confidence_threshold: float = 0.15
+    ner_confidence_threshold: float = 0.5   # Thesis-Spezifikation: ≥ 0.5
     ner_batch_size: int = 16
     
     # REBEL
@@ -414,6 +414,11 @@ class GLiNERExtractor:
         Optimiert für Throughput durch Batching (16 Texte pro Batch).
         """
         if self.model is None:
+            logger.warning(
+                "⚠ FALLBACK AKTIV: GLiNER-Modell nicht geladen → Batch-Extraktion nutzt SpaCy/Regex. "
+                "Alle %d Chunks betroffen.",
+                len(texts),
+            )
             return [self._fallback_extract(t, c) for t, c in zip(texts, chunk_ids)]
         
         all_results = []

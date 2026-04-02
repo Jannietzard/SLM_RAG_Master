@@ -274,6 +274,7 @@ def ingest_knowledge_graph(
     extraction_results: List[Dict],
     graph_path: Path,
     dataset_name: str,
+    entity_confidence_threshold: float = 0.5,
 ) -> Dict[str, int]:
     """
     Importiere Entities und Relationen in KuzuDB Knowledge Graph.
@@ -387,6 +388,10 @@ def ingest_knowledge_graph(
             entity_type = ent.get("entity_type") or ent.get("type", "UNKNOWN")
             confidence = ent.get("confidence", 0.5)
 
+            # Skip low-confidence entities (Thesis: threshold ≥ 0.5)
+            if confidence < entity_confidence_threshold:
+                continue
+
             entity_name_to_id[entity_name.lower()] = entity_id
 
             if entity_id not in seen_entities:
@@ -496,12 +501,22 @@ def run_full_import(
     vector_path = base_path / "vector_db"
     graph_path = base_path / "knowledge_graph"
 
-    # Clear wenn gewünscht
+    # Clear wenn gewünscht.
+    # WICHTIG: extraction_results.json und chunks_export.json werden NIEMALS gelöscht —
+    # sie sind die Quelldateien (Colab-Output / Phase 1) und müssen erhalten bleiben.
+    # Nur die abgeleiteten Stores (vector_db, knowledge_graph) werden gelöscht.
     if clear:
         import shutil
-        if base_path.exists():
-            shutil.rmtree(base_path)
-            logger.info(f"  Gelöscht: {base_path}")
+        if graph_only:
+            # Nur Graph neu aufbauen
+            targets = [graph_path]
+        else:
+            # Vector Store + Graph neu aufbauen — Quelldateien bleiben unangetastet
+            targets = [vector_path, graph_path]
+        for target in targets:
+            if target.exists():
+                shutil.rmtree(target)
+                logger.info(f"  Gelöscht: {target}")
 
     base_path.mkdir(parents=True, exist_ok=True)
 
@@ -533,8 +548,10 @@ def run_full_import(
 
     # Phase 3b: Knowledge Graph
     try:
+        entity_conf = config.get("entity_confidence_threshold", 0.5)
         stats = ingest_knowledge_graph(
-            documents, extraction_results, graph_path, dataset_name
+            documents, extraction_results, graph_path, dataset_name,
+            entity_confidence_threshold=entity_conf,
         )
     except Exception as e:
         logger.error(f"Knowledge Graph Ingestion fehlgeschlagen: {e}")

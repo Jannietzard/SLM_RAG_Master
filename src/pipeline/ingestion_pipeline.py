@@ -590,14 +590,22 @@ class IngestionPipeline:
         if entity_extractor is not None:
             self.entity_extractor = entity_extractor
         elif use_mocks:
+            logger.warning(
+                "⚠ FALLBACK AKTIV: MockEntityExtractor wird verwendet "
+                "(use_mocks=True) — NER/RE liefert keine echten Entitäten!"
+            )
             self.entity_extractor = MockEntityExtractor()
         else:
             self.entity_extractor = self._init_entity_extractor()
-        
+
         # Embedding Generator
         if embedding_generator is not None:
             self.embedding_generator = embedding_generator
         elif use_mocks:
+            logger.warning(
+                "⚠ FALLBACK AKTIV: MockEmbeddingGenerator wird verwendet "
+                "(use_mocks=True) — Embeddings sind zufällige Vektoren!"
+            )
             self.embedding_generator = MockEmbeddingGenerator(self.config.embedding_dim)
         else:
             self.embedding_generator = EmbeddingGenerator(
@@ -605,11 +613,15 @@ class IngestionPipeline:
                 batch_size=self.config.embedding_batch_size,
                 enable_cache=self.config.enable_caching
             )
-        
+
         # Hybrid Store
         if hybrid_store is not None:
             self.hybrid_store = hybrid_store
         elif use_mocks:
+            logger.warning(
+                "⚠ FALLBACK AKTIV: HybridStore ist None "
+                "(use_mocks=True) — kein Speicher verfügbar!"
+            )
             self.hybrid_store = None
         else:
             self.hybrid_store = self._init_hybrid_store()
@@ -645,16 +657,19 @@ class IngestionPipeline:
             from ..data_layer.entity_extraction import EntityExtractionPipeline, ExtractionConfig
             
             extraction_config = ExtractionConfig(
-                gliner_batch_size=self.config.gliner_batch_size,
-                rebel_batch_size=self.config.rebel_batch_size,
-                entity_confidence_threshold=self.config.entity_confidence_threshold,
-                relation_confidence_threshold=self.config.relation_confidence_threshold,
+                ner_batch_size=self.config.gliner_batch_size,       # ExtractionConfig nutzt ner_batch_size
+                re_batch_size=self.config.rebel_batch_size,         # ExtractionConfig nutzt re_batch_size
+                ner_confidence_threshold=self.config.entity_confidence_threshold,  # korrekter Feldname
+                re_confidence_threshold=self.config.relation_confidence_threshold,
                 min_entities_for_re=self.config.min_entities_for_re,
-                enable_caching=self.config.enable_caching
+                cache_enabled=self.config.enable_caching            # ExtractionConfig nutzt cache_enabled
             )
             return EntityExtractionPipeline(extraction_config)
-        except ImportError as e:
-            logger.warning(f"Could not import entity extractor: {e}")
+        except (ImportError, Exception) as e:
+            logger.error(
+                f"⚠ FALLBACK AKTIV: EntityExtractionPipeline konnte nicht initialisiert werden: {e} "
+                f"— MockEntityExtractor übernimmt (NER liefert keine echten Entitäten!)"
+            )
             return MockEntityExtractor()
     
     def _init_hybrid_store(self):

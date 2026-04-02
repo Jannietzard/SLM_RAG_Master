@@ -174,10 +174,14 @@ def test_vector_search(query: str, embeddings):
 def test_graph_search(query: str, store):
     header("LAYER 3 — Graph Search (KuzuDB direkt)")
 
-    # Einfache Entitätsextraktion: großgeschriebene Wörter (Nomen/Namen)
-    import re
-    entities = [w for w in re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', query)]
-    entities = list(dict.fromkeys(entities))  # dedup, order preserved
+    # GLiNER-Entitätsextraktion (konsistent mit Ingestion)
+    from src.data_layer.hybrid_retriever import ImprovedQueryEntityExtractor
+    _qee = ImprovedQueryEntityExtractor()
+    entities = _qee.extract(query)
+    if not entities:
+        # Fallback: großgeschriebene Wörter falls GLiNER leer
+        import re
+        entities = list(dict.fromkeys(re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', query)))
     info(f"Extrahierte Entitäten: {entities}")
 
     try:
@@ -309,7 +313,21 @@ def test_navigator(query: str, plan, retriever):
         return None
 
     try:
-        nav_config = ControllerConfig()
+        nav_cfg = config.get("navigator", {})
+        llm_cfg = config.get("llm", {})
+        agent_cfg = config.get("agent", {})
+        nav_config = ControllerConfig(
+            model_name=llm_cfg.get("model_name", "phi3"),
+            base_url=llm_cfg.get("base_url", "http://localhost:11434"),
+            temperature=llm_cfg.get("temperature", 0.1),
+            max_verification_iterations=agent_cfg.get("max_verification_iterations", 1),
+            relevance_threshold_factor=nav_cfg.get("relevance_threshold_factor", 0.6),
+            redundancy_threshold=nav_cfg.get("redundancy_threshold", 0.8),
+            max_context_chunks=nav_cfg.get("max_context_chunks", 10),
+            rrf_k=nav_cfg.get("rrf_k", 60),
+            top_k_per_subquery=nav_cfg.get("top_k_per_subquery", 10),
+            max_chars_per_doc=llm_cfg.get("max_chars_per_doc", 300),
+        )
         navigator = Navigator(nav_config)
         navigator.set_retriever(retriever)
         ok("Navigator initialisiert, Retriever gesetzt")
@@ -362,7 +380,7 @@ def test_verifier(query: str, gold_answer: str, context: list, skip_llm: bool):
         warn("--skip-llm aktiv: Verifier-Test übersprungen")
         return
 
-    from src.logic_layer.verifier import Verifier, VerifierConfig
+    from src.logic_layer.verifier import create_verifier
 
     # Wenn kein echtes Context vorhanden, nutze Dummy
     if not context:
@@ -373,11 +391,8 @@ def test_verifier(query: str, gold_answer: str, context: list, skip_llm: bool):
         ]
 
     try:
-        verifier_config = VerifierConfig(
-            max_tokens=100,      # kurz halten für Test
-            timeout=120,         # 2 Min Timeout
-        )
-        verifier = Verifier(config=verifier_config)
+        # Lädt alle Werte aus settings.yaml (max_docs, max_context_chars, timeout, …)
+        verifier = create_verifier(cfg=config)
         ok("Verifier initialisiert")
 
         info(f"Kontext-Chunks: {len(context)}")
@@ -509,6 +524,309 @@ def test_full_pipeline(query: str, gold_answer: str, skip_llm: bool,
         fail(f"Pipeline fehlgeschlagen: {e}")
         import traceback
         traceback.print_exc()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GRAPH QUALITY ANALYSE (--graph-quality N)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_graph_quality(n_questions: int):
+    """
+    Misst wie gut der Graph für N echte HotpotQA-Fragen arbeitet.
+
+    Erweiterte Diagnose zeigt pro Frage:
+      - Welche Entität wurde tatsächlich gematcht? (Hub-Kontamination?)
+      - Enthält ein Graph-Chunk die Gold-Antwort? (Answer Coverage)
+      - Vergleich mit Vector-Search Answer Coverage
+
+    Erkennt das "False-Positive-Hit" Problem: Keyword trifft Hub-Entitäten
+    wie "He", "American", "United States" die für fast jede Frage matchen,
+    aber keine relevanten Chunks zurückgeben.
+    """
+    header(f"GRAPH QUALITY ANALYSE — {n_questions} Fragen")
+
+    q_path = DATA_DIR / "questions.json"
+    if not q_path.exists():
+        fail(f"questions.json nicht gefunden: {q_path}")
+        return
+
+    with open(q_path, encoding="utf-8") as f:
+        all_qs = json.load(f)
+
+    n_questions = min(n_questions, len(all_qs))
+    info(f"Verfügbare Fragen: {len(all_qs)} — analysiere {n_questions}")
+
+    # Graph-Metadata anzeigen
+    meta_path = DATA_DIR / "extraction_metadata.json"
+    if meta_path.exists():
+        with open(meta_path) as f:
+            meta = json.load(f)
+        stats = meta.get("graph_stats", {})
+        ok(f"Graph-Stats: {stats.get('unique_entities', '?')} unique entities, "
+           f"{stats.get('relations', '?')} relations, "
+           f"{stats.get('document_chunks', '?')} chunks")
+        gliner_model = meta.get("gliner_model", "?")
+        ok(f"Ingestion-Methode: GLiNER ({gliner_model})")
+    else:
+        warn("Keine extraction_metadata.json — Graph-Stats unbekannt")
+
+    from src.data_layer.storage import HybridStore, StorageConfig
+    from src.data_layer.embeddings import BatchedOllamaEmbeddings
+
+    emb_cfg = config.get("embeddings", {})
+    vec_cfg = config.get("vector_store", {})
+    cache_path = Path(f"./cache/{DATASET}_embeddings.db")
+
+    try:
+        embeddings = BatchedOllamaEmbeddings(
+            model_name=emb_cfg.get("model_name", "nomic-embed-text"),
+            base_url=emb_cfg.get("base_url", "http://localhost:11434"),
+            batch_size=1,
+            cache_path=cache_path,
+        )
+        storage_config = StorageConfig(
+            vector_db_path=DATA_DIR / "vector_db",
+            graph_db_path=DATA_DIR / "knowledge_graph",
+            embedding_dim=emb_cfg.get("embedding_dim", 768),
+            normalize_embeddings=vec_cfg.get("normalize_embeddings", True),
+            distance_metric=vec_cfg.get("distance_metric", "cosine"),
+            similarity_threshold=0.0,   # Kein Filter – alle Treffer sehen
+        )
+        store = HybridStore(config=storage_config, embeddings=embeddings)
+    except Exception as e:
+        fail(f"Store-Init fehlgeschlagen: {e}")
+        return
+
+    # GLiNER laden (optional)
+    gliner = None
+    try:
+        from gliner import GLiNER
+        gliner = GLiNER.from_pretrained("urchade/gliner_small-v2.1")
+        ok("GLiNER geladen (urchade/gliner_small-v2.1)")
+    except Exception as e:
+        warn(f"GLiNER nicht ladbar: {e} — nur Keyword-Extraktion")
+
+    # ─── Hub-Erkennung ────────────────────────────────────────────────────────
+    # Entitäten die in fast jeder englischen Antwort vorkommen → Rauschen statt Signal
+    HUB_WORDS = {
+        # Pronomen (häufigster Fehler bei GLiNER/NER)
+        "i", "he", "she", "it", "they", "we", "you",
+        "his", "her", "their", "him", "them", "who", "that",
+        "this", "these", "those", "its",
+        # Generische Terme (treffen zu viele Chunks)
+        "american", "united states", "us", "uk", "british",
+        "country", "film", "movie", "people", "world", "city",
+        "government", "man", "woman", "year", "time", "place",
+        "football", "song", "album", "book", "company", "university",
+        "music", "television", "television series", "series",
+    }
+
+    def is_hub(entity_name: str) -> bool:
+        """True wenn Entity ein Hub ist (nicht-spezifisch / zu generisch)."""
+        if not entity_name:
+            return False
+        e = entity_name.strip().lower()
+        if len(e) <= 2:              # "I", "He", "US", Einzelbuchstaben
+            return True
+        if e in HUB_WORDS:
+            return True
+        return False
+
+    # ─── Entity-Extraktion ───────────────────────────────────────────────────
+    import re
+
+    def extract_keyword(query: str):
+        ents = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', query)
+        return list(dict.fromkeys(ents))
+
+    GLINER_TYPES = ["person", "organization", "city", "country", "film", "movie", "event"]
+
+    def extract_gliner(query: str):
+        if gliner is None:
+            return []
+        try:
+            preds = gliner.predict_entities(query, GLINER_TYPES, threshold=0.3)
+            return list(dict.fromkeys(p["text"] for p in preds))
+        except Exception:
+            return []
+
+    # ─── Answer Coverage Prüfung ─────────────────────────────────────────────
+    def norm_ans(t: str) -> str:
+        t = t.lower().strip()
+        t = re.sub(r'\b(a|an|the)\b', ' ', t)
+        t = re.sub(r'[^\w\s]', '', t)
+        return ' '.join(t.split())
+
+    def answer_in_chunks(gold: str, chunks: list) -> bool:
+        """True wenn normalisierte Gold-Antwort in irgendeinem Chunk vorkommt."""
+        gold_n = norm_ans(gold)
+        if not gold_n or len(gold_n) < 2:
+            return False
+        for c in chunks:
+            text = c.get("text", "") if isinstance(c, dict) else str(c)
+            if gold_n in norm_ans(text):
+                return True
+        return False
+
+    # ─── Tabellen-Header ─────────────────────────────────────────────────────
+    print(f"\n  {'#':>3}  {'KW-H':>4}  {'Top-Entity (gematcht)':>22}  {'Hub':>3}  "
+          f"{'GrAns':>5}  {'VecH':>4}  {'VecAns':>6}  Frage")
+    print(f"  {'─'*3}  {'─'*4}  {'─'*22}  {'─'*3}  {'─'*5}  {'─'*4}  {'─'*6}  {'─'*40}")
+
+    # ─── Zähler ──────────────────────────────────────────────────────────────
+    kw_hits = kw_miss = 0
+    hub_contaminated   = 0   # Fragen wo alle KW-Treffer via Hub-Entity kamen
+    any_hub_hit        = 0   # Fragen wo mindestens ein Treffer via Hub war
+    graph_answer_hits  = 0   # Fragen wo Gold-Antwort in Graph-Chunks vorkommt
+    vec_answer_hits    = 0   # Fragen wo Gold-Antwort in Vector-Chunks vorkommt
+
+    gl_hits = gl_graph_answer_hits = 0  # GLiNER-Zähler (nur wenn verfügbar)
+
+    for i in range(n_questions):
+        sample = all_qs[i]
+        query  = sample.get("question", "")
+        gold   = sample.get("answer", "")
+
+        ents_kw = extract_keyword(query)
+
+        try:
+            res_kw = store.graph_search(entities=ents_kw if ents_kw else ["___"], top_k=5)
+        except Exception as e:
+            warn(f"  [{i}] graph_search Fehler: {e}")
+            continue
+
+        n_kw = len(res_kw)
+        if n_kw > 0:
+            kw_hits += 1
+        else:
+            kw_miss += 1
+
+        # ─── Hub-Kontaminations-Diagnose ──────────────────────────────────
+        matched_entities = [r.get("matched_entity", "") for r in res_kw]
+        top_entity = matched_entities[0] if matched_entities else "NONE"
+        top_is_hub = is_hub(top_entity)
+
+        if res_kw and all(is_hub(e) for e in matched_entities):
+            hub_contaminated += 1
+        if res_kw and any(is_hub(e) for e in matched_entities):
+            any_hub_hit += 1
+
+        # ─── Graph Answer Coverage ────────────────────────────────────────
+        g_in_graph = answer_in_chunks(gold, res_kw) if gold else False
+        if g_in_graph:
+            graph_answer_hits += 1
+
+        # ─── Vector Search für Vergleich ──────────────────────────────────
+        vec_ans = False
+        n_vec = 0
+        try:
+            qvec    = embeddings.embed_query(query)
+            res_vec = store.vector_search(qvec, top_k=5)
+            n_vec   = len(res_vec)
+            vec_ans = answer_in_chunks(gold, res_vec)
+            if vec_ans:
+                vec_answer_hits += 1
+        except Exception:
+            pass
+
+        # ─── Zeilenausgabe ────────────────────────────────────────────────
+        kw_c   = GREEN if n_kw > 0 else RED
+        hub_c  = RED   if top_is_hub else GREEN
+        grn_c  = GREEN if g_in_graph else RED
+        vec_c  = GREEN if vec_ans else RED
+
+        top_ent_disp = (top_entity[:20] + "..") if len(top_entity) > 22 else top_entity.ljust(22)
+        hub_flag = f"{RED}HUB{RESET}" if top_is_hub else f"{GREEN} ok{RESET}"
+        gr_flag  = f"{GREEN}  ✓  {RESET}" if g_in_graph else f"{RED}  ✗  {RESET}"
+        v_flag   = f"{GREEN}  ✓   {RESET}" if vec_ans else f"{RED}  ✗   {RESET}"
+
+        print(
+            f"  {i:>3}  {kw_c}{n_kw:>4}{RESET}  {hub_c}{top_ent_disp}{RESET}  "
+            f"{hub_flag}  {gr_flag}  {n_vec:>4}  {v_flag}  {query[:40]}"
+        )
+
+    total = kw_hits + kw_miss
+    print(f"\n  {'─'*80}")
+    print(f"\n  {BOLD}Zusammenfassung ({total} Fragen):{RESET}")
+
+    # Graph-Hits
+    ok(f"Graph-Hits (KW):          {kw_hits:>3}/{total} ({100*kw_hits//max(total,1):>3}%)")
+
+    # Hub-Kontamination
+    hub_all_rate = 100 * hub_contaminated // max(kw_hits, 1)
+    hub_any_rate = 100 * any_hub_hit      // max(kw_hits, 1)
+    if hub_all_rate >= 50:
+        fail(f"Hub-Kontamination (alle): {hub_contaminated:>3}/{kw_hits} Hits ({hub_all_rate:>3}%) NUR via Hub-Entity")
+    else:
+        warn(f"Hub-Kontamination (alle): {hub_contaminated:>3}/{kw_hits} Hits ({hub_all_rate:>3}%) NUR via Hub-Entity")
+    warn(f"Hub-Kontamination (mind):{any_hub_hit:>4}/{kw_hits} Hits ({hub_any_rate:>3}%) mit ≥1 Hub-Entity")
+
+    # Answer Coverage
+    ans_rate = 100 * graph_answer_hits // max(total, 1)
+    vec_rate = 100 * vec_answer_hits   // max(total, 1)
+    if ans_rate >= 50:
+        ok(f"Graph Answer Coverage:    {graph_answer_hits:>3}/{total} ({ans_rate:>3}%) — Gold in Graph-Chunk")
+    else:
+        fail(f"Graph Answer Coverage:    {graph_answer_hits:>3}/{total} ({ans_rate:>3}%) — Gold in Graph-Chunk")
+    if vec_rate >= 50:
+        ok(f"Vector Answer Coverage:   {vec_answer_hits:>3}/{total} ({vec_rate:>3}%) — Gold in Vector-Chunk")
+    else:
+        warn(f"Vector Answer Coverage:   {vec_answer_hits:>3}/{total} ({vec_rate:>3}%) — Gold in Vector-Chunk")
+
+    # Effektiver Graph-Mehrwert
+    graph_only_answers = sum(
+        1 for i in range(n_questions)
+        # Nicht messbar ohne separate Liste, Hinweis im Fazit
+    )
+    print()
+    info("Diagnose:")
+    if hub_all_rate >= 60:
+        fail(f"  PROBLEM: {hub_all_rate}% der Graph-Hits kommen NUR via Hub-Entitäten")
+        fail(f"  → Die '100% Hit-Rate' ist ein False-Positive-Artefakt!")
+        fail(f"  → Keyword findet 'American', 'He', 'United States' in fast jeder Frage")
+        warn(f"  → Graph Answer Coverage ({ans_rate}%) = echter Mehrwert")
+        info(f"  → Das erklärt warum graph_only ≈ vector_only in Ablation")
+        print()
+        info(f"  Lösungsansätze für Masterarbeit:")
+        info(f"  1. Hub-Filter in graph_search: Entitäten mit >200 MENTIONS überspringen")
+        info(f"  2. Min-specificity Score: nur Named Entities mit ≥2 Wörtern oder")
+        info(f"     bekannte Proper Nouns (Kapitalisierung + nicht in HUB_WORDS)")
+        info(f"  3. Als Limitation dokumentieren: Graph-Mehrwert nur bei bridge-type")
+        info(f"     Fragen mit klar benannten Entitäten in der Query messbar")
+    elif ans_rate < vec_rate - 10:
+        warn(f"  Graph Coverage ({ans_rate}%) < Vector Coverage ({vec_rate}%) um >10pp")
+        warn(f"  → Graph fügt keinen verlässlichen Mehrwert hinzu")
+        info(f"  → Hybrid-Fusion verwässert ggf. die Vector-Ergebnisse")
+    elif ans_rate >= vec_rate:
+        ok(f"  Graph Coverage ({ans_rate}%) ≥ Vector Coverage ({vec_rate}%) → Graph hilft!")
+    else:
+        info(f"  Gemischtes Bild: Graph={ans_rate}%, Vector={vec_rate}%")
+
+    # GLiNER Vergleich (wenn verfügbar)
+    if gliner:
+        print()
+        info("GLiNER Answer Coverage Vergleich:")
+        gl_ans_hits = 0
+        for i in range(min(n_questions, len(all_qs))):
+            sample  = all_qs[i]
+            query   = sample.get("question", "")
+            gold    = sample.get("answer", "")
+            ents_gl = extract_gliner(query)
+            try:
+                res_gl = store.graph_search(entities=ents_gl if ents_gl else ["___"], top_k=5)
+                if answer_in_chunks(gold, res_gl):
+                    gl_ans_hits += 1
+            except Exception:
+                pass
+        gl_ans_rate = 100 * gl_ans_hits // max(n_questions, 1)
+        if gl_ans_rate > ans_rate:
+            ok(f"  GLiNER Graph Coverage: {gl_ans_hits}/{n_questions} ({gl_ans_rate}%) — besser als Keyword ({ans_rate}%)")
+            ok(f"  → Re-Ingest mit GLiNER-Extraction würde Graph-Mehrwert verbessern!")
+        else:
+            info(f"  GLiNER Graph Coverage: {gl_ans_hits}/{n_questions} ({gl_ans_rate}%) vs Keyword ({ans_rate}%)")
+            info(f"  → GLiNER bringt keinen messbaren Graph-Coverage-Vorteil")
+    else:
+        warn("GLiNER nicht verfügbar — GL-Vergleich nicht möglich")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -651,9 +969,18 @@ def main():
                         help="Index der HotpotQA Frage (default: 0)")
     parser.add_argument("--multi", type=int, default=0,
                         help="Vector-Score-Analyse für N Fragen (kein LLM, z.B. --multi 30)")
+    parser.add_argument("--graph-quality", type=int, default=0, metavar="N",
+                        help="Graph-Qualitäts-Analyse: Hub-Kontamination, Answer Coverage, Vector-Vergleich")
     parser.add_argument("--skip-llm", action="store_true",
                         help="LLM-Calls überspringen (Verifier + Pipeline)")
     args = parser.parse_args()
+
+    # ─── Graph-Quality Modus ─────────────────────────────────────────────────
+    if args.graph_quality > 0:
+        print(f"\n{BOLD}{'═'*70}\n  EDGE-RAG DIAGNOSE — GRAPH QUALITY MODUS\n{'═'*70}{RESET}")
+        test_graph_quality(args.graph_quality)
+        print(f"\n{BOLD}{'═'*70}\n  DIAGNOSE ABGESCHLOSSEN\n{'═'*70}{RESET}\n")
+        return
 
     # ─── Multi-Vector Modus ──────────────────────────────────────────────────
     if args.multi > 0:
