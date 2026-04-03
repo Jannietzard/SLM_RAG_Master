@@ -39,6 +39,44 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Entity-Name Normalisierung (konsistent mit GLiNERExtractor in entity_extraction.py)
+# ---------------------------------------------------------------------------
+_STRIP_ARTICLE_TYPES = frozenset({"GPE", "LOCATION", "EVENT"})
+
+_QUERY_LABEL_MAP = {
+    "person": "PERSON", "director": "PERSON", "actor": "PERSON",
+    "organization": "ORGANIZATION", "company": "ORGANIZATION", "studio": "ORGANIZATION",
+    "city": "GPE", "country": "GPE", "state": "GPE",
+    "location": "LOCATION", "place": "LOCATION",
+    "landmark": "LOCATION", "monument": "LOCATION", "building": "LOCATION",
+    "film": "WORK_OF_ART", "movie": "WORK_OF_ART", "album": "WORK_OF_ART",
+    "work of art": "WORK_OF_ART", "work_of_art": "WORK_OF_ART",
+    "award": "WORK_OF_ART", "prize": "WORK_OF_ART",
+    "event": "EVENT",
+}
+
+
+def _normalize_query_entity(text: str, label: str) -> str:
+    """
+    Normalisiere Query-Entity-Namen konsistent mit der Ingestion-Pipeline.
+
+    - Whitespace und trailing Satzzeichen entfernen
+    - Führende Artikel ('The ', 'A ', 'An ') nur für GPE/LOCATION/EVENT entfernen
+      (z.B. 'The Cold War' → 'Cold War', aber 'The Beatles' bleibt 'The Beatles')
+    """
+    _ABBREV_SUFFIXES = (" Inc.", " Ltd.", " Bros.", " Corp.", " Co.", " Jr.", " Sr.", " Dr.")
+    name = text.strip().rstrip(',;:')
+    if name.endswith('.') and not any(name.endswith(s) for s in _ABBREV_SUFFIXES):
+        name = name[:-1]
+    canonical_type = _QUERY_LABEL_MAP.get(label.lower(), label.upper())
+    if canonical_type in _STRIP_ARTICLE_TYPES:
+        for article in ("The ", "A ", "An "):
+            if name.startswith(article) and len(name) > len(article) + 1:
+                name = name[len(article):]
+                break
+    return name
+
 # Modul-Level Cache: GLiNER wird nur einmal pro Prozess geladen
 _GLINER_MODEL_CACHE = None
 
@@ -96,6 +134,10 @@ class RetrievalConfig:
     
     # SpaCy für Query Entity Extraction
     spacy_model: str = "en_core_web_sm"
+
+    # Query-Zeit NER (aus settings.yaml entity_extraction.gliner)
+    query_ner_confidence: float = 0.15
+    query_entity_types: List[str] = None  # None → Fallback auf ExtractionConfig-Default
     
     # Alias parameters for API compatibility
     top_k_vector: int = None  # Alias for vector_top_k
@@ -414,21 +456,26 @@ class ImprovedQueryEntityExtractor:
     um Konsistenz zwischen Query-Entities und Graph-Entities zu gewährleisten.
     """
     
-    def __init__(self, gliner_model=None, spacy_model: str = "en_core_web_sm"):
-        self.gliner = gliner_model  # Shared GLiNER instance
+    def __init__(
+        self,
+        gliner_model=None,
+        spacy_model: str = "en_core_web_sm",
+        entity_types: List[str] = None,
+        confidence_threshold: float = 0.15,
+    ):
+        self.gliner = gliner_model
         self.nlp = None
+        self.confidence_threshold = confidence_threshold
         self._load_spacy(spacy_model)
 
-        # Wenn kein GLiNER-Modell übergeben wurde, selbst laden (Query-Zeit-Konsistenz)
         if self.gliner is None:
             self._load_gliner()
 
-        # GLiNER Entity Types — Obermenge der Ingestion-Types für Query-Coverage
-        # Ingestion: person, organization, city, country, film, movie, event
-        # Extra für Queries: work of art (deckt Buchtitel, Songname etc. ab)
-        self.entity_types = [
+        # Entity types kommen aus settings.yaml (via RetrievalConfig.query_entity_types)
+        self.entity_types = entity_types or [
             "person", "organization", "city", "country",
-            "film", "movie", "work of art", "event",
+            "state", "location", "film", "movie", "album",
+            "work of art", "landmark", "event", "award",
         ]
 
     def _load_gliner(self):
@@ -445,7 +492,7 @@ class ImprovedQueryEntityExtractor:
             logger.warning(f"SpaCy not available: {e}")
             self.nlp = None
 
-    def extract(self, query: str, confidence_threshold: float = 0.2) -> List[str]:
+    def extract(self, query: str, confidence_threshold: float = None) -> List[str]:
         """
         Extrahiere Entitäten aus Query.
         
@@ -456,20 +503,21 @@ class ImprovedQueryEntityExtractor:
         
         Args:
             query: User Query
-            confidence_threshold: Minimum Confidence (0.5 wie in Thesis 2.5)
-            
+            confidence_threshold: Override für Threshold (None = Instanz-Default)
+
         Returns:
             Liste von Entity-Namen
         """
+        threshold = confidence_threshold if confidence_threshold is not None else self.confidence_threshold
         # Methode 1: GLiNER (bevorzugt für Konsistenz)
         if self.gliner is not None:
             try:
                 entities = self.gliner.predict_entities(
                     query,
                     self.entity_types,
-                    threshold=confidence_threshold
+                    threshold=threshold
                 )
-                return [ent["text"] for ent in entities]
+                return [_normalize_query_entity(ent["text"], ent["label"]) for ent in entities]
             except Exception as e:
                 logger.warning(f"GLiNER query extraction failed: {e}")
         
@@ -579,7 +627,9 @@ class HybridRetriever:
         
         self.entity_extractor = ImprovedQueryEntityExtractor(
             gliner_model=gliner_model,
-            spacy_model=self.config.spacy_model
+            spacy_model=self.config.spacy_model,
+            entity_types=self.config.query_entity_types,
+            confidence_threshold=self.config.query_ner_confidence,
         )
         logger.info(f"HybridRetriever initialized: mode={self.config.mode}")
     

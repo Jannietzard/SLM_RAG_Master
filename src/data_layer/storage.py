@@ -119,7 +119,7 @@ class StorageConfig:
     
     Attributes:
         vector_db_path: Directory path for LanceDB vector database
-        graph_db_path: Directory path for KuzuDB graph database
+        graph_db_path: Container directory for KuzuDB (actual file: graph_KuzuDB inside it)
         embedding_dim: Dimensionality of embedding vectors
         similarity_threshold: Minimum similarity score for retrieval
         normalize_embeddings: Whether to L2-normalize vectors
@@ -208,7 +208,7 @@ class VectorStoreAdapter:
             self.logger.debug(f"Could not open existing table: {e}")
 
     def _get_metadata_path(self) -> Path:
-        return self.db_path.parent / "vector_store_metadata.json"
+        return self.db_path / "vector_store_metadata.json"
     
     def _load_metadata(self) -> None:
         metadata_path = self._get_metadata_path()
@@ -411,37 +411,27 @@ class KuzuGraphStore:
         Initialize KuzuDB graph store.
         
         Args:
-            db_path: DIRECTORY path for KuzuDB database
-        
-        CRITICAL FIX for KuzuDB 0.11.3+:
-            KuzuDB wants the PARENT directory to exist, but will create
-            the database directory itself.
-            # KLARSTELLUNG:
-# Code ist KORREKT! KuzuDB will:
-# 1. PARENT existiert (wir erstellen) ✅
-# 2. DB path NICHT existiert (KuzuDB erstellt) ✅
+            db_path: Container directory for the graph store.
+                     The actual KuzuDB file is stored as graph_KuzuDB inside this directory.
         """
         self.db_path = Path(db_path)
         self.logger = logging.getLogger(__name__)
-        
+
         if not KUZU_AVAILABLE:
             raise ImportError("KuzuDB not installed. Install with: pip install kuzu")
-        
-        # ===================================================================
-        # CRITICAL FIX: Create PARENT directory only, let KuzuDB create db_path
-        # ===================================================================
-        # KuzuDB 0.11.3+ will create the db_path directory itself
-        # We just need to ensure the parent exists
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize KuzuDB - it will create db_path directory
-        self.db = kuzu.Database(str(self.db_path))
+
+        # db_path is the container directory; the actual KuzuDB file lives inside it.
+        # This allows sibling files (e.g. extraction_metadata.json) in the same folder.
+        self.db_path.mkdir(parents=True, exist_ok=True)
+        kuzu_file = self.db_path / "graph_KuzuDB"
+
+        self.db = kuzu.Database(str(kuzu_file))
         self.conn = kuzu.Connection(self.db)
-        
+
         # Initialize schema
         self._init_schema()
-        
-        self.logger.info(f"KuzuGraphStore initialized: {self.db_path}")
+
+        self.logger.info(f"KuzuGraphStore initialized: {kuzu_file}")
         
     def _init_schema(self) -> None:
         """

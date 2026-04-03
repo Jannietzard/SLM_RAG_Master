@@ -542,11 +542,13 @@ class SemanticChunkerWrapper:
         min_chunk_size: int = 200,
         min_lexical_diversity: float = 0.3,
         min_information_density: float = 2.0,
+        word_boundary_factor: float = 0.8,
     ):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.min_chunk_size = min_chunk_size
         self.min_lexical_diversity = min_lexical_diversity
+        self.word_boundary_factor = word_boundary_factor
         self.min_information_density = min_information_density
         self._chunker = None
         self._using_semantic = False
@@ -560,6 +562,7 @@ class SemanticChunkerWrapper:
                         chunk_size=self.chunk_size,
                         chunk_overlap=self.chunk_overlap,
                         min_chunk_size=self.min_chunk_size,
+                        word_boundary_factor=self.word_boundary_factor,
                     )
                     self._using_semantic = True
                     logger.debug("Using semantic chunker")

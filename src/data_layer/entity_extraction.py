@@ -155,15 +155,21 @@ class ExtractionConfig:
     gliner_model: str = "urchade/gliner_small-v2.1"
     entity_types: List[str] = field(default_factory=lambda: [
         # Lowercase natural-language names → bessere zero-shot performance bei GLiNER
-        "person",           # Personen (ersetzt PERSON)
-        "organization",     # Unternehmen, Studios, Institutionen (ersetzt ORGANIZATION)
-        "city",             # Städte — besser als GPE/LOCATION (verhindert Merge)
-        "country",          # Länder, Nationalitäten-Kontext
-        "film",             # Filme (ersetzt WORK_OF_ART — höhere Konfidenz)
+        "person",           # Personen
+        "organization",     # Unternehmen, Studios, Institutionen
+        "city",             # Städte (spezifisch, höhere Konfidenz)
+        "country",          # Länder
+        "state",            # Bundesstaaten, Regionen (Hawaii, California)
+        "location",         # Allgemeine Orte
+        "film",             # Filme
         "movie",            # Synonym für film (doppelte Abdeckung)
-        "event",            # Historische Ereignisse (ersetzt EVENT)
+        "album",            # Musikalben (Abbey Road etc.)
+        "work of art",      # Catch-all: ungewöhnliche Titel, Gemälde, Bücher
+        "landmark",         # Bauwerke/Sehenswürdigkeiten → WORK_OF_ART
+        "event",            # Historische Ereignisse
+        "award",            # Preise (Nobel Prize etc.)
     ])
-    ner_confidence_threshold: float = 0.5   # Thesis-Spezifikation: ≥ 0.5
+    ner_confidence_threshold: float = 0.15  # Recall-optimiert für HotpotQA
     ner_batch_size: int = 16
     
     # REBEL
@@ -323,15 +329,47 @@ class GLiNERExtractor:
         "city": "GPE", "country": "GPE", "state": "GPE", "gpe": "GPE",
         "location": "LOCATION", "place": "LOCATION",
         "film": "WORK_OF_ART", "movie": "WORK_OF_ART", "book": "WORK_OF_ART",
-        "album": "WORK_OF_ART", "song": "WORK_OF_ART", "work_of_art": "WORK_OF_ART",
+        "album": "WORK_OF_ART", "song": "WORK_OF_ART",
+        "work_of_art": "WORK_OF_ART", "work of art": "WORK_OF_ART",
+        "landmark": "LOCATION", "monument": "LOCATION", "building": "LOCATION",
+        "award": "WORK_OF_ART", "prize": "WORK_OF_ART",
         "event": "EVENT",
         "product": "PRODUCT", "technology": "TECHNOLOGY",
     }
+
+    # Typen, bei denen führende Artikel grammatikalisch sind (kein Eigenname-Teil)
+    _STRIP_ARTICLE_TYPES: frozenset = frozenset({"GPE", "LOCATION", "EVENT"})
 
     @classmethod
     def _normalize_label(cls, label: str) -> str:
         """Mappe GLiNER-Typname auf kanonischen Typ; unbekannte Typen uppercase."""
         return cls._LABEL_MAP.get(label.lower(), label.upper())
+
+    @classmethod
+    def _normalize_entity_name(cls, name: str, entity_type: str = None) -> str:
+        """
+        Normalisiere Entitätsnamen für konsistente Graph-Lookups.
+
+        - Whitespace trimmen
+        - Trailing Satzzeichen entfernen (,;:)
+        - Führenden Artikel ('The ', 'A ', 'An ') für GPE/LOCATION/EVENT entfernen,
+          weil dort 'The' grammatikalisch ist ('The Cold War' → 'Cold War').
+          Bei PERSON/ORGANIZATION/WORK_OF_ART bleibt 'The' erhalten
+          ('The Beatles', 'The Dark Knight' sind offizielle Namen).
+        """
+        name = name.strip()
+        name = name.rstrip(',;:')
+        # Trailing-Punkt entfernen wenn er ein Satzende-Artefakt ist.
+        # Ausnahme: bekannte Abkürzungen am Ende (Inc., Ltd., Bros., Corp., Co., Jr., Sr.)
+        _ABBREV_SUFFIXES = (" Inc.", " Ltd.", " Bros.", " Corp.", " Co.", " Jr.", " Sr.", " Dr.")
+        if name.endswith('.') and not any(name.endswith(s) for s in _ABBREV_SUFFIXES):
+            name = name[:-1]
+        if entity_type in cls._STRIP_ARTICLE_TYPES:
+            for article in ("The ", "A ", "An "):
+                if name.startswith(article) and len(name) > len(article) + 1:
+                    name = name[len(article):]
+                    break
+        return name
 
     def __init__(self, config: ExtractionConfig):
         self.config = config
@@ -387,9 +425,10 @@ class GLiNERExtractor:
             results = []
             for ent in entities:
                 canonical_type = self._normalize_label(ent["label"])
+                norm_name = self._normalize_entity_name(ent["text"], canonical_type)
                 entity = ExtractedEntity(
-                    entity_id=self._generate_entity_id(ent["text"], canonical_type),
-                    name=ent["text"],
+                    entity_id=self._generate_entity_id(norm_name, canonical_type),
+                    name=norm_name,
                     entity_type=canonical_type,
                     confidence=ent["score"],
                     mention_span=(ent["start"], ent["end"]),
@@ -440,9 +479,10 @@ class GLiNERExtractor:
                     results = []
                     for ent in text_entities:
                         canonical_type = self._normalize_label(ent["label"])
+                        norm_name = self._normalize_entity_name(ent["text"], canonical_type)
                         entity = ExtractedEntity(
-                            entity_id=self._generate_entity_id(ent["text"], canonical_type),
-                            name=ent["text"],
+                            entity_id=self._generate_entity_id(norm_name, canonical_type),
+                            name=norm_name,
                             entity_type=canonical_type,
                             confidence=ent["score"],
                             mention_span=(ent["start"], ent["end"]),
@@ -967,7 +1007,7 @@ class SpacyEntityPipeline:
         "EVENT":   "EVENT",
         "WORK_OF_ART": "WORK_OF_ART",
         "FAC":     "LOCATION",
-        "NORP":    "PERSON",    # Nationalities / religious groups
+        # NORP (Nationalities/religious groups) absichtlich nicht gemappt → wird ignoriert
     }
 
     def __init__(self, spacy_model: str = "en_core_web_sm", batch_size: int = 64):
