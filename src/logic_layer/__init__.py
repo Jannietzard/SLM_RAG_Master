@@ -1,19 +1,19 @@
 """
-Logic Layer - Agent-Based Query Processing
+Logic Layer — Agent-Based Query Processing
 
-Implementiert Artefakt B der Masterarbeit:
+Implements Artifact B of the master's thesis:
 "Enhancing Reasoning Fidelity in Quantized SLMs on Edge Devices"
 
-Drei-Agenten-Architektur:
-    S_P (Planner)   → Query-Klassifikation, Entity-Extraktion, Plan-Generierung
-    S_N (Navigator) → Hybrid Retrieval, RRF-Fusion, Pre-Generative Filtering
-    S_V (Verifier)  → Pre-Validation, Answer Generation, Self-Correction Loop
+Three-agent architecture:
+    S_P (Planner)   — Query classification, entity extraction, plan generation
+    S_N (Navigator) — Hybrid retrieval, RRF fusion, pre-generative filtering
+    S_V (Verifier)  — Pre-validation, answer generation, self-correction loop
 
 Usage:
     from src.logic_layer import AgenticController, create_controller
-    
+
     controller = create_controller()
-    result = controller.process("What is the capital of France?")
+    result = controller.run("What is the capital of France?")
 """
 
 # =============================================================================
@@ -35,7 +35,7 @@ from .planner import (
     HopStep,
     RetrievalPlan,
     
-    # Component classes (für erweiterte Nutzung)
+    # Component classes (for advanced use)
     QueryClassifier,
     EntityExtractor,
     PlanGenerator,
@@ -67,21 +67,28 @@ from .verifier import (
 )
 
 # =============================================================================
-# Navigator/Agent (S_N + Controller) - Navigation & Orchestration
+# Navigator (S_N) - Retrieval & Pre-Generative Filtering
 # =============================================================================
 from .navigator import (
-    # Main classes
+    # Main class
     Navigator,
-    AgenticController,
-    
-    # Factory function
-    create_controller,
-    
+
     # Data classes
     NavigatorResult,
     ControllerConfig,
-    
-    # State (für LangGraph Integration)
+)
+
+# =============================================================================
+# Controller (S_P → S_N → S_V) - Pipeline Orchestration
+# =============================================================================
+from .controller import (
+    # Main class
+    AgenticController,
+
+    # Factory function
+    create_controller,
+
+    # State (for LangGraph integration)
     AgentState,
 )
 

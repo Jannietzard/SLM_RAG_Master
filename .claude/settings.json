@@ -15,7 +15,18 @@
       "Bash(PYTHONIOENCODING=utf-8 python benchmark_datasets.py ingest --dataset hotpotqa --samples 500 --chunks-only)",
       "Bash(python -c \":*)",
       "Bash(python -X utf8 -c \":*)",
-      "Bash(python -X utf8 diagnose.py --idx 0 --layer navigator)"
+      "Bash(python -X utf8 diagnose.py --idx 0 --layer navigator)",
+      "Bash(python -X utf8 -c \"from src.data_layer import HybridStore\")",
+      "Bash(python -X utf8 -m pytest src/logic_layer/test_logic_layer.py src/data_layer/test_data_layer.py test_system/test_chunking.py test_system/test_embeddings.py -q)",
+      "Bash(python -X utf8 -m pytest src/data_layer/test_data_layer.py test_system/test_chunking.py test_system/test_embeddings.py src/pipeline/test_pipeline.py -v --tb=short)",
+      "Bash(python -X utf8 -m pytest src/data_layer/test_data_layer.py test_system/test_chunking.py test_system/test_embeddings.py src/pipeline/test_pipeline.py -x --tb=short -q)",
+      "Bash(python -X utf8 -c \"import diagnose_verbose; print\\('Import OK'\\)\")",
+      "Bash(python -X utf8 -m pytest src/logic_layer/test_logic_layer.py -v --tb=short)",
+      "Bash(python -X utf8 -m pytest src/data_layer/test_data_layer.py src/logic_layer/test_logic_layer.py test_system/test_chunking.py test_system/test_embeddings.py --tb=line -q)",
+      "Bash(python -X utf8 diagnose_verbose.py --idx 0 --skip-llm --trace-calls --no-color)",
+      "Bash(python -X utf8 diagnose_verbose.py --idx 11 --skip-llm)",
+      "Bash(python -X utf8 -m pytest src/data_layer/test_data_layer.py src/logic_layer/test_logic_layer.py -q --tb=short)",
+      "Bash(python -X utf8 diagnose_ingestion.py --indices 11,12)"
     ]
   }
 }

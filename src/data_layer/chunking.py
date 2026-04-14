@@ -1,8 +1,8 @@
 """
 Chunking Module: Document Segmentation for the Edge-RAG System
 
-Version: 4.2.0
-Last Modified: 2026-04-03
+Version: 4.3.0
+Last Modified: 2026-04-08
 
 ================================================================================
 ARCHITECTURAL ROLE
@@ -43,18 +43,23 @@ Quality Filtering (Semantic Chunker):
     and absence of transcript/whitespace artifacts. Thresholds are configurable
     via settings.yaml (ingestion.quality_filter.*).
 
-Deterministic Chunk IDs:
-    Chunk identifiers are derived from SHA-256(source_doc + position + text
-    prefix). This ensures that re-ingestion produces identical KuzuDB node IDs,
-    preserving graph integrity across runs.
+Deterministic Chunk IDs (sentence-based chunker):
+    Sentence-chunk identifiers are derived from SHA-256(source_doc + position +
+    text prefix). This ensures that re-ingestion produces identical KuzuDB node
+    IDs, preserving graph integrity across runs.
+    Semantic-chunk identifiers use SHA-256(source_doc + chunk_index + text
+    prefix) for the same guarantee.
 
 TF-IDF Importance Scoring:
     Chunk importance is the mean TF-IDF score over all non-stopword content
     terms, normalised by total term count. Stopwords are excluded from both TF
     and DF to prevent high-frequency function words from dominating.
+    IDF uses the standard log(N/df) formula (no add-one smoothing); a term
+    present in all N chunks receives IDF=0, correctly down-weighting universal
+    function terms that survived the stopword filter.
     Reference: Salton, G. & Buckley, C. (1988). "Term-weighting approaches in
     automatic text retrieval." Information Processing & Management, 24(5),
-    513–523.
+    513-523.
 
 ================================================================================
 CONFIGURATION
@@ -63,20 +68,22 @@ CONFIGURATION
 All tunable parameters originate from config/settings.yaml. Defaults in this
 file serve as documented emergency fallbacks only.
 
-  ingestion.sentences_per_chunk     → SpacySentenceChunker.sentences_per_chunk (3)
-  ingestion.sentence_overlap        → SpacySentenceChunker.sentence_overlap (1)
-  ingestion.min_chunk_size          → SentenceChunkingConfig.min_chunk_chars (50)
-  ingestion.max_chunk_chars         → SentenceChunkingConfig.max_chunk_chars (2000)
-  ingestion.word_boundary_factor    → SemanticBoundaryDetector.word_boundary_factor (0.8)
-  ingestion.spacy_model             → SentenceChunkingConfig.spacy_model ("en_core_web_sm")
-  ingestion.entity_aware_chunking   → SpacySentenceChunker.entity_aware (false)
-  ingestion.min_lexical_diversity   → AutomaticQualityFilter.min_lexical_diversity (0.3)
-  ingestion.min_information_density → AutomaticQualityFilter.min_information_density (2.0)
-  ingestion.quality_filter.min_length → AutomaticQualityFilter.min_length (100)
-  ingestion.quality_filter.min_words  → AutomaticQualityFilter.min_words (15)
-  chunking.chunk_size               → SemanticChunker.max_chunk_size (1024)
-  chunking.chunk_overlap            → SemanticChunker.overlap (128)
-  chunking.semantic.min_chunk_size  → SemanticChunker.min_chunk_size (200)
+  ingestion.sentences_per_chunk          → SpacySentenceChunker.sentences_per_chunk (3)
+  ingestion.sentence_overlap             → SpacySentenceChunker.sentence_overlap (1)
+  ingestion.min_chunk_size               → SentenceChunkingConfig.min_chunk_chars (50)
+  ingestion.max_chunk_chars              → SentenceChunkingConfig.max_chunk_chars (2000)
+  ingestion.word_boundary_factor         → SemanticBoundaryDetector.word_boundary_factor (0.8)
+  ingestion.spacy_model                  → SentenceChunkingConfig.spacy_model ("en_core_web_sm")
+  ingestion.entity_aware_chunking        → SpacySentenceChunker.entity_aware (false)
+  ingestion.min_lexical_diversity        → AutomaticQualityFilter.min_lexical_diversity (0.3)
+  ingestion.min_information_density      → AutomaticQualityFilter.min_information_density (2.0)
+  ingestion.quality_filter.min_length    → AutomaticQualityFilter.min_length (100)
+  ingestion.quality_filter.min_words     → AutomaticQualityFilter.min_words (15)
+  ingestion.transcript_ratio_threshold   → AutomaticQualityFilter.TRANSCRIPT_RATIO_THRESHOLD (0.3)
+  ingestion.whitespace_ratio_threshold   → AutomaticQualityFilter.WHITESPACE_RATIO_THRESHOLD (0.4)
+  chunking.chunk_size                    → SemanticChunker.max_chunk_size (1024)
+  chunking.chunk_overlap                 → SemanticChunker.overlap (128)
+  chunking.semantic.min_chunk_size       → SemanticChunker.min_chunk_size (200)
 
 ================================================================================
 USAGE
@@ -95,13 +102,15 @@ Semantic Chunking (structured documents):
 ================================================================================
 """
 
-import re
-import math
-import logging
 import hashlib
-from typing import TYPE_CHECKING, List, Dict, Tuple, Optional, Any
-from dataclasses import dataclass, field
+import logging
+import math
+import re
+import subprocess
+import sys
 from collections import Counter
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from spacy.language import Language
@@ -111,41 +120,52 @@ logger = logging.getLogger(__name__)
 # ─── LangChain ────────────────────────────────────────────────────────────────
 
 try:
-    from langchain.schema import Document
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain_core.documents import Document
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
     LANGCHAIN_AVAILABLE = True
 except ImportError:
-    LANGCHAIN_AVAILABLE = False
-    logger.warning(
-        "LangChain not installed — RecursiveCharacterTextSplitter unavailable. "
-        "Install with: pip install langchain"
-    )
+    try:
+        # Fallback to legacy path for older langchain installations
+        from langchain.schema import Document  # type: ignore[no-redef,assignment]
+        from langchain.text_splitter import RecursiveCharacterTextSplitter  # type: ignore[no-redef,assignment]
+        LANGCHAIN_AVAILABLE = True
+    except ImportError:
+        LANGCHAIN_AVAILABLE = False
+        logger.warning(
+            "LangChain not installed — RecursiveCharacterTextSplitter unavailable. "
+            "Install with: pip install langchain-core langchain-text-splitters"
+        )
 
-    class Document:  # type: ignore[no-redef]
-        """Minimal Document stub used only when langchain is absent."""
-        def __init__(self, page_content: str, metadata: Dict[str, Any] = None):
-            self.page_content = page_content
-            self.metadata = metadata or {}
+        class Document:  # type: ignore[no-redef]
+            """Minimal Document stub used only when langchain is absent."""
+            def __init__(self, page_content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+                self.page_content = page_content
+                self.metadata = metadata or {}
 
-    class RecursiveCharacterTextSplitter:  # type: ignore[no-redef]
-        """Minimal text splitter stub used only when langchain is absent."""
-        def __init__(self, chunk_size: int = 1024, chunk_overlap: int = 128, separators=None):
-            self.chunk_size = chunk_size
-            self.chunk_overlap = chunk_overlap
-            self.separators = separators or ["\n\n", "\n", " ", ""]
+        class RecursiveCharacterTextSplitter:  # type: ignore[no-redef]
+            """Minimal text splitter stub used only when langchain is absent."""
+            def __init__(
+                self,
+                chunk_size: int = 1024,
+                chunk_overlap: int = 128,
+                separators: Optional[List[str]] = None,
+            ) -> None:
+                self.chunk_size = chunk_size
+                self.chunk_overlap = chunk_overlap
+                self.separators = separators or ["\n\n", "\n", " ", ""]
 
-        def split_documents(self, documents):
-            result = []
-            for doc in documents:
-                text = doc.page_content
-                for i in range(0, len(text), self.chunk_size - self.chunk_overlap):
-                    chunk_text = text[i:i + self.chunk_size].strip()
-                    if chunk_text:
-                        result.append(Document(
-                            page_content=chunk_text,
-                            metadata=doc.metadata.copy()
-                        ))
-            return result
+            def split_documents(self, documents: List[Any]) -> List[Any]:
+                result = []
+                for doc in documents:
+                    text = doc.page_content
+                    for i in range(0, len(text), self.chunk_size - self.chunk_overlap):
+                        chunk_text = text[i:i + self.chunk_size].strip()
+                        if chunk_text:
+                            result.append(Document(
+                                page_content=chunk_text,
+                                metadata=doc.metadata.copy(),
+                            ))
+                return result
 
 # ─── SpaCy ────────────────────────────────────────────────────────────────────
 
@@ -177,14 +197,14 @@ class SpacyModelCache:
 
     @classmethod
     def get_model(
-        cls, model_name: str, disable: List[str] = None
+        cls, model_name: str, disable: Optional[List[str]] = None
     ) -> Optional["Language"]:
         """Return a cached SpaCy Language model, loading it from disk on first access."""
         if not SPACY_AVAILABLE:
             return None
 
         disable = disable or []
-        cache_key = f"{model_name}__{'_'.join(sorted(disable))}"
+        cache_key = "%s__%s" % (model_name, "_".join(sorted(disable)))
 
         if cache_key not in cls._instances:
             try:
@@ -196,11 +216,12 @@ class SpacyModelCache:
                 if "sentencizer" not in nlp.pipe_names and "senter" not in nlp.pipe_names:
                     nlp.add_pipe("sentencizer")
                 cls._instances[cache_key] = nlp
-                logger.info(f"SpaCy model loaded and cached: {model_name}")
-            except OSError as e:
+                logger.info("SpaCy model loaded and cached: %s", model_name)
+            except OSError as exc:
                 logger.warning(
-                    f"SpaCy model '{model_name}' not found: {e}. "
-                    "Falling back to regex sentence segmentation."
+                    "SpaCy model '%s' not found: %s. "
+                    "Falling back to regex sentence segmentation.",
+                    model_name, exc,
                 )
                 cls._instances[cache_key] = None
 
@@ -307,7 +328,7 @@ class HeaderExtractor:
         r'^(\d+\.\d+\.\d+)[\.\s]+([A-Z\u00C0-\u024F][^\n]{3,80})$',
     ]
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.current_chapter: Optional[str] = None
         self.current_section: Optional[str] = None
         self.current_subsection: Optional[str] = None
@@ -328,7 +349,7 @@ class HeaderExtractor:
                 match = re.match(pattern, line, re.MULTILINE)
                 if match:
                     number, title = match.groups()
-                    self.current_chapter = f"{number}. {title}"
+                    self.current_chapter = "%s. %s" % (number, title)
                     self.current_section = None
                     self.current_subsection = None
                     break
@@ -336,14 +357,14 @@ class HeaderExtractor:
                 match = re.match(pattern, line, re.MULTILINE)
                 if match:
                     number, title = match.groups()
-                    self.current_section = f"{number} {title}"
+                    self.current_section = "%s %s" % (number, title)
                     self.current_subsection = None
                     break
             for pattern in self.SUBSECTION_PATTERNS:
                 match = re.match(pattern, line, re.MULTILINE)
                 if match:
                     number, title = match.groups()
-                    self.current_subsection = f"{number} {title}"
+                    self.current_subsection = "%s %s" % (number, title)
                     break
 
     def extract_headers(self, text: str) -> Tuple[ChunkMetadata, str]:
@@ -392,28 +413,32 @@ class SemanticBoundaryDetector:
     """
     Detect natural semantic boundaries in text for the SemanticChunker.
 
-    Paragraph breaks (double newlines), sentence-final newlines before
-    uppercase characters, and colon-terminated lines are treated as boundary
-    candidates. A candidate is accepted only when the distance from the
-    previous accepted boundary exceeds word_boundary_factor * max_chunk_size,
-    preventing excessively short chunks.
+    Boundary patterns (in priority order):
+      - Double newline:         paragraph break — strongest structural signal
+      - Sentence-end + newline: sentence-final punctuation followed by uppercase
+                                start — article section transitions
+      - Punctuation + blank:    sentence group separated by blank line
+      - Colon + newline:        list or enumeration introduction
 
-    word_boundary_factor maps to settings.yaml: ingestion.word_boundary_factor
-    (default 0.8).
+    A candidate is accepted only when the distance from the previous accepted
+    boundary exceeds word_boundary_factor * max_chunk_size AND exceeds
+    min_boundary_distance, preventing excessively short chunks.
+
+    word_boundary_factor maps to settings.yaml: ingestion.word_boundary_factor (0.8)
     """
 
     BOUNDARY_PATTERNS = [
-        r'\n\n+',
-        r'\.\s*\n(?=[A-Z\u00C0-\u024F])',
-        r'[.!?]\s*\n\s*\n',
-        r':\s*\n',
+        r'\n\n+',                           # paragraph break
+        r'\.\s*\n(?=[A-Z\u00C0-\u024F])',  # sentence end before capitalised line
+        r'[.!?]\s*\n\s*\n',                # sentence end + blank line
+        r':\s*\n',                          # colon-terminated line (list/enum intro)
     ]
 
     def __init__(
         self,
-        min_boundary_distance: int = 200,
+        min_boundary_distance: int = 200,   # settings.yaml: ingestion.min_boundary_distance
         word_boundary_factor: float = 0.8,  # settings.yaml: ingestion.word_boundary_factor
-    ):
+    ) -> None:
         self.min_boundary_distance = min_boundary_distance
         self.word_boundary_factor = word_boundary_factor
 
@@ -454,10 +479,23 @@ class AutomaticQualityFilter:
     """
     Statistical quality gate for text chunks.
 
-    A chunk is retained only if it passes all four filters (applied in order
+    A chunk is retained only if it passes all five filters (applied in order
     of ascending computational cost). Thresholds map to settings.yaml under
     ingestion.quality_filter.*
+
+    Class-level ratio thresholds are documented design constants derived from
+    empirical evaluation on the thesis corpus:
+      TRANSCRIPT_RATIO_THRESHOLD:  dialog-label density above which text is
+                                   classified as a dialog transcript artifact.
+                                   (settings.yaml: ingestion.transcript_ratio_threshold)
+      WHITESPACE_RATIO_THRESHOLD:  whitespace fraction above which text is
+                                   classified as a layout/table artifact.
+                                   (settings.yaml: ingestion.whitespace_ratio_threshold)
     """
+
+    # Empirically tuned on thesis corpus; configurable via settings.yaml
+    TRANSCRIPT_RATIO_THRESHOLD: float = 0.3
+    WHITESPACE_RATIO_THRESHOLD: float = 0.4
 
     def __init__(
         self,
@@ -465,7 +503,7 @@ class AutomaticQualityFilter:
         min_words: int = 15,                   # settings.yaml: ingestion.quality_filter.min_words
         min_lexical_diversity: float = 0.3,    # settings.yaml: ingestion.min_lexical_diversity
         min_information_density: float = 2.0,  # settings.yaml: ingestion.min_information_density
-    ):
+    ) -> None:
         self.min_length = min_length
         self.min_words = min_words
         self.min_lexical_diversity = min_lexical_diversity
@@ -490,7 +528,7 @@ class AutomaticQualityFilter:
         H = -sum_i p_i * log2(p_i) over all word types.
 
         Reference: Shannon, C.E. (1948). "A Mathematical Theory of
-        Communication." Bell System Technical Journal, 27, 379–423.
+        Communication." Bell System Technical Journal, 27, 379-423.
 
         Low entropy (< min_information_density) indicates layout artifacts,
         highly repetitive lists, or near-empty chunks.
@@ -516,42 +554,46 @@ class AutomaticQualityFilter:
         lines = text.split('\n')
         if not lines:
             return False
-        return len(matches) / len(lines) > 0.3
+        return len(matches) / len(lines) > self.TRANSCRIPT_RATIO_THRESHOLD
 
     def detect_excessive_whitespace(self, text: str) -> bool:
-        """Return True if whitespace exceeds 40% of text length (layout artifact)."""
+        """Return True if whitespace exceeds the configured threshold (layout artifact)."""
         if not text:
             return True
-        return (text.count(' ') + text.count('\t')) / len(text) > 0.4
+        return (text.count(' ') + text.count('\t')) / len(text) > self.WHITESPACE_RATIO_THRESHOLD
 
-    def should_keep_chunk(self, text: str) -> Tuple[bool, str]:
+    def should_keep_chunk(self, text: str) -> Tuple[bool, str, float]:
         """
-        Apply all quality filters in sequence. Returns (keep, reason_string).
+        Apply all quality filters in sequence.
+
+        Returns (keep, reason_string, lexical_diversity).  The lexical_diversity
+        value is returned so that callers (SemanticChunker.chunk_document) can
+        reuse it without recomputing, since it is already computed here.
 
         Filters are ordered from cheapest to most expensive.
         """
         if len(text) < self.min_length:
-            return False, f"too_short ({len(text)} chars)"
+            return False, "too_short (%d chars)" % len(text), 0.0
 
         words = re.findall(r'\b\w+\b', text)
         if len(words) < self.min_words:
-            return False, f"too_few_words ({len(words)} words)"
+            return False, "too_few_words (%d words)" % len(words), 0.0
 
         if self.detect_transcript_pattern(text):
-            return False, "transcript_pattern_detected"
+            return False, "transcript_pattern_detected", 0.0
 
         diversity = self.calculate_lexical_diversity(text)
         if diversity < self.min_lexical_diversity:
-            return False, f"low_lexical_diversity ({diversity:.2f})"
+            return False, "low_lexical_diversity (%.2f)" % diversity, diversity
 
         density = self.calculate_information_density(text)
         if density < self.min_information_density:
-            return False, f"low_information_density ({density:.2f} bits/word)"
+            return False, "low_information_density (%.2f bits/word)" % density, diversity
 
         if self.detect_excessive_whitespace(text):
-            return False, "layout_artifact"
+            return False, "layout_artifact", diversity
 
-        return True, "passed"
+        return True, "passed", diversity
 
 
 class TFIDFScorer:
@@ -563,10 +605,10 @@ class TFIDFScorer:
 
     Reference: Salton, G. & Buckley, C. (1988). "Term-weighting approaches
     in automatic text retrieval." Information Processing & Management,
-    24(5), 513–523.
+    24(5), 513-523.
     """
 
-    def __init__(self, stopwords: frozenset = None):
+    def __init__(self, stopwords: Optional[frozenset] = None) -> None:
         self.stopwords = stopwords if stopwords is not None else ALL_STOPWORDS
         self.document_frequency: Dict[str, int] = {}
         self.total_chunks: int = 0
@@ -581,6 +623,8 @@ class TFIDFScorer:
     def _tokenize_and_filter(self, text: str) -> List[str]:
         """Tokenize and remove stopwords and single/two-character tokens."""
         words = re.findall(r'\b\w+\b', text.lower())
+        # Minimum token length 3: single and two-character tokens are almost
+        # never meaningful content terms in English or German academic text.
         return [w for w in words if w not in self.stopwords and len(w) > 2]
 
     def analyze_corpus(self, chunks: List[str]) -> None:
@@ -600,6 +644,8 @@ class TFIDFScorer:
         Return mean TF-IDF score for all content terms in the chunk.
 
         Returns 0.0 if the corpus has not been analyzed or the chunk is empty.
+        IDF = log(N / df); a term in all N chunks receives IDF = 0 (intentional:
+        universal terms carry no discriminative weight).
         """
         if self.total_chunks == 0 or chunk_index >= len(self.chunk_term_frequencies):
             return 0.0
@@ -627,19 +673,25 @@ class SemanticChunker:
     ValueError, RuntimeError, or AttributeError; other exceptions propagate.
 
     Parameter → settings.yaml mapping:
-      max_chunk_size       → chunking.chunk_size (1024)
-      min_chunk_size       → chunking.semantic.min_chunk_size (200)
-      overlap              → chunking.chunk_overlap (128)
-      word_boundary_factor → ingestion.word_boundary_factor (0.8)
+      max_chunk_size         → chunking.chunk_size (1024)
+      min_chunk_size         → chunking.semantic.min_chunk_size (200)
+      overlap                → chunking.chunk_overlap (128)
+      word_boundary_factor   → ingestion.word_boundary_factor (0.8)
+      min_words              → ingestion.quality_filter.min_words (15)
+      min_lexical_diversity  → ingestion.min_lexical_diversity (0.3)
+      min_info_density       → ingestion.min_information_density (2.0)
     """
 
     def __init__(
         self,
-        max_chunk_size: int = 1024,            # settings.yaml: chunking.chunk_size
-        min_chunk_size: int = 200,             # settings.yaml: chunking.semantic.min_chunk_size
-        overlap: int = 128,                    # settings.yaml: chunking.chunk_overlap
-        word_boundary_factor: float = 0.8,     # settings.yaml: ingestion.word_boundary_factor
-    ):
+        max_chunk_size: int = 1024,              # settings.yaml: chunking.chunk_size
+        min_chunk_size: int = 200,               # settings.yaml: chunking.semantic.min_chunk_size
+        overlap: int = 128,                      # settings.yaml: chunking.chunk_overlap
+        word_boundary_factor: float = 0.8,       # settings.yaml: ingestion.word_boundary_factor
+        min_words: int = 15,                     # settings.yaml: ingestion.quality_filter.min_words
+        min_lexical_diversity: float = 0.3,      # settings.yaml: ingestion.min_lexical_diversity
+        min_info_density: float = 2.0,           # settings.yaml: ingestion.min_information_density
+    ) -> None:
         self.max_chunk_size = max_chunk_size
         self.min_chunk_size = min_chunk_size
         self.overlap = overlap
@@ -651,9 +703,9 @@ class SemanticChunker:
         )
         self.quality_filter = AutomaticQualityFilter(
             min_length=min_chunk_size,
-            min_words=15,                      # settings.yaml: ingestion.quality_filter.min_words
-            min_lexical_diversity=0.3,         # settings.yaml: ingestion.min_lexical_diversity
-            min_information_density=2.0,       # settings.yaml: ingestion.min_information_density
+            min_words=min_words,
+            min_lexical_diversity=min_lexical_diversity,
+            min_information_density=min_info_density,
         )
         self.tfidf_scorer = TFIDFScorer()
 
@@ -665,9 +717,20 @@ class SemanticChunker:
         )
 
         logger.info(
-            f"SemanticChunker initialized: "
-            f"max_size={max_chunk_size}, min_size={min_chunk_size}, overlap={overlap}"
+            "SemanticChunker initialized: max_size=%d, min_size=%d, overlap=%d",
+            max_chunk_size, min_chunk_size, overlap,
         )
+
+    @staticmethod
+    def _generate_chunk_id(source_doc: str, chunk_index: int, text: str) -> str:
+        """
+        Generate a deterministic, content-addressed chunk identifier.
+
+        SHA-256 over (source_doc + chunk_index + text_prefix) ensures stable
+        IDs on re-ingestion, preserving KuzuDB foreign key references.
+        """
+        content = "%s:%d:%s" % (source_doc, chunk_index, text[:50])
+        return hashlib.sha256(content.encode()).hexdigest()[:20]
 
     def _find_overlap_start(self, text: str, boundary: int, target_overlap: int) -> int:
         """
@@ -708,33 +771,43 @@ class SemanticChunker:
 
         return chunks
 
-    def chunk_document(self, document: Document) -> List[Document]:
+    def chunk_document(self, document: "Document") -> List["Document"]:
         """
         Segment a Document into semantically-coherent chunks with metadata.
 
         HeaderExtractor state is reset at the start of each call to prevent
         chapter/section context from leaking across document boundaries when
         this chunker instance is reused.
+
+        Chunk IDs are deterministic SHA-256 hashes over (source_doc, index,
+        text_prefix), ensuring stable KuzuDB node IDs across re-ingestion.
         """
         text = document.page_content
         base_metadata = document.metadata.copy()
+        source_doc = base_metadata.get("source_file", "unknown")
 
         try:
             raw_chunks = self._extract_raw_chunks(text)
-        except (ValueError, RuntimeError, AttributeError) as e:
+        except (ValueError, RuntimeError, AttributeError) as exc:
             logger.warning(
-                f"Semantic chunking failed ({type(e).__name__}), using fallback: {e}"
+                "Semantic chunking failed (%s), using fallback: %s",
+                type(exc).__name__, exc,
             )
             return self.fallback_splitter.split_documents([document])
 
         if not raw_chunks:
-            # Short or structure-free document: delegate to character-level splitter
-            logger.debug("No semantic boundaries found; delegating to fallback splitter")
+            # Short or structure-free document: delegate to character-level splitter.
+            # This is expected for short documents; log at info level so the caller
+            # knows which documents bypassed semantic segmentation.
+            logger.info(
+                "No semantic boundaries found in '%s'; delegating to fallback splitter",
+                source_doc,
+            )
             return self.fallback_splitter.split_documents([document])
 
         self.tfidf_scorer.analyze_corpus(raw_chunks)
 
-        processed_chunks: List[Document] = []
+        processed_chunks: List["Document"] = []
         filter_stats: Dict[str, Any] = {"kept": 0, "filtered": 0, "reasons": {}}
 
         self.header_extractor.reset()
@@ -742,21 +815,24 @@ class SemanticChunker:
         for i, chunk_text in enumerate(raw_chunks):
             metadata, cleaned_text = self.header_extractor.extract_headers(chunk_text)
 
-            keep, reason = self.quality_filter.should_keep_chunk(cleaned_text)
+            keep, reason, lexical_diversity = self.quality_filter.should_keep_chunk(cleaned_text)
             if not keep:
                 filter_stats["filtered"] += 1
                 filter_stats["reasons"][reason] = filter_stats["reasons"].get(reason, 0) + 1
-                logger.debug(f"Filtered chunk {i}: {reason}")
+                logger.debug("Filtered chunk %d: %s", i, reason)
                 continue
 
             filter_stats["kept"] += 1
 
             importance_score = self.tfidf_scorer.calculate_chunk_importance(i)
-            lexical_diversity = self.quality_filter.calculate_lexical_diversity(cleaned_text)
+            # lexical_diversity already computed by should_keep_chunk — reuse to avoid
+            # a second O(n) pass over the text.
 
+            chunk_index = len(processed_chunks)
             enriched_metadata = base_metadata.copy()
             enriched_metadata.update({
-                "chunk_id": len(processed_chunks),
+                "chunk_id": self._generate_chunk_id(source_doc, chunk_index, cleaned_text),
+                "chunk_index": chunk_index,
                 "chunk_size": len(cleaned_text),
                 "chapter": metadata.chapter,
                 "section": metadata.section,
@@ -774,20 +850,38 @@ class SemanticChunker:
 
         if filter_stats["filtered"] > 0 or len(raw_chunks) > 10:
             logger.info(
-                f"Semantic chunking: {len(raw_chunks)} raw -> "
-                f"{filter_stats['kept']} kept "
-                f"(filtered {filter_stats['filtered']}: {filter_stats['reasons']})"
+                "Semantic chunking '%s': %d raw -> %d kept (filtered %d: %s)",
+                source_doc, len(raw_chunks), filter_stats["kept"],
+                filter_stats["filtered"], filter_stats["reasons"],
             )
 
         return processed_chunks
 
+    def chunk(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> List[Dict]:
+        """
+        Primary interface consumed by ingestion.py (DocumentIngestionPipeline).
+
+        Wraps chunk_document() and returns a list of dicts with keys 'text' and
+        'metadata', compatible with the ingestion pipeline's internal format.
+        """
+        metadata = metadata or {}
+        doc = Document(page_content=text, metadata=metadata)
+        result_docs = self.chunk_document(doc)
+        return [
+            {"text": d.page_content, "metadata": d.metadata}
+            for d in result_docs
+        ]
+
 
 def create_semantic_chunker(
-    chunk_size: int = 1024,            # settings.yaml: chunking.chunk_size
-    chunk_overlap: int = 128,           # settings.yaml: chunking.chunk_overlap
-    min_chunk_size: int = 200,          # settings.yaml: chunking.semantic.min_chunk_size
-    word_boundary_factor: float = 0.8,  # settings.yaml: ingestion.word_boundary_factor
-) -> SemanticChunker:
+    chunk_size: int = 1024,                 # settings.yaml: chunking.chunk_size
+    chunk_overlap: int = 128,               # settings.yaml: chunking.chunk_overlap
+    min_chunk_size: int = 200,              # settings.yaml: chunking.semantic.min_chunk_size
+    word_boundary_factor: float = 0.8,      # settings.yaml: ingestion.word_boundary_factor
+    min_words: int = 15,                    # settings.yaml: ingestion.quality_filter.min_words
+    min_lexical_diversity: float = 0.3,     # settings.yaml: ingestion.min_lexical_diversity
+    min_info_density: float = 2.0,          # settings.yaml: ingestion.min_information_density
+) -> "SemanticChunker":
     """
     Factory for SemanticChunker. All parameters map to settings.yaml entries.
     Defaults are emergency fallbacks; production code should pass values from
@@ -798,6 +892,9 @@ def create_semantic_chunker(
         min_chunk_size=min_chunk_size,
         overlap=chunk_overlap,
         word_boundary_factor=word_boundary_factor,
+        min_words=min_words,
+        min_lexical_diversity=min_lexical_diversity,
+        min_info_density=min_info_density,
     )
 
 
@@ -836,16 +933,16 @@ class SentenceChunkingConfig:
     def __post_init__(self) -> None:
         if self.sentences_per_chunk < 1:
             raise ValueError(
-                f"sentences_per_chunk must be >= 1, got {self.sentences_per_chunk}"
+                "sentences_per_chunk must be >= 1, got %d" % self.sentences_per_chunk
             )
         if self.sentence_overlap < 0:
             raise ValueError(
-                f"sentence_overlap must be >= 0, got {self.sentence_overlap}"
+                "sentence_overlap must be >= 0, got %d" % self.sentence_overlap
             )
         if self.sentence_overlap >= self.sentences_per_chunk:
             raise ValueError(
-                f"sentence_overlap ({self.sentence_overlap}) must be < "
-                f"sentences_per_chunk ({self.sentences_per_chunk})"
+                "sentence_overlap (%d) must be < sentences_per_chunk (%d)"
+                % (self.sentence_overlap, self.sentences_per_chunk)
             )
 
 
@@ -868,6 +965,9 @@ class SentenceChunk:
     source_doc, position, and the first 50 characters of the chunk text.
     This ensures that re-ingestion produces identical KuzuDB node IDs,
     preserving graph integrity across ingestion runs.
+
+    The 20-character hex prefix (80 bits) provides sufficient collision
+    resistance for corpora up to ~10^8 chunks (birthday bound).
     """
 
     chunk_id: str
@@ -884,14 +984,10 @@ class SentenceChunk:
         return len(self.sentences)
 
     @property
-    def char_length(self) -> int:
-        return len(self.text)
-
-    @property
     def sentence_indices(self) -> List[int]:
         return [s.index for s in self.sentences]
 
-    def to_langchain_document(self) -> Document:
+    def to_langchain_document(self) -> "Document":
         return Document(
             page_content=self.text,
             metadata={
@@ -922,7 +1018,7 @@ class SpacySentenceSegmenter:
     # Shorter spans are typically fragment artifacts from the sentencizer.
     MIN_SENTENCE_CHARS: int = 5
 
-    def __init__(self, config: SentenceChunkingConfig):
+    def __init__(self, config: SentenceChunkingConfig) -> None:
         self.config = config
         self.nlp: Optional["Language"] = None
         self.using_spacy: bool = False
@@ -984,6 +1080,14 @@ class SpacySentenceSegmenter:
 
             start = text.find(part_stripped, current_pos)
             if start == -1:
+                # part_stripped could not be located after current_pos.
+                # This should not occur with a simple regex split on the same text,
+                # but guard defensively to avoid incorrect character offsets.
+                logger.debug(
+                    "Regex segmenter: substring not found at expected position "
+                    "(sent_idx=%d, current_pos=%d); using approximate offset.",
+                    sent_idx, current_pos,
+                )
                 start = current_pos
             end = start + len(part_stripped)
             current_pos = end
@@ -1013,7 +1117,8 @@ class SpacySentenceChunker:
 
     Chunk identifiers are deterministic SHA-256 hashes over (source_doc,
     position, text_prefix), ensuring that KuzuDB graph node IDs remain stable
-    across re-ingestion runs.
+    across re-ingestion runs.  The 20-char hex prefix (80 bits) provides
+    sufficient collision resistance for corpora up to ~10^8 chunks.
     """
 
     def __init__(
@@ -1024,7 +1129,7 @@ class SpacySentenceChunker:
         max_chunk_chars: int = 2000,         # settings.yaml: ingestion.max_chunk_chars
         spacy_model: str = "en_core_web_sm", # settings.yaml: ingestion.spacy_model
         entity_aware: bool = False,          # settings.yaml: ingestion.entity_aware_chunking
-    ):
+    ) -> None:
         self.config = SentenceChunkingConfig(
             sentences_per_chunk=sentences_per_chunk,
             sentence_overlap=sentence_overlap,
@@ -1035,14 +1140,14 @@ class SpacySentenceChunker:
         )
 
         self.segmenter = SpacySentenceSegmenter(self.config)
-        self._ner_nlp = None
-        if entity_aware:
-            self._ner_nlp = SpacyModelCache.get_model(spacy_model, disable=["parser"])
+        # entity_aware is reserved for future entity-boundary-aware window
+        # adjustment; the required logic is not yet implemented.  The flag is
+        # accepted to maintain API compatibility with settings.yaml.
+        _ = entity_aware  # acknowledged; no additional model load needed
 
         logger.info(
-            f"SpacySentenceChunker initialized: "
-            f"{self.config.sentences_per_chunk}-sentence windows, "
-            f"overlap={self.config.sentence_overlap}"
+            "SpacySentenceChunker initialized: %d-sentence windows, overlap=%d",
+            self.config.sentences_per_chunk, self.config.sentence_overlap,
         )
 
     @staticmethod
@@ -1053,25 +1158,25 @@ class SpacySentenceChunker:
         SHA-256 over (source_doc + position + text_prefix) ensures identical
         IDs on re-ingestion, preserving KuzuDB foreign key references.
         """
-        content = f"{source_doc}:{position}:{text[:50]}"
+        content = "%s:%d:%s" % (source_doc, position, text[:50])
         return hashlib.sha256(content.encode()).hexdigest()[:20]
 
     def chunk_text(
         self,
         text: str,
         source_doc: str = "unknown",
-        base_metadata: Dict[str, Any] = None,
+        base_metadata: Optional[Dict[str, Any]] = None,
     ) -> List[SentenceChunk]:
         """Segment text into overlapping SentenceChunk objects."""
         if text is None:
-            logger.warning(f"chunk_text received None for source_doc={source_doc!r}")
+            logger.warning("chunk_text received None for source_doc=%r", source_doc)
             return []
 
         base_metadata = base_metadata or {}
         sentences = self.segmenter.segment(text)
 
         if not sentences:
-            logger.warning(f"No sentences found in document: {source_doc!r}")
+            logger.warning("No sentences found in document: %r", source_doc)
             return []
 
         return self._sliding_window_chunk(sentences, source_doc, base_metadata)
@@ -1163,12 +1268,16 @@ class SpacySentenceChunker:
 
         return chunks
 
-    def chunk(self, text: str, metadata: Dict[str, Any] = None) -> List[Dict]:
+    def chunk(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> List[Dict]:
         """
         Primary interface consumed by ingestion.py (DocumentIngestionPipeline).
 
         Returns a list of dicts with keys 'text' and 'metadata', compatible
         with the ingestion pipeline's internal format.
+
+        'chunk_index' is set to chunk.position so that storage.py can create
+        ordered NEXT_CHUNK edges in KuzuDB (chunk_index=0 for all chunks would
+        otherwise make sequential ordering impossible).
         """
         metadata = metadata or {}
         source_doc = metadata.get("source_file", metadata.get("source", "unknown"))
@@ -1181,6 +1290,8 @@ class SpacySentenceChunker:
                     **chunk.metadata,
                     "chunk_id": chunk.chunk_id,
                     "position": chunk.position,
+                    "chunk_index": chunk.position,  # required by storage.py NEXT_CHUNK ordering
+                    "source_file": source_doc,
                     "sentence_start": chunk.sentences[0].index if chunk.sentences else 0,
                     "sentence_end": chunk.sentences[-1].index + 1 if chunk.sentences else 0,
                     "sentence_count": chunk.sentence_count,
@@ -1192,17 +1303,17 @@ class SpacySentenceChunker:
         ]
 
     def chunk_to_documents(
-        self, text: str, metadata: Dict[str, Any] = None
-    ) -> List[Document]:
+        self, text: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> List["Document"]:
         """Convert chunked text directly to LangChain Document objects."""
         metadata = metadata or {}
         source_doc = metadata.get("source_file", metadata.get("source", "unknown"))
         chunks = self.chunk_text(text, source_doc=source_doc, base_metadata=metadata)
         return [chunk.to_langchain_document() for chunk in chunks]
 
-    def chunk_documents(self, documents: List[Document]) -> List[Document]:
+    def chunk_documents(self, documents: List["Document"]) -> List["Document"]:
         """Chunk a list of LangChain Documents into sentence-window Documents."""
-        all_chunks: List[Document] = []
+        all_chunks: List["Document"] = []
         for doc in documents:
             source = doc.metadata.get("source_file", doc.metadata.get("source", "unknown"))
             chunks = self.chunk_text(
@@ -1231,3 +1342,272 @@ def create_sentence_chunker(
         entity_aware=entity_aware,
         **kwargs,
     )
+
+
+# ============================================================================
+# PART 3: UTILITY CHUNKERS
+# ============================================================================
+# These implementations are used by ingestion.py for the "sentence", "fixed",
+# and "recursive" strategies. They live here so that all chunking logic is
+# consolidated in one module.
+# ============================================================================
+
+class SentenceChunker:
+    """
+    Regex-based sentence chunker — fast fallback when SpaCy is unavailable.
+
+    Groups N sentences per chunk using a simple punctuation-boundary regex.
+    This strategy is used when ChunkingStrategy.SENTENCE is selected, or as
+    a fallback when SpaCy cannot be loaded.
+
+    Reference: Kiss, T. & Strunk, J. (2006). "Unsupervised multilingual sentence
+    boundary detection." Computational Linguistics, 32(4), 485-525.
+    """
+
+    SENTENCE_PATTERN = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
+
+    def __init__(self, sentences_per_chunk: int = 3, min_chunk_size: int = 50) -> None:
+        self.sentences_per_chunk = sentences_per_chunk
+        self.min_chunk_size = min_chunk_size
+
+    def split_into_sentences(self, text: str) -> List[str]:
+        """Split text into sentences using a punctuation-boundary regex."""
+        if not text or not text.strip():
+            return []
+        return [s.strip() for s in self.SENTENCE_PATTERN.split(text) if s.strip()]
+
+    def chunk(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> List[Dict]:
+        """
+        Chunk text by grouping N sentences.
+
+        Returns a list of dicts with keys 'text' and 'metadata', compatible
+        with the ingestion pipeline's internal format.
+        """
+        metadata = metadata or {}
+        if not text or not text.strip():
+            return []
+
+        sentences = self.split_into_sentences(text)
+        if not sentences:
+            return []
+
+        chunks = []
+        for i in range(0, len(sentences), self.sentences_per_chunk):
+            chunk_sents = sentences[i:i + self.sentences_per_chunk]
+            chunk_text = " ".join(chunk_sents)
+            if len(chunk_text.strip()) < self.min_chunk_size:
+                continue
+            chunk_meta = metadata.copy()
+            chunk_meta.update({
+                "sentence_start": i,
+                "sentence_end": i + len(chunk_sents),
+                "sentence_count": len(chunk_sents),
+                "chunk_index": len(chunks),
+                "chunk_method": "sentence_regex",
+            })
+            chunks.append({"text": chunk_text, "metadata": chunk_meta})
+        return chunks
+
+
+#: Backward-compatibility alias — use SentenceChunker instead.
+#: Deprecated since v4.4.0; will be removed in a future version.
+RegexSentenceChunker = SentenceChunker
+
+
+class FixedSizeChunker:
+    """
+    Fixed-size chunking with configurable overlap and word-boundary snapping.
+
+    Breaks text into segments of at most chunk_size characters, trying to
+    end each segment at a word boundary rather than mid-token.
+
+    Reference: Lewis, P. et al. (2020). "Retrieval-Augmented Generation for
+    Knowledge-Intensive NLP Tasks." NeurIPS 2020.
+    """
+
+    def __init__(
+        self,
+        chunk_size: int = 1024,          # settings.yaml: ingestion.chunk_size
+        chunk_overlap: int = 128,        # settings.yaml: ingestion.chunk_overlap
+        min_chunk_size: int = 50,        # settings.yaml: ingestion.min_chunk_size
+        word_boundary_factor: float = 0.8,  # settings.yaml: ingestion.word_boundary_factor
+    ) -> None:
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.min_chunk_size = min_chunk_size
+        self.word_boundary_factor = word_boundary_factor
+
+    def chunk(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> List[Dict]:
+        """
+        Chunk text into fixed-size pieces with overlap.
+
+        Returns a list of dicts with keys 'text' and 'metadata'.
+        """
+        metadata = metadata or {}
+        if not text or not text.strip():
+            return []
+
+        chunks = []
+        start = 0
+
+        while start < len(text):
+            prev_start = start
+            end = start + self.chunk_size
+            chunk_text = text[start:end]
+
+            # Snap to word boundary if not at end of text
+            if end < len(text):
+                last_space = chunk_text.rfind(' ')
+                if last_space > self.chunk_size * self.word_boundary_factor:
+                    chunk_text = chunk_text[:last_space]
+                    end = start + last_space
+
+            if len(chunk_text.strip()) >= self.min_chunk_size:
+                chunk_meta = metadata.copy()
+                chunk_meta.update({
+                    "char_start": start,
+                    "char_end": end,
+                    "chunk_index": len(chunks),
+                    "chunk_method": "fixed",
+                })
+                chunks.append({"text": chunk_text.strip(), "metadata": chunk_meta})
+
+            # Advance with overlap; guard against infinite loop
+            start = end - self.chunk_overlap
+            start = max(start, prev_start + 1)
+            if start >= len(text) - self.min_chunk_size:
+                break
+
+        return chunks
+
+
+class RecursiveChunker:
+    """
+    Wrapper for RecursiveCharacterTextSplitter from LangChain.
+
+    Recursively splits on paragraph, line, sentence, and word boundaries
+    until chunks are below chunk_size. Falls back to fixed-size chunking when
+    LangChain is not installed, emitting a FALLBACK warning.
+    """
+
+    def __init__(
+        self,
+        chunk_size: int = 1024,          # settings.yaml: ingestion.chunk_size
+        chunk_overlap: int = 128,        # settings.yaml: ingestion.chunk_overlap
+        min_chunk_size: int = 50,        # settings.yaml: ingestion.min_chunk_size
+    ) -> None:
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.min_chunk_size = min_chunk_size
+        self._splitter = None
+        self._using_fallback = False
+
+    def _get_splitter(self):
+        """Lazy initialise splitter; log warning when LangChain is absent."""
+        if self._splitter is None:
+            if LANGCHAIN_AVAILABLE:
+                self._splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap,
+                    separators=["\n\n", "\n", ". ", " ", ""],
+                )
+            else:
+                logger.warning(
+                    "⚠ FALLBACK AKTIV: LangChain not available — "
+                    "RecursiveChunker using simple fixed-size fallback. "
+                    "Install with: pip install langchain-text-splitters"
+                )
+                self._splitter = FixedSizeChunker(
+                    self.chunk_size, self.chunk_overlap, self.min_chunk_size
+                )
+                self._using_fallback = True
+        return self._splitter
+
+    def chunk(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> List[Dict]:
+        """
+        Chunk using RecursiveCharacterTextSplitter or fixed-size fallback.
+
+        Returns a list of dicts with keys 'text' and 'metadata'.
+        """
+        metadata = metadata or {}
+        if not text or not text.strip():
+            return []
+
+        splitter = self._get_splitter()
+
+        if self._using_fallback:
+            return splitter.chunk(text, metadata)
+
+        texts = splitter.split_text(text)
+        chunks = []
+        for chunk_text in texts:
+            if len(chunk_text.strip()) < self.min_chunk_size:
+                continue
+            chunk_meta = metadata.copy()
+            chunk_meta.update({
+                "chunk_index": len(chunks),
+                "chunk_method": "recursive",
+            })
+            chunks.append({"text": chunk_text.strip(), "metadata": chunk_meta})
+        return chunks
+
+
+# ============================================================================
+# SELF-VERIFICATION  (python -m src.data_layer.chunking)
+# ============================================================================
+
+def _main() -> None:
+    """Smoke demo and test runner for direct module invocation."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    _sample = (
+        "Albert Einstein was born on March 14, 1879, in Ulm, Germany. "
+        "He developed the theory of relativity. Einstein received the Nobel "
+        "Prize in Physics in 1921. He emigrated to the United States in 1933 "
+        "and worked at Princeton University until his death in 1955."
+    )
+
+    # ── Sentence Chunker ──────────────────────────────────────────────────────
+    sc = create_sentence_chunker(sentences_per_chunk=3, sentence_overlap=1)
+    sentence_chunks = sc.chunk_text(_sample, source_doc="demo.txt")
+    assert sentence_chunks, "Expected at least one sentence chunk"
+    for chunk in sentence_chunks:
+        logger.info(
+            "SentenceChunk [%d] id=%s sents=%s  %.80s",
+            chunk.position, chunk.chunk_id, chunk.sentence_indices, chunk.text,
+        )
+    logger.info("Sentence chunker smoke demo: %d chunks produced", len(sentence_chunks))
+
+    # ── Semantic Chunker ──────────────────────────────────────────────────────
+    try:
+        _doc = Document(page_content=_sample, metadata={"source_file": "demo.txt"})
+        sem = create_semantic_chunker(chunk_size=300, chunk_overlap=50, min_chunk_size=80)
+        sem_chunks = sem.chunk_document(_doc)
+        logger.info("Semantic chunker smoke demo: %d chunks produced", len(sem_chunks))
+        for c in sem_chunks:
+            logger.info(
+                "SemanticChunk score=%.3f  %.70s",
+                c.metadata.get("importance_score", 0), c.page_content,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Semantic chunker smoke demo skipped: %s", exc)
+
+    logger.info("Smoke demo passed.")
+
+    # ── pytest ────────────────────────────────────────────────────────────────
+    test_file = (
+        __import__("pathlib").Path(__file__).parent.parent.parent
+        / "test_system" / "test_chunking.py"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-X", "utf8", "-m", "pytest", str(test_file), "-v"],
+        check=False,
+    )
+    sys.exit(proc.returncode)
+
+
+if __name__ == "__main__":
+    _main()

@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import kuzu
 
 PROJECT_ROOT = Path(__file__).parent.parent
-db = kuzu.Database(str(PROJECT_ROOT / "data/hotpotqa/knowledge_graph"))
+db = kuzu.Database(str(PROJECT_ROOT / "data/hotpotqa/graph"))
 conn = kuzu.Connection(db)
 
 # Knotenanzahl

@@ -1,158 +1,44 @@
 """
-High-Performance Batched Embeddings with Persistent Caching
+Batched Embeddings with Persistent Content-Addressed Cache
 
-Version: 2.1.0
-Author: Edge-RAG Research Project
-Last Modified: 2026-01-13
+This module implements the embedding infrastructure for the Edge-RAG pipeline.
+It overcomes the performance limitations of the standard LangChain
+OllamaEmbeddings implementation — one HTTP request per text, no caching —
+which are critical bottlenecks during document ingestion on edge hardware where
+network round-trip overhead dominates total ingestion time.
 
-===============================================================================
-PROBLEM STATEMENT
-===============================================================================
+Architectural position: Data Layer (Artifact A).
+Consumed by: ingestion.py (document indexing pipeline) and
+hybrid_retriever.py (query-time vector search). Instantiated exclusively via
+the create_embeddings(cfg) factory to ensure settings.yaml is the single source
+of truth for all parameters.
 
-Standard LangChain OllamaEmbeddings implementation has several limitations
-that make it unsuitable for production RAG systems on edge devices:
+Design:
+  BatchedOllamaEmbeddings groups texts into configurable batches and reduces N
+  sequential API calls to ceil(N / batch_size) requests. A persistent SQLite
+  cache keyed by SHA-256 hashes of the input text eliminates redundant
+  re-embedding across runs — essential for iterative development cycles on
+  devices with limited CPU and memory.
 
-1. Sequential Processing:
-   - Each text requires a separate HTTP request
-   - Network overhead dominates computation time
-   - N texts require N API calls
-   
-2. No Caching:
-   - Identical texts re-embedded on every run
-   - Development iteration becomes slow
-   - Redundant computation wastes resources
+  Batching: N=1000, batch_size=64 → 16 API calls vs 1000 sequential.
+  Caching:  cache hit ~0.1 ms vs ~50 ms fresh embedding (~500× speedup).
+  Note: Empirical speedup values are reported in the thesis evaluation chapter.
 
-3. No Batch Support:
-   - Ollama API supports batch embedding, but LangChain does not use it
-   - GPU parallelization not leveraged
+Embedding model:
+  nomic-embed-text (768 dimensions, Apache 2.0 license).
+  Reference: Nussbaum, Z. et al. (2024). "Nomic Embed: Training a Reproducible
+  Long Context Text Embedder." arXiv:2402.01613.
 
-===============================================================================
-SOLUTION: BatchedOllamaEmbeddings
-===============================================================================
-
-This module provides a custom embedding implementation with:
-
-1. BATCH PROCESSING:
-   - Groups texts into configurable batches (default: 32)
-   - Single API call per batch
-   - Reduces N API calls to ceil(N/batch_size) calls
-   
-   Performance Impact:
-   - Sequential: 1000 texts x 50ms/call = 50 seconds
-   - Batched (32): 32 calls x 50ms = 1.6 seconds
-   - Speedup: ~30x
-
-2. PERSISTENT CACHING:
-   - SQLite database for embedding storage
-   - Content-addressable via SHA256 hashing
-   - Persists across program runs
-   
-   Performance Impact:
-   - First run: Full embedding generation
-   - Subsequent runs: Cache lookup only
-   - Cache hit: ~0.1ms vs ~50ms for embedding
-   - Speedup: ~500x for cached texts
-
-3. METRICS TRACKING:
-   - Cache hit/miss statistics
-   - Timing information
-   - Batch count tracking
-   - Useful for performance profiling and thesis evaluation
-
-===============================================================================
-SCIENTIFIC FOUNDATION
-===============================================================================
-
-Text Embeddings:
-    Text embeddings map variable-length text sequences to fixed-dimensional
-    dense vectors in a continuous semantic space. Semantically similar texts
-    are mapped to nearby points in this space.
-    
-    Formally: f: String -> R^d where d is the embedding dimension
-    
-    Properties:
-    - Semantic similarity preserved: sim(f(t1), f(t2)) ~ semantic_sim(t1, t2)
-    - Fixed dimensionality enables efficient nearest neighbor search
-    - Dense representation captures latent semantics
-
-Embedding Model (nomic-embed-text):
-    - Architecture: Based on BERT with modifications for efficiency
-    - Dimensionality: 768 dimensions
-    - Training: Contrastive learning on large text corpora
-    - License: Apache 2.0 (suitable for research and commercial use)
-    
-    Reference: Nussbaum, Z. et al. (2024). "Nomic Embed: Training a 
-    Reproducible Long Context Text Embedder." arXiv:2402.01613
-
-Caching Strategy:
-    Content-addressable storage using cryptographic hashing:
-    - Input: Text string
-    - Hash: SHA256(text.encode('utf-8'))
-    - Storage: SQLite with hash as primary key
-    
-    Collision Probability:
-    - SHA256 has 2^256 possible outputs
-    - Birthday bound: 2^128 texts before 50% collision probability
-    - For practical purposes: collision-free
-
-===============================================================================
-EDGE DEVICE OPTIMIZATION
-===============================================================================
-
-Memory Efficiency:
-    - SQLite uses memory-mapped I/O
-    - Cache size configurable via max_cache_size_mb
-    - LRU-like behavior through access_count tracking
-
-CPU Optimization:
-    - Batching amortizes Python interpreter overhead
-    - JSON serialization is fast for numeric arrays
-    - No GPU required (CPU inference via Ollama)
-
-Network Optimization:
-    - Batch requests reduce TCP connection overhead
-    - Request timeout configurable
-    - Graceful error handling for network issues
-
-===============================================================================
-USAGE
-===============================================================================
-
-Basic Usage:
-    embeddings = BatchedOllamaEmbeddings(
-        model_name="nomic-embed-text",
-        base_url="http://localhost:11434",
-        batch_size=32,
-        cache_path=Path("./cache/embeddings.db"),
-    )
-    
-    # Embed documents
-    vectors = embeddings.embed_documents(["text1", "text2", "text3"])
-    
-    # Embed query
-    query_vector = embeddings.embed_query("search query")
-
-Performance Monitoring:
-    embeddings.print_metrics()
-    # Output: Cache hit rate, batch count, timing statistics
-
-Cache Management:
-    embeddings.clear_cache()  # For ablation studies
-
-===============================================================================
-MODULE STRUCTURE
-===============================================================================
+Cache design:
+  Content-addressable storage: SHA-256(text.encode("utf-8")) as primary key.
+  Collision resistance: 2^128 birthday bound — collision-free for all practical
+  corpus sizes. Backend: SQLite in WAL mode for ACID compliance without a
+  server process.
 
 Classes:
-    EmbeddingMetrics   - Dataclass for performance metrics
-    EmbeddingCache     - SQLite-based persistent cache
-    BatchedOllamaEmbeddings - Main embedding class (LangChain compatible)
-
-Dependencies:
-    - requests: HTTP client for Ollama API
-    - sqlite3: Cache database (Python standard library)
-    - tqdm: Progress bar for batch processing
-    - langchain: Base Embeddings interface
+  EmbeddingMetrics          — dataclass for cumulative performance counters
+  EmbeddingCache            — SQLite-based persistent embedding store
+  BatchedOllamaEmbeddings   — LangChain-compatible embedding client
 """
 
 import logging
@@ -161,8 +47,8 @@ import sqlite3
 import json
 import time
 from pathlib import Path
-from typing import List, Optional, Dict, Any
-from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any, Tuple
+from dataclasses import dataclass
 
 import requests
 from tqdm import tqdm
@@ -179,69 +65,47 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EmbeddingMetrics:
     """
-    Performance metrics for embedding operations.
-    
-    This dataclass tracks cumulative statistics across all embedding
-    operations, useful for performance analysis and thesis evaluation.
-    
+    Cumulative performance metrics for a BatchedOllamaEmbeddings session.
+
+    Tracks texts processed by both embed_documents and embed_query.
+    Useful for profiling cache effectiveness and batch throughput during
+    thesis evaluation.
+
     Attributes:
-        total_texts: Total number of texts processed
-        cache_hits: Number of cache hits (embedding found in cache)
-        cache_misses: Number of cache misses (embedding generated)
-        batch_count: Number of API batch calls made
-        total_time_ms: Total processing time in milliseconds
-    
-    Derived Metrics:
-        cache_hit_rate: Percentage of texts served from cache
-        avg_time_per_text_ms: Average processing time per text
-    
-    Example Output:
-        Total Texts: 1000
-        Cache Hits: 800
-        Cache Misses: 200
-        Cache Hit Rate: 80.0%
-        Batches: 7 (200 texts / 32 batch_size)
-        Total Time: 350ms (mostly from 200 cache misses)
-        Avg Time/Doc: 0.35ms
+        total_texts:    Total texts processed (documents + queries).
+        cache_hits:     Texts served from cache without an API call.
+        cache_misses:   Texts that required a fresh API call.
+        batch_count:    Number of API batch requests issued.
+        total_time_ms:  Cumulative wall-clock time in milliseconds.
     """
     total_texts: int = 0
     cache_hits: int = 0
     cache_misses: int = 0
     batch_count: int = 0
     total_time_ms: float = 0.0
-    
+
     @property
     def cache_hit_rate(self) -> float:
-        """
-        Compute cache hit rate as percentage.
-        
-        Formula: (cache_hits / (cache_hits + cache_misses)) * 100
-        
-        Returns:
-            Cache hit rate in percent [0.0, 100.0]
-        """
+        """Cache hit rate in percent [0.0, 100.0]. Returns 0.0 if no texts processed."""
         total = self.cache_hits + self.cache_misses
         if total == 0:
             return 0.0
         return (self.cache_hits / total) * 100.0
-    
+
     @property
     def avg_time_per_text_ms(self) -> float:
         """
-        Compute average processing time per text.
-        
-        Note: This includes both cached (fast) and non-cached (slow) texts.
-        For non-cached texts only, divide total_time by cache_misses.
-        
-        Returns:
-            Average time in milliseconds
+        Average processing time per text in milliseconds.
+
+        Includes both cached (fast) and non-cached (slow) texts.
+        Returns 0.0 if no texts processed.
         """
         if self.total_texts == 0:
             return 0.0
         return self.total_time_ms / self.total_texts
-    
+
     def reset(self) -> None:
-        """Reset all metrics to zero."""
+        """Reset all counters and timers to zero."""
         self.total_texts = 0
         self.cache_hits = 0
         self.cache_misses = 0
@@ -256,337 +120,265 @@ class EmbeddingMetrics:
 class EmbeddingCache:
     """
     SQLite-based persistent cache for text embeddings.
-    
-    DESIGN RATIONALE:
-    
+
+    DESIGN RATIONALE
+
     Content-Addressable Storage:
-        Embeddings are stored using SHA256 hash of the text as the key.
-        This provides several benefits:
-        - Deduplication: Identical texts map to same entry
-        - Fast lookup: O(1) hash table access via SQLite index
-        - Deterministic: Same text always produces same hash
-    
+        Key = SHA-256(text.encode("utf-8")). Properties:
+        - Deduplication: identical texts map to a single entry.
+        - O(1) lookup via SQLite B-tree index.
+        - Deterministic: same text always produces the same hash.
+
     Why SQLite:
-        - Embedded database: No separate server process
-        - ACID compliant: Data integrity guaranteed
-        - Cross-platform: Works on all operating systems
-        - Zero configuration: Single file storage
-        - Efficient: Uses B-tree indices for fast lookup
-    
-    Schema Design:
+        Embedded, zero-configuration, ACID-compliant, cross-platform.
+        WAL journal mode gives better read concurrency without a server
+        process — suitable for edge deployment with a single writer.
+
+    Schema:
         embeddings (
-            text_hash     TEXT PRIMARY KEY,  -- SHA256 hash
-            text_content  TEXT NOT NULL,     -- Original text (for debugging)
-            embedding     BLOB NOT NULL,     -- JSON-encoded vector
-            model_name    TEXT NOT NULL,     -- Embedding model identifier
-            created_at    TIMESTAMP,         -- Creation timestamp
-            access_count  INTEGER            -- Usage tracking for LRU
+            text_hash     TEXT PRIMARY KEY,  -- SHA-256 (64 hex chars)
+            text_content  TEXT NOT NULL,     -- original text
+            embedding     BLOB NOT NULL,     -- JSON-encoded float vector
+            model_name    TEXT NOT NULL,     -- model identifier
+            created_at    TIMESTAMP,
+            access_count  INTEGER            -- usage frequency tracking
         )
-    
-    USAGE PATTERNS:
-    
-    Development:
-        - Cache persists between runs
-        - Rapid iteration without re-embedding
-        - Cache hit rates typically > 95% after first run
-    
-    Production:
-        - Pre-warm cache during deployment
-        - Monitor cache size with get_stats()
-        - Clear periodically if storage constrained
-    
-    Ablation Studies:
-        - Use clear() before each experiment
-        - Ensures reproducible timing measurements
-    
-    Attributes:
-        cache_path: Path to SQLite database file
-        conn: SQLite connection object
+
+    Cache size:
+        No automatic eviction is implemented. Monitor via get_stats() and
+        call clear() before experiments that require a clean timing baseline.
     """
-    
-    # Database schema version for migration support
+
     SCHEMA_VERSION = "2.1.0"
-    
-    def __init__(self, cache_path: Path):
+
+    def __init__(self, cache_path: Path) -> None:
         """
-        Initialize embedding cache with SQLite database.
-        
-        Creates database file and schema if not exists.
-        Opens existing database if already present.
+        Initialize embedding cache.
+
+        Creates the database file and schema if they do not exist;
+        opens an existing database otherwise. Parent directories are
+        created automatically.
 
         Args:
-            cache_path: Path to SQLite database file
-                        Parent directories created if not exist
+            cache_path: Path to the SQLite database file.
         """
         self.cache_path = Path(cache_path)
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self.logger = logging.getLogger(__name__)
-        self.conn = None
-        
+        self.conn: Optional[sqlite3.Connection] = None
         self._init_db()
 
     @property
     def db_path(self) -> Path:
-        """
-        Alias for cache_path for API compatibility.
-        
-        Returns:
-            Path to the SQLite database file
-        """
+        """Alias for cache_path (API compatibility)."""
         return self.cache_path
 
     def _init_db(self) -> None:
         """
-        Initialize SQLite database schema.
-        
-        Creates table and indices if not exist.
-        Uses WAL mode for better concurrent performance.
+        Initialize SQLite schema: embeddings table, index, metadata table.
+
+        WAL mode improves read throughput under the single-writer workload
+        typical of edge ingestion pipelines.
         """
         self.conn = sqlite3.connect(
             str(self.cache_path),
-            check_same_thread=False  # Allow multi-threaded access
+            check_same_thread=False,
         )
-        
-        # Enable WAL mode for better performance
         self.conn.execute("PRAGMA journal_mode=WAL")
-        
+
         cursor = self.conn.cursor()
-        
-        # Create embeddings table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS embeddings (
-                text_hash TEXT PRIMARY KEY,
+                text_hash    TEXT PRIMARY KEY,
                 text_content TEXT NOT NULL,
-                embedding BLOB NOT NULL,
-                model_name TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                embedding    BLOB NOT NULL,
+                model_name   TEXT NOT NULL,
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 access_count INTEGER DEFAULT 1
             )
         """)
-        
-        # Create index for model+hash lookup
-        # This optimizes queries that filter by model_name
+        # Composite index on (model_name, text_hash) speeds up model-scoped
+        # lookups in get() and get_batch().
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_model_hash
             ON embeddings(model_name, text_hash)
         """)
-        
-        # Create metadata table for schema versioning
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
+                key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             )
         """)
-        
-        # Store schema version
-        cursor.execute("""
-            INSERT OR REPLACE INTO metadata (key, value)
-            VALUES ('schema_version', ?)
-        """, (self.SCHEMA_VERSION,))
-        
+        cursor.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            (self.SCHEMA_VERSION,),
+        )
         self.conn.commit()
-        
-        self.logger.debug(f"Embedding cache initialized: {self.cache_path}")
+        logger.debug("Embedding cache initialized: %s", self.cache_path)
 
     def _hash_text(self, text: str) -> str:
         """
-        Generate SHA256 hash of text for content addressing.
-        
-        HASH FUNCTION PROPERTIES:
-        
-        SHA256 (Secure Hash Algorithm 256-bit):
-        - Output: 64 hexadecimal characters (256 bits)
-        - Collision resistance: 2^128 security level
-        - Deterministic: Same input always produces same output
-        - Fast: ~500 MB/s on modern CPUs
-        
-        Args:
-            text: Input text string
-            
-        Returns:
-            64-character hexadecimal hash string
+        SHA-256 hash of text for content addressing.
+
+        Output: 64 lowercase hexadecimal characters (256 bits).
+        Collision resistance: 2^128 birthday bound.
+        Speed: ~500 MB/s on modern CPUs.
         """
-        return hashlib.sha256(text.encode('utf-8')).hexdigest()
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     def get(self, text: str, model_name: str) -> Optional[List[float]]:
         """
-        Retrieve embedding from cache if present.
-        
-        ALGORITHM:
-        1. Compute SHA256 hash of text
-        2. Query database for matching hash and model
-        3. If found, deserialize embedding and update access count
-        4. Return embedding or None
-        
+        Retrieve a single embedding from the cache.
+
+        Updates access_count on a cache hit. Returns None on a miss or
+        database error (triggers re-embedding by the caller).
+
         Args:
-            text: Text that was embedded
-            model_name: Embedding model identifier
-            
+            text:       Input text whose embedding is requested.
+            model_name: Embedding model identifier.
+
         Returns:
-            Embedding vector as list of floats, or None if not cached
+            Embedding vector as list of floats, or None.
         """
         text_hash = self._hash_text(text)
         cursor = self.conn.cursor()
-        
         try:
             cursor.execute(
-                """
-                SELECT embedding FROM embeddings 
-                WHERE text_hash = ? AND model_name = ?
-                """,
-                (text_hash, model_name)
+                "SELECT embedding FROM embeddings "
+                "WHERE text_hash = ? AND model_name = ?",
+                (text_hash, model_name),
             )
             row = cursor.fetchone()
-            
             if row is not None:
-                # Deserialize embedding from JSON
                 embedding = json.loads(row[0])
-                
-                # Update access count for LRU tracking
                 cursor.execute(
-                    """
-                    UPDATE embeddings 
-                    SET access_count = access_count + 1 
-                    WHERE text_hash = ?
-                    """,
-                    (text_hash,)
+                    "UPDATE embeddings "
+                    "SET access_count = access_count + 1 WHERE text_hash = ?",
+                    (text_hash,),
                 )
                 self.conn.commit()
-                
                 return embedding
-            
             return None
-            
-        except Exception as e:
-            self.logger.error(f"Cache GET failed: {str(e)}")
+        except sqlite3.Error as e:
+            logger.error("Cache GET failed: %s", e)
             return None
 
     def put(self, text: str, embedding: List[float], model_name: str) -> None:
         """
-        Store embedding in cache.
-        
-        Uses INSERT OR REPLACE to handle duplicate keys gracefully.
-        
+        Store an embedding in the cache (upsert semantics).
+
         Args:
-            text: Original text that was embedded
-            embedding: Embedding vector as list of floats
-            model_name: Embedding model identifier
+            text:       Original text that was embedded.
+            embedding:  Embedding vector.
+            model_name: Embedding model identifier.
         """
         text_hash = self._hash_text(text)
         embedding_json = json.dumps(embedding)
-        
         cursor = self.conn.cursor()
-        
         try:
             cursor.execute(
                 """
-                INSERT OR REPLACE INTO embeddings 
-                (text_hash, text_content, embedding, model_name, access_count)
+                INSERT OR REPLACE INTO embeddings
+                    (text_hash, text_content, embedding, model_name, access_count)
                 VALUES (?, ?, ?, ?, 1)
                 """,
-                (text_hash, text, embedding_json, model_name)
+                (text_hash, text, embedding_json, model_name),
             )
             self.conn.commit()
-            
-        except Exception as e:
-            self.logger.error(f"Cache PUT failed: {str(e)}")
+        except sqlite3.Error as e:
+            logger.error("Cache PUT failed: %s", e)
 
     def get_batch(
-        self, 
-        texts: List[str], 
-        model_name: str
+        self,
+        texts: List[str],
+        model_name: str,
     ) -> Dict[int, List[float]]:
         """
-        Retrieve multiple embeddings from cache in single query.
-        
-        More efficient than individual get() calls for large batches.
-        
+        Retrieve embeddings for multiple texts in a single SQL query.
+
+        More efficient than N individual get() calls: one SELECT IN (...)
+        replaces N separate round-trips. Bulk-updates access_count for
+        all cache hits.
+
         Args:
-            texts: List of texts to look up
-            model_name: Embedding model identifier
-            
+            texts:      Texts to look up (may contain duplicates).
+            model_name: Embedding model identifier.
+
         Returns:
-            Dictionary mapping text index to embedding (only for cache hits)
+            Dict mapping text index (position in ``texts``) to embedding.
+            Only indices with a cache hit are present.
         """
         if not texts:
             return {}
-        
-        # Compute hashes for all texts, tracking ALL indices per hash
-        # (dict comprehension would drop duplicate texts — use setdefault instead)
+
+        # Map each unique hash to all indices that share it.
+        # setdefault avoids silently dropping duplicate texts.
         hash_to_idxs: Dict[str, List[int]] = {}
         for i, t in enumerate(texts):
-            h = self._hash_text(t)
-            hash_to_idxs.setdefault(h, []).append(i)
+            hash_to_idxs.setdefault(self._hash_text(t), []).append(i)
         hashes = list(hash_to_idxs.keys())
 
-        # Query for all hashes at once
-        placeholders = ','.join(['?'] * len(hashes))
+        placeholders = ",".join(["?"] * len(hashes))
         cursor = self.conn.cursor()
-
         try:
             cursor.execute(
-                f"""
-                SELECT text_hash, embedding FROM embeddings
-                WHERE model_name = ? AND text_hash IN ({placeholders})
-                """,
-                [model_name] + hashes
+                f"SELECT text_hash, embedding FROM embeddings "
+                f"WHERE model_name = ? AND text_hash IN ({placeholders})",
+                [model_name] + hashes,
             )
+            rows = cursor.fetchall()
 
-            results = {}
-            for row in cursor.fetchall():
-                text_hash, embedding_json = row
+            results: Dict[int, List[float]] = {}
+            hit_hashes: List[str] = []
+            for text_hash, embedding_json in rows:
                 embedding = json.loads(embedding_json)
                 for idx in hash_to_idxs[text_hash]:
                     results[idx] = embedding
+                hit_hashes.append(text_hash)
+
+            # Bulk-update access counts for all cache hits.
+            if hit_hashes:
+                ph = ",".join(["?"] * len(hit_hashes))
+                cursor.execute(
+                    f"UPDATE embeddings "
+                    f"SET access_count = access_count + 1 "
+                    f"WHERE text_hash IN ({ph})",
+                    hit_hashes,
+                )
+                self.conn.commit()
 
             return results
-            
-        except Exception as e:
-            self.logger.error(f"Cache batch GET failed: {str(e)}")
+        except sqlite3.Error as e:
+            logger.error("Cache batch GET failed: %s", e)
             return {}
 
     def clear(self) -> None:
         """
-        Clear all cached embeddings.
-        
-        Use for:
-        - Ablation studies requiring fresh cache
-        - Freeing disk space
-        - Changing embedding model
-        
-        Warning: This operation is irreversible.
+        Delete all cached embeddings.
+
+        Intended for ablation studies requiring reproducible fresh timings.
+        This operation is irreversible.
         """
         cursor = self.conn.cursor()
         try:
             cursor.execute("DELETE FROM embeddings")
             self.conn.commit()
-            self.logger.info("Embedding cache cleared")
-        except Exception as e:
-            self.logger.error(f"Cache CLEAR failed: {str(e)}")
+            logger.info("Embedding cache cleared")
+        except sqlite3.Error as e:
+            logger.error("Cache CLEAR failed: %s", e)
 
     def get_stats(self) -> Dict[str, Any]:
         """
-        Retrieve cache statistics.
-        
+        Return cache statistics.
+
         Returns:
-            Dictionary containing:
-            - total_entries: Number of cached embeddings
-            - total_accesses: Sum of all access counts
-            - size_bytes: Database file size
+            Dict with keys: total_entries, total_accesses, size_bytes, size_mb.
         """
         cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT COUNT(*), COALESCE(SUM(access_count), 0) 
-            FROM embeddings
-        """)
+        cursor.execute(
+            "SELECT COUNT(*), COALESCE(SUM(access_count), 0) FROM embeddings"
+        )
         row = cursor.fetchone()
-        
-        # Get file size
-        size_bytes = 0
-        if self.cache_path.exists():
-            size_bytes = self.cache_path.stat().st_size
-        
+        size_bytes = self.cache_path.stat().st_size if self.cache_path.exists() else 0
         return {
             "total_entries": row[0] or 0,
             "total_accesses": row[1] or 0,
@@ -595,7 +387,7 @@ class EmbeddingCache:
         }
 
     def close(self) -> None:
-        """Close database connection."""
+        """Close the SQLite connection."""
         if self.conn:
             self.conn.close()
             self.conn = None
@@ -607,148 +399,108 @@ class EmbeddingCache:
 
 class BatchedOllamaEmbeddings(Embeddings):
     """
-    High-performance Ollama embeddings with batching and caching.
-    
-    This class implements the LangChain Embeddings interface while providing
-    significant performance improvements over the standard implementation.
-    
-    PERFORMANCE CHARACTERISTICS:
-    
-    Batching Impact:
-        Let N = number of texts, B = batch_size, T = time per API call
-        
-        Sequential: Time = N * T
-        Batched:    Time = ceil(N/B) * T
-        Speedup:    min(N, B) times faster
-        
-        Example (N=1000, B=32, T=50ms):
-        - Sequential: 1000 * 50ms = 50,000ms = 50s
-        - Batched: 32 * 50ms = 1,600ms = 1.6s
-        - Speedup: 31x
-    
-    Caching Impact:
-        Let H = cache hit rate, T_cache = cache lookup time, T_embed = embed time
-        
-        Expected time per text: H * T_cache + (1-H) * T_embed
-        
-        Example (H=80%, T_cache=0.1ms, T_embed=50ms):
-        - Expected: 0.8 * 0.1 + 0.2 * 50 = 0.08 + 10 = 10.08ms
-        - vs uncached: 50ms
-        - Speedup: 5x
-    
-    Combined Impact:
-        With both optimizations, typical speedups of 50-500x are achievable
-        compared to naive sequential embedding without caching.
-    
-    API DETAILS:
-    
-    Ollama Embedding API:
+    High-performance Ollama embeddings with batching and persistent caching.
+
+    Implements the LangChain Embeddings interface and can be used as a drop-in
+    replacement for OllamaEmbeddings. Key improvements over the standard
+    implementation:
+
+    Batching:
+        Let N = texts, B = batch_size, T = latency per API call.
+        Sequential: N × T.  Batched: ceil(N/B) × T.  Speedup: min(N, B)×.
+        Example (N=1000, B=64, T=50 ms): 16 × 50 ms = 0.8 s vs 50 s.
+
+    Caching:
+        Let H = cache hit rate, T_c = cache lookup time, T_e = embed time.
+        Expected time per text: H × T_c + (1−H) × T_e.
+        Example (H=0.8, T_c=0.1 ms, T_e=50 ms): ~10 ms vs 50 ms (5× speedup).
+
+    Ollama /api/embed endpoint (used directly):
         POST /api/embed
-        Body: {"model": "nomic-embed-text", "input": ["text1", "text2", ...]}
-        Response: {"embeddings": [[0.1, 0.2, ...], [0.3, 0.4, ...], ...]}
-    
-    The API supports batched input natively, which this class leverages.
-    
-    LANGCHAIN COMPATIBILITY:
-    
-    This class inherits from langchain.embeddings.base.Embeddings and
-    implements the required methods:
-    - embed_documents(texts: List[str]) -> List[List[float]]
-    - embed_query(text: str) -> List[float]
-    
-    It can be used as a drop-in replacement for any LangChain embedding model.
-    
+        Body:     {"model": "nomic-embed-text", "input": ["t1", "t2", ...]}
+        Response: {"embeddings": [[0.1, ...], [0.3, ...], ...]}
+
     Attributes:
-        model_name: Ollama model identifier (e.g., "nomic-embed-text")
-        base_url: Ollama API base URL (e.g., "http://localhost:11434")
-        batch_size: Number of texts per API batch call
-        device: Device hint ("cpu" or "gpu")
-        cache: EmbeddingCache instance for persistent caching
-        metrics: EmbeddingMetrics instance for performance tracking
+        model_name:  Ollama model identifier (e.g. "nomic-embed-text").
+        base_url:    Ollama API base URL.
+        batch_size:  Texts per API call.
+        device:      Informational label only — Ollama handles device selection.
+        timeout:     HTTP request timeout in seconds.
+        cache:       EmbeddingCache instance.
+        metrics:     EmbeddingMetrics instance.
     """
-    
-    # Default configuration values
+
+    # Class-level defaults — used when BatchedOllamaEmbeddings is instantiated
+    # directly rather than via create_embeddings().
+    # Must stay aligned with settings.yaml entries:
+    #   DEFAULT_MODEL      → embeddings.model_name
+    #   DEFAULT_URL        → embeddings.base_url
+    #   DEFAULT_BATCH_SIZE → performance.batch_size
+    #   DEFAULT_TIMEOUT    → llm.timeout
     DEFAULT_MODEL = "nomic-embed-text"
     DEFAULT_URL = "http://localhost:11434"
-    DEFAULT_BATCH_SIZE = 32
-    DEFAULT_TIMEOUT = 60  # seconds
-    
+    DEFAULT_BATCH_SIZE = 64   # matches performance.batch_size in settings.yaml
+    DEFAULT_TIMEOUT = 60      # matches llm.timeout in settings.yaml
+
     def __init__(
         self,
         model_name: str = DEFAULT_MODEL,
         base_url: str = DEFAULT_URL,
         batch_size: int = DEFAULT_BATCH_SIZE,
         cache_path: Path = Path("./cache/embeddings.db"),
-        device: str = "cpu",
+        device: str = "cpu",   # informational only — Ollama handles device selection
         timeout: int = DEFAULT_TIMEOUT,
-    ):
+    ) -> None:
         """
-        Initialize batched embedding model with caching.
+        Initialize BatchedOllamaEmbeddings.
 
         Args:
-            model_name: Ollama embedding model name
-                        Default: "nomic-embed-text" (768 dimensions)
-            base_url: Ollama API base URL
-                      Default: "http://localhost:11434"
-            batch_size: Number of texts per API batch
-                        Default: 32 (optimal for most hardware)
-                        Reduce if encountering memory issues
-            cache_path: Path to SQLite cache database
-                        Default: "./cache/embeddings.db"
-            device: Device hint for logging ("cpu" or "gpu")
-                    Note: Actual device selection is handled by Ollama
-            timeout: API request timeout in seconds
-                     Default: 60 (increase for large batches)
-        
+            model_name:  Ollama embedding model name.
+            base_url:    Ollama API base URL.
+            batch_size:  Texts per API batch. Reduce on OOM errors.
+            cache_path:  Path to the SQLite embedding cache.
+            device:      Informational label ("cpu"/"gpu"). Not used at runtime.
+            timeout:     API request timeout in seconds.
+
         Raises:
-            ConnectionError: If Ollama server is not reachable
-            RuntimeError: If embedding model is not available
+            ConnectionError: Ollama server is unreachable or timed out.
+            RuntimeError:    Embedding model is not available (HTTP 404).
         """
         self.model_name = model_name
-        self.base_url = base_url.rstrip('/')
+        self.base_url = base_url.rstrip("/")
         self.batch_size = batch_size
         self.device = device
         self.timeout = timeout
-        self.logger = logging.getLogger(__name__)
-        
-        # Initialize cache
         self.cache = EmbeddingCache(cache_path)
-        
-        # Initialize metrics
         self.metrics = EmbeddingMetrics()
-        
-        # Store embedding dimension (detected on first use)
         self._embedding_dim: Optional[int] = None
-        
-        # Test connection and model availability
         self._test_connection()
 
     def _test_connection(self) -> None:
         """
-        Test Ollama API connection and model availability.
-        
+        Verify Ollama API availability and model presence.
+
+        Uses min(10, self.timeout) as the probe timeout to avoid blocking
+        indefinitely while still respecting very short configured timeouts.
+
         Raises:
-            ConnectionError: If API is not reachable
-            RuntimeError: If model is not available
+            ConnectionError: API unreachable or timed out.
+            RuntimeError:    Model not found (HTTP 404).
         """
+        connection_timeout = min(10, self.timeout)
         try:
             response = requests.post(
                 f"{self.base_url}/api/embed",
                 json={"model": self.model_name, "input": ["connection test"]},
-                timeout=10,
+                timeout=connection_timeout,
             )
-            
             if response.status_code == 200:
-                # Detect embedding dimension
                 data = response.json()
                 if data.get("embeddings"):
                     self._embedding_dim = len(data["embeddings"][0])
-                    
-                self.logger.info(
-                    f"Ollama connection verified: "
-                    f"model={self.model_name}, "
-                    f"dim={self._embedding_dim}, "
-                    f"url={self.base_url}"
+                logger.info(
+                    "Ollama connection verified: model=%s, dim=%s, url=%s",
+                    self.model_name, self._embedding_dim, self.base_url,
                 )
             elif response.status_code == 404:
                 raise RuntimeError(
@@ -759,7 +511,6 @@ class BatchedOllamaEmbeddings(Embeddings):
                 raise ConnectionError(
                     f"Ollama API error: HTTP {response.status_code}"
                 )
-                
         except requests.exceptions.ConnectionError:
             raise ConnectionError(
                 f"Cannot connect to Ollama at {self.base_url}. "
@@ -767,32 +518,26 @@ class BatchedOllamaEmbeddings(Embeddings):
             )
         except requests.exceptions.Timeout:
             raise ConnectionError(
-                f"Ollama connection timeout. Server may be overloaded."
+                "Ollama connection timeout. Server may be overloaded."
             )
 
     @property
     def embedding_dim(self) -> Optional[int]:
-        """Return embedding dimensionality (detected on first use)."""
+        """Embedding dimensionality, detected at initialization."""
         return self._embedding_dim
 
     def _embed_batch(self, texts: List[str]) -> List[List[float]]:
         """
-        Embed a batch of texts via Ollama API.
-        
-        ALGORITHM:
-        1. Send POST request with batch of texts
-        2. Parse response JSON
-        3. Validate response structure
-        4. Return list of embedding vectors
-        
+        Send a single batch to the Ollama /api/embed endpoint.
+
         Args:
-            texts: List of texts to embed (length <= batch_size)
-            
+            texts: Up to batch_size texts to embed.
+
         Returns:
-            List of embedding vectors, same length as input texts
-            
+            List of embedding vectors, same length as input.
+
         Raises:
-            RuntimeError: If API call fails or response is malformed
+            RuntimeError: API error, count mismatch, or request timeout.
         """
         try:
             response = requests.post(
@@ -800,207 +545,154 @@ class BatchedOllamaEmbeddings(Embeddings):
                 json={"model": self.model_name, "input": texts},
                 timeout=self.timeout,
             )
-            
             if response.status_code != 200:
                 raise RuntimeError(
                     f"Ollama API error: HTTP {response.status_code} - "
                     f"{response.text[:200]}"
                 )
-            
             data = response.json()
             embeddings = data.get("embeddings", [])
-            
-            # Validate response
             if len(embeddings) != len(texts):
                 raise RuntimeError(
-                    f"Embedding count mismatch: "
-                    f"expected {len(texts)}, got {len(embeddings)}"
+                    f"Embedding count mismatch: expected {len(texts)}, "
+                    f"got {len(embeddings)}"
                 )
-            
-            # Update embedding dimension if not set
             if self._embedding_dim is None and embeddings:
                 self._embedding_dim = len(embeddings[0])
-            
             return embeddings
-            
         except requests.exceptions.Timeout:
             raise RuntimeError(
                 f"Ollama API timeout after {self.timeout}s. "
                 f"Consider reducing batch_size or increasing timeout."
             )
         except Exception as e:
-            self.logger.error(f"Batch embedding failed: {str(e)}")
+            logger.error("Batch embedding failed: %s", e)
             raise
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """
         Embed a list of documents with batching and caching.
-        
-        ALGORITHM:
-        
-        Phase 1 - Cache Lookup:
-            For each text, check if embedding exists in cache.
-            Separate texts into cached (hits) and uncached (misses).
-        
-        Phase 2 - Batch Embedding:
-            For uncached texts, group into batches of size batch_size.
-            Call Ollama API once per batch.
-            Store results in cache for future use.
-        
-        Phase 3 - Result Assembly:
-            Combine cached and newly-generated embeddings.
-            Sort by original index to preserve input order.
-        
-        COMPLEXITY:
-        
-        Let N = number of texts, H = cache hit count, B = batch_size
-        
-        Cache lookup: O(N) hash computations + O(N) SQLite queries
-        API calls: ceil((N-H) / B) HTTP requests
-        Result assembly: O(N log N) for sorting
-        
-        Total: O(N log N) + O(ceil((N-H)/B) * API_latency)
-        
+
+        Algorithm:
+          Phase 1 — Batch cache lookup: single SQL query for all N texts.
+          Phase 2 — API batching: ceil((N−H) / batch_size) requests for cache
+                    misses; results stored in cache immediately.
+          Phase 3 — Reassembly: results sorted to restore original input order.
+
+        Complexity:
+          Cache lookup: O(N) hashes + O(1) SQL query.
+          API calls:    ceil((N−H) / B) HTTP requests.
+          Assembly:     O(N log N).
+
         Args:
-            texts: List of text strings to embed
-            
+            texts: Text strings to embed.
+
         Returns:
-            List of embedding vectors in same order as input texts.
-            Each vector has length equal to model's embedding dimension.
+            Embedding vectors in the same order as the input list.
         """
         if not texts:
             return []
-        
+
         start_time = time.time()
-        
-        # Data structures for result assembly
-        # List of (original_index, embedding) tuples
-        results: List[tuple] = []
-        
-        # Texts that need embedding (cache misses)
+        results: List[Tuple[int, List[float]]] = []
         texts_to_embed: List[str] = []
         indices_to_embed: List[int] = []
-        
-        # Phase 1: Cache Lookup
         cache_hits_this_run = 0
         cache_misses_this_run = 0
-        
+
+        # Phase 1: Batch cache lookup — one SQL query replaces N round-trips.
+        cached = self.cache.get_batch(texts, self.model_name)
         for i, text in enumerate(texts):
-            cached_embedding = self.cache.get(text, self.model_name)
-            
-            if cached_embedding is not None:
-                results.append((i, cached_embedding))
+            if i in cached:
+                results.append((i, cached[i]))
                 cache_hits_this_run += 1
             else:
                 texts_to_embed.append(text)
                 indices_to_embed.append(i)
                 cache_misses_this_run += 1
-        
-        # Update cumulative metrics
+
         self.metrics.total_texts += len(texts)
         self.metrics.cache_hits += cache_hits_this_run
         self.metrics.cache_misses += cache_misses_this_run
-        
-        # Phase 2: Batch Embedding for Cache Misses
+
+        # Phase 2: Batch API calls for cache misses.
         batches_this_run = 0
-        
         if texts_to_embed:
             num_batches = (len(texts_to_embed) + self.batch_size - 1) // self.batch_size
-            
-            # Progress bar for user feedback
-            self.logger.info(
-                f"Generating embeddings for {len(texts_to_embed)} texts "
-                f"in {num_batches} batches..."
+            logger.info(
+                "Generating embeddings for %d texts in %d batches...",
+                len(texts_to_embed), num_batches,
             )
-            
             for batch_idx in tqdm(
-                range(num_batches), 
-                desc="Embedding batches", 
+                range(num_batches),
+                desc="Embedding batches",
                 unit="batch",
-                disable=num_batches < 3  # Disable for small jobs
+                disable=num_batches < 3,
             ):
-                # Compute batch boundaries
                 start_idx = batch_idx * self.batch_size
                 end_idx = min(start_idx + self.batch_size, len(texts_to_embed))
                 batch_texts = texts_to_embed[start_idx:end_idx]
-                
-                # API call for this batch
                 batch_embeddings = self._embed_batch(batch_texts)
-                
-                # Store in cache and collect results
-                for j, (text, embedding) in enumerate(zip(batch_texts, batch_embeddings)):
+                for j, (text, embedding) in enumerate(
+                    zip(batch_texts, batch_embeddings)
+                ):
                     self.cache.put(text, embedding, self.model_name)
-                    original_idx = indices_to_embed[start_idx + j]
-                    results.append((original_idx, embedding))
-                
+                    results.append((indices_to_embed[start_idx + j], embedding))
                 batches_this_run += 1
-            
             self.metrics.batch_count += batches_this_run
-        
-        # Phase 3: Sort Results by Original Index
+
+        # Phase 3: Restore original input order.
         results.sort(key=lambda x: x[0])
         embeddings = [emb for _, emb in results]
-        
-        # Update timing metrics
+
         elapsed_ms = (time.time() - start_time) * 1000
         self.metrics.total_time_ms += elapsed_ms
-        
-        # Log performance summary
-        cache_hit_rate = (cache_hits_this_run / len(texts) * 100) if texts else 0
-        
-        self.logger.info(
-            f"Embedded {len(texts)} texts: "
-            f"cache_hit_rate={cache_hit_rate:.1f}%, "
-            f"batches={batches_this_run}, "
-            f"time={elapsed_ms:.1f}ms, "
-            f"avg={elapsed_ms/len(texts):.2f}ms/text"
+        cache_hit_rate = cache_hits_this_run / len(texts) * 100
+        logger.info(
+            "Embedded %d texts: cache_hit_rate=%.1f%%, batches=%d, "
+            "time=%.1fms, avg=%.2fms/text",
+            len(texts), cache_hit_rate, batches_this_run,
+            elapsed_ms, elapsed_ms / len(texts),
         )
-        
         return embeddings
 
     def embed_query(self, text: str) -> List[float]:
         """
-        Embed a single query text.
-        
-        Optimized for single-text embedding with caching.
-        
+        Embed a single query string with caching.
+
         Args:
-            text: Query string to embed
-            
+            text: Query text.
+
         Returns:
-            Embedding vector as list of floats
+            Embedding vector as list of floats.
         """
-        # Check cache first
+        self.metrics.total_texts += 1  # count queries alongside documents
         cached = self.cache.get(text, self.model_name)
         if cached is not None:
             self.metrics.cache_hits += 1
             return cached
-        
-        # Cache miss: generate embedding
         self.metrics.cache_misses += 1
         embedding = self._embed_batch([text])[0]
-        
-        # Store in cache
         self.cache.put(text, embedding, self.model_name)
-        
         return embedding
 
     def clear_cache(self) -> None:
         """
-        Clear embedding cache and reset metrics.
-        
-        Use before ablation studies to ensure clean measurements.
+        Clear the embedding cache and reset session metrics.
+
+        Call before ablation studies to ensure reproducible timing baselines.
         """
         self.cache.clear()
         self.metrics.reset()
-        self.logger.info("Embedding cache and metrics cleared")
+        logger.info("Embedding cache and metrics cleared")
 
     def get_metrics(self) -> Dict[str, Any]:
         """
-        Get current metrics as dictionary.
-        
+        Return current session metrics as a dictionary.
+
         Returns:
-            Dictionary containing all metric values
+            Dict with keys: total_texts, cache_hits, cache_misses,
+            cache_hit_rate, batch_count, total_time_ms, avg_time_per_text_ms.
         """
         return {
             "total_texts": self.metrics.total_texts,
@@ -1014,55 +706,83 @@ class BatchedOllamaEmbeddings(Embeddings):
 
     def print_metrics(self) -> None:
         """
-        Print formatted performance metrics to console.
-        
-        Useful for debugging and thesis documentation.
+        Log formatted performance metrics at INFO level.
+
+        Useful for profiling sessions and documenting thesis evaluation results.
         """
         cache_stats = self.cache.get_stats()
-        
-        print("\n" + "=" * 70)
-        print("EMBEDDING PERFORMANCE METRICS")
-        print("=" * 70)
-        print(f"Model:        {self.model_name}")
-        print(f"Dimension:    {self._embedding_dim}")
-        print(f"Batch Size:   {self.batch_size}")
-        print(f"Device:       {self.device}")
-        print()
-        print("Session Metrics:")
-        print(f"  Total Texts:     {self.metrics.total_texts}")
-        print(f"  Cache Hits:      {self.metrics.cache_hits}")
-        print(f"  Cache Misses:    {self.metrics.cache_misses}")
-        print(f"  Cache Hit Rate:  {self.metrics.cache_hit_rate:.1f}%")
-        print(f"  Batch Count:     {self.metrics.batch_count}")
-        print(f"  Total Time:      {self.metrics.total_time_ms:.1f}ms")
-        print(f"  Avg Time/Text:   {self.metrics.avg_time_per_text_ms:.2f}ms")
-        print()
-        print("Cache Statistics:")
-        print(f"  Cached Entries:  {cache_stats['total_entries']}")
-        print(f"  Total Accesses:  {cache_stats['total_accesses']}")
-        print(f"  Cache Size:      {cache_stats['size_mb']:.2f} MB")
-        print("=" * 70)
+        msg = "\n".join([
+            "",
+            "=" * 70,
+            "EMBEDDING PERFORMANCE METRICS",
+            "=" * 70,
+            f"Model:        {self.model_name}",
+            f"Dimension:    {self._embedding_dim}",
+            f"Batch Size:   {self.batch_size}",
+            "",
+            "Session Metrics:",
+            f"  Total Texts:     {self.metrics.total_texts}",
+            f"  Cache Hits:      {self.metrics.cache_hits}",
+            f"  Cache Misses:    {self.metrics.cache_misses}",
+            f"  Cache Hit Rate:  {self.metrics.cache_hit_rate:.1f}%",
+            f"  Batch Count:     {self.metrics.batch_count}",
+            f"  Total Time:      {self.metrics.total_time_ms:.1f}ms",
+            f"  Avg Time/Text:   {self.metrics.avg_time_per_text_ms:.2f}ms",
+            "",
+            "Cache Statistics:",
+            f"  Cached Entries:  {cache_stats['total_entries']}",
+            f"  Total Accesses:  {cache_stats['total_accesses']}",
+            f"  Cache Size:      {cache_stats['size_mb']:.2f} MB",
+            "=" * 70,
+        ])
+        logger.info(msg)
 
-    def __del__(self):
-        """Cleanup: close cache database connection."""
-        if hasattr(self, 'cache') and self.cache is not None:
+    # ---- Context Manager Protocol ----------------------------------------
+
+    def __enter__(self) -> "BatchedOllamaEmbeddings":
+        """Support ``with BatchedOllamaEmbeddings(...) as emb:`` usage."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Any,
+        exc_val: Any,
+        exc_tb: Any,
+    ) -> None:
+        """Close the cache connection on context manager exit."""
+        self.cache.close()
+
+    def __del__(self) -> None:
+        """Safety net: close cache connection if context manager was not used."""
+        if hasattr(self, "cache") and self.cache is not None:
             self.cache.close()
-
 
 
 # ============================================================================
 # FACTORY
 # ============================================================================
 
-def create_embeddings(cfg: dict = None) -> BatchedOllamaEmbeddings:
+def create_embeddings(
+    cfg: Optional[Dict[str, Any]] = None,
+) -> BatchedOllamaEmbeddings:
     """
-    Factory für BatchedOllamaEmbeddings. Liest alle Parameter aus cfg (settings.yaml-Dict).
+    Factory for BatchedOllamaEmbeddings that reads all parameters from the
+    settings.yaml configuration dictionary.
+
+    Parameter mapping from settings.yaml:
+        embeddings.model_name  → model_name
+        embeddings.base_url    → base_url
+        embeddings.cache_path  → cache_path
+        performance.batch_size → batch_size
+        performance.device     → device
+        llm.timeout            → timeout
 
     Args:
-        cfg: Settings-Dict (aus settings.yaml geladen). None → Defaults.
+        cfg: Full settings dict as loaded from config/settings.yaml.
+             Pass None or {} to fall back to class-level defaults.
 
     Returns:
-        Konfigurierte BatchedOllamaEmbeddings-Instanz.
+        Configured BatchedOllamaEmbeddings instance.
     """
     cfg = cfg or {}
     emb_cfg = cfg.get("embeddings", {})
@@ -1072,7 +792,7 @@ def create_embeddings(cfg: dict = None) -> BatchedOllamaEmbeddings:
     return BatchedOllamaEmbeddings(
         model_name=emb_cfg.get("model_name", "nomic-embed-text"),
         base_url=emb_cfg.get("base_url", "http://localhost:11434"),
-        batch_size=perf_cfg.get("batch_size", 32),
+        batch_size=perf_cfg.get("batch_size", 64),
         cache_path=Path(emb_cfg.get("cache_path", "./cache/embeddings.db")),
         device=perf_cfg.get("device", "cpu"),
         timeout=llm_cfg.get("timeout", 60),
@@ -1080,103 +800,49 @@ def create_embeddings(cfg: dict = None) -> BatchedOllamaEmbeddings:
 
 
 # ============================================================================
-# SELF-TEST / DIAGNOSTICS
+# SMOKE DEMO
 # ============================================================================
 
 if __name__ == "__main__":
-    import unittest
     import tempfile
-    import shutil
-    import sys
     from unittest.mock import MagicMock, patch
 
-    # Configure logging for tests
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    class TestEmbeddingsModule(unittest.TestCase):
-        """Self-contained tests for embeddings module."""
+    def _make_response(vecs):
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = {"embeddings": vecs}
+        return r
 
-        def setUp(self):
-            """Create temporary directory for cache DB."""
-            self.test_dir = tempfile.mkdtemp()
-            self.db_path = Path(self.test_dir) / "test_embeddings.db"
-            
-        def tearDown(self):
-            """Cleanup temporary directory."""
-            shutil.rmtree(self.test_dir)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        db_path = Path(tmp) / "demo.db"
+        texts = [
+            "Edge AI on resource-constrained devices.",
+            "Hybrid retrieval-augmented generation.",
+            "Quantization reduces model memory footprint.",
+        ]
 
-        def test_cache_operations(self):
-            """Test SQLite cache put/get mechanisms."""
-            print("\n  Testing Cache Operations...", end="")
-            cache = EmbeddingCache(self.db_path)
-            
-            # Test Data
-            text = "Test Vector"
-            vec = [0.1, 0.2, 0.3]
-            model = "test-model"
-            
-            # 1. Put
-            cache.put(text, vec, model)
-            
-            # 2. Get (Hit)
-            result = cache.get(text, model)
-            self.assertEqual(result, vec, "Cache retrieval failed")
-            
-            # 3. Get (Miss)
-            self.assertIsNone(cache.get("Unknown", model), "Cache should return None for miss")
-            
-            cache.close()
-            print(" OK")
+        with patch(
+            "requests.post",
+            side_effect=[
+                _make_response([[0.0] * 768]),           # _test_connection
+                _make_response([[float(i) / 10] * 768 for i in range(3)]),  # batch
+            ],
+        ):
+            # Use context manager so the SQLite connection is closed before
+            # TemporaryDirectory cleanup — avoids WinError 32 on Windows.
+            with BatchedOllamaEmbeddings(
+                model_name="nomic-embed-text",
+                batch_size=8,
+                cache_path=db_path,
+            ) as emb:
+                vecs = emb.embed_documents(texts)
+                print(f"── embed_documents ──  {len(vecs)} vectors, dim={len(vecs[0])}")
 
-        @patch('requests.post')
-        def test_batched_embedding_flow(self, mock_post):
-            """Test full embedding flow with mocked API."""
-            print("  Testing Batching & API Flow...", end="")
-            
-            # Mock Ollama Response
-            # Simulates an API response for a batch of 2 texts
-            mock_response = MagicMock()
-            mock_response.status_code = 200
-            mock_response.json.return_value = {
-                "embeddings": [
-                    [0.1] * 768,  # Vector for text 1
-                    [0.2] * 768   # Vector for text 2
-                ]
-            }
-            mock_post.return_value = mock_response
+                # Second call — all from cache, no API side_effect needed
+                with patch("requests.post", side_effect=RuntimeError("should not call API")):
+                    vecs2 = emb.embed_documents(texts)
+                    print(f"── cache-only call ──  {len(vecs2)} vectors (all from cache)")
 
-            # Initialize Embedder with small batch size
-            embedder = BatchedOllamaEmbeddings(
-                model_name="test-model",
-                batch_size=2,
-                cache_path=self.db_path
-            )
-            
-            # Force dimension to avoid init API call in test
-            embedder._embedding_dim = 768 
-
-            texts = ["Text A", "Text B"]
-            
-            # Run Embedding
-            embeddings = embedder.embed_documents(texts)
-            
-            # Verifications
-            self.assertEqual(len(embeddings), 2)
-            self.assertEqual(embeddings[0], [0.1] * 768)
-            self.assertEqual(embedder.metrics.cache_misses, 2)
-            self.assertEqual(embedder.metrics.batch_count, 1) # 2 texts fit in 1 batch of size 2
-            
-            print(" OK")
-            
-            # Test Cache Hit on second run
-            print("  Testing Cache Hit Logic...", end="")
-            embedder.embed_documents(texts)
-            self.assertEqual(embedder.metrics.cache_hits, 2)
-            print(" OK")
-
-    print("\n" + "="*60)
-    print("RUNNING EMBEDDINGS.PY SELF-TESTS")
-    print("="*60)
-    
-    # Run tests
-    unittest.main(argv=['first-arg-is-ignored'], exit=False)
+        emb.print_metrics()

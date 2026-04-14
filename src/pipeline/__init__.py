@@ -24,8 +24,9 @@ from .ingestion_pipeline import (
     IngestionConfig,
     IngestionMetrics,
     DocumentLoader,
-    EmbeddingGenerator,
-    create_ingestion_pipeline
+    MockEmbeddingGenerator,
+    MockEntityExtractor,
+    create_ingestion_pipeline,
 )
 
 __all__ = [
@@ -35,12 +36,13 @@ __all__ = [
     "BatchProcessor",
     "create_pipeline",
     "create_full_pipeline",
-    
+
     # Ingestion Pipeline
     "IngestionPipeline",
     "IngestionConfig",
     "IngestionMetrics",
     "DocumentLoader",
-    "EmbeddingGenerator",
-    "create_ingestion_pipeline"
+    "MockEmbeddingGenerator",
+    "MockEntityExtractor",
+    "create_ingestion_pipeline",
 ]

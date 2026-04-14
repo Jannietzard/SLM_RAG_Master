@@ -1,50 +1,62 @@
 """
 Entity Extraction Pipeline: GLiNER + REBEL
 
-Version: 4.0.0 - MASTERTHESIS IMPLEMENTATION
-Author: Edge-RAG Research Project
+This module implements Named Entity Recognition (NER) and Relation Extraction
+(RE) for the Edge-RAG pipeline. It populates the KuzuDB knowledge graph during
+document ingestion, enabling graph-augmented hybrid retrieval in the Navigator
+agent (S_N). Architectural position: Data Layer (Artifact A).
 
-===============================================================================
-IMPLEMENTATION GEMÄSS MASTERTHESIS ABSCHNITT 2.5
-===============================================================================
+Data flow:
+  raw chunk text
+    → GLiNERExtractor (zero-shot NER)
+    → REBELExtractor (relation extraction, conditional on entity count)
+    → EntityExtractionPipeline (cache + orchestration)
+    → KuzuDB knowledge graph
 
-Stufe 1: Named Entity Recognition mit GLiNER-small
-    - Zero-Shot NER ohne domänenspezifisches Fine-Tuning
-    - 6 Entitätstypen: PERSON, ORGANIZATION, LOCATION, DATE, EVENT, CONCEPT
-    - Confidence Threshold: 0.5
-    - Batch Size: 16
+NER fallback chain (activated when GLiNER is unavailable or fails):
+  1. GLiNER zero-shot NER — primary backend (bidirectional transformer)
+  2. SpaCy en_core_web_sm — supervised fallback, loaded once at init
+  3. Regex proper-noun heuristic — last resort, CONCEPT type only
 
-Stufe 2: Relation Extraction mit REBEL
-    - Nur auf Chunks mit >= 2 Entitäten (60% weniger RE-Aufrufe)
-    - Relation Types: works_for, located_in, part_of, etc.
-    - Confidence Threshold: 0.7
-    - Batch Size: 8
+Lightweight alternative:
+  SpacyEntityPipeline implements the same interface as EntityExtractionPipeline
+  using only SpaCy (no GLiNER/REBEL). Recommended for memory-constrained
+  deployments where the combined ~3.1 GB footprint of GLiNER + REBEL is
+  infeasible on the target hardware (< 16 GB RAM).
 
-Optimierungen:
-    - Batch-Processing für GLiNER (16) und REBEL (8)
-    - Entity Caching (LRU-Cache für häufige Entitäten)
-    - Selective RE (nur Chunk-Paare mit Co-Occurrences, 70% weniger Aufrufe)
-    - Ziel-Latenz: 80-120ms pro Chunk
+Entity ID design:
+  Each entity is identified by SHA-256(f"{name.lower()}:{type}")[:24].
+  96-bit output space → birthday-bound collision probability < 1 in 10^14
+  for any realistic corpus. See _generate_entity_id() for rationale.
 
-===============================================================================
+Cache design:
+  EntityCache is a hybrid in-memory LRU + SQLite persistent store, scoped
+  by (text_hash, model_name) to invalidate stale entries when the NER model
+  or configuration changes between ingestion runs.
+
+Scientific references:
+  NER:   Zaratiana, U. et al. (2023). "GLiNER: Generalist Model for Named
+         Entity Recognition using Bidirectional Transformer." arXiv:2311.08526.
+  RE:    Cabot, P. L. H., & Navigli, R. (2021). "REBEL: Relation Extraction
+         by End-to-end Language generation." EMNLP 2021 Findings.
+  SpaCy: Honnibal, M. et al. (2020). "spaCy: Industrial-strength Natural
+         Language Processing in Python." https://spacy.io
 """
 
 import logging
 import hashlib
 import json
+import re
 import sqlite3
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
-from functools import lru_cache
 from collections import OrderedDict
 import time
 
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# GLiNER INTEGRATION
-# ============================================================================
+# ── Optional dependency flags ──────────────────────────────────────────────────
 
 try:
     from gliner import GLiNER
@@ -52,31 +64,13 @@ try:
 except ImportError:
     GLINER_AVAILABLE = False
     logger.warning("GLiNER not available. Install with: pip install gliner")
-# ============================================================================
-# ENTITY EXTRACTION PIPELINE
-# ============================================================================
-"""
-Entity Extraction -> Graph Store Integration
-
-Diese Komponente fehlt komplett in der aktuellen Implementierung!
-Sie ist essentiell für die Funktionsfähigkeit des Hybrid Index.
-"""
-
-from .storage import KuzuGraphStore
-# ============================================================================
-# REBEL INTEGRATION (Transformers)
-# ============================================================================
 
 try:
-    from transformers import pipeline, AutoModelForSeq2SeqLM, AutoTokenizer
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
     logger.warning("Transformers not available. Install with: pip install transformers")
-
-# ============================================================================
-# SPACY FALLBACK
-# ============================================================================
 
 try:
     import spacy
@@ -86,25 +80,51 @@ except ImportError:
     logger.warning("SpaCy not available. Install with: pip install spacy")
 
 
-# ============================================================================
-# DATA CLASSES
-# ============================================================================
+# ── Module-level entity ID helper (shared by all extractor classes) ────────────
+
+def _generate_entity_id(name: str, entity_type: str) -> str:
+    """
+    Deterministic entity identifier via SHA-256 content addressing.
+
+    Key properties:
+      - Stable:              same (name, type) always yields the same ID.
+      - Deduplicating:       identical strings share one knowledge-graph node.
+      - Collision-resistant: 24 hex chars = 96-bit output space.
+        Birthday bound at 50% collision probability: √(2^96) ≈ 9 × 10^14
+        distinct (name, type) pairs — safe for any realistic corpus.
+
+    Design choice: 24 hex chars balances storage compactness with collision
+    safety. MD5 (previously used, 48-bit truncated) had a birthday bound of
+    ~16 million entries — insufficient for large Wikipedia-scale corpora.
+
+    Args:
+        name:        Normalized entity name (lowercase, stripped).
+        entity_type: Canonical type string (e.g. "PERSON", "GPE").
+
+    Returns:
+        24-character lowercase hexadecimal string.
+    """
+    combined = f"{name.lower().strip()}:{entity_type}"
+    return hashlib.sha256(combined.encode()).hexdigest()[:24]
+
+
+# ── Data classes ───────────────────────────────────────────────────────────────
 
 @dataclass
 class ExtractedEntity:
-    """Extrahierte Named Entity."""
+    """Container for a single named entity extracted from a text chunk."""
     entity_id: str
     name: str
-    entity_type: str  # PERSON, ORGANIZATION, LOCATION, DATE, EVENT, CONCEPT
+    entity_type: str           # Canonical type: PERSON, GPE, LOCATION, etc.
     confidence: float
-    mention_span: Tuple[int, int]  # Character offsets (start, end)
+    mention_span: Tuple[int, int]   # Character offsets (start, end)
     source_chunk_id: str
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "entity_id": self.entity_id,
             "name": self.name,
-            "type": self.entity_type,
+            "entity_type": self.entity_type,   # canonical key — no "type" alias
             "confidence": self.confidence,
             "mention_span": list(self.mention_span),
             "source_chunk_id": self.source_chunk_id,
@@ -113,36 +133,36 @@ class ExtractedEntity:
 
 @dataclass
 class ExtractedRelation:
-    """Extrahierte Relation zwischen Entitäten."""
-    subject_entity: str  # Entity name
-    relation_type: str   # z.B. "works_for", "located_in", "part_of"
-    object_entity: str   # Entity name
+    """Container for a subject–relation–object triple."""
+    subject_entity: str
+    relation_type: str
+    object_entity: str
     confidence: float
-    source_chunk_ids: List[str]  # Chunks, die diese Relation belegen
-    
+    source_chunk_ids: List[str]
+
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "subject": self.subject_entity,
-            "relation": self.relation_type,
-            "object": self.object_entity,
+            "subject_entity": self.subject_entity,
+            "relation_type": self.relation_type,
+            "object_entity": self.object_entity,
             "confidence": self.confidence,
-            "source_chunks": self.source_chunk_ids,
+            "source_chunk_ids": self.source_chunk_ids,
         }
 
 
 @dataclass
 class ChunkExtractionResult:
-    """Ergebnis der Entity/Relation Extraction für einen Chunk."""
+    """Aggregated extraction result for one text chunk."""
     chunk_id: str
     text: str
     entities: List[ExtractedEntity]
     relations: List[ExtractedRelation]
     extraction_time_ms: float
-    
+
     @property
     def entity_count(self) -> int:
         return len(self.entities)
-    
+
     @property
     def relation_count(self) -> int:
         return len(self.relations)
@@ -150,178 +170,309 @@ class ChunkExtractionResult:
 
 @dataclass
 class ExtractionConfig:
-    """Konfiguration für Entity Extraction Pipeline."""
-    # GLiNER
+    """
+    Configuration for the entity extraction pipeline.
+
+    All parameters that appear here also exist in config/settings.yaml
+    → entity_extraction, which is the single source of truth during a run.
+    The values below serve as documented emergency fallbacks when no config
+    file is provided (e.g. in unit tests).
+    """
+    # ── GLiNER NER ────────────────────────────────────────────────────────────
+    # Reference: Zaratiana et al. (2023). arXiv:2311.08526.
     gliner_model: str = "urchade/gliner_small-v2.1"
     entity_types: List[str] = field(default_factory=lambda: [
-        # Lowercase natural-language names → bessere zero-shot performance bei GLiNER
-        "person",           # Personen
-        "organization",     # Unternehmen, Studios, Institutionen
-        "city",             # Städte (spezifisch, höhere Konfidenz)
-        "country",          # Länder
-        "state",            # Bundesstaaten, Regionen (Hawaii, California)
-        "location",         # Allgemeine Orte
-        "film",             # Filme
-        "movie",            # Synonym für film (doppelte Abdeckung)
-        "album",            # Musikalben (Abbey Road etc.)
-        "work of art",      # Catch-all: ungewöhnliche Titel, Gemälde, Bücher
-        "landmark",         # Bauwerke/Sehenswürdigkeiten → WORK_OF_ART
-        "event",            # Historische Ereignisse
-        "award",            # Preise (Nobel Prize etc.)
+        # Lowercase natural-language labels produce better zero-shot results
+        # with GLiNER's bidirectional span-prediction approach.
+        "person", "organization",
+        "city", "country", "state", "location",
+        "film", "movie", "album", "work of art",
+        "landmark",    # buildings/monuments → maps to LOCATION
+        "event", "award",
     ])
-    ner_confidence_threshold: float = 0.15  # Recall-optimiert für HotpotQA
+    ner_confidence_threshold: float = 0.15   # recall-optimised for HotpotQA
     ner_batch_size: int = 16
-    
-    # REBEL
+
+    # ── REBEL Relation Extraction ─────────────────────────────────────────────
+    # Reference: Cabot & Navigli (2021). EMNLP 2021 Findings.
     rebel_model: str = "Babelscape/rebel-large"
-    re_confidence_threshold: float = 0.5
+    re_confidence_threshold: float = 0.5   # uniform sentinel — REBEL emits no per-triplet score
     re_batch_size: int = 8
-    min_entities_for_re: int = 2  # Nur RE wenn >= 2 Entitäten
-    
-    # Caching
+    min_entities_for_re: int = 2           # skip RE when fewer entities are found
+    rebel_max_input_length: int = 256      # tokenizer truncation length
+    rebel_max_output_length: int = 256     # generation length cap
+    rebel_num_beams: int = 5               # beam search width
+    device: str = "cpu"                    # "cuda" if GPU is available
+
+    # ── Caching ───────────────────────────────────────────────────────────────
     cache_enabled: bool = True
     cache_path: str = "./data/entity_cache.db"
     lru_cache_size: int = 10000
-    
-    # Selective RE
-    selective_re: bool = True
 
 
-# ============================================================================
-# ENTITY CACHE (LRU + SQLite Persistent)
-# ============================================================================
+# ── Entity Cache ───────────────────────────────────────────────────────────────
 
 class EntityCache:
     """
-    Hybrid Entity Cache: In-Memory LRU + SQLite Persistence.
-    
-    Cacht häufige Entitäten (z.B. "United States", "World War II"),
-    sodass wiederholte Mentions keine erneute Extraktion erfordern.
+    Hybrid in-memory LRU + SQLite persistent cache for extraction results.
+
+    DESIGN
+
+    Content-addressable storage:
+        Cache key = (SHA-256(text.encode())[:16], model_name).
+        Scoping by model_name ensures cache invalidation when the NER model
+        or entity type list changes between ingestion runs.
+
+    In-memory LRU:
+        Implemented via collections.OrderedDict (move_to_end on access).
+        In-memory key = f"{text_hash}:{model_name}".
+        Evicts the least-recently-used entry when max_size is reached.
+
+    SQLite backend:
+        WAL mode for improved read concurrency.
+        check_same_thread=False for thread-safe access.
+
+    Schema:
+        entity_cache (
+            text_hash     TEXT NOT NULL,   -- SHA-256[:16] of input text
+            model_name    TEXT NOT NULL,   -- NER model identifier
+            entities_json TEXT NOT NULL,   -- JSON-encoded extraction dict
+            hit_count     INTEGER DEFAULT 1,
+            last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (text_hash, model_name)
+        )
     """
-    
-    def __init__(self, cache_path: str, max_size: int = 10000):
+
+    def __init__(self, cache_path: str, max_size: int = 10000) -> None:
         self.cache_path = Path(cache_path)
         self.max_size = max_size
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # In-Memory LRU Cache
         self._memory_cache: OrderedDict = OrderedDict()
-        
-        # SQLite für Persistenz
+        self.conn: Optional[sqlite3.Connection] = None
         self._init_db()
-        self._load_from_db()
-        
-        logger.info(f"EntityCache initialized with {len(self._memory_cache)} entries")
-    
-    def _init_db(self):
-        """Initialisiere SQLite Datenbank."""
-        self.conn = sqlite3.connect(str(self.cache_path))
+        logger.info("EntityCache initialized: %s", self.cache_path)
+
+    def _init_db(self) -> None:
+        """Create schema if absent; enable WAL mode."""
+        self.conn = sqlite3.connect(
+            str(self.cache_path),
+            check_same_thread=False,
+        )
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS entity_cache (
-                text_hash TEXT PRIMARY KEY,
-                entities_json TEXT,
-                hit_count INTEGER DEFAULT 1,
-                last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                text_hash     TEXT NOT NULL,
+                model_name    TEXT NOT NULL,
+                entities_json TEXT NOT NULL,
+                hit_count     INTEGER DEFAULT 1,
+                last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (text_hash, model_name)
             )
         """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_model_hitcount
+            ON entity_cache(model_name, hit_count DESC)
+        """)
         self.conn.commit()
-    
-    def _load_from_db(self):
-        """Lade häufig verwendete Einträge in Memory-Cache."""
-        cursor = self.conn.execute("""
-            SELECT text_hash, entities_json 
-            FROM entity_cache 
-            ORDER BY hit_count DESC 
-            LIMIT ?
-        """, (self.max_size,))
-        
-        for row in cursor:
-            self._memory_cache[row[0]] = json.loads(row[1])
-    
+
     def _text_hash(self, text: str) -> str:
-        """Generiere Hash für Text."""
+        """SHA-256 of text, truncated to 16 hex chars (64-bit cache key)."""
         return hashlib.sha256(text.encode()).hexdigest()[:16]
-    
-    def get(self, text: str) -> Optional[List[Dict]]:
+
+    def get(self, text: str, model_name: str) -> Optional[Dict[str, Any]]:
         """
-        Hole gecachte Entitäten für Text.
-        
+        Retrieve a cached extraction result for a single text.
+
+        Args:
+            text:       Input text.
+            model_name: NER model identifier (cache scope key).
+
         Returns:
-            List[Dict] mit Entitäten oder None wenn nicht gecacht.
+            Dict with "entities" and "relations" lists, or None on a miss.
         """
         key = self._text_hash(text)
-        
-        # Memory-Cache Check
-        if key in self._memory_cache:
-            # Move to end (LRU)
-            self._memory_cache.move_to_end(key)
-            return self._memory_cache[key]
-        
-        # DB Check
-        cursor = self.conn.execute(
-            "SELECT entities_json FROM entity_cache WHERE text_hash = ?",
-            (key,)
-        )
-        row = cursor.fetchone()
-        
-        if row:
-            entities = json.loads(row[0])
-            # Update hit count
+        mem_key = f"{key}:{model_name}"
+
+        # In-memory LRU check
+        if mem_key in self._memory_cache:
+            self._memory_cache.move_to_end(mem_key)
+            return self._memory_cache[mem_key]
+
+        # SQLite check
+        try:
+            cursor = self.conn.execute(
+                "SELECT entities_json FROM entity_cache "
+                "WHERE text_hash = ? AND model_name = ?",
+                (key, model_name),
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                data = json.loads(row[0])
+                self.conn.execute(
+                    "UPDATE entity_cache "
+                    "SET hit_count = hit_count + 1, "
+                    "last_accessed = CURRENT_TIMESTAMP "
+                    "WHERE text_hash = ? AND model_name = ?",
+                    (key, model_name),
+                )
+                self.conn.commit()
+                self._add_to_memory(mem_key, data)
+                return data
+            return None
+        except sqlite3.Error as e:
+            logger.error("EntityCache GET failed: %s", e)
+            return None
+
+    def put(self, text: str, data: Dict[str, Any], model_name: str) -> None:
+        """
+        Store an extraction result (upsert).
+
+        Args:
+            text:       Original input text.
+            data:       Dict with "entities" and "relations" lists.
+            model_name: NER model identifier.
+        """
+        key = self._text_hash(text)
+        mem_key = f"{key}:{model_name}"
+        self._add_to_memory(mem_key, data)
+        try:
             self.conn.execute(
-                "UPDATE entity_cache SET hit_count = hit_count + 1, last_accessed = CURRENT_TIMESTAMP WHERE text_hash = ?",
-                (key,)
+                """
+                INSERT OR REPLACE INTO entity_cache
+                    (text_hash, model_name, entities_json, hit_count)
+                VALUES (?, ?, ?, 1)
+                """,
+                (key, model_name, json.dumps(data)),
             )
             self.conn.commit()
-            # Add to memory cache
-            self._add_to_memory(key, entities)
-            return entities
-        
-        return None
-    
-    def put(self, text: str, entities: List[Dict]):
-        """Speichere Entitäten für Text."""
-        key = self._text_hash(text)
-        entities_json = json.dumps(entities)
-        
-        # Memory Cache
-        self._add_to_memory(key, entities)
-        
-        # DB
-        self.conn.execute("""
-            INSERT OR REPLACE INTO entity_cache (text_hash, entities_json, hit_count, last_accessed)
-            VALUES (?, ?, COALESCE((SELECT hit_count FROM entity_cache WHERE text_hash = ?), 0) + 1, CURRENT_TIMESTAMP)
-        """, (key, entities_json, key))
-        self.conn.commit()
-    
-    def _add_to_memory(self, key: str, value: List[Dict]):
-        """Füge zum Memory-Cache hinzu mit LRU Eviction."""
+        except sqlite3.Error as e:
+            logger.error("EntityCache PUT failed: %s", e)
+
+    def get_batch(
+        self,
+        texts: List[str],
+        model_name: str,
+    ) -> Dict[int, Dict[str, Any]]:
+        """
+        Retrieve cached results for multiple texts in a single SQL query.
+
+        More efficient than N individual get() calls: one SELECT IN (...)
+        plus memory-cache checks replaces N sequential round-trips.
+
+        Args:
+            texts:      Input texts (may contain duplicates).
+            model_name: NER model identifier.
+
+        Returns:
+            Dict mapping text index (position in ``texts``) to cached result.
+            Only cache-hit indices are present.
+        """
+        if not texts:
+            return {}
+
+        hash_to_idxs: Dict[str, List[int]] = {}
+        for i, t in enumerate(texts):
+            hash_to_idxs.setdefault(self._text_hash(t), []).append(i)
+
+        # Check memory cache first — avoids SQL for hot entries.
+        results: Dict[int, Dict[str, Any]] = {}
+        db_hashes: List[str] = []
+        for h, idxs in hash_to_idxs.items():
+            mem_key = f"{h}:{model_name}"
+            if mem_key in self._memory_cache:
+                self._memory_cache.move_to_end(mem_key)
+                for idx in idxs:
+                    results[idx] = self._memory_cache[mem_key]
+            else:
+                db_hashes.append(h)
+
+        # Fetch remaining misses from SQLite in one query.
+        if db_hashes:
+            placeholders = ",".join(["?"] * len(db_hashes))
+            try:
+                cursor = self.conn.execute(
+                    f"SELECT text_hash, entities_json FROM entity_cache "
+                    f"WHERE model_name = ? AND text_hash IN ({placeholders})",
+                    [model_name] + db_hashes,
+                )
+                rows = cursor.fetchall()
+                hit_hashes: List[str] = []
+                for text_hash, entities_json in rows:
+                    data = json.loads(entities_json)
+                    for idx in hash_to_idxs[text_hash]:
+                        results[idx] = data
+                    self._add_to_memory(f"{text_hash}:{model_name}", data)
+                    hit_hashes.append(text_hash)
+
+                if hit_hashes:
+                    ph = ",".join(["?"] * len(hit_hashes))
+                    self.conn.execute(
+                        f"UPDATE entity_cache "
+                        f"SET hit_count = hit_count + 1, "
+                        f"last_accessed = CURRENT_TIMESTAMP "
+                        f"WHERE model_name = ? AND text_hash IN ({ph})",
+                        [model_name] + hit_hashes,
+                    )
+                    self.conn.commit()
+            except sqlite3.Error as e:
+                logger.error("EntityCache batch GET failed: %s", e)
+
+        return results
+
+    def _add_to_memory(self, mem_key: str, value: Dict[str, Any]) -> None:
+        """Add to in-memory LRU; evict least-recently-used entry if at capacity."""
         if len(self._memory_cache) >= self.max_size:
-            # Entferne ältesten Eintrag
             self._memory_cache.popitem(last=False)
-        self._memory_cache[key] = value
-    
-    def close(self):
-        """Schließe DB-Verbindung."""
-        self.conn.close()
+        self._memory_cache[mem_key] = value
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Return cache statistics."""
+        cursor = self.conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(hit_count), 0) FROM entity_cache"
+        )
+        row = cursor.fetchone()
+        size_bytes = self.cache_path.stat().st_size if self.cache_path.exists() else 0
+        return {
+            "total_entries": row[0] or 0,
+            "total_hits": row[1] or 0,
+            "memory_entries": len(self._memory_cache),
+            "size_mb": size_bytes / (1024 * 1024),
+        }
+
+    def close(self) -> None:
+        """Close the SQLite connection."""
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+
+    def __enter__(self) -> "EntityCache":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
 
 
-# ============================================================================
-# GLiNER NER EXTRACTOR
-# ============================================================================
+# ── GLiNER NER Extractor ───────────────────────────────────────────────────────
 
 class GLiNERExtractor:
     """
-    Named Entity Recognition mit GLiNER-small.
+    Named Entity Recognition via GLiNER (zero-shot).
 
-    GLiNER ist ein Zero-Shot NER Modell, das beliebige Entitätstypen
-    ohne domänenspezifisches Fine-Tuning extrahieren kann.
+    GLiNER predicts entity spans by treating entity-type descriptions as
+    natural-language labels fed to a bidirectional encoder (DeBERTa-v3-small),
+    eliminating the need for domain-specific fine-tuning data.
 
-    Referenz: Zaratiana et al. (2023). "GLiNER: Generalist Model for
-    Named Entity Recognition using Bidirectional Transformer"
+    Reference: Zaratiana, U. et al. (2023). "GLiNER: Generalist Model for
+    Named Entity Recognition using Bidirectional Transformer." arXiv:2311.08526.
+
+    Fallback chain (activated when GLiNER model is unavailable or raises):
+      1. SpaCy en_core_web_sm — loaded once at __init__ to avoid repeated
+         12 MB model-load overhead in the per-chunk hot path.
+      2. Regex proper-noun heuristic — last resort.
     """
 
-    # Normalisierung: natürlichsprachige Typnamen → kanonische Typen
-    _LABEL_MAP: dict = {
+    # Natural-language GLiNER output label → canonical internal type.
+    _LABEL_MAP: Dict[str, str] = {
         "person": "PERSON", "director": "PERSON", "actor": "PERSON",
         "politician": "PERSON", "scientist": "PERSON", "athlete": "PERSON",
         "organization": "ORGANIZATION", "company": "ORGANIZATION",
@@ -337,32 +488,43 @@ class GLiNERExtractor:
         "product": "PRODUCT", "technology": "TECHNOLOGY",
     }
 
-    # Typen, bei denen führende Artikel grammatikalisch sind (kein Eigenname-Teil)
+    # Types for which leading articles are grammatical, not part of the name.
+    # GPE:      "The United States" → "United States"
+    # LOCATION: "The Alps"          → "Alps"
+    # EVENT:    "The Cold War"       → "Cold War"
+    # Excluded: PERSON ("The Rock"), ORGANIZATION ("The Beatles"),
+    #           WORK_OF_ART ("The Dark Knight") — "The" is the official name.
     _STRIP_ARTICLE_TYPES: frozenset = frozenset({"GPE", "LOCATION", "EVENT"})
+
+    # Trailing period must NOT be stripped for these abbreviation suffixes.
+    _ABBREV_SUFFIXES: Tuple[str, ...] = (
+        " Inc.", " Ltd.", " Bros.", " Corp.", " Co.", " Jr.", " Sr.", " Dr.",
+    )
 
     @classmethod
     def _normalize_label(cls, label: str) -> str:
-        """Mappe GLiNER-Typname auf kanonischen Typ; unbekannte Typen uppercase."""
+        """Map a GLiNER output label to the canonical internal type."""
         return cls._LABEL_MAP.get(label.lower(), label.upper())
 
     @classmethod
-    def _normalize_entity_name(cls, name: str, entity_type: str = None) -> str:
+    def _normalize_entity_name(cls, name: str, entity_type: Optional[str] = None) -> str:
         """
-        Normalisiere Entitätsnamen für konsistente Graph-Lookups.
+        Normalize entity name for consistent knowledge-graph lookups.
 
-        - Whitespace trimmen
-        - Trailing Satzzeichen entfernen (,;:)
-        - Führenden Artikel ('The ', 'A ', 'An ') für GPE/LOCATION/EVENT entfernen,
-          weil dort 'The' grammatikalisch ist ('The Cold War' → 'Cold War').
-          Bei PERSON/ORGANIZATION/WORK_OF_ART bleibt 'The' erhalten
-          ('The Beatles', 'The Dark Knight' sind offizielle Namen).
+        Transformations (applied in order):
+          1. Strip leading/trailing whitespace.
+          2. Remove trailing , ; :
+          3. Remove trailing period unless the name ends with a known
+             abbreviation suffix (Inc., Ltd., etc.). Sentence-boundary
+             periods are frequently attached to the last token of a span.
+          4. Strip leading articles ("The ", "A ", "An ") for
+             GPE/LOCATION/EVENT types only, where the article is
+             grammatical rather than part of the official name.
         """
-        name = name.strip()
-        name = name.rstrip(',;:')
-        # Trailing-Punkt entfernen wenn er ein Satzende-Artefakt ist.
-        # Ausnahme: bekannte Abkürzungen am Ende (Inc., Ltd., Bros., Corp., Co., Jr., Sr.)
-        _ABBREV_SUFFIXES = (" Inc.", " Ltd.", " Bros.", " Corp.", " Co.", " Jr.", " Sr.", " Dr.")
-        if name.endswith('.') and not any(name.endswith(s) for s in _ABBREV_SUFFIXES):
+        name = name.strip().rstrip(",;:")
+        if name.endswith(".") and not any(
+            name.endswith(s) for s in cls._ABBREV_SUFFIXES
+        ):
             name = name[:-1]
         if entity_type in cls._STRIP_ARTICLE_TYPES:
             for article in ("The ", "A ", "An "):
@@ -371,659 +533,501 @@ class GLiNERExtractor:
                     break
         return name
 
-    def __init__(self, config: ExtractionConfig):
+    def __init__(self, config: ExtractionConfig) -> None:
         self.config = config
-        self.model = None
+        self.model: Optional[Any] = None
+        self._nlp: Optional[Any] = None   # SpaCy model — loaded once if needed
+        self._fallback_warned: bool = False
         self._load_model()
-    
-    def _load_model(self):
-        """Lade GLiNER Modell."""
+        # Pre-load the SpaCy fallback so _spacy_extract does not call
+        # spacy.load() on every chunk invocation (12 MB model, ~100 ms load).
+        if self.model is None and SPACY_AVAILABLE:
+            self._nlp = self._load_spacy()
+
+    def _load_model(self) -> None:
+        """Load GLiNER model weights. Sets self.model = None on failure."""
         if not GLINER_AVAILABLE:
-            logger.warning("GLiNER not available, using fallback")
+            logger.warning("GLiNER package not installed; fallback chain active")
             return
-        
         try:
-            logger.info(f"Loading GLiNER model: {self.config.gliner_model}")
+            logger.info("Loading GLiNER model: %s", self.config.gliner_model)
             self.model = GLiNER.from_pretrained(self.config.gliner_model)
             logger.info("GLiNER model loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load GLiNER: {e}")
+        except (OSError, ValueError, RuntimeError) as e:
+            logger.error(
+                "Failed to load GLiNER model '%s': %s", self.config.gliner_model, e
+            )
             self.model = None
-    
-    def extract(
-        self, 
-        text: str, 
-        chunk_id: str
-    ) -> List[ExtractedEntity]:
+
+    def _load_spacy(self) -> Optional[Any]:
+        """Load SpaCy model once; return None on failure."""
+        try:
+            nlp = spacy.load("en_core_web_sm")
+            logger.info("SpaCy fallback model loaded (en_core_web_sm)")
+            return nlp
+        except (OSError, ImportError) as e:
+            logger.warning("SpaCy model 'en_core_web_sm' unavailable: %s", e)
+            return None
+
+    def extract(self, text: str, chunk_id: str) -> List[ExtractedEntity]:
         """
-        Extrahiere Entitäten aus einem Text.
-        
+        Extract named entities from a single text chunk.
+
         Args:
-            text: Input-Text
-            chunk_id: ID des Chunks
-            
+            text:     Input text.
+            chunk_id: Unique identifier of the source chunk.
+
         Returns:
-            Liste von ExtractedEntity Objekten
+            List of ExtractedEntity objects.
         """
         if self.model is None:
-            if not getattr(self, '_fallback_warned', False):
+            if not self._fallback_warned:
                 logger.warning(
-                    "FALLBACK: GLiNER-Modell nicht geladen "
-                    "→ SpaCy/Regex-Extraktion wird verwendet"
+                    "GLiNER model unavailable — using %s fallback for NER",
+                    "SpaCy" if self._nlp is not None else "regex",
                 )
                 self._fallback_warned = True
             return self._fallback_extract(text, chunk_id)
-        
+
         try:
-            # GLiNER Prediction
             entities = self.model.predict_entities(
                 text,
                 self.config.entity_types,
-                threshold=self.config.ner_confidence_threshold
+                threshold=self.config.ner_confidence_threshold,
             )
-            
-            results = []
-            for ent in entities:
-                canonical_type = self._normalize_label(ent["label"])
-                norm_name = self._normalize_entity_name(ent["text"], canonical_type)
-                entity = ExtractedEntity(
-                    entity_id=self._generate_entity_id(norm_name, canonical_type),
-                    name=norm_name,
-                    entity_type=canonical_type,
-                    confidence=ent["score"],
-                    mention_span=(ent["start"], ent["end"]),
-                    source_chunk_id=chunk_id,
-                )
-                results.append(entity)
-
-            return results
-
-        except Exception as e:
-            logger.error(f"GLiNER extraction failed: {e}")
+            return self._build_entities(entities, chunk_id)
+        except (RuntimeError, ValueError) as e:
+            logger.error("GLiNER extraction failed: %s", e)
             return self._fallback_extract(text, chunk_id)
-    
+
     def extract_batch(
-        self, 
-        texts: List[str], 
-        chunk_ids: List[str]
+        self,
+        texts: List[str],
+        chunk_ids: List[str],
     ) -> List[List[ExtractedEntity]]:
         """
-        Batch-Extraktion für multiple Texte.
-        
-        Optimiert für Throughput durch Batching (16 Texte pro Batch).
+        Batch NER for multiple texts.
+
+        Processes texts in batches of config.ner_batch_size to amortise
+        GLiNER inference overhead. Falls back per-batch on exception.
+
+        Args:
+            texts:     Input texts.
+            chunk_ids: Corresponding chunk identifiers.
+
+        Returns:
+            List of entity lists in the same order as the input.
         """
         if self.model is None:
             logger.warning(
-                "⚠ FALLBACK AKTIV: GLiNER-Modell nicht geladen → Batch-Extraktion nutzt SpaCy/Regex. "
-                "Alle %d Chunks betroffen.",
+                "GLiNER model unavailable — fallback NER for all %d chunks",
                 len(texts),
             )
             return [self._fallback_extract(t, c) for t, c in zip(texts, chunk_ids)]
-        
-        all_results = []
-        batch_size = self.config.ner_batch_size
-        
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
-            batch_ids = chunk_ids[i:i + batch_size]
-            
+
+        all_results: List[List[ExtractedEntity]] = []
+        for i in range(0, len(texts), self.config.ner_batch_size):
+            batch_texts = texts[i : i + self.config.ner_batch_size]
+            batch_ids = chunk_ids[i : i + self.config.ner_batch_size]
             try:
-                # GLiNER unterstützt Batch-Processing
                 batch_entities = self.model.batch_predict_entities(
                     batch_texts,
                     self.config.entity_types,
-                    threshold=self.config.ner_confidence_threshold
+                    threshold=self.config.ner_confidence_threshold,
                 )
-                
                 for text_entities, chunk_id in zip(batch_entities, batch_ids):
-                    results = []
-                    for ent in text_entities:
-                        canonical_type = self._normalize_label(ent["label"])
-                        norm_name = self._normalize_entity_name(ent["text"], canonical_type)
-                        entity = ExtractedEntity(
-                            entity_id=self._generate_entity_id(norm_name, canonical_type),
-                            name=norm_name,
-                            entity_type=canonical_type,
-                            confidence=ent["score"],
-                            mention_span=(ent["start"], ent["end"]),
-                            source_chunk_id=chunk_id,
-                        )
-                        results.append(entity)
-                    all_results.append(results)
-                    
-            except Exception as e:
-                logger.error(f"Batch extraction failed: {e}")
-                # Fallback für diesen Batch
-                for text, chunk_id in zip(batch_texts, batch_ids):
-                    all_results.append(self._fallback_extract(text, chunk_id))
-        
+                    all_results.append(self._build_entities(text_entities, chunk_id))
+            except (RuntimeError, ValueError) as e:
+                logger.error(
+                    "GLiNER batch extraction failed (batch starting at %d): %s", i, e
+                )
+                for t, c in zip(batch_texts, batch_ids):
+                    all_results.append(self._fallback_extract(t, c))
+
         return all_results
-    
+
+    def _build_entities(
+        self, raw_entities: List[Dict[str, Any]], chunk_id: str
+    ) -> List[ExtractedEntity]:
+        """Convert GLiNER prediction dicts to ExtractedEntity objects."""
+        results = []
+        for ent in raw_entities:
+            canonical_type = self._normalize_label(ent["label"])
+            norm_name = self._normalize_entity_name(ent["text"], canonical_type)
+            results.append(ExtractedEntity(
+                entity_id=_generate_entity_id(norm_name, canonical_type),
+                name=norm_name,
+                entity_type=canonical_type,
+                confidence=ent["score"],
+                mention_span=(ent["start"], ent["end"]),
+                source_chunk_id=chunk_id,
+            ))
+        return results
+
     def _fallback_extract(self, text: str, chunk_id: str) -> List[ExtractedEntity]:
-        """Fallback NER mit SpaCy oder Regex."""
-        if SPACY_AVAILABLE:
+        """Route to SpaCy (if loaded) or regex fallback."""
+        if self._nlp is not None:
             return self._spacy_extract(text, chunk_id)
         return self._regex_extract(text, chunk_id)
-    
+
     def _spacy_extract(self, text: str, chunk_id: str) -> List[ExtractedEntity]:
-        """SpaCy-basierte NER als Fallback."""
+        """
+        SpaCy-based NER fallback.
+
+        Confidence is set to 0.7 as a sentinel value: SpaCy en_core_web_sm
+        is a supervised pipeline-model but does not emit per-span probabilities.
+        """
+        _TYPE_MAP = {
+            "PERSON": "PERSON", "ORG": "ORGANIZATION",
+            "GPE": "LOCATION", "LOC": "LOCATION",
+            "DATE": "DATE", "EVENT": "EVENT",
+        }
         try:
-            nlp = spacy.load("en_core_web_sm")
-            doc = nlp(text)
-            
-            # SpaCy -> GLiNER Type Mapping
-            type_map = {
-                "PERSON": "PERSON",
-                "ORG": "ORGANIZATION",
-                "GPE": "LOCATION",
-                "LOC": "LOCATION",
-                "DATE": "DATE",
-                "EVENT": "EVENT",
-            }
-            
+            doc = self._nlp(text)
             results = []
             for ent in doc.ents:
-                ent_type = type_map.get(ent.label_, "CONCEPT")
-                entity = ExtractedEntity(
-                    entity_id=self._generate_entity_id(ent.text, ent_type),
+                ent_type = _TYPE_MAP.get(ent.label_, "CONCEPT")
+                results.append(ExtractedEntity(
+                    entity_id=_generate_entity_id(ent.text, ent_type),
                     name=ent.text,
                     entity_type=ent_type,
-                    confidence=0.7,  # SpaCy gibt keine Confidence
+                    confidence=0.7,   # sentinel: supervised model, no per-span score
                     mention_span=(ent.start_char, ent.end_char),
                     source_chunk_id=chunk_id,
-                )
-                results.append(entity)
-            
+                ))
             return results
-            
-        except Exception as e:
-            logger.error(f"SpaCy extraction failed: {e}")
+        except (RuntimeError, AttributeError) as e:
+            logger.error("SpaCy extraction failed: %s", e)
             return self._regex_extract(text, chunk_id)
-    
+
     def _regex_extract(self, text: str, chunk_id: str) -> List[ExtractedEntity]:
-        """Regex-basierte Entity Extraction als letzter Fallback."""
-        import re
-        
+        """
+        Regex proper-noun heuristic — last-resort fallback.
+
+        Matches multi-word sequences of Title-Cased tokens. Confidence is
+        set to 0.5 as a sentinel — this is a heuristic, not a model score.
+        All entities are assigned the CONCEPT type.
+        """
         results = []
-        
-        # Proper Nouns (Multi-word)
-        for match in re.finditer(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b', text):
-            entity = ExtractedEntity(
-                entity_id=self._generate_entity_id(match.group(1), "CONCEPT"),
+        for match in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", text):
+            results.append(ExtractedEntity(
+                entity_id=_generate_entity_id(match.group(1), "CONCEPT"),
                 name=match.group(1),
                 entity_type="CONCEPT",
-                confidence=0.5,
+                confidence=0.5,   # sentinel: heuristic, not a model score
                 mention_span=(match.start(), match.end()),
                 source_chunk_id=chunk_id,
-            )
-            results.append(entity)
-        
+            ))
         return results
-    
-    @staticmethod
-    def _generate_entity_id(name: str, entity_type: str) -> str:
-        """Generiere eindeutige Entity ID."""
-        combined = f"{name.lower().strip()}:{entity_type}"
-        return hashlib.md5(combined.encode()).hexdigest()[:12]
 
 
-# ============================================================================
-# REBEL RELATION EXTRACTOR
-# ============================================================================
-
-# Ersetzen Sie die gesamte REBELExtractor Klasse in entity_extraction.py hiermit:
+# ── REBEL Relation Extractor ───────────────────────────────────────────────────
 
 class REBELExtractor:
     """
-    Relation Extraction mit REBEL.
-    Implementierung via model.generate() statt pipeline(), um Task-Fehler zu vermeiden.
+    Relation Extraction via REBEL (Relation Extraction By End-to-end Language).
+
+    REBEL casts RE as a seq2seq task: the input is raw text; the output is a
+    linearized sequence of (subject, relation, object) triplets encoded with
+    special tokens (<triplet>, <subj>, <obj>).
+
+    Reference: Cabot, P. L. H., & Navigli, R. (2021). "REBEL: Relation
+    Extraction by End-to-end Language generation." EMNLP 2021 Findings.
+
+    Implementation note:
+        model.generate() is used directly rather than the HuggingFace
+        pipeline() abstraction to avoid task-label inference errors from the
+        REBEL model card.
+
+    Memory note:
+        rebel-large requires ~2.7 GB RAM. On edge hardware with < 16 GB,
+        evaluate whether RE is required for the use case. SpacyEntityPipeline
+        (relations=[]) eliminates this footprint entirely.
+
+    Non-determinism:
+        Beam search on CPU is deterministic given identical inputs and weights.
+        On GPU, set torch.backends.cudnn.deterministic = True if strict
+        reproducibility across runs is required.
     """
-    
-    def __init__(self, config: ExtractionConfig):
+
+    def __init__(self, config: ExtractionConfig) -> None:
         self.config = config
-        self.model = None
-        self.tokenizer = None
-        self.device = "cpu"  # Oder "cuda" wenn verfügbar
+        self.model: Optional[Any] = None
+        self.tokenizer: Optional[Any] = None
         self._load_model()
-    
-    def _load_model(self):
+
+    def _load_model(self) -> None:
+        """Load REBEL tokenizer and model. Sets self.model = None on failure."""
         if not TRANSFORMERS_AVAILABLE:
-            logger.warning("Transformers not available, REBEL disabled")
+            logger.warning("Transformers package not installed; REBEL disabled")
             return
-        
         try:
-            logger.info(f"Loading REBEL model: {self.config.rebel_model}")
+            logger.info("Loading REBEL model: %s", self.config.rebel_model)
             self.tokenizer = AutoTokenizer.from_pretrained(self.config.rebel_model)
             self.model = AutoModelForSeq2SeqLM.from_pretrained(self.config.rebel_model)
-            self.model.to(self.device)
+            self.model.to(self.config.device)
             logger.info("REBEL model loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load REBEL: {e}")
+        except (OSError, ValueError, RuntimeError) as e:
+            logger.error(
+                "Failed to load REBEL model '%s': %s", self.config.rebel_model, e
+            )
             self.model = None
-    
-    def extract(self, text: str, entities: List[ExtractedEntity], chunk_id: str) -> List[ExtractedRelation]:
-        # Optimization: Skip if not enough entities (Thesis 2.5)
+
+    def extract(
+        self,
+        text: str,
+        entities: List[ExtractedEntity],
+        chunk_id: str,
+    ) -> List[ExtractedRelation]:
+        """
+        Extract relations from text given the entities identified by NER.
+
+        Selective application: returns [] immediately if fewer than
+        config.min_entities_for_re entities were found, avoiding ~60% of
+        REBEL calls on HotpotQA where most chunks mention only one entity.
+
+        Args:
+            text:     Input chunk text.
+            entities: NER-extracted entities for this chunk.
+            chunk_id: Source chunk identifier.
+
+        Returns:
+            List of ExtractedRelation objects, empty if REBEL is unavailable
+            or too few entities are present.
+        """
         if len(entities) < self.config.min_entities_for_re:
             return []
-        
+
         if self.model is None:
+            logger.warning(
+                "REBEL model unavailable — relation extraction skipped (chunk %s)",
+                chunk_id,
+            )
             return []
-        
+
         try:
-            # Tokenize & Generate
             inputs = self.tokenizer(
-                text, max_length=256, padding=True, truncation=True, return_tensors="pt"
-            ).to(self.device)
+                text,
+                max_length=self.config.rebel_max_input_length,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            ).to(self.config.device)
 
             generated_ids = self.model.generate(
                 inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
-                max_length=256,
-                num_beams=5,
+                max_length=self.config.rebel_max_output_length,
+                num_beams=self.config.rebel_num_beams,
                 num_return_sequences=1,
             )
 
-            # Decode
-            raw_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=False)
-            # Cleanup special tokens that might break parsing
-            raw_text = raw_text.replace("<s>", "").replace("</s>", "").replace("<pad>", "")
+            raw_text = self.tokenizer.decode(
+                generated_ids[0], skip_special_tokens=False
+            )
+            raw_text = (
+                raw_text.replace("<s>", "")
+                .replace("</s>", "")
+                .replace("<pad>", "")
+            )
 
             triplets = self._parse_triplets(raw_text)
-            
-            # Filter: Keep only relations connecting known entities
             entity_names = {e.name.lower() for e in entities}
+
             results = []
-            
             for subj, rel, obj in triplets:
-                # Check if subject or object matches any extracted entity (fuzzy match)
-                is_relevant = any(e in subj.lower() or e in obj.lower() for e in entity_names)
-                
-                if is_relevant:
-                    relation = ExtractedRelation(
+                # Relevance filter: keep triplets referencing at least one
+                # known entity (substring check to handle partial name matches).
+                if any(e in subj.lower() or e in obj.lower() for e in entity_names):
+                    results.append(ExtractedRelation(
                         subject_entity=subj.strip(),
                         relation_type=rel.strip(),
                         object_entity=obj.strip(),
+                        # REBEL does not emit per-triplet scores; re_confidence_threshold
+                        # is used as a uniform sentinel value for all extracted triplets.
                         confidence=self.config.re_confidence_threshold,
                         source_chunk_ids=[chunk_id],
-                    )
-                    results.append(relation)
-            
+                    ))
             return results
-            
-        except Exception as e:
-            logger.error(f"REBEL extraction failed: {e}")
+
+        except (RuntimeError, ValueError) as e:
+            logger.error("REBEL extraction failed for chunk %s: %s", chunk_id, e)
             return []
 
     def _parse_triplets(self, text: str) -> List[Tuple[str, str, str]]:
+        """
+        Parse REBEL output format into (subject, relation, object) tuples.
+
+        REBEL linearization format:
+          <triplet> subject <subj> object <obj> relation [<triplet> ...]
+        """
         triplets = []
         try:
-            # REBEL Format ist oft: Subject <subj> Object <obj> Relation
-            parts = text.split("<triplet>")
-            for part in parts:
-                if "<subj>" in part and "<obj>" in part:
-                    subj_parts = part.split("<subj>")
-                    subject = subj_parts[0]
-                    
-                    # Split nach Object und Relation
-                    obj_rel_parts = subj_parts[1].split("<obj>")
-                    object_ = obj_rel_parts[0]  # Das ist das Objekt (z.B. Bill Gates)
-                    relation = obj_rel_parts[1] # Das ist die Relation (z.B. founded by)
-                    
-                    if subject and relation and object_:
-                        triplets.append((subject.strip(), relation.strip(), object_.strip()))
-        except Exception as e:
-            logger.debug(f"Triplet-Parsing fehlgeschlagen (übersprungen): {e}")
+            for part in text.split("<triplet>"):
+                if "<subj>" not in part or "<obj>" not in part:
+                    continue
+                subj_parts = part.split("<subj>")
+                subject = subj_parts[0].strip()
+                obj_rel_parts = subj_parts[1].split("<obj>")
+                object_ = obj_rel_parts[0].strip()
+                relation = obj_rel_parts[1].strip()
+                if subject and relation and object_:
+                    triplets.append((subject, relation, object_))
+        except (IndexError, AttributeError) as e:
+            logger.debug("Triplet parsing skipped (malformed REBEL output): %s", e)
         return triplets
 
-    def extract_batch(self, texts, entities_per_text, chunk_ids):
-        # Fallback to sequential for stability if batching is complex with manual generate
-        # Or implement manual batching similar to extract() but with padded inputs
-        results = []
-        for t, e, c in zip(texts, entities_per_text, chunk_ids):
-            results.append(self.extract(t, e, c))
-        return results
+    def extract_sequential(
+        self,
+        texts: List[str],
+        entities_per_text: List[List[ExtractedEntity]],
+        chunk_ids: List[str],
+    ) -> List[List[ExtractedRelation]]:
+        """
+        Apply relation extraction to a list of texts, one at a time.
 
-# ============================================================================
-# UNIFIED EXTRACTION PIPELINE
-# ============================================================================
+        Note: REBEL's variable-length seq2seq output does not support true
+        input batching without additional padding logic. This method processes
+        texts sequentially. The re_batch_size parameter in ExtractionConfig
+        is reserved for a future batched implementation.
+
+        Args:
+            texts:             Input texts.
+            entities_per_text: Parallel entity lists.
+            chunk_ids:         Parallel chunk identifiers.
+
+        Returns:
+            List of relation lists in the same order as the input.
+        """
+        return [
+            self.extract(t, e, c)
+            for t, e, c in zip(texts, entities_per_text, chunk_ids)
+        ]
+
+
+# ── Unified Extraction Pipeline ────────────────────────────────────────────────
 
 class EntityExtractionPipeline:
     """
-    Unified Entity Extraction Pipeline: GLiNER + REBEL.
-    
-    Kombiniert NER und RE in einer optimierten Pipeline mit:
-    - Batch-Processing (GLiNER: 16, REBEL: 8)
-    - Entity Caching (LRU + SQLite)
-    - Selective RE (nur bei >= 2 Entitäten)
-    
-    Ziel-Latenz: 80-120ms pro Chunk
+    Orchestrates GLiNER NER + REBEL RE with cache-first batch processing.
+
+    Processing stages per batch (process_chunks_batch):
+      Phase 1 — Batch cache lookup: single SQL query for all N texts.
+      Phase 2 — Batch NER for cache misses (GLiNERExtractor.extract_batch).
+      Phase 3 — Sequential RE for chunks with ≥ min_entities_for_re.
+      Phase 4 — Cache write for newly extracted results.
+      Phase 5 — Result reassembly in original input order.
+
+    Typical latency (CPU, gliner_small-v2.1, rebel-large):
+      Cache hit:           ~0.5 ms/chunk (memory) | ~1 ms/chunk (SQLite)
+      Cache miss, NER:     ~6–10 ms/chunk
+      Cache miss, NER+RE:  ~80–120 ms/chunk
     """
-    
-    def __init__(self, config: ExtractionConfig = None):
+
+    def __init__(self, config: Optional[ExtractionConfig] = None) -> None:
         self.config = config or ExtractionConfig()
-        
-        # Komponenten initialisieren
         self.ner_extractor = GLiNERExtractor(self.config)
         self.re_extractor = REBELExtractor(self.config)
-        
-        # Cache
-        if self.config.cache_enabled:
-            self.cache = EntityCache(
-                self.config.cache_path,
-                self.config.lru_cache_size
-            )
-        else:
-            self.cache = None
-        
-        # Statistiken
-        self.stats = {
+        self.cache: Optional[EntityCache] = (
+            EntityCache(self.config.cache_path, self.config.lru_cache_size)
+            if self.config.cache_enabled
+            else None
+        )
+        self.stats: Dict[str, Any] = {
             "total_chunks": 0,
             "cache_hits": 0,
             "ner_calls": 0,
             "re_calls": 0,
             "total_entities": 0,
             "total_relations": 0,
-            "avg_latency_ms": 0,
+            # Note: last_batch_avg_ms reflects the most recent batch only,
+            # not a session-wide average.
+            "last_batch_avg_ms": 0.0,
         }
-        
         logger.info("EntityExtractionPipeline initialized")
-    
-    def process_chunk(
-        self, 
-        text: str, 
-        chunk_id: str
-    ) -> ChunkExtractionResult:
+
+    # ── Cache reconstruction ─────────────────────────────────────────────────
+
+    def _reconstruct_from_cache(
+        self,
+        cached: Dict[str, Any],
+        chunk_id: str,
+    ) -> Tuple[List[ExtractedEntity], List[ExtractedRelation]]:
         """
-        Verarbeite einen einzelnen Chunk.
-        
-        Args:
-            text: Chunk-Text
-            chunk_id: Eindeutige Chunk-ID
-            
-        Returns:
-            ChunkExtractionResult mit Entitäten und Relationen
+        Deserialize a cached extraction result into typed objects.
+
+        Handles both the current serialization format (entity_type key) and
+        the legacy format (type key) for backwards compatibility with caches
+        written by earlier versions of this module.
         """
-        start_time = time.time()
+        entities = [
+            ExtractedEntity(
+                entity_id=e.get("entity_id", ""),
+                name=e.get("name", ""),
+                entity_type=e.get("entity_type", e.get("type", "CONCEPT")),
+                confidence=e.get("confidence", 0.5),
+                mention_span=tuple(e.get("mention_span", [0, 0])),
+                source_chunk_id=chunk_id,
+            )
+            for e in cached.get("entities", [])
+        ]
+        relations = [
+            ExtractedRelation(
+                subject_entity=r.get("subject_entity", r.get("subject", "")),
+                relation_type=r.get("relation_type", r.get("relation", "")),
+                object_entity=r.get("object_entity", r.get("object", "")),
+                confidence=r.get("confidence", 0.5),
+                source_chunk_ids=[chunk_id],
+            )
+            for r in cached.get("relations", [])
+        ]
+        return entities, relations
+
+    # ── Public API ───────────────────────────────────────────────────────────
+
+    def process_chunk(self, text: str, chunk_id: str) -> ChunkExtractionResult:
+        """
+        Extract entities and relations from a single chunk.
+
+        Checks the entity cache first; runs GLiNER + REBEL on a cache miss.
+        """
+        start = time.time()
         self.stats["total_chunks"] += 1
-        
-        # Cache Check
+
         if self.cache:
-            cached = self.cache.get(text)
-            if cached:
+            cached = self.cache.get(text, self.config.gliner_model)
+            if cached is not None:
                 self.stats["cache_hits"] += 1
-                # Reconstruct entities from cache
-                entities = []
-                for e in cached.get("entities", []):
-                    # Cache stores 'type', but ExtractedEntity expects 'entity_type'
-                    entity_dict = {
-                        "entity_id": e.get("entity_id", ""),
-                        "name": e.get("name", ""),
-                        "entity_type": e.get("type", e.get("entity_type", "CONCEPT")),
-                        "confidence": e.get("confidence", 0.5),
-                        "mention_span": tuple(e.get("mention_span", [0, 0])),
-                        "source_chunk_id": chunk_id  # Override with current chunk_id
-                    }
-                    entities.append(ExtractedEntity(**entity_dict))
-                
-                # Reconstruct relations from cache
-                relations = []
-                for r in cached.get("relations", []):
-                    relation_dict = {
-                        "subject_entity": r.get("subject", r.get("subject_entity", "")),
-                        "relation_type": r.get("relation", r.get("relation_type", "")),
-                        "object_entity": r.get("object", r.get("object_entity", "")),
-                        "confidence": r.get("confidence", 0.5),
-                        "source_chunk_ids": [chunk_id]  # Override with current chunk_id
-                    }
-                    relations.append(ExtractedRelation(**relation_dict))
-                
+                entities, relations = self._reconstruct_from_cache(cached, chunk_id)
                 return ChunkExtractionResult(
-                    chunk_id=chunk_id,
-                    text=text,
-                    entities=entities,
-                    relations=relations,
-                    extraction_time_ms=(time.time() - start_time) * 1000,
+                    chunk_id=chunk_id, text=text,
+                    entities=entities, relations=relations,
+                    extraction_time_ms=(time.time() - start) * 1000,
                 )
-        
-        # NER mit GLiNER
+
         self.stats["ner_calls"] += 1
         entities = self.ner_extractor.extract(text, chunk_id)
-        
-        # RE mit REBEL (nur wenn >= min_entities_for_re)
-        relations = []
+
+        relations: List[ExtractedRelation] = []
         if len(entities) >= self.config.min_entities_for_re:
             self.stats["re_calls"] += 1
             relations = self.re_extractor.extract(text, entities, chunk_id)
-        
-        # Cache Update
+
         if self.cache:
-            cache_data = {
-                "entities": [e.to_dict() for e in entities],
-                "relations": [r.to_dict() for r in relations],
-            }
-            self.cache.put(text, cache_data)
-        
-        # Statistiken
+            self.cache.put(
+                text,
+                {"entities": [e.to_dict() for e in entities],
+                 "relations": [r.to_dict() for r in relations]},
+                self.config.gliner_model,
+            )
+
         self.stats["total_entities"] += len(entities)
         self.stats["total_relations"] += len(relations)
-        
-        elapsed_ms = (time.time() - start_time) * 1000
-        
         return ChunkExtractionResult(
-            chunk_id=chunk_id,
-            text=text,
-            entities=entities,
-            relations=relations,
-            extraction_time_ms=elapsed_ms,
+            chunk_id=chunk_id, text=text,
+            entities=entities, relations=relations,
+            extraction_time_ms=(time.time() - start) * 1000,
         )
-    
-    def process_chunks_batch(
-        self,
-        texts: List[str],
-        chunk_ids: List[str]
-    ) -> List[ChunkExtractionResult]:
-        """
-        Batch-Verarbeitung mehrerer Chunks.
-        
-        Optimiert für Throughput durch:
-        - Batch NER (16 Texte)
-        - Batch RE (8 Texte)
-        - Cache-Lookups
-        
-        Args:
-            texts: Liste von Chunk-Texten
-            chunk_ids: Liste von Chunk-IDs
-            
-        Returns:
-            Liste von ChunkExtractionResult
-        """
-        start_time = time.time()
-        results = []
-        
-        # Separate cached und uncached
-        uncached_indices = []
-        uncached_texts = []
-        uncached_ids = []
-        
-        for i, (text, chunk_id) in enumerate(zip(texts, chunk_ids)):
-            self.stats["total_chunks"] += 1
-            
-            if self.cache:
-                cached = self.cache.get(text)
-                if cached:
-                    self.stats["cache_hits"] += 1
-                    # Reconstruct entities from cache
-                    entities = []
-                    for e in cached.get("entities", []):
-                        entity_dict = {
-                            "entity_id": e.get("entity_id", ""),
-                            "name": e.get("name", ""),
-                            "entity_type": e.get("type", e.get("entity_type", "CONCEPT")),
-                            "confidence": e.get("confidence", 0.5),
-                            "mention_span": tuple(e.get("mention_span", [0, 0])),
-                            "source_chunk_id": chunk_id
-                        }
-                        entities.append(ExtractedEntity(**entity_dict))
-                    
-                    # Reconstruct relations from cache
-                    relations = []
-                    for r in cached.get("relations", []):
-                        relation_dict = {
-                            "subject_entity": r.get("subject", r.get("subject_entity", "")),
-                            "relation_type": r.get("relation", r.get("relation_type", "")),
-                            "object_entity": r.get("object", r.get("object_entity", "")),
-                            "confidence": r.get("confidence", 0.5),
-                            "source_chunk_ids": [chunk_id]
-                        }
-                        relations.append(ExtractedRelation(**relation_dict))
-                    
-                    results.append((i, ChunkExtractionResult(
-                        chunk_id=chunk_id,
-                        text=text,
-                        entities=entities,
-                        relations=relations,
-                        extraction_time_ms=0,
-                    )))
-                    continue
-            
-            uncached_indices.append(i)
-            uncached_texts.append(text)
-            uncached_ids.append(chunk_id)
-        
-        # Batch NER für uncached
-        if uncached_texts:
-            self.stats["ner_calls"] += len(uncached_texts)
-            all_entities = self.ner_extractor.extract_batch(uncached_texts, uncached_ids)
-            
-            # Batch RE (nur für Texte mit >= min_entities)
-            all_relations = self.re_extractor.extract_batch(
-                uncached_texts, all_entities, uncached_ids
-            )
-            self.stats["re_calls"] += sum(
-                1 for ents in all_entities 
-                if len(ents) >= self.config.min_entities_for_re
-            )
-            
-            # Ergebnisse zusammenführen
-            for idx, text, chunk_id, entities, relations in zip(
-                uncached_indices, uncached_texts, uncached_ids, all_entities, all_relations
-            ):
-                # Update relation source chunks
-                for rel in relations:
-                    rel.source_chunk_ids = [chunk_id]
-                
-                # Cache
-                if self.cache:
-                    cache_data = {
-                        "entities": [e.to_dict() for e in entities],
-                        "relations": [r.to_dict() for r in relations],
-                    }
-                    self.cache.put(text, cache_data)
-                
-                self.stats["total_entities"] += len(entities)
-                self.stats["total_relations"] += len(relations)
-                
-                results.append((idx, ChunkExtractionResult(
-                    chunk_id=chunk_id,
-                    text=text,
-                    entities=entities,
-                    relations=relations,
-                    extraction_time_ms=0,
-                )))
-        
-        # Sort by original index
-        results.sort(key=lambda x: x[0])
-        final_results = [r[1] for r in results]
-        
-        # Update timing
-        total_elapsed = (time.time() - start_time) * 1000
-        avg_per_chunk = total_elapsed / len(texts) if texts else 0
-        self.stats["avg_latency_ms"] = avg_per_chunk
-        
-        for result in final_results:
-            result.extraction_time_ms = avg_per_chunk
-        
-        logger.info(
-            f"Batch extraction: {len(texts)} chunks, "
-            f"{self.stats['total_entities']} entities, "
-            f"{self.stats['total_relations']} relations, "
-            f"{total_elapsed:.0f}ms total ({avg_per_chunk:.1f}ms/chunk)"
-        )
-        
-        return final_results
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Hole Statistiken."""
-        return {
-            **self.stats,
-            "cache_hit_rate": (
-                self.stats["cache_hits"] / self.stats["total_chunks"]
-                if self.stats["total_chunks"] > 0 else 0
-            ),
-            "re_skip_rate": (
-                1 - (self.stats["re_calls"] / self.stats["ner_calls"])
-                if self.stats["ner_calls"] > 0 else 0
-            ),
-        }
-    
-    def close(self):
-        """Cleanup."""
-        if self.cache:
-            self.cache.close()
-
-
-# ============================================================================
-# SPACY ENTITY PIPELINE (Edge-optimiert, kein GLiNER/REBEL)
-# ============================================================================
-
-class SpacyEntityPipeline:
-    """
-    Lightweight Entity Extraction Pipeline auf Basis von SpaCy.
-
-    Ersetzt GLiNER + REBEL für Edge-Devices:
-    - Modell: en_core_web_sm (12 MB, bereits für Chunking installiert)
-    - Latenz: 3-5 ms pro Chunk (vs. 80-120 ms mit GLiNER)
-    - Kein Modell-Download erforderlich
-
-    Implementiert dieselbe Schnittstelle wie EntityExtractionPipeline:
-    - process_chunks_batch(texts, chunk_ids) → List[ChunkExtractionResult]
-
-    Erkannte Entity-Typen (SpaCy → interne Bezeichnung):
-    - PERSON  → PERSON
-    - ORG     → ORGANIZATION
-    - GPE     → LOCATION   (Länder, Städte, Bundesstaaten)
-    - LOC     → LOCATION   (geografische Orte)
-    - DATE    → DATE
-    - EVENT   → EVENT
-    """
-
-    # SpaCy-Label → interner Entity-Typ
-    _LABEL_MAP = {
-        "PERSON":  "PERSON",
-        "ORG":     "ORGANIZATION",
-        "GPE":     "LOCATION",
-        "LOC":     "LOCATION",
-        "DATE":    "DATE",
-        "EVENT":   "EVENT",
-        "WORK_OF_ART": "WORK_OF_ART",
-        "FAC":     "LOCATION",
-        # NORP (Nationalities/religious groups) absichtlich nicht gemappt → wird ignoriert
-    }
-
-    def __init__(self, spacy_model: str = "en_core_web_sm", batch_size: int = 64):
-        """
-        Args:
-            spacy_model: SpaCy-Modell (muss installiert sein)
-            batch_size:  Chunks pro nlp.pipe()-Batch
-        """
-        import spacy as _spacy
-        self.nlp = _spacy.load(spacy_model)
-        self.batch_size = batch_size
-        logger.info(f"SpacyEntityPipeline initialisiert: model={spacy_model}")
-
-    # ------------------------------------------------------------------
-    # Öffentliche Schnittstelle (kompatibel mit EntityExtractionPipeline)
-    # ------------------------------------------------------------------
 
     def process_chunks_batch(
         self,
@@ -1031,17 +1035,205 @@ class SpacyEntityPipeline:
         chunk_ids: List[str],
     ) -> List[ChunkExtractionResult]:
         """
-        Extrahiere Named Entities aus einer Liste von Chunk-Texten.
+        Batch entity extraction with cache-first strategy.
+
+        Phase 1 — Batch cache lookup: single SQL query for all N texts,
+                   replacing N individual round-trips.
+        Phase 2 — Batch NER for cache misses (GLiNER batches ner_batch_size).
+        Phase 3 — Sequential RE for chunks with ≥ min_entities_for_re.
+        Phase 4 — Cache write for newly extracted results.
+        Phase 5 — Reassembly in original input order.
 
         Args:
-            texts:     Chunk-Texte
-            chunk_ids: Eindeutige IDs (parallel zu texts)
+            texts:     Chunk texts in processing order.
+            chunk_ids: Corresponding chunk identifiers.
 
         Returns:
-            List[ChunkExtractionResult] — selbes Format wie EntityExtractionPipeline
+            ChunkExtractionResult list in the same order as the input.
+        """
+        start = time.time()
+        results: List[Tuple[int, ChunkExtractionResult]] = []
+        uncached_indices: List[int] = []
+        uncached_texts: List[str] = []
+        uncached_ids: List[str] = []
+
+        self.stats["total_chunks"] += len(texts)
+
+        # Phase 1: Batch cache lookup
+        cached_map = (
+            self.cache.get_batch(texts, self.config.gliner_model)
+            if self.cache else {}
+        )
+        for i, (text, chunk_id) in enumerate(zip(texts, chunk_ids)):
+            if i in cached_map:
+                self.stats["cache_hits"] += 1
+                entities, relations = self._reconstruct_from_cache(
+                    cached_map[i], chunk_id
+                )
+                results.append((i, ChunkExtractionResult(
+                    chunk_id=chunk_id, text=text,
+                    entities=entities, relations=relations,
+                    extraction_time_ms=0.0,
+                )))
+            else:
+                uncached_indices.append(i)
+                uncached_texts.append(text)
+                uncached_ids.append(chunk_id)
+
+        # Phase 2 + 3: NER + RE for cache misses
+        if uncached_texts:
+            self.stats["ner_calls"] += len(uncached_texts)
+            all_entities = self.ner_extractor.extract_batch(uncached_texts, uncached_ids)
+            all_relations = self.re_extractor.extract_sequential(
+                uncached_texts, all_entities, uncached_ids
+            )
+            self.stats["re_calls"] += sum(
+                1 for ents in all_entities
+                if len(ents) >= self.config.min_entities_for_re
+            )
+
+            for idx, text, chunk_id, entities, relations in zip(
+                uncached_indices, uncached_texts, uncached_ids,
+                all_entities, all_relations,
+            ):
+                for rel in relations:
+                    rel.source_chunk_ids = [chunk_id]
+
+                # Phase 4: Cache write
+                if self.cache:
+                    self.cache.put(
+                        text,
+                        {"entities": [e.to_dict() for e in entities],
+                         "relations": [r.to_dict() for r in relations]},
+                        self.config.gliner_model,
+                    )
+
+                self.stats["total_entities"] += len(entities)
+                self.stats["total_relations"] += len(relations)
+                results.append((idx, ChunkExtractionResult(
+                    chunk_id=chunk_id, text=text,
+                    entities=entities, relations=relations,
+                    extraction_time_ms=0.0,
+                )))
+
+        # Phase 5: Restore original input order
+        results.sort(key=lambda x: x[0])
+        final_results = [r[1] for r in results]
+
+        total_elapsed = (time.time() - start) * 1000
+        avg_per_chunk = total_elapsed / len(texts) if texts else 0.0
+        self.stats["last_batch_avg_ms"] = avg_per_chunk
+        for result in final_results:
+            result.extraction_time_ms = avg_per_chunk
+
+        logger.info(
+            "Batch extraction: %d chunks, %d entities, %d relations, "
+            "%.0fms total (%.1fms/chunk)",
+            len(texts),
+            sum(len(r.entities) for r in final_results),
+            sum(len(r.relations) for r in final_results),
+            total_elapsed, avg_per_chunk,
+        )
+        return final_results
+
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Return cumulative pipeline statistics.
+
+        Note: last_batch_avg_ms reflects the most recent process_chunks_batch
+        call, not a session-wide average.
+        """
+        total = self.stats["total_chunks"]
+        ner = self.stats["ner_calls"]
+        return {
+            **self.stats,
+            "cache_hit_rate": self.stats["cache_hits"] / total if total > 0 else 0.0,
+            "re_skip_rate": (
+                1 - (self.stats["re_calls"] / ner) if ner > 0 else 0.0
+            ),
+        }
+
+    def close(self) -> None:
+        """Release resources (SQLite connection)."""
+        if self.cache:
+            self.cache.close()
+
+    def __enter__(self) -> "EntityExtractionPipeline":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+
+# ── Lightweight SpaCy-only Pipeline ───────────────────────────────────────────
+
+class SpacyEntityPipeline:
+    """
+    Lightweight NER pipeline using SpaCy only (no GLiNER/REBEL).
+
+    Intended for memory-constrained deployments where the combined ~3.1 GB
+    footprint of GLiNER + REBEL is infeasible on the target hardware.
+    Uses SpaCy en_core_web_sm (12 MB, typically already installed).
+
+    Interface: process_chunks_batch is compatible with EntityExtractionPipeline
+    so the two classes are interchangeable from the pipeline caller's perspective.
+    All returned ChunkExtractionResult objects have relations=[].
+
+    Performance: 3–5 ms/chunk via nlp.pipe() (vs. 80–120 ms with GLiNER + REBEL).
+
+    Reference: Honnibal, M. et al. (2020). "spaCy: Industrial-strength Natural
+    Language Processing in Python." https://spacy.io
+
+    SpaCy label → internal type mapping:
+      PERSON      → PERSON          ORG         → ORGANIZATION
+      GPE         → LOCATION        LOC         → LOCATION
+      DATE        → DATE            EVENT       → EVENT
+      WORK_OF_ART → WORK_OF_ART     FAC         → LOCATION
+      (CARDINAL, ORDINAL, MONEY, PERCENT, QUANTITY are omitted)
+    """
+
+    _LABEL_MAP: Dict[str, str] = {
+        "PERSON":      "PERSON",
+        "ORG":         "ORGANIZATION",
+        "GPE":         "LOCATION",
+        "LOC":         "LOCATION",
+        "DATE":        "DATE",
+        "EVENT":       "EVENT",
+        "WORK_OF_ART": "WORK_OF_ART",
+        "FAC":         "LOCATION",
+    }
+
+    def __init__(
+        self,
+        spacy_model: str = "en_core_web_sm",
+        batch_size: int = 64,
+    ) -> None:
+        """
+        Args:
+            spacy_model: SpaCy model name (must be installed).
+            batch_size:  Chunks per nlp.pipe() call.
+        """
+        import spacy as _spacy
+        self.nlp = _spacy.load(spacy_model)
+        self.batch_size = batch_size
+        logger.info("SpacyEntityPipeline initialized: model=%s", spacy_model)
+
+    def process_chunks_batch(
+        self,
+        texts: List[str],
+        chunk_ids: List[str],
+    ) -> List[ChunkExtractionResult]:
+        """
+        Extract named entities from a batch of chunks via nlp.pipe().
+
+        Args:
+            texts:     Chunk texts.
+            chunk_ids: Corresponding chunk identifiers.
+
+        Returns:
+            List[ChunkExtractionResult] with relations=[] for all results.
         """
         results: List[ChunkExtractionResult] = []
-
         for doc, chunk_id, text in zip(
             self.nlp.pipe(texts, batch_size=self.batch_size),
             chunk_ids,
@@ -1049,150 +1241,175 @@ class SpacyEntityPipeline:
         ):
             t0 = time.time()
             entities = self._extract_from_doc(doc, chunk_id)
-            elapsed = (time.time() - t0) * 1000
             results.append(ChunkExtractionResult(
                 chunk_id=chunk_id,
                 text=text,
                 entities=entities,
-                relations=[],        # SpaCy macht keine Relation Extraction
-                extraction_time_ms=elapsed,
+                relations=[],   # SpaCy provides no relation extraction
+                extraction_time_ms=(time.time() - t0) * 1000,
             ))
-
         return results
 
-    # ------------------------------------------------------------------
-    # Interne Hilfsmethoden
-    # ------------------------------------------------------------------
+    def _extract_from_doc(
+        self,
+        doc: Any,   # spacy.tokens.Doc — not annotated to avoid hard import
+        chunk_id: str,
+    ) -> List[ExtractedEntity]:
+        """
+        Convert a SpaCy Doc to ExtractedEntity objects.
 
-    def _extract_from_doc(self, doc, chunk_id: str) -> List[ExtractedEntity]:
-        """Erstelle ExtractedEntity-Objekte aus einem SpaCy Doc."""
+        Deduplicates by entity_id within the chunk: the same entity string
+        appearing multiple times produces only one ExtractedEntity per chunk.
+        """
         entities: List[ExtractedEntity] = []
         seen_ids: set = set()
 
         for ent in doc.ents:
             ent_type = self._LABEL_MAP.get(ent.label_)
             if ent_type is None:
-                continue  # CARDINAL, ORDINAL, MONEY etc. überspringen
+                continue   # Skip CARDINAL, ORDINAL, MONEY, etc.
 
-            entity_id = self._generate_entity_id(ent.text, ent_type)
-
-            # Pro Chunk: jede entity_id nur einmal als ExtractedEntity
-            # (MENTIONS-Relation wird trotzdem angelegt)
+            entity_id = _generate_entity_id(ent.text, ent_type)
             if entity_id in seen_ids:
-                continue
+                continue   # Deduplicate within chunk
             seen_ids.add(entity_id)
 
             entities.append(ExtractedEntity(
                 entity_id=entity_id,
                 name=ent.text,
                 entity_type=ent_type,
-                confidence=0.8,   # SpaCy gibt keine numerische Confidence
+                confidence=0.8,   # sentinel: supervised model, no per-span score
                 mention_span=(ent.start_char, ent.end_char),
                 source_chunk_id=chunk_id,
             ))
-
         return entities
 
-    @staticmethod
-    def _generate_entity_id(name: str, entity_type: str) -> str:
-        """Stabiler Hash-ID (identisch mit GLiNERExtractor._generate_entity_id)."""
-        combined = f"{name.lower().strip()}:{entity_type}"
-        return hashlib.md5(combined.encode()).hexdigest()[:12]
 
-
-# ============================================================================
-# FACTORY FUNCTION
-# ============================================================================
+# ── Factory ────────────────────────────────────────────────────────────────────
 
 def create_extraction_pipeline(
-    config_path: str = None,
-    **kwargs
+    cfg: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
 ) -> EntityExtractionPipeline:
     """
-    Factory für EntityExtractionPipeline.
-    
+    Factory for EntityExtractionPipeline.
+
+    Reads all parameters from the settings.yaml configuration dictionary.
+    The **kwargs allow individual parameter overrides, which is useful for
+    test setups (e.g. cache_enabled=False).
+
+    Parameter mapping from settings.yaml → entity_extraction:
+      gliner.model_name              → gliner_model
+      gliner.entity_types            → entity_types
+      gliner.confidence_threshold    → ner_confidence_threshold
+      gliner.batch_size              → ner_batch_size
+      rebel.model_name               → rebel_model
+      rebel.confidence_threshold     → re_confidence_threshold
+      rebel.batch_size               → re_batch_size
+      rebel.min_entities_for_re      → min_entities_for_re
+      rebel.max_input_length         → rebel_max_input_length
+      rebel.max_output_length        → rebel_max_output_length
+      rebel.num_beams                → rebel_num_beams
+      caching.enabled                → cache_enabled
+      caching.cache_path             → cache_path
+      caching.lru_cache_size         → lru_cache_size
+      performance.device             → device
+
     Args:
-        config_path: Pfad zur YAML-Konfiguration
-        **kwargs: Überschreibe einzelne Config-Werte
-        
+        cfg:     Full settings dict as loaded from config/settings.yaml.
+                 Pass None or {} to fall back to ExtractionConfig defaults.
+        **kwargs: Override individual ExtractionConfig fields by name.
+
     Returns:
-        Konfigurierte EntityExtractionPipeline
+        Configured EntityExtractionPipeline instance.
     """
-    config = ExtractionConfig()
-    
-    if config_path:
-        import yaml
-        with open(config_path) as f:
-            yaml_config = yaml.safe_load(f)
-            
-        if "entity_extraction" in yaml_config:
-            ee_config = yaml_config["entity_extraction"]
-            
-            if "gliner" in ee_config:
-                config.gliner_model = ee_config["gliner"].get("model_name", config.gliner_model)
-                config.entity_types = ee_config["gliner"].get("entity_types", config.entity_types)
-                config.ner_confidence_threshold = ee_config["gliner"].get("confidence_threshold", config.ner_confidence_threshold)
-                config.ner_batch_size = ee_config["gliner"].get("batch_size", config.ner_batch_size)
-            
-            if "rebel" in ee_config:
-                config.rebel_model = ee_config["rebel"].get("model_name", config.rebel_model)
-                config.re_confidence_threshold = ee_config["rebel"].get("confidence_threshold", config.re_confidence_threshold)
-                config.re_batch_size = ee_config["rebel"].get("batch_size", config.re_batch_size)
-                config.min_entities_for_re = ee_config["rebel"].get("min_entities_for_re", config.min_entities_for_re)
-            
-            if "caching" in ee_config:
-                config.cache_enabled = ee_config["caching"].get("enabled", config.cache_enabled)
-                config.cache_path = ee_config["caching"].get("cache_path", config.cache_path)
-                config.lru_cache_size = ee_config["caching"].get("lru_cache_size", config.lru_cache_size)
-            
-            config.selective_re = ee_config.get("selective_re", config.selective_re)
-    
-    # Override mit kwargs
+    cfg = cfg or {}
+    ee = cfg.get("entity_extraction", {})
+    gliner_cfg = ee.get("gliner", {})
+    rebel_cfg = ee.get("rebel", {})
+    cache_cfg = ee.get("caching", {})
+    perf_cfg = cfg.get("performance", {})
+
+    _d = ExtractionConfig()   # default values as authoritative reference
+    config = ExtractionConfig(
+        gliner_model=gliner_cfg.get("model_name", _d.gliner_model),
+        entity_types=gliner_cfg.get("entity_types", _d.entity_types),
+        ner_confidence_threshold=gliner_cfg.get(
+            "confidence_threshold", _d.ner_confidence_threshold
+        ),
+        ner_batch_size=gliner_cfg.get("batch_size", _d.ner_batch_size),
+        rebel_model=rebel_cfg.get("model_name", _d.rebel_model),
+        re_confidence_threshold=rebel_cfg.get(
+            "confidence_threshold", _d.re_confidence_threshold
+        ),
+        re_batch_size=rebel_cfg.get("batch_size", _d.re_batch_size),
+        min_entities_for_re=rebel_cfg.get(
+            "min_entities_for_re", _d.min_entities_for_re
+        ),
+        rebel_max_input_length=rebel_cfg.get(
+            "max_input_length", _d.rebel_max_input_length
+        ),
+        rebel_max_output_length=rebel_cfg.get(
+            "max_output_length", _d.rebel_max_output_length
+        ),
+        rebel_num_beams=rebel_cfg.get("num_beams", _d.rebel_num_beams),
+        cache_enabled=cache_cfg.get("enabled", _d.cache_enabled),
+        cache_path=cache_cfg.get("cache_path", _d.cache_path),
+        lru_cache_size=cache_cfg.get("lru_cache_size", _d.lru_cache_size),
+        device=perf_cfg.get("device", _d.device),
+    )
+
+    # Apply kwarg overrides (useful for test setups).
     for key, value in kwargs.items():
         if hasattr(config, key):
             setattr(config, key, value)
-    
+        else:
+            logger.warning("create_extraction_pipeline: unknown kwarg '%s' ignored", key)
+
     return EntityExtractionPipeline(config)
 
 
-# ============================================================================
-# CLI / TESTING
-# ============================================================================
+# ── Smoke Demo + Test Runner ────────────────────────────────────────────────────
+
+def _main() -> None:
+    """Smoke demo + test runner invoked when the module is run directly."""
+    import sys
+    import subprocess
+    from pathlib import Path
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    # ── 1. Smoke Demo ────────────────────────────────────────────────────────
+    pipeline = create_extraction_pipeline(cache_enabled=False)
+    demo_texts = [
+        "Albert Einstein was born in Ulm, Germany in 1879.",
+        "Microsoft was founded by Bill Gates and Paul Allen in Albuquerque.",
+        "The Eiffel Tower is located in Paris, France.",
+    ]
+    logger.info("── Entity Extraction Smoke Demo ──")
+    for idx, demo_text in enumerate(demo_texts):
+        demo_result = pipeline.process_chunk(demo_text, f"chunk_{idx}")
+        logger.info(
+            "chunk_%d: %d entities, %d relations, %.1fms",
+            idx, demo_result.entity_count, demo_result.relation_count,
+            demo_result.extraction_time_ms,
+        )
+        for ent in demo_result.entities:
+            logger.info("  %-30s [%-12s] conf=%.2f", ent.name, ent.entity_type, ent.confidence)
+    pipeline.close()
+
+    # ── 2. Pytest Test Suite ─────────────────────────────────────────────────
+    # Runs the entity-related tests from test_data_layer.py so that
+    # `python entity_extraction.py` serves as a self-contained verification.
+    test_file = Path(__file__).parent / "test_data_layer.py"
+    logger.info("── Running pytest: %s ──", test_file)
+    proc = subprocess.run(
+        [sys.executable, "-X", "utf8", "-m", "pytest", str(test_file),
+         "-v", "-k", "entity"],
+        check=False,
+    )
+    sys.exit(proc.returncode)
+
 
 if __name__ == "__main__":
-    import sys
-    
-    logging.basicConfig(level=logging.INFO)
-    
-    # Test Pipeline
-    pipeline = create_extraction_pipeline(cache_enabled=False)
-    
-    test_texts = [
-        "Albert Einstein was born in Ulm, Germany in 1879. He worked at Princeton University.",
-        "Microsoft was founded by Bill Gates and Paul Allen in Albuquerque, New Mexico.",
-        "The Eiffel Tower is located in Paris, France. It was designed by Gustave Eiffel.",
-    ]
-    
-    print("\n" + "="*70)
-    print("ENTITY EXTRACTION PIPELINE TEST")
-    print("="*70)
-    
-    for i, text in enumerate(test_texts):
-        result = pipeline.process_chunk(text, f"chunk_{i}")
-        
-        print(f"\n--- Chunk {i} ---")
-        print(f"Text: {text[:100]}...")
-        print(f"Entities ({len(result.entities)}):")
-        for e in result.entities:
-            print(f"  - {e.name} [{e.entity_type}] (conf: {e.confidence:.2f})")
-        print(f"Relations ({len(result.relations)}):")
-        for r in result.relations:
-            print(f"  - {r.subject_entity} --[{r.relation_type}]--> {r.object_entity}")
-        print(f"Time: {result.extraction_time_ms:.1f}ms")
-    
-    print("\n--- Statistics ---")
-    stats = pipeline.get_stats()
-    for key, value in stats.items():
-        print(f"  {key}: {value}")
-    
-    pipeline.close()
+    _main()

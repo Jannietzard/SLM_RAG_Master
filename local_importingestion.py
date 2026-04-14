@@ -7,30 +7,30 @@ Dieses Skript importiert die Ergebnisse der Colab-Extraktion in die lokalen
 Stores (LanceDB + KuzuDB).
 
 Input:
-    - chunks_export.json      (Phase 1: Chunks aus benchmark_datasets.py)
-    - extraction_results.json (Phase 2: Entities + Relations aus Colab)
+    - chunks_export.json                    (Phase 1: Chunks aus benchmark_datasets.py)
+    - data/<dataset>/graph/extraction_results.json (Phase 2: Entities + Relations aus Colab)
 
 Output:
-    - data/<dataset>/vector_db/       (LanceDB)
-    - data/<dataset>/knowledge_graph/  (KuzuDB)
+    - data/<dataset>/vector/       (LanceDB)
+    - data/<dataset>/graph/        (KuzuDB)
 
 Usage:
     python local_import_ingestion.py \\
         --chunks data/hotpotqa/chunks_export.json \\
-        --extractions extraction_results.json \\
+        --extractions data/hotpotqa/graph/extraction_results.json \\
         --dataset hotpotqa
 
     # Mit bestehendem config
     python local_import_ingestion.py \\
         --chunks data/hotpotqa/chunks_export.json \\
-        --extractions extraction_results.json \\
+        --extractions data/hotpotqa/graph/extraction_results.json \\
         --dataset hotpotqa \\
         --config config/settings.yaml
 
     # Nur Graph-Import (Vector Store existiert bereits)
     python local_import_ingestion.py \\
         --chunks data/hotpotqa/chunks_export.json \\
-        --extractions extraction_results.json \\
+        --extractions data/hotpotqa/graph/extraction_results.json \\
         --dataset hotpotqa \\
         --graph-only
 
@@ -232,7 +232,7 @@ def ingest_vector_store(
     vector_config = config.get("vector_store", {})
     storage_config = StorageConfig(
         vector_db_path=vector_path,
-        graph_db_path=vector_path.parent / "knowledge_graph",  # wird hier nicht genutzt
+        graph_db_path=vector_path.parent / "graph",  # wird hier nicht genutzt
         embedding_dim=embedding_config.get("embedding_dim", 768),
         similarity_threshold=vector_config.get("similarity_threshold", 0.3),
         normalize_embeddings=vector_config.get("normalize_embeddings", True),
@@ -498,13 +498,13 @@ def run_full_import(
 
     # Pfade
     base_path = Path("./data") / dataset_name
-    vector_path = base_path / "vector_db"
-    graph_path = base_path / "knowledge_graph"
+    vector_path = base_path / "vector"
+    graph_path = base_path / "graph"
 
     # Clear wenn gewünscht.
     # WICHTIG: extraction_results.json und chunks_export.json werden NIEMALS gelöscht —
     # sie sind die Quelldateien (Colab-Output / Phase 1) und müssen erhalten bleiben.
-    # Nur die abgeleiteten Stores (vector_db, knowledge_graph) werden gelöscht.
+    # Nur die abgeleiteten Stores (vector, graph) werden gelöscht.
     if clear:
         import shutil
         if graph_only:
@@ -579,7 +579,7 @@ def run_full_import(
     print("═" * 70)
 
     # Extraction-Metadaten speichern
-    meta_path = base_path / "extraction_metadata.json"
+    meta_path = base_path / "graph" / "extraction_metadata.json"
     meta = extraction_data.get("metadata", {})
     meta["import_time_seconds"] = round(total_elapsed, 1)
     meta["graph_stats"] = stats
@@ -601,20 +601,20 @@ Beispiele:
   # Standard-Import (Vector Store + Knowledge Graph)
   python local_import_ingestion.py \\
       --chunks data/hotpotqa/chunks_export.json \\
-      --extractions extraction_results.json \\
+      --extractions data/hotpotqa/graph/extraction_results.json \\
       --dataset hotpotqa
 
   # Nur Knowledge Graph (Vector Store existiert schon)
   python local_import_ingestion.py \\
       --chunks data/hotpotqa/chunks_export.json \\
-      --extractions extraction_results.json \\
+      --extractions data/hotpotqa/graph/extraction_results.json \\
       --dataset hotpotqa \\
       --graph-only
 
   # Mit YAML Config
   python local_import_ingestion.py \\
       --chunks data/hotpotqa/chunks_export.json \\
-      --extractions extraction_results.json \\
+      --extractions data/hotpotqa/graph/extraction_results.json \\
       --dataset hotpotqa \\
       --config config/settings.yaml
         """,

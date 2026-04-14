@@ -3,8 +3,8 @@
 **Project:** Enhancing Reasoning Fidelity in Quantized Small Language Models on Edge Devices via Hybrid Retrieval-Augmented Generation
 **Author:** Jan Nietzard
 **Institution:** FOM Hochschule, Master of Science
-**Version:** 3.3.0
-**Last Updated:** 2026-04-02
+**Version:** 4.0.0
+**Last Updated:** 2026-04-11
 
 ---
 
@@ -71,13 +71,14 @@ Entwicklungfolder/
 │   │   ├── hybrid_retriever.py     # HybridRetriever, RRFFusion, PreGenerativeFilter
 │   │   ├── ingestion.py            # DocumentIngestionPipeline
 │   │   ├── test_data_layer.py      # Pytest test suite (33 tests)
-│   │   └── conftest.py
+│   │   └── conftest.py             # Adds project root to sys.path
 │   │
 │   ├── logic_layer/                # Artifact B: Agentic Reasoning
 │   │   ├── __init__.py             # 34 public exports
 │   │   ├── planner.py              # S_P: Query analysis & plan generation
 │   │   ├── navigator.py            # S_N: Retrieval orchestration
 │   │   ├── verifier.py             # S_V: Pre-validation & generation
+│   │   ├── controller.py           # AgenticController: LangGraph state machine
 │   │   ├── test_logic_layer.py
 │   │   └── conftest.py
 │   │
@@ -91,19 +92,18 @@ Entwicklungfolder/
 │       ├── ablation_study.py       # Ablation study runner
 │       ├── evaluate_hotpotqa.py    # HotpotQA-specific evaluator
 │       ├── test_rag_quality.py     # RAG quality diagnostics
-│       ├── test_kuzu_migration.py  # Graph store verification
-│       ├── ollama_performance_diagnostic.py
-│       └── verify_storage_fix.py
+│       └── ollama_performance_diagnostic.py
 │
 ├── config/
 │   └── settings.yaml               # Unified configuration (single source of truth)
 │
 ├── data/                           # Runtime data (gitignored)
 │   ├── hotpotqa/
-│   │   ├── vector_db/              # LanceDB vector store (directory)
-│   │   ├── knowledge_graph         # KuzuDB graph database (SINGLE FILE, not directory)
-│   │   ├── extraction_metadata.json# Graph ingestion stats (GLiNER model, entity counts)
-│   │   ├── questions.json          # Benchmark questions
+│   │   ├── vector/                 # LanceDB vector store (directory)
+│   │   ├── graph/                  # KuzuDB graph database (directory)
+│   │   │   └── extraction_results.json  # GLiNER+REBEL extraction output (Colab)
+│   │   ├── chunks_export.json      # All chunks with text + metadata (Phase 1 output)
+│   │   ├── questions.json          # Benchmark questions with supporting_facts
 │   │   └── articles_info.json
 │   ├── 2wikimultihop/              # (same structure)
 │   └── strategyqa/                 # (same structure)
@@ -115,14 +115,29 @@ Entwicklungfolder/
 ├── evaluation_results/             # JSON ablation results
 ├── logs/                           # Structured log output
 ├── benchmark_datasets.py           # CLI entry point for all experiments
-├── diagnose.py                     # Layer-by-layer diagnostic tool (graph quality, vector scores)
+├── diagnose.py                     # Layer-by-layer diagnostic (graph quality, vector scores)
+├── diagnose_verbose.py             # Trace-mode diagnostic with per-call timing
+├── diagnose_ingestion.py           # Ingestion consistency checker (chunks→LanceDB→KuzuDB→rank)
+├── local_importingestion.py        # Phase 3 import: chunks_export.json + extraction_results.json → stores
 ├── test_system/
 │   ├── graph_3d.py                 # Graph visualisation: matplotlib PNG + pyvis HTML
+│   ├── graph_inspect.py            # Graph schema and statistics inspector
+│   ├── test_chunking.py            # 29 chunking unit tests
+│   ├── test_embeddings.py          # 34 embedding unit tests
+│   ├── test_ner_quality.py         # NER quality evaluation (20-sentence gold set)
 │   └── graph_preview.html          # Generated interactive visualisation (gitignored)
 └── requirements.txt
 ```
 
-**Total source code:** ~27 Python files, approximately 15,000 lines of production code (excluding tests and generated data).
+**Total source code:** ~35 Python files, approximately 18,000 lines of production code (excluding tests and generated data).
+
+**Decoupled ingestion architecture (3-phase):**
+
+| Phase | Tool | Description |
+|---|---|---|
+| Phase 1 | `benchmark_datasets.py ingest` | Chunk articles → `chunks_export.json` |
+| Phase 2 | Google Colab (GPU) | GLiNER + REBEL extraction → `extraction_results.json` |
+| Phase 3 | `local_importingestion.py` | Import Phase 1+2 outputs → LanceDB + KuzuDB |
 
 ---
 
@@ -265,7 +280,7 @@ Chunk 2:            [S4, S5, S6]
 
 This ensures that reasoning evidence spanning a sentence boundary is represented in at least one chunk without duplication of full chunks.
 
-**SpaCy model caching:** The model is loaded once per process via a module-level `SpyModelCache` singleton to avoid repeated 200–300 ms model load times across multiple chunker instantiations.
+**SpaCy model caching:** The model is loaded once per process via a module-level `SpacyModelCache` singleton to avoid repeated 200–300 ms model load times across multiple chunker instantiations.
 
 #### 3.2.2 SemanticChunker
 
@@ -309,26 +324,33 @@ Entity extraction populates the knowledge graph with named entities and their re
 class ExtractionConfig:
     gliner_model: str = "urchade/gliner_small-v2.1"
     entity_types: List[str] = [
-        # Lowercase natural-language names → bessere zero-shot performance bei GLiNER
-        "person", "organization", "city", "country",
-        "film", "movie", "event",
+        # Lowercase natural-language labels — better zero-shot performance with GLiNER
+        "person", "organization", "city", "country", "state",
+        "location", "film", "movie", "album", "work of art",
+        "landmark", "event", "award",
     ]
-    ner_confidence_threshold: float = 0.5   # Filterung von Rausch-Entitäten (Stand 2026-04-02)
+    ner_confidence_threshold: float = 0.15  # Recall-optimised for HotpotQA
     ner_batch_size: int = 16
+    rebel_max_input_length: int = 256
+    rebel_max_output_length: int = 256
+    rebel_num_beams: int = 3
+    device: str = "cpu"
 ```
 
-> **Änderungshistorie:** Bis 2026-04-01 war `ner_confidence_threshold=0.15` und die Entity Types waren UPPERCASE (`PERSON`, `ORGANIZATION` etc.). Der niedrige Threshold führte zu Hub-Kontamination durch generische Tokens ("American" 898 Chunks, "He" 737). Seit 2026-04-02: Threshold=0.5, lowercase Types — Unique Entities reduziert von 36.996 → 23.858 (−35%). Siehe Abschnitt 12.6.
+> **Change history:** Prior to 2026-04-01, `ner_confidence_threshold=0.15` and entity types were UPPERCASE (`PERSON`, `ORGANIZATION`, etc.), causing hub contamination ("American" 898 chunks, "He" 737). From 2026-04-02: threshold raised to 0.5, lowercase types — unique entities reduced from 36,996 → 23,858 (−35%). Subsequently revised to `0.15` again for recall (Section 12.6): the entity types and normalisation now prevent noise better than the threshold alone.
 
 **`ExtractedEntity`** (output dataclass):
 
 | Field | Type | Description |
 |---|---|---|
-| `entity_id` | `str` | UUID |
-| `name` | `str` | Surface form |
-| `entity_type` | `str` | One of 8 entity types |
+| `entity_id` | `str` | SHA-256 24-char hex ID |
+| `name` | `str` | Surface form (normalised) |
+| `entity_type` | `str` | One of 13 entity types |
 | `confidence` | `float` | GLiNER span score |
 | `mention_span` | `Tuple[int, int]` | Character offsets |
 | `source_chunk_id` | `str` | Parent chunk |
+
+> **Note on `to_dict()`:** The serialised key is `"entity_type"` (not `"type"`). Entity IDs were migrated from UUID (12-char MD5) to SHA-256 24-char hex in April 2026 — existing KuzuDB stores built before this change use the old format and require re-ingestion.
 
 #### 3.3.2 Relation Extraction (RE)
 
@@ -345,6 +367,8 @@ RE is applied *conditionally*: only to chunks with ≥ 2 extracted entities. Thi
 | `object_entity` | `str` | Entity name |
 | `confidence` | `float` | REBEL generation score |
 | `source_chunk_ids` | `List[str]` | Provenance |
+
+> **Note on `to_dict()`:** Serialised keys are `"subject_entity"`, `"relation_type"`, `"object_entity"` (not `"subject"`, `"relation"`, `"object"`). REBEL's `extract_batch` was renamed `extract_sequential` to reflect the seq2seq model's limitation.
 
 **`EntityExtractionPipeline`** — main interface:
 
@@ -495,14 +519,17 @@ The hybrid retriever combines results from both retrieval modalities using Recip
 @dataclass
 class RetrievalConfig:
     mode: RetrievalMode = RetrievalMode.HYBRID   # VECTOR | GRAPH | HYBRID
-    top_k_vector: int = 20
-    top_k_graph: int = 10
-    vector_weight: float = 0.7
-    graph_weight: float = 0.3
+    vector_top_k: int = 20          # canonical name (not top_k_vector)
+    graph_top_k: int = 10           # canonical name (not top_k_graph)
+    vector_weight: float = 0.7      # used to disable modality (weight=0); NOT an RRF coefficient
+    graph_weight: float = 0.3       # used to disable modality (weight=0); NOT an RRF coefficient
     similarity_threshold: float = 0.3
-    rrf_k: int = 60                    # RRF smoothing constant
-    cross_source_boost: float = 1.2    # Bonus for dual-indexed results
+    rrf_k: int = 60                 # RRF smoothing constant (Cormack et al., 2009)
+    cross_source_boost: float = 1.2 # Bonus for dual-indexed results
     final_top_k: int = 10
+    query_ner_confidence: float = 0.15       # Read from settings.yaml
+    query_entity_types: List[str] = field(default_factory=list)  # Read from settings.yaml
+    gliner_model_name: str = "urchade/gliner_small-v2.1"
 ```
 
 #### 3.5.2 Reciprocal Rank Fusion (RRFFusion)
@@ -564,13 +591,19 @@ class PreGenerativeFilter:
     def filter(self, results: List[RetrievalResult]) -> List[RetrievalResult]
 ```
 
-Three sequential filter stages:
+Six sequential filter stages:
 
-1. **Relevance filter** — Removes results below `relevance_threshold_factor × max_score`. Ensures only contextually coherent results are passed downstream.
+1. **Relevance filter** — Removes results below `relevance_threshold_factor × max_score` (default factor: 0.85). Score compression in nomic-embed-text (all pairs score 0.74–0.80) means this threshold must be calibrated carefully — too low keeps all chunks, too high removes everything. The factor `0.85 × max` keeps only results close to the top score.
 
-2. **Redundancy filter** — Deduplicates by Jaccard similarity on token sets. Two results are considered redundant if `|A ∩ B| / |A ∪ B| > redundancy_threshold` (default: 0.8).
+2. **Redundancy filter** — Deduplicates by Jaccard similarity on token sets. Two results are considered redundant if `|A ∩ B| / |A ∪ B| > redundancy_threshold` (default: 0.8). Preserves topically similar but informationally complementary chunks.
 
 3. **Contradiction filter** — Applies a lightweight NLI classifier to detect conflicting factual claims. Conflicted pairs are resolved by retaining the higher-scoring result.
+
+4. **Entity-overlap filter** — Retains only chunks that share at least one named entity with the query entity set. Reduces noise from topically adjacent but factually irrelevant chunks.
+
+5. **Entity-mention filter** (`_entity_mention_filter` in `navigator.py`) — Checks that each chunk's *text* contains at least one query entity as a literal mention. Multi-word entities (e.g. `"Scott Derrickson"`) match if the full phrase appears OR individual tokens ≥ 5 characters appear as whole words (`\b...\b`). Single-token entities are only checked if length ≥ 5 (avoids false positives from short stopwords like `"Were"` or `"Wood"`). **Safety fallback:** if all chunks are filtered, all are returned (context is never empty).
+
+6. **Context-shrinkage guard** — Ensures the final context set does not drop below a minimum size threshold. Prevents edge cases where aggressive upstream filters produce an empty context window.
 
 #### 3.5.4 ImprovedQueryEntityExtractor
 
@@ -600,8 +633,15 @@ class HybridRetriever:
         hybrid_store: HybridStore,
         embeddings: BatchedOllamaEmbeddings,
     )
-    def retrieve(self, query: str) -> Tuple[List[RetrievalResult], RetrievalMetrics]
+    def retrieve(
+        self,
+        query: str,
+        top_k: Optional[int] = None,
+        entity_hints: Optional[List[str]] = None,   # Pre-extracted entities (bypass GLiNER)
+    ) -> Tuple[List[RetrievalResult], RetrievalMetrics]
 ```
+
+> **`entity_hints` parameter:** When provided, the retriever uses these entity names directly for graph search instead of running GLiNER on the sub-query. This is critical for iterative multi-hop retrieval (Section 12.18), where bridge entities are discovered at runtime and passed to the next hop. Without this, GLiNER fails on short sub-query fragments (3–5 words) that lack context for reliable NER.
 
 **`RetrievalMetrics`** (output dataclass):
 
@@ -660,16 +700,19 @@ Classification is performed using a rule-based SpaCy pipeline (dependency parsin
 ```python
 @dataclass
 class RetrievalPlan:
-    query: str
+    original_query: str              # The unmodified input query
     query_type: QueryType
-    strategy: RetrievalStrategy       # VECTOR_ONLY | GRAPH_ONLY | HYBRID
+    strategy: RetrievalStrategy      # VECTOR_ONLY | GRAPH_ONLY | HYBRID
     confidence: float
 
-    entities: List[EntityInfo]        # Named entities extracted from query
-    hop_sequence: List[HopStep]       # Decomposed sub-queries for multi-hop
+    entities: List[EntityInfo]       # Named entities extracted from query (SpaCy)
+    hop_sequence: List[HopStep]      # Decomposed sub-queries for multi-hop
+    sub_queries: List[str]           # Flat list of sub-query strings
 
     temporal_constraints: Dict[str, Any]
     comparison_pairs: List[Tuple[str, str]]
+    estimated_hops: int = 1
+    metadata: Dict[str, Any] = field(default_factory=dict)
     cached_answer: Optional[str] = None   # For early-exit short-circuit
 ```
 
@@ -677,24 +720,27 @@ class RetrievalPlan:
 
 | Field | Type | Description |
 |---|---|---|
-| `name` | `str` | Surface form |
-| `entity_type` | `str` | SpaCy NER label |
+| `text` | `str` | Surface form of the entity |
+| `label` | `str` | SpaCy NER label (e.g. `PERSON`, `ORG`) |
 | `confidence` | `float` | Detection confidence |
-| `is_bridge_entity` | `bool` | Multi-hop indicator |
+| `start_char` | `int` | Start character offset in query |
+| `end_char` | `int` | End character offset in query |
+| `is_bridge` | `bool` | Multi-hop indicator |
 
 **`HopStep`** (dataclass — for multi-hop decomposition):
 
 | Field | Type | Description |
 |---|---|---|
-| `hop_number` | `int` | Step index |
+| `step_id` | `int` | Step index (0-based) |
 | `sub_query` | `str` | Decomposed sub-question |
-| `bridge_entities` | `List[str]` | Entities connecting this hop |
-| `expected_constraints` | `Dict` | Temporal/type constraints |
+| `target_entities` | `List[str]` | Entity names targeted in this hop |
+| `depends_on` | `List[int]` | `step_id`s that must complete before this step |
+| `is_bridge` | `bool` | Whether this step retrieves a bridge entity |
 
 #### 4.1.3 Strategy Selection
 
 ```
-if query_type == MULTI_HOP or entities.any(is_bridge_entity):
+if query_type == MULTI_HOP or entities.any(is_bridge=True):
     strategy = HYBRID
 elif query_type in {SINGLE_HOP, COMPARISON} and entities.count >= 2:
     strategy = HYBRID
@@ -725,7 +771,7 @@ class ControllerConfig:
     cross_source_boost: float = 1.2
 
     enable_pre_filtering: bool = True
-    relevance_threshold_factor: float = 0.6
+    relevance_threshold_factor: float = 0.85   # Raised from 0.6; see Section 12.16
     redundancy_threshold: float = 0.8
     enable_contradiction_filter: bool = True
 ```
@@ -749,17 +795,33 @@ class NavigatorResult:
 Input:  RetrievalPlan
 Output: NavigatorResult
 
-1. For each sub_query in plan.hop_sequence:
-   a. embed(sub_query) → query_embedding
-   b. vector_search(query_embedding, top_k=20)  ~8–12ms
-   c. if strategy ∈ {GRAPH, HYBRID}:
-         extract_entities(sub_query)            ~3–5ms
-         graph_search(entities, max_hops=2)     ~1–30ms
+SIMPLE (no bridge dependencies):
+  For each sub_query in plan.hop_sequence:
+    a. embed(sub_query) → query_embedding
+    b. vector_search(query_embedding, top_k=20)          ~8–12ms
+    c. if strategy ∈ {GRAPH, HYBRID}:
+          entities = entity_hints or extract_entities(sub_query)  ~3–5ms
+          graph_search(entities, max_hops=2)                      ~1–30ms
+  → RRF fusion → PreGenerativeFilter → top-K chunks
 
-2. RRF fusion of all results                   ~1ms
-3. PreGenerativeFilter                         ~2ms
-4. Return top-K filtered chunks
+ITERATIVE (bridge dependencies detected, see Section 12.18):
+  Sort hop_sequence by step_id
+  current_hints = plan.entities (SpaCy-extracted)
+  accumulated_context = []
+
+  for step in sorted_hops:
+    sub_results = retrieve(step.sub_query, entity_hints=current_hints)
+    accumulated_context += deduplicate(sub_results)
+
+    if step.is_bridge:
+      bridge_entities = _extract_bridge_entities(sub_results, exclude=query_tokens)
+      if bridge_entities:
+        current_hints = current_hints ∪ bridge_entities  (up to 3 new entities)
+
+  → PreGenerativeFilter(accumulated_context) → top-K chunks
 ```
+
+The iterative path activates when any `HopStep.depends_on` is non-empty. It resolves the *hidden bridge entity problem*: the answer to hop 0 becomes the graph search key for hop 1, enabling retrieval of the answer document even when the bridge entity was unknown at query time.
 
 ---
 
@@ -781,7 +843,7 @@ class VerifierConfig:
     max_iterations: int = 2          # Initial generation + 1 correction round
     max_context_chars: int = 2400    # Total chars fed to LLM (~600 tokens)
     max_docs: int = 6                # Maximum number of context documents
-    max_chars_per_doc: int = 400     # Characters per individual document
+    max_chars_per_doc: int = 500     # Characters per individual document (raised from 400)
 ```
 
 > **Wichtig:** Alle `VerifierConfig`-Werte werden durch `_verifier_config_from_cfg()` in `agent_pipeline.py` aus `config/settings.yaml` gelesen. Die Klassen-Defaults sind Fallback-Werte und sollten nie direkt im Code überschrieben werden.
@@ -840,6 +902,8 @@ return VerificationResult(answer, confidence, iterations_used)
 ---
 
 ## 5. Pipeline Layer
+
+The pipeline layer contains two orchestration implementations: the original `AgentPipeline` (simple sequential chain) and the newer `AgenticController` (LangGraph state machine with iterative multi-hop support). Both expose a compatible `process(query)` interface.
 
 ### 5.1 Agent Pipeline
 
@@ -915,6 +979,71 @@ This is the primary entry point for external consumers (e.g., `benchmark_dataset
 
 ---
 
+### 5.3 AgenticController
+
+**File:** `src/logic_layer/controller.py`
+
+The `AgenticController` is a LangGraph-based state machine that replaces the linear `AgentPipeline` for production use. It models the S_P → S_N → S_V chain as a directed graph of nodes with typed state transitions.
+
+#### 5.3.1 State Machine
+
+```
+START
+  │
+  ▼
+_planner_node()          → Calls Planner; populates RetrievalPlan in state
+  │
+  ▼
+_navigator_node()         → Inspects hop_sequence for bridge dependencies
+  │                          ├─ has_bridge_deps=False → _simple_navigate()
+  │                          └─ has_bridge_deps=True  → _iterative_navigator_node()
+  ▼
+_verifier_node()          → Calls Verifier with accumulated context
+  │
+  ▼
+END
+```
+
+#### 5.3.2 Iterative Navigator
+
+`_iterative_navigator_node(state, hop_sequence, entity_names, plan_dict, start_time)`:
+
+```python
+# Step 1: Sort hops by step_id
+sorted_hops = sorted(hop_sequence, key=lambda h: h.get("step_id", 0))
+
+# Step 2: Execute hops in dependency order
+for step in sorted_hops:
+    results = navigator.navigate_step(step.sub_query, entity_hints=current_hints)
+    accumulated_context += deduplicate(results)   # by chunk_id
+
+    # Step 3: After bridge hop, extract new entities
+    if step.is_bridge:
+        bridge_entities = _extract_bridge_entities(results, exclude=query_tokens)
+        current_hints.extend(bridge_entities)     # max 3 new entities
+
+# Step 4: Apply pre-generative filter to accumulated context
+final_context = navigator.filter(accumulated_context)
+```
+
+#### 5.3.3 Bridge Entity Extraction
+
+`_extract_bridge_entities(chunks, exclude)` — static method:
+- Regex: capitalized multi-word phrases (`\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b`)
+- Excludes: tokens already in the original query
+- Returns up to 3 candidates (prioritised by frequency in retrieved chunks)
+- **Fallback:** if extraction yields nothing, original `entity_hints` are retained unchanged
+
+#### 5.3.4 Safety Constraints
+
+| Constraint | Value | Reason |
+|---|---|---|
+| Max iterative hops | 3 | Prevents unbounded loops |
+| Bridge entity limit | 3 per step | Prevents graph search fan-out |
+| Fallback on empty bridge | retain prior hints | Graceful degradation to single-hop behaviour |
+
+---
+
 ### 5.2 Ingestion Pipeline
 
 **File:** `src/pipeline/ingestion_pipeline.py`
@@ -979,13 +1108,13 @@ vector_store:
   index_type: "ivfflat"             # Approximate nearest-neighbour index
   distance_metric: "cosine"         # Required for text embeddings
   normalize_embeddings: true
-  top_k_vectors: 10
+  vector_top_k: 10
   similarity_threshold: 0.3
 
 # ── KNOWLEDGE GRAPH ────────────────────────────────────────────────────────
 graph:
   backend: "kuzu"                   # Primary: KuzuDB (Cypher-native)
-  graph_path: "./data/knowledge_graph"  # KuzuDB Single-File (kein Verzeichnis!)
+  graph_path: "./data/{dataset}/graph"  # Per-dataset KuzuDB directory
   max_hops: 2
   top_k_entities: 5
   entity_extraction_method: "keyword"   # keyword | spacy | gliner
@@ -1002,14 +1131,41 @@ llm:
   base_url: "http://localhost:11434"
   temperature: 0.1
   max_tokens: 200              # Erhöht von 50 auf 200; verhindert Antwort-Truncation
-  max_context_chars: 2400      # Gesamt-Zeichen für den LLM-Kontext (~600 Tokens)
-  max_docs: 6                  # Maximale Anzahl Kontext-Dokumente
-  max_chars_per_doc: 400       # Maximale Zeichen pro Kontext-Dokument
+  max_context_chars: 2400      # Total chars for LLM context (~600 tokens)
+  max_docs: 6                  # Maximum context documents
+  max_chars_per_doc: 500       # Characters per document (raised from 400 to reduce key-sentence loss)
 
 # ── AGENTIC CONTROLLER ─────────────────────────────────────────────────────
 agent:
-  max_verification_iterations: 2   # 1 initiale Antwort + 1 Korrektur-Runde
+  max_verification_iterations: 2   # 1 initial answer + 1 correction round
   enable_verification: true
+  relevance_threshold_factor: 0.85  # PreGenerativeFilter: keep within 15% of top score
+  redundancy_threshold: 0.8         # Jaccard dedup threshold
+
+# ── ENTITY EXTRACTION ──────────────────────────────────────────────────────
+entity_extraction:
+  gliner:
+    model_name: "urchade/gliner_small-v2.1"
+    confidence_threshold: 0.15          # Recall-optimised for HotpotQA
+    query_ner_confidence: 0.15          # Query-time threshold (same model, shorter text)
+    entity_types:
+      - person
+      - organization
+      - city
+      - country
+      - state
+      - location
+      - film
+      - movie
+      - album
+      - work of art
+      - landmark
+      - event
+      - award
+  rebel:
+    max_input_length: 256
+    max_output_length: 256
+    num_beams: 3
 
 # ── INGESTION ──────────────────────────────────────────────────────────────
 ingestion:
@@ -1162,26 +1318,57 @@ python benchmark_datasets.py test
 
 Results of the ablation study are persisted to `evaluation_results/ablation_<timestamp>.json`.
 
-### 7.5 Graph Quality Diagnostics
+### 7.5 Diagnostic Tools
 
-**File:** `diagnose.py`
+Three diagnostic scripts are available for investigating retrieval quality, ingestion consistency, and LLM behaviour.
 
-Das Diagnoseskript testet jeden Pipeline-Layer einzeln und bietet einen spezialisierten Graph-Qualitäts-Modus.
+#### `diagnose.py` — Layer-by-layer pipeline diagnostic
 
 ```bash
-# Alle Layer testen (eine Beispiel-Frage)
-python diagnose.py --idx 5
+# Test all pipeline layers for one question
+python -X utf8 diagnose.py --idx 5
 
-# Graph-Qualitäts-Analyse (Hub-Kontamination, Answer Coverage)
-python diagnose.py --graph-quality 20
+# Graph quality analysis (hub contamination, answer coverage)
+python -X utf8 diagnose.py --graph-quality 20
 
-# Vector-Score-Analyse für N Fragen (kein LLM nötig)
-python diagnose.py --multi 50
+# Vector score analysis for N questions (no LLM required)
+python -X utf8 diagnose.py --multi 50
 
-# Nur bestimmten Layer testen
-python diagnose.py --layer retrieval
-python diagnose.py --layer verifier --skip-llm
+# Test a specific layer only
+python -X utf8 diagnose.py --layer retrieval
+python -X utf8 diagnose.py --layer verifier --skip-llm
 ```
+
+#### `diagnose_verbose.py` — Trace-mode diagnostic with per-call timing
+
+```bash
+# Full trace including retrieval call timings and chunk scores
+python -X utf8 diagnose_verbose.py --idx 11 --trace-calls
+
+# Skip LLM to focus on retrieval only
+python -X utf8 diagnose_verbose.py --idx 12 --skip-llm
+```
+
+#### `diagnose_ingestion.py` — Ingestion consistency checker
+
+Traces each question's supporting articles through the full ingestion pipeline: `chunks_export.json` → LanceDB → KuzuDB → retrieval rank.
+
+```bash
+# Check ingestion consistency for specific question indices
+python -X utf8 diagnose_ingestion.py --indices 11,12
+
+# Check a range with vector rank included (requires Ollama)
+python -X utf8 diagnose_ingestion.py --indices 0-19 --vector
+
+# Different dataset
+python -X utf8 diagnose_ingestion.py --indices 0-9 --dataset 2wikimultihop
+```
+
+**Output per question:**
+1. Answer-bearing chunks (chunks whose text contains the gold answer)
+2. Supporting-fact article presence in each store (chunks_export → LanceDB → KuzuDB)
+3. Retrieval rank per query entity (graph and vector)
+4. Crowd-out analysis: how many competing sources contain the same entity
 
 **Graph-Quality Output (--graph-quality N)** zeigt pro Frage:
 
@@ -1277,7 +1464,7 @@ Both Ollama models run entirely on CPU and require no GPU. `phi3` is loaded as a
 **KuzuDB** was selected over NetworkX because:
 - Native Cypher query language: expressive multi-hop path queries.
 - Persistent on-disk storage: graph survives process restarts.
-- Measured 10–100× faster traversal than NetworkX for graphs with >100 nodes (see `test_performance_comparison` in `test_kuzu_migration.py`).
+- Measured 10–100× faster traversal than NetworkX for graphs with >100 nodes (verified during migration benchmarks, April 2026).
 - Embedded: no server process required.
 
 ---
@@ -1341,10 +1528,11 @@ Both Ollama models run entirely on CPU and require no GPU. `phi3` is loaded as a
         │
         ▼
   Persisted to ./data/hotpotqa/
-    vector_db/              (LanceDB, Verzeichnis)
-    knowledge_graph         (KuzuDB, Single File)
-    extraction_metadata.json(Entity/Relation-Stats)
-    questions.json          (500 test questions)
+    vector/                 (LanceDB directory)
+    graph/                  (KuzuDB directory)
+      extraction_results.json  (Colab Phase 2 output — unchanged by Phase 3)
+    chunks_export.json      (Phase 1 output — source of truth for chunks)
+    questions.json          (500 test questions with supporting_facts)
 ```
 
 ### 9.2 Query Processing Flow
@@ -1475,8 +1663,10 @@ For a HotpotQA subset of 500 questions (~10,000 chunks):
 | RRF fusion | ~0.5 ms | Pure Python, O(N log N) |
 | PreGenerativeFilter | ~1–3 ms | Jaccard + NLI |
 | **Total retrieval** | **~40–110 ms** | Without LLM generation |
-| LLM generation (phi3) | ~200–600 ms | CPU, 4-bit quantised |
-| **End-to-end** | **~250–700 ms** | Full pipeline |
+| LLM generation (phi3) | ~200 ms–62 s | CPU, 4-bit quantised; context size and KV-cache allocation dominate |
+| **End-to-end** | **~250 ms–65 s** | Full pipeline; LLM is the dominant bottleneck on CPU |
+
+> **LLM timeout note:** Ollama allocates the full KV-cache context window regardless of prompt length. On CPU, phi3 runs at approximately 8 tokens/second. A 2,400-character context (~600 tokens) can produce 60+ second responses. The system applies a 60-second `timeout` to Ollama HTTP calls; exceeding it returns the partial output. In practice, responses for bridge-resolved multi-hop queries with full context fit within 45 seconds.
 
 ### 10.3 Embedding Cache Efficiency
 
@@ -1689,7 +1879,216 @@ Für die Masterarbeit wird diese Limitierung als dokumentierte Known Issue behan
 
 ---
 
+### 12.10 Planner Sub-Query Rewriting für Comparison-Queries (2026-04-02)
+
+**Problem:** Comparison-Queries wie `"Were Scott Derrickson and Ed Wood of the same nationality?"` erzeugen ohne Rewriting Sub-Queries wie `"Were Scott Derrickson of the same nationality as Ed Wood?"`. Diese komplex formulierten Sub-Queries haben geringe Vektor-Ähnlichkeit zu Fakten-Chunks.
+
+**Lösung:** `_ATTR_MAP` mit 8 Regex-Patterns in `src/logic_layer/planner.py` `_decompose_comparison()`:
+
+| Pattern | Template |
+|---|---|
+| `same nationality` | `"What is the nationality of {entity}?"` |
+| `same birthplace` | `"Where was {entity} born?"` |
+| `same profession` | `"What is the profession of {entity}?"` |
+| `same genre` | `"What genre is {entity}?"` |
+| `same age` | `"When was {entity} born?"` |
+| `same country` | `"What country is {entity} from?"` |
+| `same religion` | `"What is the religion of {entity}?"` |
+| `born in the same` | `"Where was {entity} born?"` |
+
+**Ergebnis:** `"Were Scott Derrickson and Ed Wood of the same nationality?"` erzeugt jetzt:
+1. `"What is the nationality of Scott Derrickson?"` → direkter Treffer ✓
+2. `"What is the nationality of Ed Wood?"` → kein Treffer (Disambiguierungs-Problem 12.9)
+3. Original-Query als Kontext-Fallback
+
+---
+
+### 12.11 Navigator Entity-Mention Filter (2026-04-02)
+
+**Problem:** Für Sub-Queries wie `"What is the nationality of Ed Wood?"` hat `nomic-embed-text` hohe Ähnlichkeit zu beliebigen Nationalitäts-Artikeln. Beispiel: `"British people, or Britons..."` Score 0.798, relevanter Ed-Wood-Chunk nur 0.649 — unterhalb aller Ergebnisse.
+
+**Lösung:** `_entity_mention_filter()` als Filter 5 in `_navigate()` der `Navigator`-Klasse (`src/logic_layer/navigator.py`):
+
+- Multi-Word Entities (z.B. `"Scott Derrickson"`): prüfe vollständige Phrase **oder** einzelne Tokens ≥5 Zeichen als ganze Wörter (`\bscott\b`, `\bderrickson\b`)
+- Single-Token Entities: nur prüfen wenn ≥5 Zeichen (vermeidet False Positives durch `"Were"`, `"Wood"`)
+- **Safety-Fallback:** wenn alle Chunks gefiltert werden → behalte alle (kein leerer Kontext)
+
+**Ergebnis (Frage 0):**
+- `"British people"` → entfernt ✓ (kein "Scott", "Derrickson")
+- `"The Oku people"` → entfernt ✓ (kein Match, vorher durch "Were"-Entity falsch behalten)
+- `"Tyler Bates"` → behalten ✓ (enthält "Scott" im vollen Chunk-Text, da Tyler Bates mit Scott Derrickson zusammenarbeitete)
+- 20 raw → 5 relevante Chunks (vorher 6 mit 2 irrelevanten)
+
+---
+
+### 12.12 Verifier `best_answer or ...` Bug Fix (2026-04-02)
+
+**Problem:** In `src/logic_layer/verifier.py` the verifier used `best_answer or "[Error:...]"`. Python's `or` returns the fallback when `best_answer` is **falsy** — including empty string `""`. An LLM returning `""` would incorrectly be treated as an error.
+
+**Fix:** `best_answer if best_answer is not None else "[Error: no valid answer generated]"`
+
+---
+
+### 12.13 Data Layer Code Reviews (April 2026)
+
+All four data layer modules were comprehensively reviewed and refactored in April 2026. Key changes:
+
+**`entity_extraction.py`:**
+- Entity IDs: MD5 12-char → SHA-256 24-char (`_generate_entity_id` module-level function)
+- `EntityCache`: `get()`/`put()` now require `model_name` param — scoped by `(text_hash, model_name)` to invalidate on model change; `get_batch()` added (1 SQL query vs N round-trips)
+- `ExtractionConfig`: removed `selective_re` (never used); added `rebel_max_input_length`, `rebel_max_output_length`, `rebel_num_beams`, `device`
+- `GLiNERExtractor`: SpaCy NLP loaded once in `__init__` (not per-chunk)
+- `REBELExtractor.extract_batch` → renamed `extract_sequential` (documents model's seq2seq limitation)
+- `ExtractedEntity.to_dict()`: key `"type"` → `"entity_type"`; `ExtractedRelation.to_dict()`: keys renamed to `"subject_entity"`, `"object_entity"`, `"relation_type"`
+- **Re-ingestion required** if entity IDs changed (MD5→SHA-256): existing KuzuDB entries are invalid.
+
+**`chunking.py`:**
+- Removed 316 lines of print()-based test harness
+- UUID chunk IDs → deterministic SHA-256 (`source_doc:position:text[:50]`)
+- Dead code removed; `word_boundary_factor` threaded as parameter
+- `except Exception` narrowed to `(ValueError, RuntimeError, AttributeError)`
+
+**`embeddings.py`:**
+- `embed_documents` Phase 1 now uses `cache.get_batch()` (1 SQL query instead of N individual calls)
+- `embed_query` now increments `metrics.total_texts` (was missing)
+- `print_metrics()` replaced `print()` with `logger.info()`
+- `DEFAULT_BATCH_SIZE` 32→64; all 4 `except Exception` in `EmbeddingCache` → `except sqlite3.Error`
+- `get_batch` now bulk-updates `access_count`; context manager added (`__enter__`/`__exit__`)
+
+**`hybrid_retriever.py`:**
+- `QueryEntityExtractor` class removed (dead code — was immediately overwritten)
+- Key name bugs fixed: `_vector_only_results` uses `document_id`+`metadata.source_file`; `_graph_only_results` uses `source_file`, `hops`, `matched_entity`
+- `threading.Lock` added to `_GLINER_MODEL_CACHE` (double-checked locking)
+- `gliner_model_name` threaded through `RetrievalConfig` → `ImprovedQueryEntityExtractor` → `_get_gliner_model()`
+- Alias params `top_k_vector`/`top_k_graph` removed; canonical names `vector_top_k`/`graph_top_k` used everywhere
+- `top_k or ...` → `top_k if top_k is not None else ...` (falsy-zero bug fixed)
+
+---
+
+### 12.14 entity_hints Parameter: GLiNER Re-extraction on Short Sub-Queries (2026-04-11)
+
+**Problem:** In iterative multi-hop retrieval, the second hop's sub-query is a short 3–5 word phrase like `"screenwriter of Evolution"`. GLiNER on such a short fragment produces unreliable or no entity extractions. The graph search then falls back to regex patterns which miss multi-word bridge entities.
+
+**Solution:** `entity_hints: Optional[List[str]]` parameter added to `HybridRetriever.retrieve()`. When provided, the hints are used directly as graph search entity names, bypassing GLiNER. The `Navigator` passes `entity_hints=entity_names` (SpaCy-extracted entities from the full original query) when invoking the retriever, and `AgenticController` extends these with bridge entities discovered during iterative execution.
+
+**Propagation path:**
+```
+AgenticController._iterative_navigator_node()
+  └─► Navigator.navigate_step(sub_query, entity_hints=current_hints)
+        └─► HybridRetriever.retrieve(sub_query, entity_hints=current_hints)
+              └─► HybridStore.graph_search(entity_names=entity_hints)
+```
+
+---
+
+### 12.15 Storage Fuzzy Name Matching (`_name_variants`) (2026-04-11)
+
+**Problem:** KuzuDB graph lookup is exact string matching. Queries for `"David Weissman"` find no results if the graph stores `"David N. Weissman"`. Similarly, looking up `"End of Days"` fails if the entity was stored as `"End of Days (film)"`.
+
+**Solution:** `_name_variants(name)` helper in `KuzuGraphStore.find_chunks_by_entity_multihop()`:
+- For 2-token names where the first token is ≤ 3 characters (e.g. `"Ed Wood"`): also tries last-name-only (`"Wood"`)
+- For all names: also tries individual tokens ≥ 4 characters as standalone search terms
+- The loop tries each variant until hop-0 results are found; `entity_name` is updated to the effective variant for hop-2/3 queries
+
+**Limitation:** This is a lightweight heuristic, not a full entity linking solution. It resolves common short-name/full-name mismatches but does not handle aliases (`"Ed Wood"` ↔ `"Edward Davis Wood Jr."`). True disambiguation requires an entity linking system (e.g., BLINK, REL) — documented as Known Issue 12.9.
+
+---
+
+### 12.16 Relevance Threshold Factor: 0.6 → 0.85 (2026-04-11)
+
+**Problem:** `nomic-embed-text` exhibits score compression: all text-pair similarities fall in the range 0.739–0.786 regardless of semantic relevance. A threshold factor of `0.6 × max_score` ≈ `0.6 × 0.786` = 0.47 — well below every result — effectively disabled the relevance filter. Every chunk passed through, filling the context window with noise.
+
+**Solution:** `relevance_threshold_factor: 0.6 → 0.85`. This keeps only results within 15% of the top score. For score range [0.74, 0.79], this filters chunks scoring below ~0.67. Combined with the entity-mention filter (12.11), context quality improved measurably.
+
+**Configuration location:** `config/settings.yaml` — `agent.relevance_threshold_factor`. No hardcoding in code.
+
+---
+
+### 12.17 Comparison Decomposition: Removed 3rd Sub-Query (2026-04-11)
+
+**Problem:** `_decompose_comparison()` in `planner.py` produced three sub-queries:
+1. `"What is the nationality of Scott Derrickson?"`
+2. `"What is the nationality of Ed Wood?"`
+3. Original query as fallback: `"Were Scott Derrickson and Ed Wood of the same nationality?"`
+
+The third sub-query is a rephrased version of the original question. It embeds as near-identical to the first two and retrieves duplicate chunks, wasting context budget without adding new evidence.
+
+**Solution:** Removed the third sub-query. The comparison decomposition now produces exactly 2 sub-queries (one per entity). If neither entity yields retrievable chunks, the original query is used as the sole sub-query via the existing single-hop fallback path.
+
+---
+
+### 12.18 Iterative Multi-hop Implementation (2026-04-11)
+
+**Problem:** `HopStep.depends_on` and `HopStep.is_bridge` were defined in the data structures but never evaluated. All sub-queries in `hop_sequence` were dispatched simultaneously, which defeats the purpose of bridge-entity reasoning: the bridge entity name is unknown until hop 0 completes.
+
+**Concrete failure case (idx=11):** Question: *"Who was the screenwriter of the film 'Evolution', and also wrote the screenplay for the movie in which David Weissman was credited as a producer?"* — The bridge entity is the name of the film David Weissman produced, which must be retrieved first to find the relevant screenwriter.
+
+**Concrete failure case (idx=12):** Question: *"The song 'Oh My God' appears on the soundtrack for which year was the film with Guns N' Roses' contribution released?"* — The bridge is the film title ("End of Days"), not stated in the query.
+
+**Solution:** Three coordinated changes:
+
+1. **Planner (`planner.py`) — Patterns C and D:**
+   - Pattern C: detects `"for a/an/the [film|movie|show|...]"` → HopStep 0 retrieves the bridge film, HopStep 1 retrieves the answer
+   - Pattern D: detects `"[role] with [qualifier] co-wrote/directed/..."` → bridge is the work, not the person
+
+2. **Controller (`controller.py`) — `_iterative_navigator_node()`:**
+   - Sorts hops by `step_id`; executes in order
+   - After each `is_bridge=True` step: calls `_extract_bridge_entities()` on retrieved chunks
+   - Bridge entities are added to `current_hints`; passed as `entity_hints` to subsequent steps
+   - Context accumulated across all steps, deduplicated by `chunk_id`
+
+3. **HybridRetriever / Navigator — `entity_hints` parameter (see 12.14)**
+
+**Routing in `_navigator_node()`:**
+```python
+has_bridge_deps = any(h.get("depends_on") for h in hop_sequence_raw)
+if has_bridge_deps and len(hop_sequence_raw) > 1:
+    return _iterative_navigator_node(state, ...)
+else:
+    return _simple_navigate(state, ...)   # original behaviour
+```
+
+**Verified results:** Both idx=11 and idx=12 now retrieve the correct answer-bearing chunks after the iterative hop resolves the bridge entity.
+
+---
+
+### 12.19 Ingestion Diagnostic Tool: `diagnose_ingestion.py` (2026-04-11)
+
+**Motivation:** When retrieval fails for a specific question, the root cause may be at any of three levels: (1) the article was never chunked, (2) the chunk was never indexed in LanceDB or KuzuDB, or (3) the chunk is present but ranked below the top-k cutoff. Previously, this required manually querying each store.
+
+**Tool:** `diagnose_ingestion.py` provides a full trace from source article to retrieval rank for any set of question indices.
+
+**Four diagnostic stages per question:**
+1. Answer-bearing chunks: scans `chunks_export.json` for the gold answer string
+2. Supporting article presence: checks each store (chunks_export → LanceDB → KuzuDB) per supporting fact
+3. Retrieval rank: runs graph and vector search and reports rank of first chunk from the correct source
+4. Crowd-out analysis: shows competing sources per entity (identifies why correct chunk is pushed down)
+
+**Usage:**
+```bash
+python -X utf8 diagnose_ingestion.py --indices 11,12
+python -X utf8 diagnose_ingestion.py --indices 0-19 --vector  # includes vector rank (slow)
+python -X utf8 diagnose_ingestion.py --indices 0-9 --dataset 2wikimultihop
+```
+
+**Confirmed findings (idx=12):** "End of Days" chunk (id=262) present in all three stores; entity "End of Days" returns graph rank #1; "Oh My God" chunk (id=263) contains gold answer ("1999"). Root cause of failure: query entity was "Arnold Schwarzenegger" (crowd-out by other Schwarzenegger films) rather than "End of Days" — resolved by iterative multi-hop (12.18).
+
+---
+
 *End of Technical Architecture Documentation*
+
+---
+
+## Test Suite Summary
+
+| File | Tests | Status |
+|---|---|---|
+| `src/data_layer/test_data_layer.py` | 33 | ✓ |
+| `src/logic_layer/test_logic_layer.py` | ~50 | ✓ |
+| `src/pipeline/test_pipeline.py` | 54 | ✓ |
+| `test_system/test_chunking.py` | 29 | ✓ |
+| `test_system/test_embeddings.py` | 34 | ✓ |
+| **Total** | **~200** | **✓** |
 
 ---
 
@@ -1702,8 +2101,10 @@ Für die Masterarbeit wird diese Limitierung als dokumentierte Known Issue behan
 | 2.1.0 | 2026-01-25 | Distance metric fix (L2 → cosine) |
 | 3.0.0 | 2026-01-30 | Three-agent pipeline (S_P, S_N, S_V) |
 | 3.1.0 | 2026-02-26 | Comprehensive review; all bugs resolved |
-| 3.1.1 | 2026-03-15 | LLM-Config-Fixes: max_tokens=200, neue Context-Budget-Felder |
-| 3.1.2 | 2026-03-31 | Äußerer Retry-Loop aus AgentPipeline entfernt; Self-Correction nur im Verifier |
-| 3.1.3 | 2026-03-31 | Graph-Qualitäts-Diagnose (diagnose.py --graph-quality); Graph-Visualisierung (graph_3d.py) |
-| 3.2.0 | 2026-04-01 | Vollständige Dokumentationsüberarbeitung; Abschnitt 12 (Änderungen & Alternativen) hinzugefügt |
-| 3.3.0 | 2026-04-02 | Threshold 0.15→0.5 (Re-Ingestion); GLiNER Query-Konsistenz-Fix; Fallback-Warnings; Entity-Disambiguierung dokumentiert |
+| 3.1.1 | 2026-03-15 | LLM config: max_tokens=200; new context-budget fields |
+| 3.1.2 | 2026-03-31 | Outer retry loop removed from AgentPipeline; self-correction in Verifier only |
+| 3.1.3 | 2026-03-31 | Graph quality diagnostics (diagnose.py --graph-quality); graph visualisation (graph_3d.py) |
+| 3.2.0 | 2026-04-01 | Full documentation revision; Section 12 (Changes & Alternatives) added |
+| 3.3.0 | 2026-04-02 | Threshold 0.15→0.5 (re-ingestion); GLiNER query consistency fix; fallback warnings; entity disambiguation documented |
+| 3.4.0 | 2026-04-02 | Planner sub-query rewriting (12.10); Navigator entity-mention filter (12.11); Verifier `or`-bug fix (12.12) |
+| 4.0.0 | 2026-04-11 | Data layer reviews (12.13); entity_hints parameter (12.14); storage fuzzy matching (12.15); threshold 0.6→0.85 (12.16); comparison noise sub-query removed (12.17); iterative multi-hop implemented (12.18); diagnose_ingestion.py added (12.19); all dataclass field names corrected; AgenticController documented (§5.3); repository structure updated |

@@ -61,7 +61,7 @@ chunking:
 # ============================================================================
 vector_store:
   provider: "lancedb"
-  db_path: "./data/vector_db"
+  db_path: "./data/vector"
   
   # Index type: "flat" (exact) or "ivfflat" (approximate, faster)
   index_type: "ivfflat"
@@ -79,6 +79,8 @@ vector_store:
   # Retrieval parameters
   top_k_vectors: 10
   similarity_threshold: 0.3    # Minimum similarity [0.0, 1.0]
+  overfetch_factor: 3          # ANN candidates = top_k * overfetch_factor; filtered by threshold
+  graph_text_max_chars: 500    # Max characters stored in graph node (full text in vector store)
 
 # ============================================================================
 # KNOWLEDGE GRAPH
@@ -101,9 +103,9 @@ graph:
   backend: "kuzu"
   
   # Database path
-  # KuzuDB: Directory (e.g., "./data/knowledge_graph")
-  # NetworkX: File (e.g., "./data/knowledge_graph/graph.graphml")
-  graph_path: "./data/knowledge_graph"
+  # KuzuDB: Directory (e.g., "./data/graph")
+  # NetworkX: File (e.g., "./data/graph/graph.graphml")
+  graph_path: "./data/graph"
   
   # Graph traversal settings
   max_hops: 2                    # Maximum path length for traversal
@@ -150,8 +152,13 @@ rag:
   graph_weight: 0.3
 
   # RRF Fusion Parameter
-  rrf_k: 60                    # Reciprocal Rank Fusion Konstante (Standard: 60)
-  cross_source_boost: 1.2      # Boost für Chunks, die in beiden Retrieval-Pfaden auftauchen
+  # Note: rrf_k here is consumed by HybridRetriever (data layer) for its own
+  # internal fusion pass.  The Navigator (logic layer) reads navigator.rrf_k
+  # separately for its RRF fusion over sub-query result lists.  Both keys
+  # default to 60 (Cormack et al., 2009) but serve different components and
+  # must be maintained independently.
+  rrf_k: 60                    # Reciprocal Rank Fusion constant (standard: 60)
+  cross_source_boost: 1.2      # Boost for chunks appearing in both retrieval paths
 
   # Future work options
   reranking_enabled: false
@@ -186,42 +193,86 @@ llm:
   #   - Prompt-Overhead (~150 chars) → ~1050 chars Gesamtinput ans LLM
   max_context_chars: 900    # Gesamtbudget (Sicherheitsnetz)
   max_docs: 3               # Navigator wählt vor, Verifier nimmt Top-3
-  max_chars_per_doc: 300    # Pro Chunk ~75 Wörter — enthält relevante Fakten
+  max_chars_per_doc: 500    # ~125 words per chunk — increased from 300 to reduce key-sentence loss
 
 # ============================================================================
 # NAVIGATOR (S_N) — Pre-Generative Filtering
 # ============================================================================
 navigator:
-  # Relevance Filter: behalte Chunks mit Score >= factor × max_score
-  relevance_threshold_factor: 0.6
+  # Relevance Filter: keep chunks with score >= factor × max_rrf_score
+  relevance_threshold_factor: 0.85  # raised from 0.6 — score compression 0.74–0.80 made 0.6 keep everything
 
-  # Redundancy Filter: Jaccard-Similarity-Schwelle für Deduplizierung
+  # Redundancy Filter: Jaccard similarity threshold for deduplication
   redundancy_threshold: 0.8
 
-  # Maximale Chunk-Anzahl nach Filtering (vor Context Shrinkage)
+  # Maximum chunk count after filtering (before context shrinkage)
   max_context_chunks: 10
 
-  # Reciprocal Rank Fusion Konstante (Standard: 60)
+  # Reciprocal Rank Fusion smoothing constant (standard: 60)
+  # Reference: Cormack et al. (2009). SIGIR. DOI: 10.1145/1571941.1572114
   rrf_k: 60
 
-  # Top-K Ergebnisse pro Sub-Query aus Retriever
+  # Top-K results per sub-query from HybridRetriever
   top_k_per_subquery: 10
 
+  # Cross-source corroboration boost weights for RRF fusion.
+  # A chunk appearing in N sources/M sub-queries receives:
+  #   boost = 1 + source_weight*(N-1) + query_weight*(M-1)
+  # Empirically tuned on HotpotQA dev set (thesis section 3.3).
+  corroboration_source_weight: 0.1
+  corroboration_query_weight: 0.05
+
+  # Contradiction filter thresholds (numeric heuristic, original contribution).
+  # Two chunks are flagged as contradictory when:
+  #   word_overlap > overlap_threshold AND
+  #   max(n1,n2)/min(n1,n2) > ratio_threshold AND min(n1,n2) > min_value
+  contradiction_overlap_threshold: 0.3
+  contradiction_ratio_threshold: 2.0
+  contradiction_min_value: 10.0
+
 # ============================================================================
-# PLANNER (S_P) — Query-Analyse und Plan-Generierung
+# PLANNER (S_P) — Query Analysis and Plan Generation
 # ============================================================================
 planner:
-  # Minimale NER-Confidence für Entity-Extraktion
+  # Minimum NER confidence for entity extraction
   min_entity_confidence: 0.7
 
-  # Maximale Anzahl zu extrahierender Entities pro Query
+  # Maximum number of entities to extract per query
   max_entities: 10
 
-  # Bridge Entity Detection aktivieren (für Multi-Hop)
+  # Enable bridge entity detection (for multi-hop)
   enable_bridge_detection: true
 
-  # Temporale Constraints parsen
+  # Parse temporal constraints from queries
   enable_temporal_parsing: true
+
+  # ---------------------------------------------------------------------------
+  # CLASSIFIER WEIGHT CONSTANTS
+  # Empirically tuned on HotpotQA dev set (thesis Section 4.3 ablation).
+  # All six values can be varied here without code changes.
+  # ---------------------------------------------------------------------------
+  # Score bonus for SpaCy Matcher syntactic hits (Phase 2 of classify())
+  classifier_spacy_weight: 1.5
+  # Score bonus when entity/noun density indicates multi-hop (Phase 3)
+  classifier_entity_boost: 0.5
+  # Base term in confidence formula: conf = min(cap, base + score * scale)
+  classifier_confidence_base: 0.6
+  # Score multiplier in confidence formula
+  classifier_confidence_scale: 0.15
+  # Upper cap on returned classification confidence
+  classifier_confidence_cap: 0.95
+  # Confidence returned when no pattern matches (SINGLE_HOP fallback)
+  classifier_fallback_confidence: 0.8
+
+  # ---------------------------------------------------------------------------
+  # ENTITY DENSITY THRESHOLDS (Phase 3 of classify())
+  # Queries with more than these counts receive a multi-hop score boost.
+  # ---------------------------------------------------------------------------
+  entity_density_threshold: 2    # named entity count threshold
+  noun_density_threshold: 4      # noun/proper-noun count threshold
+
+  # Confidence assigned to entities found via regex fallback (not SpaCy NER)
+  regex_entity_confidence: 0.75
 
 # ============================================================================
 # AVAILABLE MODELS (für Multi-Modell-Evaluation und Ablation)
@@ -268,9 +319,14 @@ agent:
   # Maximum verification iterations in self-correction loop
   # 1 = kein Self-Correction (Baseline), 2 = Thesis-Default (1 Korrektur-Runde)
   max_verification_iterations: 2
-  
-  # Enable/disable verification stage
-  enable_verification: true
+
+  # Enable/disable individual pipeline stages (ablation flags)
+  enable_planner: true
+  enable_verifier: true
+
+  # FIFO query-result cache (SHA-256-keyed, insertion-order eviction)
+  enable_caching: true
+  cache_max_size: 1000
 
 # ============================================================================
 # QUANTIZATION SETTINGS
@@ -287,8 +343,8 @@ paths:
   root: "./"
   data: "./data"
   documents: "./data/documents"
-  vector_db: "./data/vector_db"
-  graph_db: "./data/knowledge_graph"
+  vector_db: "./data/vector"
+  graph_db: "./data/graph"
   logs: "./logs"
   cache: "./cache"
 
@@ -349,6 +405,55 @@ benchmark:
 
 
 # ============================================================================
+# VERIFIER (S_V) — Pre-Validation and Self-Correction
+# ============================================================================
+verifier:
+  # ---------------------------------------------------------------------------
+  # PRE-GENERATION VALIDATION FLAGS
+  # Set enable_contradiction_detection: true only when Transformers is
+  # installed — the NLI model (~270 MB) is downloaded on first use.
+  # ---------------------------------------------------------------------------
+  enable_entity_path_validation: true
+  enable_contradiction_detection: false   # Disabled by default (NLI download)
+  enable_credibility_scoring: true
+
+  # NLI contradiction detection model and parameters.
+  # Reference: Reimers & Gurevych (2019). arXiv:1908.10084.
+  nli_model: "cross-encoder/nli-distilroberta-base"
+  contradiction_threshold: 0.85    # NLI confidence above which a pair is flagged
+  nli_max_input_chars: 200         # Truncation per chunk before NLI (edge CPU)
+
+  # Entity-path validation: minimum fraction of query entities that must
+  # appear in the retrieved context for the check to pass.
+  entity_coverage_threshold: 0.5
+
+  # Source credibility scoring thresholds.
+  min_credibility_score: 0.5       # Chunks below this are filtered
+
+  # Credibility signal weights — must sum to 1.0.
+  # Empirically chosen on a HotpotQA dev-set sample; see thesis Section 3.4.
+  credibility_weight_cross_ref: 0.4     # Cross-reference corroboration
+  credibility_weight_entity_freq: 0.3   # Named-entity density
+  credibility_weight_provenance: 0.3    # Graph vs. vector retrieval origin
+
+  # Credibility scoring normalisation constants.
+  credibility_cross_ref_max: 3.0        # Divisor for cross-reference count
+  credibility_provenance_baseline: 0.5  # Score for vector-only (non-graph) chunks
+
+  # SpaCy processing limit inside credibility scoring (edge CPU budget).
+  spacy_max_chars: 500
+
+  # ConfidenceLevel thresholds for VerificationResult.confidence property.
+  # A verified-claim ratio >= high_threshold → HIGH, >= medium_threshold → MEDIUM.
+  confidence_high_threshold: 0.8
+  confidence_medium_threshold: 0.5
+
+  # Claim extraction and entity verification limits.
+  min_claim_chars: 15       # Minimum characters for a sentence to count as a claim
+  max_entities_to_verify: 5 # Max entities checked per claim during verification
+  max_key_phrases: 10       # Max key phrases per chunk in cross-reference scoring
+
+# ============================================================================
 # INGESTION CONFIGURATION
 # ============================================================================
 ingestion:
@@ -373,9 +478,17 @@ ingestion:
   # 0.8 = brich am Wort, sofern das Leerzeichen im letzten 20% des Chunks liegt.
   word_boundary_factor: 0.8
 
+  # Maximum character length per sentence-based chunk (SpacySentenceChunker)
+  max_chunk_chars: 2000
+
   # SpaCy-spezifisch
   spacy_model: "en_core_web_sm"
   entity_aware_chunking: false
+
+  # Quality Filter thresholds (AutomaticQualityFilter — semantic chunking only)
+  quality_filter:
+    min_length: 100   # Minimum characters per chunk
+    min_words: 15     # Minimum word count per chunk
 
   # Metadata & Entity Extraction
   extract_entities: true
@@ -387,6 +500,7 @@ ingestion:
 entity_extraction:
 
   # GLiNER Named Entity Recognition
+  # Reference: Zaratiana et al. (2023). arXiv:2311.08526.
   gliner:
     model_name: "urchade/gliner_small-v2.1"
     entity_types:
@@ -394,24 +508,31 @@ entity_extraction:
       - "organization"
       - "city"
       - "country"
+      - "state"
+      - "location"
       - "film"
       - "movie"
+      - "album"           # music albums (Abbey Road etc.)
+      - "work of art"     # catch-all for unusual titles, paintings, books
+      - "landmark"        # buildings/monuments → maps to LOCATION
       - "event"
-    confidence_threshold: 0.15   # Niedrig für hohen Recall (HotpotQA)
+      - "award"
+    confidence_threshold: 0.15   # recall-optimised for HotpotQA
     batch_size: 16
 
   # REBEL Relation Extraction
+  # Reference: Cabot & Navigli (2021). EMNLP 2021 Findings.
   rebel:
     model_name: "Babelscape/rebel-large"
-    confidence_threshold: 0.5
-    batch_size: 8
-    min_entities_for_re: 2       # RE nur wenn >= 2 Entitäten im Chunk
+    confidence_threshold: 0.5    # uniform sentinel — REBEL emits no per-triplet score
+    batch_size: 8                # reserved for future batched implementation
+    min_entities_for_re: 2       # skip RE when fewer entities are found (~60% reduction)
+    max_input_length: 256        # tokenizer truncation length
+    max_output_length: 256       # generation length cap
+    num_beams: 5                 # beam search width
 
-  # Entity Caching (LRU + SQLite)
+  # Entity Caching (in-memory LRU + SQLite persistent store)
   caching:
     enabled: true
     cache_path: "./data/entity_cache.db"
     lru_cache_size: 10000
-
-  # Selective RE: RE nur auf Chunks mit Co-Occurring Entities
-  selective_re: true

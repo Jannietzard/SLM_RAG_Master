@@ -30,6 +30,9 @@ from datetime import datetime
 
 import yaml
 
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 
 # ============================================================================
 # SETUP
@@ -65,18 +68,24 @@ def normalize_answer(text: str) -> str:
 
 
 def compute_exact_match(prediction: str, gold: str) -> bool:
-    """Compute Exact Match (EM) score."""
+    """Compute Exact Match (EM) score.
+
+    Accepts the prediction if:
+    1. The normalized strings are identical, OR
+    2. The gold answer appears as a whole-word span inside the prediction
+       (word-boundary anchored to avoid substring false positives like
+       "no" matching "cannot").
+    """
     pred_norm = normalize_answer(prediction)
     gold_norm = normalize_answer(gold)
-    
-    # Exact match
+
     if pred_norm == gold_norm:
         return True
-    
-    # Gold answer contained in prediction
-    if gold_norm in pred_norm:
+
+    # Whole-word containment check (word-boundary anchored)
+    if re.search(r'\b' + re.escape(gold_norm) + r'\b', pred_norm):
         return True
-    
+
     return False
 
 
@@ -153,7 +162,7 @@ class HotpotQAEvaluator:
     
     def __init__(
         self,
-        config_path: Path = Path("./config/settings.yaml"),
+        config_path: Path = PROJECT_ROOT / "config" / "settings.yaml",
         logger: logging.Logger = None
     ):
         self.config_path = config_path
@@ -162,32 +171,71 @@ class HotpotQAEvaluator:
         self.config = None
         
     def setup_pipeline(self, retrieval_mode: str = "hybrid") -> None:
-        """Initialize the RAG pipeline."""
+        """Initialize the RAG pipeline with retriever and graph store."""
         self.logger.info(f"Setting up pipeline (mode={retrieval_mode})...")
-        
-        # Load and modify config
+
         with open(self.config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
-        
-        # Set retrieval mode
-        self.config["rag"]["retrieval_mode"] = retrieval_mode
-        
-        # Import and initialize
-        from src.pipeline.agent_pipeline import create_pipeline
 
-        self.pipeline = create_pipeline()
-        
+        self.config["rag"]["retrieval_mode"] = retrieval_mode
+
+        from src.data_layer.storage import HybridStore, StorageConfig
+        from src.data_layer.embeddings import BatchedOllamaEmbeddings
+        from src.data_layer.hybrid_retriever import HybridRetriever, RetrievalConfig, RetrievalMode
+        from src.pipeline.agent_pipeline import create_full_pipeline
+
+        # Build storage
+        vector_path = PROJECT_ROOT / "data" / "hotpotqa" / "vector"
+        graph_path  = PROJECT_ROOT / "data" / "hotpotqa" / "graph"
+        storage_cfg = StorageConfig(
+            vector_db_path=vector_path,
+            graph_db_path=graph_path,
+        )
+        embeddings = BatchedOllamaEmbeddings(
+            model_name=self.config.get("embeddings", {}).get("model_name", "nomic-embed-text"),
+            base_url=self.config.get("embeddings", {}).get("base_url", "http://localhost:11434"),
+        )
+        hybrid_store = HybridStore(config=storage_cfg, embeddings=embeddings)
+
+        # Build retriever
+        mode_map = {
+            "hybrid": RetrievalMode.HYBRID,
+            "vector": RetrievalMode.VECTOR,
+            "graph":  RetrievalMode.GRAPH,
+        }
+        rag_cfg = self.config.get("rag", {})
+        ee_gliner = self.config.get("entity_extraction", {}).get("gliner", {})
+        ret_cfg = RetrievalConfig(
+            mode=mode_map.get(retrieval_mode, RetrievalMode.HYBRID),
+            vector_top_k=rag_cfg.get("top_k_vectors", 10),
+            final_top_k=rag_cfg.get("top_k_vectors", 10),
+            rrf_k=rag_cfg.get("rrf_k", 60),
+            cross_source_boost=rag_cfg.get("cross_source_boost", 1.2),
+            query_ner_confidence=ee_gliner.get("confidence_threshold", 0.15),
+            query_entity_types=ee_gliner.get("entity_types") or None,
+        )
+        retriever = HybridRetriever(
+            hybrid_store=hybrid_store,
+            embeddings=embeddings,
+            config=ret_cfg,
+        )
+
+        self.pipeline = create_full_pipeline(
+            hybrid_retriever=retriever,
+            graph_store=hybrid_store.graph_store,
+            config=self.config,
+        )
         self.logger.info("Pipeline ready")
     
     def load_questions(
         self,
-        questions_path: Path = Path("./data/hotpotqa_test_questions.json"),
+        questions_path: Path = PROJECT_ROOT / "data" / "hotpotqa" / "questions.json",
         n_samples: int = None
     ) -> List[Dict]:
         """Load test questions."""
         if not questions_path.exists():
             self.logger.error(f"Questions file not found: {questions_path}")
-            self.logger.error("Run 'python ingest_hotpotqa.py' first!")
+            self.logger.error("Expected: data/hotpotqa/questions.json")
             sys.exit(1)
         
         with open(questions_path, 'r', encoding='utf-8') as f:
@@ -324,7 +372,7 @@ class HotpotQAEvaluator:
         summary: EvalSummary
     ) -> None:
         """Save evaluation results."""
-        output_dir = Path("./evaluation_results")
+        output_dir = PROJECT_ROOT / "evaluation_results"
         output_dir.mkdir(exist_ok=True)
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -440,7 +488,7 @@ def parse_args():
     parser.add_argument(
         "--questions-file",
         type=Path,
-        default=Path("./data/hotpotqa_test_questions.json"),
+        default=PROJECT_ROOT / "data" / "hotpotqa" / "questions.json",
         help="Path to test questions JSON"
     )
     return parser.parse_args()

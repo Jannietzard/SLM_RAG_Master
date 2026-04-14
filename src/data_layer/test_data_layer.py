@@ -1,69 +1,68 @@
 """
-Comprehensive Test Suite for Data Layer (Artefakt A)
+Data Layer Test Suite — Artifact A
 
-Version: 4.0.0
+Version: 4.1.0
 Author: Edge-RAG Research Project
 
 ===============================================================================
-TEST COVERAGE
+PURPOSE AND SCOPE
 ===============================================================================
 
-1. Storage Tests (LanceDB + KuzuDB)
-   - Vector Store: add, search, count
-   - Graph Store: nodes, edges, traversal
-   - Hybrid Store: combined operations
+Automated regression suite for all five Data Layer (Artifact A) components of
+the Edge-RAG system:
 
-2. Embedding Tests
-   - Batch processing
-   - Cache hit/miss
-   - Dimension validation
+  1. Storage (LanceDB vector store + KuzuDB knowledge graph)
+  2. Embeddings (SQLite-backed cache, metrics)
+  3. Chunking (sentence-based, semantic, fixed-size)
+  4. Entity Extraction (data structures and caching; ML models require Ollama
+     and are validated separately in test_system/test_ner_quality.py)
+  5. Hybrid Retrieval (RRF fusion, pre-generative filtering, retrieval modes)
 
-3. Chunking Tests
-   - Sentence-based (SpaCy)
-   - Semantic chunking
-   - Fixed-size chunking
+Integration tests (TestFullPipeline) exercise the end-to-end data flow from
+raw text ingestion to ranked retrieval results.
 
-4. Entity Extraction Tests (wenn verfügbar)
-   - GLiNER NER
-   - REBEL Relation Extraction
-   - Caching
+Performance tests (TestPerformance) measure LanceDB and embedding latency with
+a deterministic mock embeddings model.  Actual thesis latency targets for
+SLMs (10–80 s for 1.5B–3.8B models) are validated by test_system/diagnose.py
+on target edge hardware.
 
-5. Retrieval Tests
-   - Vector retrieval
-   - Graph retrieval
-   - RRF Fusion
-   - Pre-generative filtering
+===============================================================================
+TEST INFRASTRUCTURE
+===============================================================================
 
-6. Integration Tests
-   - Full ingestion pipeline
-   - End-to-end retrieval
+All tests use a module-scoped temporary directory to avoid repeated KuzuDB
+initialisation overhead.  Each test opens its own subdirectory, so tests are
+fully independent.  The mock embedding fixture produces deterministic vectors
+seeded per text (hash-based), guaranteeing identical outputs across machines
+and CI runs.
 
 ===============================================================================
 USAGE
 ===============================================================================
 
-# Run all tests:
-pytest test_data_layer.py -v
+    # Run all tests:
+    pytest test_data_layer.py -v
 
-# Run specific test class:
-pytest test_data_layer.py::TestVectorStore -v
+    # Run specific test class:
+    pytest test_data_layer.py::TestVectorStore -v
 
-# Run with coverage:
-pytest test_data_layer.py --cov=src.data_layer --cov-report=html
+    # Run with coverage:
+    pytest test_data_layer.py --cov=src.data_layer --cov-report=html
 
 ===============================================================================
 """
 
-import pytest
-import tempfile
-import shutil
 import logging
+import shutil
+import tempfile
 import time
-import numpy as np
 from pathlib import Path
-from typing import List, Dict, Any
-from unittest.mock import Mock, patch, MagicMock
-from dataclasses import dataclass
+from typing import Generator, List
+
+import numpy as np
+import pytest
+
+from langchain_core.documents import Document
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -75,17 +74,16 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 @pytest.fixture(scope="module")
-def temp_dir():
-    """Create temporary directory for test databases."""
+def temp_dir() -> Generator[Path, None, None]:
+    """Create a module-scoped temporary directory for test databases."""
     tmp = tempfile.mkdtemp(prefix="test_data_layer_")
     yield Path(tmp)
-    # Cleanup
     shutil.rmtree(tmp, ignore_errors=True)
 
 
 @pytest.fixture
-def sample_texts():
-    """Sample texts for testing."""
+def sample_texts() -> List[str]:
+    """Five science-biography sentences covering distinct topics."""
     return [
         "Albert Einstein was born in Ulm, Germany in 1879. He developed the theory of relativity.",
         "Marie Curie was a Polish physicist. She discovered radium and polonium.",
@@ -96,44 +94,53 @@ def sample_texts():
 
 
 @pytest.fixture
-def sample_documents():
-    """Sample LangChain-style documents."""
-    from langchain.schema import Document
-
+def sample_documents() -> List[Document]:
+    """Three LangChain Documents with metadata required by the storage schema."""
     return [
         Document(
             page_content="Einstein developed E=mc². This equation relates mass and energy.",
-            metadata={"source_file": "physics.pdf", "page_number": 1, "chunk_id": "c1"}
+            metadata={"source_file": "physics.pdf", "page_number": 1, "chunk_id": "c1",
+                      "chunk_index": 0}
         ),
         Document(
             page_content="Curie won two Nobel Prizes. She was the first woman to win a Nobel Prize.",
-            metadata={"source_file": "biography.pdf", "page_number": 5, "chunk_id": "c2"}
+            metadata={"source_file": "biography.pdf", "page_number": 5, "chunk_id": "c2",
+                      "chunk_index": 0}
         ),
         Document(
             page_content="Newton's laws describe motion. The third law states every action has a reaction.",
-            metadata={"source_file": "physics.pdf", "page_number": 12, "chunk_id": "c3"}
+            metadata={"source_file": "physics.pdf", "page_number": 12, "chunk_id": "c3",
+                      "chunk_index": 1}
         ),
     ]
 
 
 @pytest.fixture
 def mock_embeddings():
-    """Mock embedding model that returns random vectors."""
+    """
+    Deterministic mock embedding model.
+
+    Vectors are seeded per-text via hash(text) so that identical inputs
+    always produce identical outputs across machines and test runs.  This
+    is required for reproducible similarity-ordering assertions.
+    """
     class MockEmbeddings:
-        def __init__(self, dim=768):
+        def __init__(self, dim: int = 768) -> None:
             self.dim = dim
-        
+
         def embed_documents(self, texts: List[str]) -> List[List[float]]:
-            return [self._random_embedding() for _ in texts]
-        
+            return [self._make_embedding(text) for text in texts]
+
         def embed_query(self, text: str) -> List[float]:
-            return self._random_embedding()
-        
-        def _random_embedding(self) -> List[float]:
-            vec = np.random.randn(self.dim).astype(np.float32)
-            vec = vec / np.linalg.norm(vec)  # L2 normalize
+            return self._make_embedding(text)
+
+        def _make_embedding(self, text: str) -> List[float]:
+            # Seed per text for determinism; modulo avoids negative seeds.
+            rng = np.random.default_rng(abs(hash(text)) % (2 ** 32))
+            vec = rng.standard_normal(self.dim).astype(np.float32)
+            vec /= np.linalg.norm(vec) + 1e-8
             return vec.tolist()
-    
+
     return MockEmbeddings()
 
 
@@ -142,267 +149,289 @@ def mock_embeddings():
 # ============================================================================
 
 class TestVectorStore:
-    """Tests for LanceDB Vector Store."""
-    
-    def test_initialization(self, temp_dir):
-        """Test vector store initialization."""
+    """Tests for the LanceDB Vector Store adapter."""
+
+    def test_initialization(self, temp_dir: Path) -> None:
+        """Vector store initialises correctly and exposes expected attributes."""
         from src.data_layer.storage import VectorStoreAdapter
-        
+
         db_path = temp_dir / "vector_test"
         store = VectorStoreAdapter(
             db_path=db_path,
             embedding_dim=768,
             normalize_embeddings=True,
-            distance_metric="cosine"
+            distance_metric="cosine",
         )
-        
+
         assert store.db is not None
         assert store.embedding_dim == 768
         assert store.distance_metric == "cosine"
-    
-    def test_add_and_search(self, temp_dir, sample_documents, mock_embeddings):
-        """Test adding documents and searching."""
+
+    def test_add_and_search(
+        self, temp_dir: Path, sample_documents: List[Document], mock_embeddings
+    ) -> None:
+        """Adding documents and searching returns similarity-scored results."""
         from src.data_layer.storage import VectorStoreAdapter
-        
+
         db_path = temp_dir / "vector_add_search"
         store = VectorStoreAdapter(db_path=db_path, embedding_dim=768)
-        
-        # Add documents
+
         store.add_documents_with_embeddings(sample_documents, mock_embeddings)
-        
-        # Search
+
         query_embedding = mock_embeddings.embed_query("Einstein relativity")
-        results = store.vector_search(query_embedding, top_k=3)
-        
+        # threshold=0.0 to bypass the similarity filter with mock embeddings
+        results = store.vector_search(query_embedding, top_k=3, threshold=0.0)
+
         assert len(results) > 0
         assert all("similarity" in r for r in results)
-        assert all(0 <= r["similarity"] <= 1 for r in results)
-    
-    def test_dimension_validation(self, temp_dir):
-        """Test embedding dimension mismatch detection."""
+        assert all(0.0 <= r["similarity"] <= 1.0 for r in results)
+
+    def test_dimension_validation(self, temp_dir: Path) -> None:
+        """Embedding dimension mismatch raises ValueError with a clear message."""
         from src.data_layer.storage import VectorStoreAdapter
-        
+
         db_path = temp_dir / "vector_dim_test"
         store = VectorStoreAdapter(db_path=db_path, embedding_dim=768)
-        
-        # Try to add wrong dimension
-        wrong_embeddings = [[0.1] * 512]  # Wrong dimension
-        
+
+        # 512 != 768 — deliberately wrong dimension for error-injection test
+        wrong_embeddings = [[0.1] * 512]
+
         with pytest.raises(ValueError, match="DIMENSION MISMATCH"):
             store._validate_embedding_dimension(wrong_embeddings)
-    
-    def test_distance_to_similarity(self, temp_dir):
-        """Test distance to similarity conversion."""
+
+    def test_distance_to_similarity(self, temp_dir: Path) -> None:
+        """Cosine distance is correctly converted to similarity in [0, 1]."""
         from src.data_layer.storage import VectorStoreAdapter
-        
+
         db_path = temp_dir / "vector_dist_test"
         store = VectorStoreAdapter(db_path=db_path, distance_metric="cosine")
-        
-        # Cosine distance 0 -> similarity 1
+
         assert store._distance_to_similarity(0.0) == 1.0
-        # Cosine distance 1 -> similarity 0
         assert store._distance_to_similarity(1.0) == 0.0
-        # Cosine distance 0.5 -> similarity 0.5
-        assert store._distance_to_similarity(0.5) == 0.5
+        assert store._distance_to_similarity(0.5) == pytest.approx(0.5)
 
 
 class TestKuzuGraphStore:
-    """Tests for KuzuDB Graph Store."""
-    
-    def test_initialization(self, temp_dir):
-        """Test graph store initialization."""
+    """Tests for the KuzuDB Knowledge Graph store."""
+
+    def test_initialization(self, temp_dir: Path) -> None:
+        """KuzuGraphStore initialises and exposes a live connection."""
         from src.data_layer.storage import KuzuGraphStore
 
         db_path = temp_dir / "graph_test"
         store = KuzuGraphStore(db_path)
-        
+
         assert store.db is not None
         assert store.conn is not None
-    
-    def test_add_document_chunk(self, temp_dir):
-        """Test adding document chunks."""
+
+    def test_add_document_chunk(self, temp_dir: Path) -> None:
+        """MERGE-ing a DocumentChunk persists text retrievable via Cypher."""
         from src.data_layer.storage import KuzuGraphStore
 
         db_path = temp_dir / "graph_chunks"
         store = KuzuGraphStore(db_path)
-        
+
         store.add_document_chunk(
             chunk_id="chunk_001",
             text="Einstein was born in Ulm.",
             page_number=1,
             chunk_index=0,
-            source_file="test.pdf"
+            source_file="test.pdf",
         )
-        
-        # Verify via query
+
         result = store.conn.execute(
             "MATCH (c:DocumentChunk {chunk_id: 'chunk_001'}) RETURN c.text"
         )
         assert result.has_next()
-        row = result.get_next()
-        assert "Einstein" in row[0]
-    
-    def test_add_source_document(self, temp_dir):
-        """Test adding source documents."""
+        assert "Einstein" in result.get_next()[0]
+
+    def test_add_source_document(self, temp_dir: Path) -> None:
+        """MERGE-ing a SourceDocument node persists filename."""
         from src.data_layer.storage import KuzuGraphStore
 
         db_path = temp_dir / "graph_source"
         store = KuzuGraphStore(db_path)
-        
+
         store.add_source_document(
             doc_id="doc_001",
             filename="thesis.pdf",
-            total_pages=100
+            total_pages=100,
         )
-        
-        # Verify
+
         result = store.conn.execute(
             "MATCH (d:SourceDocument {doc_id: 'doc_001'}) RETURN d.filename"
         )
         assert result.has_next()
-    
-    def test_graph_traversal(self, temp_dir):
-        """Test multi-hop graph traversal."""
+
+    def test_get_context_chunks(self, temp_dir: Path) -> None:
+        """get_context_chunks returns neighbouring chunk IDs via NEXT_CHUNK edges."""
         from src.data_layer.storage import KuzuGraphStore
 
-        db_path = temp_dir / "graph_traversal"
+        db_path = temp_dir / "graph_context"
         store = KuzuGraphStore(db_path)
-        
-        # Add chunks
+
         for i in range(3):
             store.add_document_chunk(
-                chunk_id=f"chunk_{i}",
-                text=f"Text {i}",
+                chunk_id=f"ctx_{i}",
+                text=f"Context text {i}",
                 page_number=1,
                 chunk_index=i,
-                source_file="test.pdf"
+                source_file="test.pdf",
             )
-        
-        # Add sequential relations
-        store.add_next_chunk_relation("chunk_0", "chunk_1")
-        store.add_next_chunk_relation("chunk_1", "chunk_2")
-        
-        # Test traversal
-        neighbors = store.get_context_chunks("chunk_0", window=2)
-        assert len(neighbors) >= 1
-    
-    def test_statistics(self, temp_dir):
-        """Test graph statistics."""
+
+        store.add_next_chunk_relation("ctx_0", "ctx_1")
+        store.add_next_chunk_relation("ctx_1", "ctx_2")
+
+        neighbours = store.get_context_chunks("ctx_0", window=2)
+        assert len(neighbours) >= 1
+        assert "ctx_0" in neighbours
+
+    def test_graph_traversal(self, temp_dir: Path) -> None:
+        """graph_traversal returns a hop-distance map for reachable nodes."""
+        from src.data_layer.storage import KuzuGraphStore
+
+        db_path = temp_dir / "graph_traversal_direct"
+        store = KuzuGraphStore(db_path)
+
+        for i in range(3):
+            store.add_document_chunk(
+                chunk_id=f"trav_{i}",
+                text=f"Traversal text {i}",
+                page_number=1,
+                chunk_index=i,
+                source_file="test.pdf",
+            )
+
+        store.add_next_chunk_relation("trav_0", "trav_1")
+        store.add_next_chunk_relation("trav_1", "trav_2")
+
+        visited = store.graph_traversal("trav_0", max_hops=2)
+
+        assert "trav_0" in visited
+        assert visited["trav_0"] == 0
+        assert "trav_1" in visited
+        assert visited["trav_1"] == 1
+
+    def test_statistics(self, temp_dir: Path) -> None:
+        """get_statistics returns a dict with at least the document_chunks count."""
         from src.data_layer.storage import KuzuGraphStore
 
         db_path = temp_dir / "graph_stats"
         store = KuzuGraphStore(db_path)
-        
-        # Add some data
-        store.add_document_chunk("c1", "Text 1", 1, 0, "test.pdf")
-        store.add_document_chunk("c2", "Text 2", 1, 1, "test.pdf")
-        
+
+        store.add_document_chunk("s1", "Stats text 1", 1, 0, "test.pdf")
+        store.add_document_chunk("s2", "Stats text 2", 1, 1, "test.pdf")
+
         stats = store.get_statistics()
         assert "document_chunks" in stats
         assert stats["document_chunks"] >= 2
 
 
 class TestHybridStore:
-    """Tests for combined Vector + Graph store."""
-    
-    def test_initialization(self, temp_dir, mock_embeddings):
-        """Test hybrid store initialization."""
+    """Tests for the combined Vector + Graph store facade."""
+
+    def test_initialization(self, temp_dir: Path, mock_embeddings) -> None:
+        """HybridStore initialises both sub-stores without errors."""
         from src.data_layer.storage import HybridStore, StorageConfig
-        
+
         config = StorageConfig(
             vector_db_path=temp_dir / "hybrid_vector",
             graph_db_path=temp_dir / "hybrid_graph",
-            embedding_dim=768
+            embedding_dim=768,
         )
-        
+
         store = HybridStore(config, mock_embeddings)
-        
+
         assert store.vector_store is not None
         assert store.graph_store is not None
-    
-    def test_add_documents(self, temp_dir, sample_documents, mock_embeddings):
-        """Test adding documents to both stores."""
+
+    def test_add_documents(
+        self,
+        temp_dir: Path,
+        sample_documents: List[Document],
+        mock_embeddings,
+    ) -> None:
+        """add_documents writes to both vector and graph stores."""
         from src.data_layer.storage import HybridStore, StorageConfig
-        
+
         config = StorageConfig(
             vector_db_path=temp_dir / "hybrid_add_vector",
-            graph_db_path=temp_dir / "hybrid_add_graph"
+            graph_db_path=temp_dir / "hybrid_add_graph",
         )
-        
+
         store = HybridStore(config, mock_embeddings)
         store.add_documents(sample_documents)
-        
-        # Verify vector store
+
+        # Verify vector store received the documents
         query_emb = mock_embeddings.embed_query("Einstein")
-        vector_results = store.vector_store.vector_search(query_emb, top_k=3)
+        vector_results = store.vector_store.vector_search(
+            query_emb, top_k=3, threshold=0.0
+        )
         assert len(vector_results) > 0
 
 
 # ============================================================================
-# 2. EMBEDDING TESTS
+# 2. EMBEDDING INFRASTRUCTURE TESTS
 # ============================================================================
 
-class TestBatchedOllamaEmbeddings:
-    """Tests for batched embedding generation."""
-    
-    def test_cache_initialization(self, temp_dir):
-        """Test embedding cache initialization."""
+class TestEmbeddingInfrastructure:
+    """Tests for EmbeddingCache and EmbeddingMetrics."""
+
+    def test_cache_initialization(self, temp_dir: Path) -> None:
+        """EmbeddingCache creates the SQLite database file on init."""
         from src.data_layer.embeddings import EmbeddingCache
 
         cache_path = temp_dir / "embed_cache.db"
         cache = EmbeddingCache(cache_path)
-        
+
         assert cache.db_path == cache_path
         assert cache_path.exists()
-        
+
         cache.close()
-    
-    def test_cache_put_get(self, temp_dir):
-        """Test cache put and get operations."""
+
+    def test_cache_put_get(self, temp_dir: Path) -> None:
+        """Cache put/get round-trip preserves the full embedding vector."""
         from src.data_layer.embeddings import EmbeddingCache
 
         cache_path = temp_dir / "embed_cache_ops.db"
         cache = EmbeddingCache(cache_path)
-        
+
         test_text = "Hello World"
         test_embedding = [0.1] * 768
-        
-        # Put
+
         cache.put(test_text, test_embedding, "test-model")
-        
-        # Get
         retrieved = cache.get(test_text, "test-model")
+
         assert retrieved is not None
-        assert len(retrieved) == 768
-        assert abs(retrieved[0] - 0.1) < 0.001
-        
+        assert retrieved == pytest.approx(test_embedding)
+
         cache.close()
-    
-    def test_cache_miss(self, temp_dir):
-        """Test cache miss returns None."""
+
+    def test_cache_miss(self, temp_dir: Path) -> None:
+        """cache.get returns None for text that was never stored."""
         from src.data_layer.embeddings import EmbeddingCache
 
         cache_path = temp_dir / "embed_cache_miss.db"
         cache = EmbeddingCache(cache_path)
-        
+
         result = cache.get("nonexistent text", "test-model")
         assert result is None
-        
+
         cache.close()
-    
-    def test_metrics_tracking(self):
-        """Test embedding metrics."""
+
+    def test_metrics_tracking(self) -> None:
+        """EmbeddingMetrics computes cache_hit_rate and avg_time_per_text_ms."""
         from src.data_layer.embeddings import EmbeddingMetrics
 
         metrics = EmbeddingMetrics()
         metrics.total_texts = 100
         metrics.cache_hits = 80
         metrics.cache_misses = 20
-        
-        assert metrics.cache_hit_rate == 80.0
-        
+
+        assert metrics.cache_hit_rate == pytest.approx(80.0)
+
         metrics.total_time_ms = 500
-        assert metrics.avg_time_per_text_ms == 5.0
+        assert metrics.avg_time_per_text_ms == pytest.approx(5.0)
 
 
 # ============================================================================
@@ -410,85 +439,86 @@ class TestBatchedOllamaEmbeddings:
 # ============================================================================
 
 class TestSentenceChunking:
-    """Tests for sentence-based chunking."""
-    
-    def test_sentence_chunker_basic(self):
-        """Test basic sentence chunking."""
-        from src.data_layer.ingestion import SentenceChunker
+    """Tests for sentence-based text chunking."""
 
-        chunker = SentenceChunker(sentences_per_chunk=2, min_chunk_size=20)
-        
+    def test_sentence_chunker_basic(self) -> None:
+        """SentenceChunker produces at least two chunks and includes 'text' key."""
+        from src.data_layer import SentenceChunker
+
+        chunker = SentenceChunker(
+            sentences_per_chunk=2,
+            # sentences_per_chunk=2 differs from settings.yaml default (3)
+            # deliberately to test a non-default configuration.
+            min_chunk_size=20,
+        )
+
         text = "First sentence. Second sentence. Third sentence. Fourth sentence."
         chunks = chunker.chunk(text)
-        
+
         assert len(chunks) >= 2
         assert all("text" in c for c in chunks)
-    
-    def test_spacy_sentence_chunker(self):
-        """Test SpaCy-based sentence chunking (wenn verfügbar)."""
+
+    def test_spacy_sentence_chunker(self) -> None:
+        """SpacySentenceChunker chunks by sentence windows with overlap."""
         from src.data_layer.chunking import SpacySentenceChunker
 
+        # sentences_per_chunk=3 and sentence_overlap=1 match settings.yaml defaults.
         chunker = SpacySentenceChunker(sentences_per_chunk=3, sentence_overlap=1)
-        
-        text = """
-        Albert Einstein was born in 1879. He was a theoretical physicist.
-        Einstein developed the theory of relativity. He won the Nobel Prize in 1921.
-        His work changed our understanding of physics. He died in 1955.
-        """
-        
+
+        text = (
+            "Albert Einstein was born in 1879. He was a theoretical physicist. "
+            "Einstein developed the theory of relativity. He won the Nobel Prize in 1921. "
+            "His work changed our understanding of physics. He died in 1955."
+        )
+
         chunks = chunker.chunk_text(text, source_doc="test.txt")
-        
+
         assert len(chunks) >= 2
-        assert all(hasattr(c, 'text') for c in chunks)
-        assert all(hasattr(c, 'sentences') for c in chunks)
-        # 3-Satz-Fenster Validierung
+        assert all(hasattr(c, "text") for c in chunks)
+        assert all(hasattr(c, "sentences") for c in chunks)
+        # Each chunk must not exceed the configured window size.
         assert all(c.sentence_count <= 3 for c in chunks)
 
 
 class TestSemanticChunking:
-    """Tests for semantic chunking."""
-    
-    def test_semantic_chunker(self):
-        """Test semantic chunker with quality metrics."""
+    """Tests for semantic chunking with quality metrics."""
+
+    def test_semantic_chunker(self) -> None:
+        """Semantic chunker produces chunks with quality metadata keys."""
         from src.data_layer.chunking import create_semantic_chunker
-        from langchain.schema import Document
-        
+
         chunker = create_semantic_chunker(
             chunk_size=300,
             chunk_overlap=50,
-            min_chunk_size=50
+            min_chunk_size=50,
         )
-        
+
         doc = Document(
-            page_content="""
-            1. Introduction
-            
-            This thesis investigates machine learning techniques.
-            The research focuses on edge deployment scenarios.
-            
-            1.1 Problem Statement
-            
-            Modern language models require significant resources.
-            This creates challenges for edge device deployment.
-            """,
-            metadata={"source_file": "test.pdf"}
+            page_content=(
+                "1. Introduction\n\n"
+                "This thesis investigates machine learning techniques. "
+                "The research focuses on edge deployment scenarios.\n\n"
+                "1.1 Problem Statement\n\n"
+                "Modern language models require significant resources. "
+                "This creates challenges for edge device deployment."
+            ),
+            metadata={"source_file": "test.pdf"},
         )
-        
+
         chunks = chunker.chunk_document(doc)
-        
+
         assert len(chunks) >= 1
         assert all("importance_score" in c.metadata for c in chunks)
         assert all("lexical_diversity" in c.metadata for c in chunks)
-    
-    def test_header_extraction(self):
-        """Test header/section extraction."""
+
+    def test_header_extraction(self) -> None:
+        """HeaderExtractor identifies at least one structural section marker."""
         from src.data_layer.chunking import HeaderExtractor
-        
+
         extractor = HeaderExtractor()
-        
         text = "1.1 Introduction\nThis is the introduction text."
-        metadata, cleaned = extractor.extract_headers(text)
-        
+        metadata, _cleaned = extractor.extract_headers(text)
+
         assert metadata.section is not None or metadata.chapter is not None
 
 
@@ -497,74 +527,96 @@ class TestSemanticChunking:
 # ============================================================================
 
 class TestEntityExtraction:
-    """Tests for GLiNER + REBEL entity extraction."""
-    
-    def test_extracted_entity_dataclass(self):
-        """Test ExtractedEntity dataclass."""
+    """Tests for GLiNER + REBEL data structures and caching.
+
+    Note: GLiNER and REBEL model inference is not tested here because it
+    requires GPU or slow CPU inference.  Model-level quality is validated
+    in test_system/test_ner_quality.py.
+    """
+
+    def test_extracted_entity_dataclass(self) -> None:
+        """ExtractedEntity stores fields correctly and serialises to dict."""
         from src.data_layer.entity_extraction import ExtractedEntity
-        
+
         entity = ExtractedEntity(
             entity_id="e001",
             name="Albert Einstein",
             entity_type="PERSON",
             confidence=0.95,
             mention_span=(0, 15),
-            source_chunk_id="c001"
+            source_chunk_id="c001",
         )
-        
+
         assert entity.name == "Albert Einstein"
         assert entity.entity_type == "PERSON"
-        
+
         d = entity.to_dict()
-        assert d["type"] == "PERSON"
-        assert d["confidence"] == 0.95
-    
-    def test_extracted_relation_dataclass(self):
-        """Test ExtractedRelation dataclass."""
+        # Key renamed from "type" to "entity_type" in entity_extraction v3.1 rewrite.
+        assert d["entity_type"] == "PERSON"
+        assert d["confidence"] == pytest.approx(0.95)
+
+    def test_extracted_relation_dataclass(self) -> None:
+        """ExtractedRelation stores fields correctly and serialises to dict."""
         from src.data_layer.entity_extraction import ExtractedRelation
-        
+
         relation = ExtractedRelation(
             subject_entity="Einstein",
             relation_type="works_for",
             object_entity="Princeton University",
             confidence=0.85,
-            source_chunk_ids=["c001"]
+            source_chunk_ids=["c001"],
         )
-        
+
         assert relation.relation_type == "works_for"
-        
+
         d = relation.to_dict()
-        assert d["subject"] == "Einstein"
-        assert d["object"] == "Princeton University"
-    
-    def test_extraction_config(self):
-        """Test ExtractionConfig defaults."""
+        # Keys renamed from "subject"/"object"/"relation" in entity_extraction v3.1 rewrite.
+        assert d["subject_entity"] == "Einstein"
+        assert d["object_entity"] == "Princeton University"
+
+    def test_extraction_config(self) -> None:
+        """ExtractionConfig defaults match settings.yaml thesis specifications."""
         from src.data_layer.entity_extraction import ExtractionConfig
-        
+
         config = ExtractionConfig()
-        
-        # Thesis-Spezifikationen
-        assert config.ner_confidence_threshold == 0.15
-        assert config.re_confidence_threshold == 0.5
+
+        # Thesis 2.5 / settings.yaml: gliner.confidence_threshold = 0.15
+        assert config.ner_confidence_threshold == pytest.approx(0.15)
+        # Thesis 2.5 / settings.yaml: rebel.confidence_threshold = 0.5
+        assert config.re_confidence_threshold == pytest.approx(0.5)
+        # settings.yaml: gliner.batch_size = 16
         assert config.ner_batch_size == 16
+        # settings.yaml: rebel.batch_size = 8
         assert config.re_batch_size == 8
+        # settings.yaml: rebel.min_entities_for_re = 2 (skip RE when < 2 entities)
         assert config.min_entities_for_re == 2
-        assert "person" in config.entity_types        # lowercase seit GLiNER-Umstellung
-        assert "organization" in config.entity_types  # lowercase seit GLiNER-Umstellung
-    
-    def test_entity_cache(self, temp_dir):
-        """Test entity caching."""
+        # GLiNER uses lowercase labels for better zero-shot performance.
+        assert "person" in config.entity_types
+        assert "organization" in config.entity_types
+
+    def test_entity_cache(self, temp_dir: Path) -> None:
+        """EntityCache stores and retrieves data keyed by (text_hash, model_name)."""
         from src.data_layer.entity_extraction import EntityCache
-        
+
         cache = EntityCache(temp_dir / "entity_cache.db", max_size=100)
-        
-        test_entities = [{"name": "Einstein", "type": "PERSON"}]
-        cache.put("Test text about Einstein", test_entities)
-        
-        retrieved = cache.get("Test text about Einstein")
+
+        test_data = {
+            "entities": [{"name": "Einstein", "entity_type": "PERSON"}],
+            "relations": [],
+        }
+        cache.put(
+            "Test text about Einstein",
+            test_data,
+            "urchade/gliner_small-v2.1",
+        )
+
+        retrieved = cache.get(
+            "Test text about Einstein",
+            "urchade/gliner_small-v2.1",
+        )
         assert retrieved is not None
-        assert retrieved[0]["name"] == "Einstein"
-        
+        assert retrieved["entities"][0]["name"] == "Einstein"
+
         cache.close()
 
 
@@ -573,151 +625,207 @@ class TestEntityExtraction:
 # ============================================================================
 
 class TestRRFFusion:
-    """Tests for Reciprocal Rank Fusion."""
-    
-    def test_rrf_formula(self):
-        """Test RRF score calculation."""
+    """Tests for Reciprocal Rank Fusion.
+
+    Reference: Cormack, Clarke & Buettcher (2009). "Reciprocal Rank Fusion
+    outperforms Condorcet and individual Rank Learning Methods." SIGIR 2009.
+    DOI: 10.1145/1571941.1572114.
+    """
+
+    def test_rrf_formula(self) -> None:
+        """RRF score for rank 1 with k=60 equals 1/(60+1) = 1/61.
+
+        Verifies that RRFFusion.fuse() implements the formula exactly:
+            score(rank r) = 1 / (k + r)   [r is 1-based]
+
+        Reference: Cormack et al. (2009). SIGIR 2009.
+        """
         from src.data_layer.hybrid_retriever import RRFFusion
-        
-        fusion = RRFFusion(k=60, cross_source_boost=1.2)
-        
-        # RRF score for rank 1: 1/(60+1) = 0.01639...
-        expected_score = 1 / 61
-        assert abs(expected_score - 0.01639) < 0.001
-    
-    def test_rrf_fusion_basic(self):
-        """Test basic RRF fusion."""
-        from src.data_layer.hybrid_retriever import RRFFusion
-        
-        fusion = RRFFusion(k=60, cross_source_boost=1.2)
-        
+
+        # cross_source_boost=1.0 isolates the formula without the boost factor.
+        fusion = RRFFusion(k=60, cross_source_boost=1.0)
+
         vector_results = [
-            {"document_id": "c1", "text": "Text 1", "similarity": 0.9, "metadata": {"source_file": "a"}, "position": 0},
-            {"document_id": "c2", "text": "Text 2", "similarity": 0.8, "metadata": {"source_file": "a"}, "position": 1},
+            {
+                "document_id": "c1",
+                "text": "T1",
+                "similarity": 0.9,
+                "metadata": {"source_file": "a"},
+                "position": 0,
+            },
         ]
 
-        graph_results = [
-            {"chunk_id": "c1", "text": "Text 1", "hops": 1, "source_file": "a", "matched_entity": "", "position": 0},
-            {"chunk_id": "c3", "text": "Text 3", "hops": 2, "source_file": "b", "matched_entity": "", "position": 0},
-        ]
-        
-        results = fusion.fuse(vector_results, graph_results, final_top_k=3)
-        
-        assert len(results) > 0
-        # c1 sollte am höchsten sein (in beiden Listen)
-        assert results[0].chunk_id == "c1"
-        assert results[0].retrieval_method == "hybrid"  # In beiden
-    
-    def test_cross_source_boost(self):
-        """Test cross-source boost for hybrid results."""
+        results = fusion.fuse(vector_results, [], final_top_k=1)
+
+        assert len(results) == 1
+        # Rank 1 (first result), k=60: score = 1 / (60 + 1) = 1/61 ≈ 0.01639
+        expected = 1.0 / (60 + 1)
+        assert results[0].rrf_score == pytest.approx(expected, abs=1e-6)
+
+    def test_rrf_fusion_basic(self) -> None:
+        """The chunk appearing in both result lists receives the highest RRF score.
+
+        Reference: Cormack et al. (2009). SIGIR 2009.
+        """
         from src.data_layer.hybrid_retriever import RRFFusion
-        
-        fusion = RRFFusion(k=60, cross_source_boost=1.5)
-        
-        # Same chunk in both sources
+
+        fusion = RRFFusion(k=60, cross_source_boost=1.2)
+
         vector_results = [
-            {"document_id": "c1", "text": "T1", "similarity": 0.9, "metadata": {"source_file": "a"}, "position": 0},
+            {
+                "document_id": "c1",
+                "text": "Text 1",
+                "similarity": 0.9,
+                "metadata": {"source_file": "a"},
+                "position": 0,
+            },
+            {
+                "document_id": "c2",
+                "text": "Text 2",
+                "similarity": 0.8,
+                "metadata": {"source_file": "a"},
+                "position": 1,
+            },
         ]
         graph_results = [
-            {"chunk_id": "c1", "text": "T1", "hops": 1, "source_file": "a", "matched_entity": "", "position": 0},
+            {
+                "chunk_id": "c1",
+                "text": "Text 1",
+                "hops": 1,
+                "source_file": "a",
+                "matched_entity": "",
+                "position": 0,
+            },
+            {
+                "chunk_id": "c3",
+                "text": "Text 3",
+                "hops": 2,
+                "source_file": "b",
+                "matched_entity": "",
+                "position": 0,
+            },
         ]
-        
-        results = fusion.fuse(vector_results, graph_results)
-        
-        # With boost, score should be higher than without
-        boosted_score = results[0].rrf_score
-        
-        # Calculate unboosted
-        fusion_no_boost = RRFFusion(k=60, cross_source_boost=1.0)
-        results_no_boost = fusion_no_boost.fuse(vector_results, graph_results)
-        unboosted_score = results_no_boost[0].rrf_score
-        
-        assert boosted_score > unboosted_score
+
+        results = fusion.fuse(vector_results, graph_results, final_top_k=3)
+
+        assert len(results) > 0
+        # c1 appears in both lists — highest score after cross-source boost.
+        assert results[0].chunk_id == "c1"
+        assert results[0].retrieval_method == "hybrid"
+
+    def test_cross_source_boost(self) -> None:
+        """A chunk appearing in both result lists scores higher with boost > 1."""
+        from src.data_layer.hybrid_retriever import RRFFusion
+
+        vector_results = [
+            {
+                "document_id": "c1",
+                "text": "T1",
+                "similarity": 0.9,
+                "metadata": {"source_file": "a"},
+                "position": 0,
+            },
+        ]
+        graph_results = [
+            {
+                "chunk_id": "c1",
+                "text": "T1",
+                "hops": 1,
+                "source_file": "a",
+                "matched_entity": "",
+                "position": 0,
+            },
+        ]
+
+        fusion_boosted = RRFFusion(k=60, cross_source_boost=1.5)
+        results_boosted = fusion_boosted.fuse(vector_results, graph_results)
+
+        fusion_unboosted = RRFFusion(k=60, cross_source_boost=1.0)
+        results_unboosted = fusion_unboosted.fuse(vector_results, graph_results)
+
+        assert results_boosted[0].rrf_score > results_unboosted[0].rrf_score
 
 
 class TestPreGenerativeFilter:
-    """Tests for pre-generative filtering."""
-    
-    def test_relevance_filter(self):
-        """Test relevance threshold filtering."""
+    """Tests for pre-generative (Navigator) relevance and redundancy filtering."""
+
+    def test_relevance_filter(self) -> None:
+        """Relevance filter removes chunks below factor * max_score threshold."""
         from src.data_layer.hybrid_retriever import (
             PreGenerativeFilter,
             RetrievalResult,
         )
-        
+
         pf = PreGenerativeFilter(relevance_threshold_factor=0.5)
-        
+
         results = [
             RetrievalResult("c1", "High score", "a", 0, rrf_score=1.0),
             RetrievalResult("c2", "Medium score", "a", 1, rrf_score=0.6),
             RetrievalResult("c3", "Low score", "a", 2, rrf_score=0.3),
         ]
-        
+
         filtered = pf._relevance_filter(results)
-        
-        # With factor 0.5, threshold = 0.5 * 1.0 = 0.5
-        # c3 (0.3) should be filtered out
+
+        # threshold = 0.5 * max_score(1.0) = 0.5; c3 (0.3) is below threshold.
         assert len(filtered) == 2
         assert all(r.rrf_score >= 0.5 for r in filtered)
-    
-    def test_redundancy_filter(self):
-        """Test redundancy (duplicate) filtering."""
+
+    def test_redundancy_filter(self) -> None:
+        """Redundancy filter removes chunks with Jaccard similarity above threshold."""
         from src.data_layer.hybrid_retriever import (
             PreGenerativeFilter,
             RetrievalResult,
         )
-        
+
         pf = PreGenerativeFilter(jaccard_threshold=0.8)
-        
+
         results = [
             RetrievalResult("c1", "Einstein was a physicist", "a", 0, rrf_score=1.0),
-            RetrievalResult("c2", "Einstein was a great physicist", "a", 1, rrf_score=0.9),  # Similar
-            RetrievalResult("c3", "Darwin studied evolution", "a", 2, rrf_score=0.8),  # Different
+            RetrievalResult("c2", "Einstein was a great physicist", "a", 1, rrf_score=0.9),
+            RetrievalResult("c3", "Darwin studied evolution", "a", 2, rrf_score=0.8),
         ]
-        
+
         filtered = pf._redundancy_filter(results)
-        
-        # c2 should be filtered as redundant to c1
-        assert len(filtered) <= 2
+
+        # c2 is near-duplicate of c1; only c1 + c3 should survive.
+        assert len(filtered) == 2
 
 
 class TestHybridRetriever:
-    """Tests for full hybrid retrieval."""
-    
-    def test_retrieval_modes(self, temp_dir, mock_embeddings):
-        """Test different retrieval modes."""
+    """Tests for the full hybrid retrieval pipeline."""
+
+    def test_retrieval_modes(self, temp_dir: Path, mock_embeddings) -> None:
+        """All three RetrievalMode values execute without errors."""
         from src.data_layer.hybrid_retriever import (
             HybridRetriever,
             RetrievalConfig,
             RetrievalMode,
         )
         from src.data_layer.storage import HybridStore, StorageConfig
-        
-        # Setup store
+
         storage_config = StorageConfig(
             vector_db_path=temp_dir / "retriever_vector",
-            graph_db_path=temp_dir / "retriever_graph"
+            graph_db_path=temp_dir / "retriever_graph",
         )
         store = HybridStore(storage_config, mock_embeddings)
-        
-        # Test each mode
+
         for mode in [RetrievalMode.VECTOR, RetrievalMode.GRAPH, RetrievalMode.HYBRID]:
             retrieval_config = RetrievalConfig(
                 mode=mode,
-                top_k_vector=5,
-                top_k_graph=3,
+                vector_top_k=5,
+                graph_top_k=3,
                 vector_weight=0.7,
                 graph_weight=0.3,
-                similarity_threshold=0.0
+                # threshold=0.0 avoids mock-embedding score variability
+                similarity_threshold=0.0,
             )
-            
+
             retriever = HybridRetriever(
                 config=retrieval_config,
                 hybrid_store=store,
-                embeddings=mock_embeddings
+                embeddings=mock_embeddings,
             )
-            
-            # Should not raise
+
             results, metrics = retriever.retrieve("test query")
             assert isinstance(results, list)
 
@@ -727,85 +835,103 @@ class TestHybridRetriever:
 # ============================================================================
 
 class TestFullPipeline:
-    """End-to-end integration tests."""
-    
-    def test_ingestion_to_retrieval(self, temp_dir, sample_texts, mock_embeddings):
-        """Test full pipeline from ingestion to retrieval."""
-        from src.data_layer.storage import HybridStore, StorageConfig
-        from src.data_layer.ingestion import DocumentIngestionPipeline, IngestionConfig
+    """End-to-end integration tests covering ingestion → retrieval."""
+
+    def test_ingestion_to_retrieval(
+        self,
+        temp_dir: Path,
+        sample_texts: List[str],
+        mock_embeddings,
+    ) -> None:
+        """Full pipeline: chunked ingestion followed by vector retrieval returns results."""
         from src.data_layer.hybrid_retriever import (
             HybridRetriever,
             RetrievalConfig,
             RetrievalMode,
         )
-        from langchain.schema import Document
-        
+        from src.data_layer import DocumentIngestionPipeline, IngestionConfig
+        from src.data_layer.storage import HybridStore, StorageConfig
+
         # 1. Setup
         storage_config = StorageConfig(
             vector_db_path=temp_dir / "e2e_vector",
-            graph_db_path=temp_dir / "e2e_graph"
+            graph_db_path=temp_dir / "e2e_graph",
         )
         store = HybridStore(storage_config, mock_embeddings)
-        
+
         ingestion_config = IngestionConfig(
             chunking_strategy="sentence",
-            sentences_per_chunk=2
+            sentences_per_chunk=2,
         )
         pipeline = DocumentIngestionPipeline(ingestion_config)
-        
+
         # 2. Ingest
         documents = [
-            Document(page_content=text, metadata={"source_file": f"doc_{i}.txt"})
+            Document(
+                page_content=text,
+                metadata={"source_file": f"doc_{i}.txt"},
+            )
             for i, text in enumerate(sample_texts)
         ]
-        
         chunked_docs = pipeline.process_documents(documents)
         store.add_documents(chunked_docs)
-        
-        # 3. Retrieve
+
+        # 3. Retrieve — threshold=0.0 ensures all chunks are eligible candidates
         retrieval_config = RetrievalConfig(
             mode=RetrievalMode.VECTOR,
-            top_k_vector=3,
-            top_k_graph=2,
+            vector_top_k=3,
+            graph_top_k=2,
             vector_weight=0.7,
             graph_weight=0.3,
-            similarity_threshold=0.0
+            similarity_threshold=0.0,
         )
-        
+
         retriever = HybridRetriever(
             config=retrieval_config,
             hybrid_store=store,
-            embeddings=mock_embeddings
+            embeddings=mock_embeddings,
         )
-        
+
         results, metrics = retriever.retrieve("Who developed relativity?")
-        
-        # Verify
-        assert len(results) >= 0  # May be empty with mock embeddings
-        # If results exist, verify structure
-        if len(results) > 0:
-            assert all(hasattr(r, 'text') for r in results)
-            assert all(hasattr(r, 'rrf_score') for r in results)  # RetrievalResult uses rrf_score, not relevance_score
-    
-    def test_thesis_compliance(self):
-        """Verify implementation matches Thesis Abschnitt 2 specifications."""
+
+        # With deterministic mock embeddings and threshold=0.0, ingestion of
+        # 5 texts must produce at least one retrievable result.
+        assert len(results) > 0, (
+            "Expected at least one result; check ingestion pipeline and retrieval config."
+        )
+        assert all(hasattr(r, "chunk_id") for r in results)
+        assert all(hasattr(r, "text") for r in results)
+        assert all(hasattr(r, "rrf_score") for r in results)
+        assert all(r.rrf_score >= 0.0 for r in results)
+
+    def test_thesis_compliance(self) -> None:
+        """Verify that ExtractionConfig and SentenceChunkingConfig match thesis specifications.
+
+        This test encodes thesis section 2 parameter values as assertions so that
+        any future change to defaults is caught immediately.
+        """
         from src.data_layer.entity_extraction import ExtractionConfig
         from src.data_layer.chunking import SentenceChunkingConfig
-        
-        # Thesis 2.2: 3-Satz-Fenster
+
+        # Thesis 2.2 / settings.yaml: 3-sentence window
         chunk_config = SentenceChunkingConfig()
         assert chunk_config.sentences_per_chunk == 3
-        
-        # Thesis 2.5: GLiNER Confidence 0.15, REBEL Confidence 0.5
+
+        # Thesis 2.5 / settings.yaml: GLiNER threshold = 0.15 (recall-optimised)
         extract_config = ExtractionConfig()
-        assert extract_config.ner_confidence_threshold == 0.15
-        assert extract_config.re_confidence_threshold == 0.5
-        
-        # Thesis 2.5: Batch sizes
+        assert extract_config.ner_confidence_threshold == pytest.approx(0.15)
+
+        # Thesis 2.5 / settings.yaml: REBEL threshold = 0.5
+        assert extract_config.re_confidence_threshold == pytest.approx(0.5)
+
+        # settings.yaml: gliner.batch_size = 16
         assert extract_config.ner_batch_size == 16
+
+        # settings.yaml: rebel.batch_size = 8
         assert extract_config.re_batch_size == 8
-        
-        # Thesis 2.5: Selective RE
+
+        # settings.yaml: rebel.min_entities_for_re = 2
+        # Skip relation extraction when fewer than 2 entities are found (~60% reduction).
         assert extract_config.min_entities_for_re == 2
 
 
@@ -814,50 +940,254 @@ class TestFullPipeline:
 # ============================================================================
 
 class TestPerformance:
-    """Performance and latency tests."""
-    
-    def test_embedding_latency(self, mock_embeddings, sample_texts):
-        """Test embedding generation latency."""
+    """Baseline performance tests using mock embeddings.
+
+    These tests measure infrastructure latency (NumPy ops, LanceDB ANN) with
+    a deterministic mock model.  They do NOT validate thesis latency targets
+    for SLMs (10–80 s for 1.5B–3.8B models on edge CPU); that validation is
+    performed by test_system/diagnose.py on target hardware.
+    """
+
+    def test_embedding_latency(
+        self, mock_embeddings, sample_texts: List[str]
+    ) -> None:
+        """Mock embedding generation completes within 100 ms per batch."""
         start = time.time()
-        
+
         for _ in range(10):
             mock_embeddings.embed_documents(sample_texts)
-        
+
         elapsed = (time.time() - start) * 1000 / 10
-        logger.info(f"Avg embedding latency: {elapsed:.1f}ms for {len(sample_texts)} texts")
-        
-        # Should be fast with mock
-        assert elapsed < 100  # ms
-    
-    def test_vector_search_latency(self, temp_dir, sample_texts, mock_embeddings):
-        """Test vector search latency."""
+        logger.info(
+            "Mock embedding latency: %.1f ms for %d texts", elapsed, len(sample_texts)
+        )
+
+        assert elapsed < 100  # ms — relaxed threshold for CI; not a thesis claim
+
+    def test_vector_search_latency(
+        self, temp_dir: Path, sample_texts: List[str], mock_embeddings
+    ) -> None:
+        """LanceDB ANN search over 100 documents completes within 100 ms."""
         from src.data_layer.storage import VectorStoreAdapter
-        from langchain.schema import Document
-        
+
         db_path = temp_dir / "perf_vector"
         store = VectorStoreAdapter(db_path=db_path, embedding_dim=768)
-        
-        # Add documents
+
         docs = [
-            Document(page_content=t, metadata={"chunk_id": f"c{i}"})
-            for i, t in enumerate(sample_texts * 20)  # 100 docs
+            Document(
+                page_content=t,
+                metadata={"chunk_id": f"perf_{i}", "source_file": "perf.pdf"},
+            )
+            for i, t in enumerate(sample_texts * 20)  # 100 documents
         ]
         store.add_documents_with_embeddings(docs, mock_embeddings)
-        
-        # Measure search
+
         query_emb = mock_embeddings.embed_query("test query")
-        
+
         latencies = []
         for _ in range(10):
             start = time.time()
-            store.vector_search(query_emb, top_k=10)
+            store.vector_search(query_emb, top_k=10, threshold=0.0)
             latencies.append((time.time() - start) * 1000)
-        
+
         avg_latency = sum(latencies) / len(latencies)
-        logger.info(f"Avg vector search latency: {avg_latency:.1f}ms")
-        
-        # Thesis target: 20-40ms
-        assert avg_latency < 100  # Relaxed for CI environments
+        logger.info("LanceDB vector search latency: %.1f ms (100 docs)", avg_latency)
+
+        # Thesis target for vector search: 20–40 ms; relaxed to 100 ms for CI.
+        assert avg_latency < 100  # ms
+
+
+# ============================================================================
+# 8. EDGE CASE TESTS
+# ============================================================================
+
+class TestEdgeCases:
+    """Edge case and boundary condition tests."""
+
+    def test_add_empty_document_list(
+        self, temp_dir: Path, mock_embeddings
+    ) -> None:
+        """add_documents([]) must return without error and leave stores empty."""
+        from src.data_layer.storage import HybridStore, StorageConfig
+
+        config = StorageConfig(
+            vector_db_path=temp_dir / "edge_empty_vector",
+            graph_db_path=temp_dir / "edge_empty_graph",
+            embedding_dim=768,
+        )
+        store = HybridStore(config, mock_embeddings)
+
+        # Must not raise
+        store.add_documents([])
+
+        # Vector store should have no table or empty table
+        query_emb = mock_embeddings.embed_query("anything")
+        results = store.vector_search(query_emb, top_k=5, threshold=0.0)
+        assert results == []
+
+    def test_vector_search_on_empty_store(self, temp_dir: Path) -> None:
+        """vector_search on an uninitialised store returns an empty list."""
+        from src.data_layer.storage import VectorStoreAdapter
+
+        db_path = temp_dir / "edge_empty_vs"
+        store = VectorStoreAdapter(db_path=db_path, embedding_dim=768)
+
+        # No documents added — table does not exist yet
+        query_emb = [0.0] * 768
+        results = store.vector_search(query_emb, top_k=5)
+
+        assert results == []
+
+    def test_multihop_empty_entity_name(self, temp_dir: Path) -> None:
+        """find_chunks_by_entity_multihop with empty string returns empty list."""
+        from src.data_layer.storage import KuzuGraphStore
+
+        db_path = temp_dir / "edge_empty_entity"
+        store = KuzuGraphStore(db_path)
+
+        results = store.find_chunks_by_entity_multihop("")
+        assert results == []
+
+
+# ============================================================================
+# DOCUMENT INGESTION PIPELINE
+# ============================================================================
+
+class TestDocumentIngestionPipeline:
+    """Tests for DocumentIngestionPipeline and IngestionConfig."""
+
+    def test_valid_config_sentence_spacy(self):
+        """sentence_spacy strategy is accepted without error."""
+        from src.data_layer import IngestionConfig
+        cfg = IngestionConfig(chunking_strategy="sentence_spacy")
+        assert cfg.chunking_strategy == "sentence_spacy"
+
+    def test_valid_config_all_strategies(self):
+        """All five strategy names are accepted by IngestionConfig."""
+        from src.data_layer import IngestionConfig
+        for strategy in ("sentence", "sentence_spacy", "semantic", "fixed", "recursive"):
+            cfg = IngestionConfig(chunking_strategy=strategy)
+            assert cfg.chunking_strategy == strategy
+
+    def test_invalid_strategy_raises(self):
+        """Unknown chunking strategy raises ValueError at construction time."""
+        from src.data_layer import IngestionConfig
+        with pytest.raises(ValueError, match="Invalid chunking_strategy"):
+            IngestionConfig(chunking_strategy="nonexistent")
+
+    def test_chunk_size_too_small_raises(self):
+        """chunk_size < 50 raises ValueError."""
+        from src.data_layer import IngestionConfig
+        with pytest.raises(ValueError, match="chunk_size"):
+            IngestionConfig(chunk_size=10)
+
+    def test_overlap_geq_window_raises(self):
+        """sentence_overlap >= sentences_per_chunk raises ValueError."""
+        from src.data_layer import IngestionConfig
+        with pytest.raises(ValueError, match="sentence_overlap"):
+            IngestionConfig(sentences_per_chunk=3, sentence_overlap=3)
+
+    def test_process_text_returns_chunks(self):
+        """process_text on non-empty text returns at least one chunk."""
+        from src.data_layer import create_data_layer_pipeline
+        pipeline = create_data_layer_pipeline(strategy="sentence", min_chunk_size=10)
+        text = (
+            "Albert Einstein was born in Ulm. He developed the theory of relativity. "
+            "Einstein received the Nobel Prize in 1921."
+        )
+        chunks = pipeline.process_text(text, {"source": "test"})
+        assert len(chunks) >= 1
+        assert all("text" in c and "metadata" in c for c in chunks)
+
+    def test_process_text_empty_returns_empty(self):
+        """Empty text input yields an empty chunk list."""
+        from src.data_layer import create_data_layer_pipeline
+        pipeline = create_data_layer_pipeline(strategy="sentence")
+        assert pipeline.process_text("") == []
+        assert pipeline.process_text("   ") == []
+
+    def test_process_texts_global_chunk_ids(self):
+        """process_texts assigns monotonically increasing global_chunk_id."""
+        from src.data_layer import create_data_layer_pipeline
+        pipeline = create_data_layer_pipeline(strategy="sentence", min_chunk_size=10)
+        texts = [
+            "Einstein was a physicist. He won the Nobel Prize.",
+            "Bohr was a Danish physicist. He studied atomic structure.",
+        ]
+        chunks = pipeline.process_texts(texts)
+        ids = [c["metadata"]["global_chunk_id"] for c in chunks]
+        assert ids == list(range(len(ids))), "global_chunk_id must be 0, 1, 2, ..."
+
+    def test_process_texts_empty_list(self):
+        """process_texts with empty list returns empty list."""
+        from src.data_layer import create_data_layer_pipeline
+        pipeline = create_data_layer_pipeline(strategy="sentence")
+        assert pipeline.process_texts([]) == []
+
+    def test_source_id_added_to_metadata(self):
+        """source_id is propagated to chunk metadata when add_source_metadata=True."""
+        from src.data_layer import create_data_layer_pipeline
+        pipeline = create_data_layer_pipeline(strategy="sentence", min_chunk_size=10)
+        chunks = pipeline.process_text(
+            "Einstein developed relativity. Bohr studied atomic structure.",
+            source_id="doc-001",
+        )
+        assert all(c["metadata"].get("source_id") == "doc-001" for c in chunks)
+
+    def test_fixed_strategy_produces_chunks(self):
+        """fixed strategy produces at least one chunk for multi-sentence text."""
+        from src.data_layer import create_data_layer_pipeline
+        pipeline = create_data_layer_pipeline(
+            strategy="fixed", chunk_size=100, chunk_overlap=20, min_chunk_size=20
+        )
+        text = "Word " * 60  # 360 chars > chunk_size=100
+        chunks = pipeline.process_text(text)
+        assert len(chunks) >= 2, "Expected multiple fixed-size chunks"
+
+    def test_recursive_strategy_produces_chunks(self):
+        """recursive strategy produces at least one chunk."""
+        from src.data_layer import create_data_layer_pipeline
+        pipeline = create_data_layer_pipeline(
+            strategy="recursive", chunk_size=200, chunk_overlap=20, min_chunk_size=20
+        )
+        text = "Einstein was a physicist. " * 20
+        chunks = pipeline.process_text(text)
+        assert len(chunks) >= 1
+
+    def test_create_ingestion_config_from_settings(self):
+        """create_ingestion_config reads values from a settings-style dict."""
+        from src.data_layer import create_ingestion_config
+        fake_settings = {
+            "ingestion": {
+                "chunking_strategy": "fixed",
+                "chunk_size": 512,
+                "chunk_overlap": 64,
+                "sentences_per_chunk": 2,
+                "sentence_overlap": 0,
+                "spacy_model": "en_core_web_sm",
+            }
+        }
+        cfg = create_ingestion_config(fake_settings)
+        assert cfg.chunking_strategy == "fixed"
+        assert cfg.chunk_size == 512
+        assert cfg.chunk_overlap == 64
+        assert cfg.sentences_per_chunk == 2
+
+    def test_create_ingestion_config_empty_dict_uses_defaults(self):
+        """create_ingestion_config({}) falls back to IngestionConfig defaults."""
+        from src.data_layer import create_ingestion_config, IngestionConfig
+        cfg = create_ingestion_config({})
+        defaults = IngestionConfig()
+        assert cfg.chunking_strategy == defaults.chunking_strategy
+        assert cfg.sentences_per_chunk == defaults.sentences_per_chunk
+
+    def test_get_stats_contains_strategy(self):
+        """get_stats() returns a dict including the active chunking_strategy."""
+        from src.data_layer import create_data_layer_pipeline
+        pipeline = create_data_layer_pipeline(strategy="sentence")
+        stats = pipeline.get_stats()
+        assert stats["chunking_strategy"] == "sentence"
+        assert "chunking_module_available" in stats
 
 
 # ============================================================================

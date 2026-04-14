@@ -121,8 +121,8 @@ def test_vector_search(query: str, embeddings):
     vec_cfg  = config.get("vector_store", {})
 
     storage_config = StorageConfig(
-        vector_db_path=DATA_DIR / "vector_db",
-        graph_db_path=DATA_DIR / "knowledge_graph",
+        vector_db_path=DATA_DIR / "vector",
+        graph_db_path=DATA_DIR / "graph",
         embedding_dim=emb_cfg.get("embedding_dim", 768),
         similarity_threshold=vec_cfg.get("similarity_threshold", 0.3),
         normalize_embeddings=vec_cfg.get("normalize_embeddings", True),
@@ -473,8 +473,8 @@ def test_full_pipeline(query: str, gold_answer: str, skip_llm: bool,
 
     if store is None:
         storage_config = StorageConfig(
-            vector_db_path=DATA_DIR / "vector_db",
-            graph_db_path=DATA_DIR / "knowledge_graph",
+            vector_db_path=DATA_DIR / "vector",
+            graph_db_path=DATA_DIR / "graph",
             embedding_dim=emb_cfg.get("embedding_dim", 768),
             similarity_threshold=vec_cfg.get("similarity_threshold", 0.3),
             normalize_embeddings=vec_cfg.get("normalize_embeddings", True),
@@ -557,7 +557,7 @@ def test_graph_quality(n_questions: int):
     info(f"Verfügbare Fragen: {len(all_qs)} — analysiere {n_questions}")
 
     # Graph-Metadata anzeigen
-    meta_path = DATA_DIR / "extraction_metadata.json"
+    meta_path = DATA_DIR / "graph" / "extraction_metadata.json"
     if meta_path.exists():
         with open(meta_path) as f:
             meta = json.load(f)
@@ -585,8 +585,8 @@ def test_graph_quality(n_questions: int):
             cache_path=cache_path,
         )
         storage_config = StorageConfig(
-            vector_db_path=DATA_DIR / "vector_db",
-            graph_db_path=DATA_DIR / "knowledge_graph",
+            vector_db_path=DATA_DIR / "vector",
+            graph_db_path=DATA_DIR / "graph",
             embedding_dim=emb_cfg.get("embedding_dim", 768),
             normalize_embeddings=vec_cfg.get("normalize_embeddings", True),
             distance_metric=vec_cfg.get("distance_metric", "cosine"),
@@ -867,8 +867,8 @@ def test_multi_vector(n_questions: int):
             cache_path=cache_path,
         )
         storage_config = StorageConfig(
-            vector_db_path=DATA_DIR / "vector_db",
-            graph_db_path=DATA_DIR / "knowledge_graph",
+            vector_db_path=DATA_DIR / "vector",
+            graph_db_path=DATA_DIR / "graph",
             embedding_dim=emb_cfg.get("embedding_dim", 768),
             similarity_threshold=0.0,          # Kein Filter – wir wollen alle Scores sehen
             normalize_embeddings=vec_cfg.get("normalize_embeddings", True),

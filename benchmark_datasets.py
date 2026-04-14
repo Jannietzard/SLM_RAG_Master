@@ -495,8 +495,8 @@ class StoreManager:
         ds_path = self.base_path / dataset
         return {
             "root": ds_path,
-            "vector_db": ds_path / "vector_db",
-            "knowledge_graph": ds_path / "knowledge_graph",
+            "vector": ds_path / "vector",
+            "graph": ds_path / "graph",
             "questions": ds_path / "questions.json",
             "articles_info": ds_path / "articles_info.json",
         }
@@ -553,7 +553,7 @@ class StoreManager:
     def dataset_exists(self, dataset: str) -> bool:
         """Check if dataset is ingested."""
         paths = self.get_paths(dataset)
-        return paths["vector_db"].exists() and paths["questions"].exists()
+        return paths["vector"].exists() and paths["questions"].exists()
     
     def get_status(self) -> Dict[str, bool]:
         """Get ingestion status for all datasets."""
@@ -817,8 +817,8 @@ def create_pipeline(
     # Update config
     pipeline_config = config.copy()
     pipeline_config["paths"] = pipeline_config.get("paths", {}).copy()
-    pipeline_config["paths"]["vector_db"] = str(paths["vector_db"])
-    pipeline_config["paths"]["graph_db"] = str(paths["knowledge_graph"])
+    pipeline_config["paths"]["vector"] = str(paths["vector"])
+    pipeline_config["paths"]["graph_db"] = str(paths["graph"])
 
     # Model override (--model flag) — all model names live in settings.yaml
     if model_name is not None:
@@ -859,8 +859,8 @@ def create_pipeline(
     
     vector_config = pipeline_config.get("vector_store", {})
     storage_config = StorageConfig(
-        vector_db_path=paths["vector_db"],
-        graph_db_path=paths["knowledge_graph"],
+        vector_db_path=paths["vector"],
+        graph_db_path=paths["graph"],
         embedding_dim=embedding_config.get("embedding_dim", 768),
         similarity_threshold=vector_config.get("similarity_threshold", 0.3),
         normalize_embeddings=vector_config.get("normalize_embeddings", True),
@@ -1056,8 +1056,8 @@ def cmd_ingest(args, config: Dict, store_manager: StoreManager):
             paths = store_manager.get_paths(dataset)
             run_ingestion(
                 documents,
-                paths["vector_db"],
-                paths["knowledge_graph"],
+                paths["vector"],
+                paths["graph"],
                 config,
                 dataset,
             )

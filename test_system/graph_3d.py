@@ -42,7 +42,7 @@ parser.add_argument("--no-html", action="store_true",
 args = parser.parse_args()
 
 # ─── Datenbankverbindung ──────────────────────────────────────────────────────
-db   = kuzu.Database(str(PROJECT_ROOT / "data/hotpotqa/knowledge_graph"))
+db   = kuzu.Database(str(PROJECT_ROOT / "data/hotpotqa/graph"))
 conn = kuzu.Connection(db)
 
 # ─── Hub-Filter: Pronomen und generische Terme ausschließen ──────────────────

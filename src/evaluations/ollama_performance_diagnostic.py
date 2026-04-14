@@ -1,4 +1,4 @@
-"""
+test"""
 EMBEDDING DIMENSION DIAGNOSTIC - Finde Bug!
 
 Dieser Test prüft ALLE Stellen wo Dimensionen eine Rolle spielen.
@@ -69,8 +69,8 @@ def diagnose_embedding_dimensions():
     
     # Simulate wie main.py StorageConfig erstellt
     storage_config = StorageConfig(
-        vector_db_path=Path("./data/vector_db"),
-        graph_db_path=Path("./data/knowledge_graph"),
+        vector_db_path=Path("./data/vector"),
+        graph_db_path=Path("./data/graph"),
         embedding_dim=embedding_config.get("embedding_dim", 768),  # ← DEFAULT!
     )
     
@@ -88,12 +88,12 @@ def diagnose_embedding_dimensions():
     # 4. Check LanceDB Table (if exists)
     print("\n4. CHECKING LANCEDB TABLE...")
     
-    table_path = Path("./data/vector_db/documents.lance")
+    table_path = Path("./data/vector/documents.lance")
     
     if table_path.exists():
         try:
             import lancedb
-            db = lancedb.connect("./data/vector_db")
+            db = lancedb.connect("./data/vector")
             table = db.open_table("documents")
             
             # Get first vector to check dimension
@@ -141,7 +141,7 @@ def diagnose_embedding_dimensions():
     if table_path.exists():
         try:
             import lancedb
-            db = lancedb.connect("./data/vector_db")
+            db = lancedb.connect("./data/vector")
             table = db.open_table("documents")
             sample = table.to_pandas().head(1)
             if 'vector' in sample.columns:
@@ -166,7 +166,7 @@ def diagnose_embedding_dimensions():
         print(f"     embedding_dim: {actual_dim}  # ← Set to actual dimension!")
         
         print("\n2. CLEAR vector store (dimension mismatch):")
-        print(f"   rm -rf data/vector_db/")
+        print(f"   rm -rf data/vector/")
         print(f"   rm -rf cache/embeddings.db")
         
         print("\n3. RE-INGEST with correct config:")
@@ -211,8 +211,8 @@ def test_query_with_diagnostics():
     
     # Initialize store
     storage_config = StorageConfig(
-        vector_db_path=Path("./data/vector_db"),
-        graph_db_path=Path("./data/knowledge_graph"),
+        vector_db_path=Path("./data/vector"),
+        graph_db_path=Path("./data/graph"),
         embedding_dim=embedding_config.get("embedding_dim", 768),
     )
     

@@ -1,5 +1,5 @@
 """
-RAG Quality Diagnosis & Testing Script (FIXED)
+RAG Quality Diagnosis & Testing Script
 
 This script helps you:
 1. Verify your config is loaded correctly
@@ -7,28 +7,36 @@ This script helps you:
 3. Measure actual RAG quality
 4. Compare vector vs hybrid retrieval
 
-FIXED: Properly loads existing LanceDB tables
+Usage (from any directory):
+    python src/evaluations/test_rag_quality.py
+    python src/evaluations/test_rag_quality.py --query "Who directed Inception?"
 """
 
 import yaml
 import logging
+import argparse
 from pathlib import Path
 import sys
 
-# Add project to path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+# Projekt-Root: src/evaluations -> src -> ROOT
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data_layer.embeddings import BatchedOllamaEmbeddings
 from src.data_layer.storage import HybridStore, StorageConfig
 from src.data_layer.hybrid_retriever import HybridRetriever, RetrievalConfig, RetrievalMode
 
 
-def load_and_verify_config(config_path: Path = Path("./config/settings.yaml")):
+def load_and_verify_config(config_path: Path = None):
     """Load and print current config values."""
+    if config_path is None:
+        config_path = PROJECT_ROOT / "config" / "settings.yaml"
+
     print("\n" + "="*70)
     print("CONFIG VERIFICATION")
     print("="*70)
-    
+    print(f"  Config: {config_path}")
+
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     
@@ -179,14 +187,14 @@ def test_german_queries(
         print(f"\n{i}. Query: '{query}'")
         print("-" * 70)
         
-        results = retriever.retrieve(query)
-        
+        results, metrics = retriever.retrieve(query)
+
         if results:
-            print(f"✓ {len(results)} results found")
-            
+            print(f"✓ {len(results)} results found  (latency: {metrics.total_time_ms:.0f}ms)")
+
             # Show top 3
             for j, result in enumerate(results[:3], 1):
-                print(f"\n   {j}. Score: {result.relevance_score:.4f}")
+                print(f"\n   {j}. Score: {result.rrf_score:.4f}")
                 print(f"      Method: {result.retrieval_method}")
                 text_preview = result.text[:120].replace('\n', ' ')
                 print(f"      Text: {text_preview}...")
@@ -216,14 +224,14 @@ def calculate_rag_quality_metrics(
     print(f"Relevance threshold: {relevance_threshold}\n")
     
     for query in test_queries:
-        results = retriever.retrieve(query)
-        
+        results, _ = retriever.retrieve(query)
+
         if results:
             queries_with_results += 1
             total_results += len(results)
-            
+
             for result in results:
-                score = result.relevance_score
+                score = result.rrf_score
                 all_scores.append(score)
                 
                 if score >= relevance_threshold:
@@ -286,30 +294,58 @@ def calculate_rag_quality_metrics(
 
 def main():
     """Run full diagnosis."""
+    parser = argparse.ArgumentParser(description="RAG Quality Diagnosis Tool")
+    parser.add_argument(
+        "--query", "-q",
+        type=str,
+        default=None,
+        help="Custom test query (default: uses built-in test queries)"
+    )
+    parser.add_argument(
+        "--dataset", "-d",
+        type=str,
+        default="hotpotqa",
+        help="Dataset subdirectory under data/ (default: hotpotqa)"
+    )
+    args = parser.parse_args()
+
     print("\n" + "="*70)
     print("RAG QUALITY DIAGNOSIS TOOL")
+    print(f"  Project Root: {PROJECT_ROOT}")
+    print(f"  Dataset:      {args.dataset}")
     print("="*70)
-    
+
     # 1. Verify config
     config = load_and_verify_config()
-    
+
     # 2. Initialize components
     print("\nInitializing components...")
-    
+
     embedding_config = config.get("embeddings", {})
     perf_config = config.get("performance", {})
-    
+    paths_config = config.get("paths", {})
+
+    # Datenpfade: dataset-spezifischer Unterordner (wie diagnose.py)
+    # z.B. data/hotpotqa/vector, data/hotpotqa/graph
+    data_dir = PROJECT_ROOT / "data" / args.dataset
+    cache_path = PROJECT_ROOT / paths_config.get("cache", "cache").lstrip("./")
+    vector_db_path = data_dir / "vector"
+    graph_db_path = data_dir / "graph"
+
+    print(f"  Vector DB:    {vector_db_path}")
+    print(f"  Graph DB:     {graph_db_path}")
+
     embeddings = BatchedOllamaEmbeddings(
         model_name=embedding_config.get("model_name", "nomic-embed-text"),
         base_url=embedding_config.get("base_url", "http://localhost:11434"),
         batch_size=perf_config.get("batch_size", 32),
-        cache_path=Path(config.get("paths", {}).get("cache", "./cache")) / "embeddings.db",
+        cache_path=cache_path / "embeddings.db",
         device=perf_config.get("device", "cpu"),
     )
-    
+
     storage_config = StorageConfig(
-        vector_db_path=Path(config.get("paths", {}).get("vector_db", "./data/vector_db")),
-        graph_db_path=Path(config.get("paths", {}).get("graph_db", "./data/knowledge_graph")),
+        vector_db_path=vector_db_path,
+        graph_db_path=graph_db_path,
         embedding_dim=embedding_config.get("embedding_dim", 768),
     )
     
@@ -362,8 +398,13 @@ def main():
     test_german_queries(retriever)
     
     # 4. Calculate metrics
-    test_queries = ["Summarize how Big Data impacts our world."]
-    
+    default_queries = [
+        "Were Scott Derrickson and Ed Wood of the same nationality?",
+        "What is the capital of France?",
+        "Who directed the movie Inception?",
+    ]
+    test_queries = [args.query] if args.query else default_queries
+
     metrics = calculate_rag_quality_metrics(retriever, test_queries)
     
     # 5. Recommendations

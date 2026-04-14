@@ -1,18 +1,20 @@
 """
-NER Qualitätstest: 10 typische HotpotQA-Sätze.
+NER Qualitätstest: 20 typische HotpotQA-Sätze.
 Zeigt was extrahiert wird vs. was erwartet wird.
 """
 import sys
 from pathlib import Path
-# Projektverzeichnis zu sys.path hinzufügen (damit src.* Imports funktionieren)
-sys.path.insert(0, str(Path(__file__).parent.parent))
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 import os, warnings, logging
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 warnings.filterwarnings('ignore')
 logging.disable(logging.CRITICAL)
 
-from src.data_layer.entity_extraction import EntityExtractionPipeline, ExtractionConfig
+from src.data_layer.entity_extraction import create_extraction_pipeline
+
+_settings_path = PROJECT_ROOT / "config" / "settings.yaml"
 
 TESTS = [
     {
@@ -29,15 +31,15 @@ TESTS = [
     },
     {
         "text": "The Eiffel Tower is located in Paris, France. It was built by Gustave Eiffel.",
-        "expect": {"Eiffel Tower": "WORK_OF_ART", "Paris": "GPE", "France": "GPE", "Gustave Eiffel": "PERSON"},
+        "expect": {"Eiffel Tower": "LOCATION", "Paris": "GPE", "France": "GPE", "Gustave Eiffel": "PERSON"},
     },
     {
         "text": "Marie Curie was a Polish physicist. She won the Nobel Prize in Physics in 1903.",
-        "expect": {"Marie Curie": "PERSON", "Nobel Prize in Physics": "ORGANIZATION"},
+        "expect": {"Marie Curie": "PERSON", "Nobel Prize in Physics": "WORK_OF_ART"},
     },
     {
         "text": "Christopher Nolan directed Inception and The Dark Knight for Warner Bros.",
-        "expect": {"Christopher Nolan": "PERSON", "Inception": "WORK_OF_ART", "The Dark Knight": "WORK_OF_ART", "Warner Bros.": "ORGANIZATION"},
+        "expect": {"Christopher Nolan": "PERSON", "Inception": "WORK_OF_ART", "The Dark Knight": "WORK_OF_ART", "Warner Bros": "ORGANIZATION"},
     },
     {
         "text": "Apple Inc. was founded by Steve Jobs in Cupertino, California.",
@@ -55,10 +57,50 @@ TESTS = [
         "text": "The Beatles released Abbey Road in 1969. The band was formed in Liverpool.",
         "expect": {"The Beatles": "ORGANIZATION", "Abbey Road": "WORK_OF_ART", "Liverpool": "GPE"},
     },
+    # ── S11–S20: zweite Runde ────────────────────────────────────────────────
+    {
+        "text": "Quentin Tarantino wrote and directed Pulp Fiction, released by Miramax Films.",
+        "expect": {"Quentin Tarantino": "PERSON", "Pulp Fiction": "WORK_OF_ART", "Miramax Films": "ORGANIZATION"},
+    },
+    {
+        "text": "The World War II ended in 1945 with the surrender of Germany and Japan.",
+        "expect": {"World War II": "EVENT", "Germany": "GPE", "Japan": "GPE"},
+    },
+    {
+        "text": "J.K. Rowling wrote the Harry Potter series, published by Bloomsbury Publishing.",
+        "expect": {"J.K. Rowling": "PERSON", "Harry Potter": "WORK_OF_ART", "Bloomsbury Publishing": "ORGANIZATION"},
+    },
+    {
+        "text": "The Louvre is a historic monument in Paris that houses the Mona Lisa.",
+        "expect": {"Louvre": "LOCATION", "Paris": "GPE"},
+    },
+    {
+        "text": "Nikola Tesla was a Serbian-American inventor. He worked for Thomas Edison in New York.",
+        "expect": {"Nikola Tesla": "PERSON", "Thomas Edison": "PERSON", "New York": "GPE"},
+    },
+    {
+        "text": "Led Zeppelin released their debut album Led Zeppelin in 1969 on Atlantic Records.",
+        "expect": {"Atlantic Records": "ORGANIZATION"},
+    },
+    {
+        "text": "The French Revolution began in 1789 and led to the rise of Napoleon Bonaparte.",
+        "expect": {"French Revolution": "EVENT", "Napoleon Bonaparte": "PERSON"},
+    },
+    {
+        "text": "Stanley Kubrick directed 2001: A Space Odyssey, produced by Metro-Goldwyn-Mayer.",
+        "expect": {"Stanley Kubrick": "PERSON", "2001: A Space Odyssey": "WORK_OF_ART", "Metro-Goldwyn-Mayer": "ORGANIZATION"},
+    },
+    {
+        "text": "Amazon was founded by Jeff Bezos in Seattle, Washington in 1994.",
+        "expect": {"Amazon": "ORGANIZATION", "Jeff Bezos": "PERSON", "Seattle, Washington": "GPE"},
+    },
+    {
+        "text": "The Vietnam War was fought in Vietnam, Laos, and Cambodia from 1955 to 1975.",
+        "expect": {"Vietnam War": "EVENT", "Vietnam": "GPE", "Laos": "GPE", "Cambodia": "GPE"},
+    },
 ]
 
-config = ExtractionConfig(cache_enabled=False)
-pipe = EntityExtractionPipeline(config)
+pipe = create_extraction_pipeline(config_path=_settings_path, cache_enabled=True)
 
 texts = [t["text"] for t in TESTS]
 ids   = [f"s{i+1}" for i in range(len(TESTS))]

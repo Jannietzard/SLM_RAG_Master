@@ -1,23 +1,55 @@
 """
-pytest Tests für src/pipeline
+pytest test suite for src/pipeline — Artifact A (Ingestion) + Artifact B (Query)
 
-Abgedeckte Klassen:
-    - PipelineResult
-    - AgentPipeline
-    - BatchProcessor
-    - IngestionConfig
-    - IngestionMetrics
-    - DocumentLoader
-    - MockEmbeddingGenerator / MockEntityExtractor
-    - IngestionPipeline
-    - create_pipeline / create_ingestion_pipeline (Factory Functions)
+================================================================================
+COVERAGE
+================================================================================
 
-Alle LLM-Aufrufe werden gemockt (kein laufendes Ollama nötig).
+Artifact A — Ingestion Pipeline (ingestion_pipeline.py):
+    - IngestionConfig        dataclass defaults and from_yaml() key-path mapping
+    - IngestionMetrics       counter initialisation and to_dict() structure
+    - DocumentLoader         multi-format loading (txt, json, jsonl, md, HotpotQA)
+    - MockEmbeddingGenerator shape, L2 normalisation, empty input
+    - MockEntityExtractor    return types and basic extraction
+    - IngestionPipeline      end-to-end ingest(), metric reset, chunker fallback
+    - create_ingestion_pipeline  factory function with and without config
+
+Artifact B — Query Pipeline (agent_pipeline.py):
+    - PipelineResult         to_dict(), to_json(), field defaults
+    - AgentPipeline          initialisation, process(), caching, stats
+    - BatchProcessor         process_batch(), evaluate(), exact_match()
+    - create_pipeline        deprecated factory function
+
+================================================================================
+MOCKING STRATEGY
+================================================================================
+
+Ollama LLM calls are intercepted at the lowest feasible boundary:
+    patch.object(verifier, '_call_llm', return_value=("answer", latency_ms))
+
+Real Planner/Navigator/Verifier instances are used (not Mock(spec=...)) because
+process() chains all three agents in sequence. Patching only _call_llm tests
+the full integration path — including Planner's query decomposition and
+Navigator's retrieval — while eliminating network dependency.
+
+IngestionPipeline tests use use_mocks=True, which substitutes
+MockEmbeddingGenerator and MockEntityExtractor. No GPU or Ollama instance is
+required to run this suite.
+
+================================================================================
+HOW TO RUN
+================================================================================
+
+    # From the project root (Entwicklungfolder):
+    python -X utf8 -m pytest src/pipeline/test_pipeline.py -v
+
+    # With coverage:
+    python -X utf8 -m pytest src/pipeline/test_pipeline.py -v --cov=src/pipeline
+
+================================================================================
 """
 
 import json
-import tempfile
-import textwrap
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -26,21 +58,31 @@ import pytest
 
 
 # ============================================================================
-# HELPERS
+# SHARED HELPERS
 # ============================================================================
 
-def _make_mock_verifier_result():
-    """Erstelle VerificationResult-ähnliches Mock-Objekt."""
-    from src.logic_layer.verifier import VerificationResult, ConfidenceLevel
-    result = VerificationResult(
-        answer="Test answer.",
-        iterations=1,
-        verified_claims=["claim_a"],
-        violated_claims=[],
-        all_verified=True,
-        timing_ms=10.0,
+def _make_pipeline_result(**kwargs):
+    """
+    Build a minimal PipelineResult for use in test fixtures.
+
+    Return type: PipelineResult (imported lazily to avoid module-level coupling)
+    """
+    from src.pipeline.agent_pipeline import PipelineResult
+
+    defaults = dict(
+        answer="Test answer",
+        confidence="high",
+        query="test query",
+        planner_result={"query_type": "single_hop"},
+        navigator_result={"filtered_context": []},
+        verifier_result={"answer": "Test answer", "confidence": "high"},
+        planner_time_ms=5.0,
+        navigator_time_ms=20.0,
+        verifier_time_ms=100.0,
+        total_time_ms=125.0,
     )
-    return result
+    defaults.update(kwargs)
+    return PipelineResult(**defaults)
 
 
 # ============================================================================
@@ -48,27 +90,13 @@ def _make_mock_verifier_result():
 # ============================================================================
 
 class TestPipelineResult:
-    """Tests für PipelineResult Dataclass."""
+    """Tests for PipelineResult dataclass."""
 
-    def _make_result(self, **kwargs):
-        from src.pipeline.agent_pipeline import PipelineResult
-        defaults = dict(
-            answer="Test answer",
-            confidence="high",
-            query="test query",
-            planner_result={"query_type": "single_hop"},
-            navigator_result={"filtered_context": []},
-            verifier_result={"answer": "Test answer", "confidence": "high"},
-            planner_time_ms=5.0,
-            navigator_time_ms=20.0,
-            verifier_time_ms=100.0,
-            total_time_ms=125.0,
-        )
-        defaults.update(kwargs)
-        return PipelineResult(**defaults)
+    def _make_result(self, **kwargs) -> "PipelineResult":  # type: ignore[name-defined]
+        return _make_pipeline_result(**kwargs)
 
     def test_to_dict_has_required_keys(self):
-        """to_dict() enthält answer, confidence, query, stages, timing, optimization."""
+        """to_dict() contains answer, confidence, query, stages, timing, optimization."""
         result = self._make_result()
         d = result.to_dict()
         assert "answer" in d
@@ -79,7 +107,7 @@ class TestPipelineResult:
         assert "optimization" in d
 
     def test_to_dict_stages_structure(self):
-        """stages-Dict enthält planner, navigator, verifier."""
+        """stages dict contains planner, navigator, verifier."""
         result = self._make_result()
         stages = result.to_dict()["stages"]
         assert "planner" in stages
@@ -87,7 +115,7 @@ class TestPipelineResult:
         assert "verifier" in stages
 
     def test_to_dict_timing_keys(self):
-        """timing-Dict enthält alle vier Timing-Werte."""
+        """timing dict contains all four timing values."""
         result = self._make_result()
         timing = result.to_dict()["timing"]
         assert "planner_ms" in timing
@@ -96,23 +124,21 @@ class TestPipelineResult:
         assert "total_ms" in timing
 
     def test_to_json_is_valid_json(self):
-        """to_json() erzeugt valides JSON."""
+        """to_json() produces valid JSON."""
         result = self._make_result()
         json_str = result.to_json()
         parsed = json.loads(json_str)
         assert parsed["answer"] == "Test answer"
 
-    def test_optimization_flags_default_false(self):
-        """early_exit_used und cached_result sind standardmäßig False."""
+    def test_cached_result_default_false(self):
+        """cached_result defaults to False."""
         result = self._make_result()
-        assert result.early_exit_used is False
         assert result.cached_result is False
 
     def test_optimization_flags_in_to_dict(self):
-        """Optimization-Flags erscheinen in to_dict()."""
-        result = self._make_result(early_exit_used=True, cached_result=True)
+        """optimization dict contains the cached flag."""
+        result = self._make_result(cached_result=True)
         opt = result.to_dict()["optimization"]
-        assert opt["early_exit"] is True
         assert opt["cached"] is True
 
 
@@ -121,11 +147,18 @@ class TestPipelineResult:
 # ============================================================================
 
 class TestAgentPipeline:
-    """Tests für AgentPipeline Orchestrator."""
+    """Tests for AgentPipeline orchestrator."""
 
     @pytest.fixture
     def mock_agents(self):
-        """Erstelle Mock-Agenten für schnelle Tests."""
+        """
+        Create real Planner, Navigator, and Verifier instances with default configs.
+
+        Real instances (not Mock(spec=...)) are used deliberately: process()
+        chains all three agents in sequence, so patching only _call_llm provides
+        a faithful integration test of the full S_P → S_N → S_V path while
+        eliminating the Ollama network dependency.
+        """
         from src.logic_layer.planner import Planner
         from src.logic_layer.navigator import Navigator, ControllerConfig
         from src.logic_layer.verifier import Verifier, VerifierConfig
@@ -137,7 +170,7 @@ class TestAgentPipeline:
 
     @pytest.fixture
     def pipeline(self, mock_agents):
-        """Pipeline mit Mock-Agenten, Caching deaktiviert."""
+        """Pipeline with real agents, caching disabled."""
         from src.pipeline.agent_pipeline import AgentPipeline
         planner, navigator, verifier = mock_agents
         return AgentPipeline(
@@ -148,7 +181,7 @@ class TestAgentPipeline:
         )
 
     def test_initialization_stores_agents(self, mock_agents):
-        """Pipeline speichert alle drei Agenten."""
+        """Pipeline stores all three agents."""
         from src.pipeline.agent_pipeline import AgentPipeline
         planner, navigator, verifier = mock_agents
         pipeline = AgentPipeline(planner=planner, navigator=navigator, verifier=verifier)
@@ -157,48 +190,47 @@ class TestAgentPipeline:
         assert pipeline.verifier is verifier
 
     def test_initialization_defaults(self):
-        """Pipeline kann ohne Agenten initialisiert werden."""
+        """Pipeline can be initialised without agents."""
         from src.pipeline.agent_pipeline import AgentPipeline
         pipeline = AgentPipeline()
         assert pipeline.planner is None
         assert pipeline.navigator is None
         assert pipeline.verifier is None
-        assert pipeline.enable_early_exit is True
         assert pipeline.enable_caching is True
 
     def test_get_stats_initial_values(self, pipeline):
-        """Statistiken sind initial alle null."""
+        """All statistics are zero at initialisation."""
         stats = pipeline.get_stats()
         assert stats["total_queries"] == 0
         assert stats["cache_hits"] == 0
-        assert stats["early_exits"] == 0
 
     def test_get_stats_has_required_keys(self, pipeline):
-        """Statistiken enthalten alle erwarteten Keys."""
+        """Statistics contain all expected keys."""
         stats = pipeline.get_stats()
-        for key in ("total_queries", "cache_hits", "early_exits",
-                    "avg_latency_ms", "cache_size", "cache_hit_rate", "early_exit_rate"):
-            assert key in stats, f"Fehlender Key: {key}"
+        for key in ("total_queries", "cache_hits",
+                    "avg_latency_ms", "cache_size", "cache_hit_rate"):
+            assert key in stats, f"Missing key: {key}"
 
     def test_clear_cache(self):
-        """clear_cache() leert den internen Cache."""
-        from src.pipeline.agent_pipeline import AgentPipeline, PipelineResult
+        """clear_cache() empties the internal cache."""
+        from src.pipeline.agent_pipeline import AgentPipeline
         pipeline = AgentPipeline()
-        # Manuell eintragen
+        # Insert manually to verify clear_cache() operates on the right dict
         pipeline._cache["key"] = Mock()
         assert len(pipeline._cache) == 1
         pipeline.clear_cache()
         assert len(pipeline._cache) == 0
 
     def test_process_increments_total_queries(self, pipeline):
-        """Jede process()-Anfrage erhöht total_queries."""
-        mock_result = _make_mock_verifier_result()
+        """Each process() call increments total_queries."""
+        # _call_llm is the lowest-level boundary before the Ollama API call.
+        # Patching here exercises full S_P → S_N → S_V routing.
         with patch.object(pipeline.verifier, '_call_llm', return_value=("Answer.", 0.05)):
             pipeline.process("What is machine learning?")
         assert pipeline.get_stats()["total_queries"] == 1
 
     def test_process_returns_pipeline_result(self, pipeline):
-        """process() gibt PipelineResult zurück."""
+        """process() returns a PipelineResult."""
         from src.pipeline.agent_pipeline import PipelineResult
         with patch.object(pipeline.verifier, '_call_llm', return_value=("ML answer.", 0.05)):
             result = pipeline.process("What is machine learning?")
@@ -207,7 +239,7 @@ class TestAgentPipeline:
         assert result.answer != ""
 
     def test_process_result_has_timing(self, pipeline):
-        """PipelineResult enthält positive Timing-Werte."""
+        """PipelineResult contains positive timing values."""
         with patch.object(pipeline.verifier, '_call_llm', return_value=("Answer.", 0.05)):
             result = pipeline.process("What is AI?")
         assert result.total_time_ms > 0
@@ -216,7 +248,7 @@ class TestAgentPipeline:
         assert result.verifier_time_ms >= 0
 
     def test_cache_hit_on_repeated_query(self, mock_agents):
-        """Zweite identische Anfrage trifft den Cache."""
+        """A second identical query hits the cache and returns the same answer."""
         from src.pipeline.agent_pipeline import AgentPipeline
         planner, navigator, verifier = mock_agents
         pipeline = AgentPipeline(
@@ -224,20 +256,22 @@ class TestAgentPipeline:
             enable_caching=True,
         )
         with patch.object(pipeline.verifier, '_call_llm', return_value=("Answer.", 0.05)):
-            pipeline.process("What is Python?")
+            result1 = pipeline.process("What is Python?")
             result2 = pipeline.process("What is Python?")
         assert result2.cached_result is True
         assert pipeline.get_stats()["cache_hits"] == 1
+        # Cached content must equal the original result
+        assert result2.answer == result1.answer
 
     def test_caching_disabled_no_cache_hits(self, pipeline):
-        """Mit enable_caching=False gibt es keine Cache-Hits."""
+        """With enable_caching=False there are no cache hits."""
         with patch.object(pipeline.verifier, '_call_llm', return_value=("Answer.", 0.05)):
             pipeline.process("What is Python?")
             pipeline.process("What is Python?")
         assert pipeline.get_stats()["cache_hits"] == 0
 
     def test_verifier_result_contains_confidence(self, pipeline):
-        """verifier_result-Dict enthält 'confidence' Key (Bug Fix #3)."""
+        """verifier_result dict contains the 'confidence' key (Enum serialisation fix)."""
         with patch.object(pipeline.verifier, '_call_llm', return_value=("Answer.", 0.05)):
             result = pipeline.process("Who invented the telephone?")
         assert "confidence" in result.verifier_result
@@ -248,36 +282,34 @@ class TestAgentPipeline:
 # ============================================================================
 
 class TestBatchProcessor:
-    """Tests für BatchProcessor."""
+    """Tests for BatchProcessor."""
 
     @pytest.fixture
     def processor(self):
-        """BatchProcessor mit einfacher Mock-Pipeline."""
-        from src.pipeline.agent_pipeline import AgentPipeline, BatchProcessor, PipelineResult
+        """BatchProcessor with a simple mock pipeline."""
+        from src.pipeline.agent_pipeline import AgentPipeline, BatchProcessor
+
         mock_pipeline = Mock(spec=AgentPipeline)
-        mock_pipeline.process.return_value = PipelineResult(
-            answer="test answer",
-            confidence="high",
-            query="q",
-            planner_result={},
-            navigator_result={},
-            verifier_result={},
-            planner_time_ms=1.0,
-            navigator_time_ms=2.0,
-            verifier_time_ms=3.0,
-            total_time_ms=6.0,
+        mock_pipeline.process.return_value = _make_pipeline_result(
+            answer="test answer", query="q"
         )
-        mock_pipeline.get_stats.return_value = {"total_queries": 0}
+        mock_pipeline.get_stats.return_value = {
+            "total_queries": 0,
+            "cache_hits": 0,
+            "avg_latency_ms": 0.0,
+            "cache_size": 0,
+            "cache_hit_rate": 0.0,
+        }
         return BatchProcessor(mock_pipeline)
 
     def test_process_batch_returns_list(self, processor):
-        """process_batch() gibt Liste zurück."""
+        """process_batch() returns a list."""
         results = processor.process_batch(["Q1", "Q2", "Q3"])
         assert isinstance(results, list)
         assert len(results) == 3
 
     def test_process_batch_simplified_keys(self, processor):
-        """Simplified-Modus enthält query, answer, confidence, latency_ms."""
+        """Simplified mode contains query, answer, confidence, latency_ms."""
         results = processor.process_batch(["Q1"])
         r = results[0]
         assert "query" in r
@@ -286,51 +318,49 @@ class TestBatchProcessor:
         assert "latency_ms" in r
 
     def test_process_batch_return_details(self, processor):
-        """return_details=True gibt vollständiges to_dict() zurück."""
+        """return_details=True returns the full to_dict() output with stages key."""
         results = processor.process_batch(["Q1"], return_details=True)
         r = results[0]
-        assert "stages" in r or "answer" in r  # to_dict()-Format
+        # to_dict() always includes a "stages" key — assert the nested structure
+        # is present, not just the flat "answer" key which is always available.
+        assert "stages" in r
 
     def test_process_batch_handles_exception(self, processor):
-        """Fehler in process() werden pro Query abgefangen, nicht als Crash."""
+        """
+        Errors in process() are caught per-query; successful queries still return results.
+
+        The side_effect list causes: first call → Exception, second call → success.
+        This verifies that per-query error containment does not abort the full batch.
+        """
+        success_result = _make_pipeline_result(answer="ok", query="Q2")
         processor.pipeline.process.side_effect = [
-            Exception("simulated error"),
-            processor.pipeline.process.return_value,
+            Exception("err"),
+            success_result,
         ]
-        processor.pipeline.process.side_effect = None
-        processor.pipeline.process.side_effect = Exception("err")
-        results = processor.process_batch(["Bad query"])
+        results = processor.process_batch(["Bad query", "Good query"])
         assert results[0]["error"] == "err"
+        assert results[1]["answer"] == "ok"
 
     def test_exact_match_true(self):
-        """_exact_match() ist case-insensitiv und strip()-sicher."""
+        """_exact_match() is case-insensitive and strip()-safe."""
         from src.pipeline.agent_pipeline import BatchProcessor
         assert BatchProcessor._exact_match("Paris", "paris") is True
         assert BatchProcessor._exact_match("  Paris  ", "Paris") is True
 
     def test_exact_match_false(self):
-        """_exact_match() False bei unterschiedlichen Antworten."""
+        """_exact_match() returns False for different answers."""
         from src.pipeline.agent_pipeline import BatchProcessor
         assert BatchProcessor._exact_match("Paris", "Berlin") is False
 
     def test_evaluate_returns_metrics(self, processor):
-        """evaluate() gibt Dict mit accuracy und total_queries zurück."""
+        """evaluate() returns a dict with accuracy, correct, and total_queries."""
         processor.pipeline.process.side_effect = None
-        from src.pipeline.agent_pipeline import PipelineResult
-        processor.pipeline.process.return_value = PipelineResult(
-            answer="test answer",
-            confidence="high",
-            query="q",
-            planner_result={},
-            navigator_result={},
-            verifier_result={},
-            planner_time_ms=1.0,
-            navigator_time_ms=2.0,
-            verifier_time_ms=3.0,
-            total_time_ms=6.0,
+        processor.pipeline.process.return_value = _make_pipeline_result(
+            answer="test answer", query="q"
         )
         metrics = processor.evaluate(["Q1"], ["test answer"])
         assert "accuracy" in metrics
+        assert "correct" in metrics
         assert "total_queries" in metrics
         assert metrics["accuracy"] == 1.0
 
@@ -340,32 +370,62 @@ class TestBatchProcessor:
 # ============================================================================
 
 class TestIngestionConfig:
-    """Tests für IngestionConfig Dataclass."""
+    """Tests for IngestionConfig dataclass."""
 
     def test_defaults(self):
-        """IngestionConfig hat sinnvolle Standardwerte."""
+        """IngestionConfig has sensible default values matching settings.yaml."""
         from src.pipeline.ingestion_pipeline import IngestionConfig
         config = IngestionConfig()
-        assert config.sentences_per_chunk == 3
-        assert config.sentence_overlap == 1
-        assert config.embedding_dim == 768
-        assert config.gliner_batch_size == 16
-        assert config.rebel_batch_size == 8
-        assert config.enable_caching is True
+        assert config.sentences_per_chunk == 3    # settings.yaml → ingestion.sentences_per_chunk
+        assert config.sentence_overlap == 1       # settings.yaml → ingestion.sentence_overlap
+        assert config.embedding_dim == 768        # settings.yaml → embeddings.embedding_dim
+        assert config.gliner_batch_size == 16     # settings.yaml → entity_extraction.gliner.batch_size
+        assert config.rebel_batch_size == 8       # settings.yaml → entity_extraction.rebel.batch_size
+        assert config.enable_caching is True      # settings.yaml → entity_extraction.caching.enabled
 
     def test_from_yaml_uses_provided_values(self):
-        """from_yaml() übernimmt Werte aus Dict."""
+        """from_yaml() applies values from the dict (uses correct settings.yaml key paths)."""
         from src.pipeline.ingestion_pipeline import IngestionConfig
         yaml_cfg = {
-            "chunking": {"sentence_chunking": {"sentences_per_chunk": 5}},
-            "embedding": {"dimension": 384},
+            "ingestion": {"sentences_per_chunk": 5},   # → sentences_per_chunk
+            "embeddings": {"embedding_dim": 384},       # → embedding_dim
         }
         config = IngestionConfig.from_yaml(yaml_cfg)
         assert config.sentences_per_chunk == 5
         assert config.embedding_dim == 384
 
+    def test_from_yaml_entity_extraction_section(self):
+        """from_yaml() correctly reads entity_extraction.* sub-sections."""
+        from src.pipeline.ingestion_pipeline import IngestionConfig
+        yaml_cfg = {
+            "entity_extraction": {
+                "gliner": {"confidence_threshold": 0.3, "batch_size": 8},
+                "rebel": {"confidence_threshold": 0.6, "min_entities_for_re": 3},
+                "caching": {"enabled": False},
+            }
+        }
+        config = IngestionConfig.from_yaml(yaml_cfg)
+        assert config.entity_confidence_threshold == 0.3
+        assert config.gliner_batch_size == 8
+        assert config.relation_confidence_threshold == 0.6
+        assert config.min_entities_for_re == 3
+        assert config.enable_caching is False
+
+    def test_from_yaml_paths_section(self):
+        """from_yaml() correctly reads paths.* storage locations."""
+        from src.pipeline.ingestion_pipeline import IngestionConfig
+        yaml_cfg = {
+            "paths": {
+                "vector_db": "./custom/vector",
+                "graph_db": "./custom/graph",
+            }
+        }
+        config = IngestionConfig.from_yaml(yaml_cfg)
+        assert config.vector_db_path == "./custom/vector"
+        assert config.graph_db_path == "./custom/graph"
+
     def test_from_yaml_uses_defaults_for_missing_keys(self):
-        """from_yaml() fällt auf Defaults zurück wenn Keys fehlen."""
+        """from_yaml() falls back to defaults when keys are missing."""
         from src.pipeline.ingestion_pipeline import IngestionConfig
         config = IngestionConfig.from_yaml({})
         assert config.sentences_per_chunk == 3
@@ -377,10 +437,10 @@ class TestIngestionConfig:
 # ============================================================================
 
 class TestIngestionMetrics:
-    """Tests für IngestionMetrics Dataclass."""
+    """Tests for IngestionMetrics dataclass."""
 
     def test_defaults_zero(self):
-        """Alle Zähler starten bei 0."""
+        """All counters start at 0."""
         from src.pipeline.ingestion_pipeline import IngestionMetrics
         m = IngestionMetrics()
         assert m.documents_processed == 0
@@ -389,7 +449,7 @@ class TestIngestionMetrics:
         assert m.relations_extracted == 0
 
     def test_to_dict_structure(self):
-        """to_dict() enthält counts, timing_ms, performance."""
+        """to_dict() contains counts, timing_ms, performance."""
         from src.pipeline.ingestion_pipeline import IngestionMetrics
         m = IngestionMetrics(documents_processed=2, chunks_created=10)
         d = m.to_dict()
@@ -404,7 +464,7 @@ class TestIngestionMetrics:
 # ============================================================================
 
 class TestDocumentLoader:
-    """Tests für DocumentLoader."""
+    """Tests for DocumentLoader."""
 
     @pytest.fixture
     def loader(self):
@@ -412,7 +472,7 @@ class TestDocumentLoader:
         return DocumentLoader()
 
     def test_load_text_file(self, loader, tmp_path):
-        """Lädt Plain-Text-Datei und gibt Dokument zurück."""
+        """Loads a plain-text file and returns a document."""
         f = tmp_path / "doc.txt"
         f.write_text("Hello world. This is a test.", encoding="utf-8")
         docs = list(loader.load(str(f)))
@@ -420,8 +480,16 @@ class TestDocumentLoader:
         assert docs[0]["text"] == "Hello world. This is a test."
         assert "source" in docs[0]["metadata"]
 
+    def test_load_markdown_file(self, loader, tmp_path):
+        """Loads a Markdown file via the same text-loading path as .txt."""
+        f = tmp_path / "doc.md"
+        f.write_text("# Title\n\nSome content.", encoding="utf-8")
+        docs = list(loader.load(str(f)))
+        assert len(docs) == 1
+        assert "Title" in docs[0]["text"]
+
     def test_load_json_file_list(self, loader, tmp_path):
-        """Lädt JSON-Array und gibt ein Dokument pro Item zurück."""
+        """Loads a JSON array and returns one document per item."""
         data = [{"text": "First doc"}, {"text": "Second doc"}]
         f = tmp_path / "docs.json"
         f.write_text(json.dumps(data), encoding="utf-8")
@@ -430,14 +498,14 @@ class TestDocumentLoader:
         assert docs[0]["text"] == "First doc"
 
     def test_load_json_file_single_dict(self, loader, tmp_path):
-        """Lädt JSON-Dict als einzelnes Dokument."""
+        """Loads a JSON dict as a single document."""
         f = tmp_path / "doc.json"
         f.write_text(json.dumps({"text": "Single doc"}), encoding="utf-8")
         docs = list(loader.load(str(f)))
         assert len(docs) == 1
 
     def test_load_jsonl_file(self, loader, tmp_path):
-        """Lädt JSONL-Datei (eine JSON-Zeile pro Dokument)."""
+        """Loads a JSONL file (one JSON line per document)."""
         lines = [json.dumps({"text": "Line 1"}), json.dumps({"text": "Line 2"})]
         f = tmp_path / "docs.jsonl"
         f.write_text("\n".join(lines), encoding="utf-8")
@@ -445,7 +513,7 @@ class TestDocumentLoader:
         assert len(docs) == 2
 
     def test_load_hotpotqa_format(self, loader, tmp_path):
-        """Parst HotpotQA-Format korrekt (context als Liste von Tupeln)."""
+        """Parses HotpotQA format correctly (context as list of tuples)."""
         item = {
             "_id": "abc123",
             "question": "Where was Einstein born?",
@@ -462,27 +530,45 @@ class TestDocumentLoader:
         assert "Einstein" in docs[0]["text"]
         assert docs[0]["id"] == "abc123"
 
+    def test_load_hotpotqa_malformed_context_no_crash(self, loader, tmp_path):
+        """
+        Malformed HotpotQA context (non-2-tuple entry) is logged and skipped,
+        not raised. Verifies the try/except (TypeError, ValueError) guard.
+        """
+        item = {
+            "_id": "bad1",
+            "context": [
+                ["Good title", ["Sentence one."]],
+                "not_a_tuple",          # malformed entry
+            ]
+        }
+        f = tmp_path / "bad.jsonl"
+        f.write_text(json.dumps(item), encoding="utf-8")
+        # Must not raise; should return a document with partial text
+        docs = list(loader.load(str(f)))
+        assert len(docs) == 1  # file loads; document is produced despite partial context
+
     def test_load_missing_file_raises(self, loader):
-        """Nicht existierender Pfad → FileNotFoundError."""
+        """Non-existent path raises FileNotFoundError."""
         with pytest.raises(FileNotFoundError):
             list(loader.load("/nonexistent/path/file.txt"))
 
     def test_load_directory(self, loader, tmp_path):
-        """Verzeichnis mit mehreren .txt-Dateien wird rekursiv geladen."""
+        """A directory with multiple .txt files is loaded recursively."""
         (tmp_path / "a.txt").write_text("Doc A", encoding="utf-8")
         (tmp_path / "b.txt").write_text("Doc B", encoding="utf-8")
         docs = list(loader.load(str(tmp_path)))
         assert len(docs) == 2
 
-    def test_generate_id_is_deterministic(self, loader):
-        """Gleicher Source-String → gleiche ID."""
+    def test_generate_id_is_deterministic(self):
+        """Same source string produces the same ID."""
         from src.pipeline.ingestion_pipeline import DocumentLoader
         id1 = DocumentLoader._generate_id("test_source")
         id2 = DocumentLoader._generate_id("test_source")
         assert id1 == id2
 
     def test_generate_id_different_sources(self):
-        """Verschiedene Sources → verschiedene IDs."""
+        """Different source strings produce different IDs."""
         from src.pipeline.ingestion_pipeline import DocumentLoader
         assert DocumentLoader._generate_id("a") != DocumentLoader._generate_id("b")
 
@@ -492,32 +578,33 @@ class TestDocumentLoader:
 # ============================================================================
 
 class TestMockComponents:
-    """Tests für Mock-Komponenten (MockEmbeddingGenerator, MockEntityExtractor)."""
+    """Tests for mock components (MockEmbeddingGenerator, MockEntityExtractor)."""
 
     def test_mock_embedding_shape(self):
-        """MockEmbeddingGenerator gibt korrektes Shape zurück."""
+        """MockEmbeddingGenerator returns the correct shape."""
         from src.pipeline.ingestion_pipeline import MockEmbeddingGenerator
-        gen = MockEmbeddingGenerator(embedding_dim=768)
+        gen = MockEmbeddingGenerator(embedding_dim=768)  # matches embeddings.embedding_dim
         embeddings = gen.embed(["text1", "text2", "text3"])
         assert embeddings.shape == (3, 768)
 
     def test_mock_embedding_l2_normalized(self):
-        """Mock-Embeddings sind L2-normalisiert."""
+        """Mock embeddings are L2-normalised (seed fixed for deterministic output)."""
         from src.pipeline.ingestion_pipeline import MockEmbeddingGenerator
         gen = MockEmbeddingGenerator(embedding_dim=128)
-        embeddings = gen.embed(["hello world"])
+        embeddings = gen.embed(["hello world"], seed=42)
         norms = np.linalg.norm(embeddings, axis=1)
-        assert abs(norms[0] - 1.0) < 1e-6
+        # Tolerance 1e-5: float32 has ~7 decimal digits; 1e-6 is too tight across hardware
+        assert abs(norms[0] - 1.0) < 1e-5
 
     def test_mock_embedding_empty_input(self):
-        """Leere Input-Liste → leeres Array."""
+        """Empty input list returns an empty array."""
         from src.pipeline.ingestion_pipeline import MockEmbeddingGenerator
         gen = MockEmbeddingGenerator()
         result = gen.embed([])
         assert len(result) == 0
 
     def test_mock_entity_extractor_returns_lists(self):
-        """MockEntityExtractor gibt zwei Listen zurück."""
+        """MockEntityExtractor returns two lists."""
         from src.pipeline.ingestion_pipeline import MockEntityExtractor
         extractor = MockEntityExtractor()
         chunks = [{"chunk_id": "c1", "text": "Apple was founded by Steve Jobs."}]
@@ -526,7 +613,7 @@ class TestMockComponents:
         assert isinstance(relations, list)
 
     def test_mock_entity_extractor_extracts_capitalized(self):
-        """MockEntityExtractor findet großgeschriebene Wörter als Entities."""
+        """MockEntityExtractor finds capitalised words as entities."""
         from src.pipeline.ingestion_pipeline import MockEntityExtractor
         extractor = MockEntityExtractor()
         chunks = [{"chunk_id": "c1", "text": "Albert Einstein worked at Princeton University."}]
@@ -540,21 +627,21 @@ class TestMockComponents:
 # ============================================================================
 
 class TestIngestionPipeline:
-    """Tests für IngestionPipeline (mit Mock-Komponenten)."""
+    """Tests for IngestionPipeline (with mock components)."""
 
     @pytest.fixture
     def pipeline(self):
-        """Pipeline mit use_mocks=True — kein GPU/Modell nötig."""
+        """Pipeline with use_mocks=True — no GPU/model required."""
         from src.pipeline.ingestion_pipeline import IngestionPipeline
         return IngestionPipeline(use_mocks=True)
 
     def test_initialization_with_mocks(self, pipeline):
-        """Initialisierung mit use_mocks=True schlägt nicht fehl."""
+        """Initialisation with use_mocks=True does not fail."""
         from src.pipeline.ingestion_pipeline import IngestionPipeline
         assert isinstance(pipeline, IngestionPipeline)
 
     def test_ingest_text_file(self, pipeline, tmp_path):
-        """Ingestiert eine .txt-Datei und gibt IngestionMetrics zurück."""
+        """Ingests a .txt file and returns IngestionMetrics."""
         from src.pipeline.ingestion_pipeline import IngestionMetrics
         f = tmp_path / "test.txt"
         f.write_text(
@@ -568,14 +655,14 @@ class TestIngestionPipeline:
         assert metrics.chunks_created >= 1
 
     def test_ingest_returns_metrics_with_timing(self, pipeline, tmp_path):
-        """Metriken enthalten positive Gesamtzeit."""
+        """Metrics contain a positive total time."""
         f = tmp_path / "test.txt"
         f.write_text("Hello world. This is test content.", encoding="utf-8")
         metrics = pipeline.ingest(str(f))
         assert metrics.total_time_ms > 0
 
     def test_ingest_resets_metrics_between_calls(self, pipeline, tmp_path):
-        """Metriken werden bei jedem ingest()-Aufruf zurückgesetzt, nicht akkumuliert."""
+        """Metrics are reset on each ingest() call, not accumulated."""
         f = tmp_path / "test.txt"
         f.write_text(
             "The quick brown fox jumps over the lazy dog. "
@@ -585,22 +672,22 @@ class TestIngestionPipeline:
         )
         pipeline.ingest(str(f))
         pipeline.ingest(str(f))
-        # documents_processed sollte 1 sein (nur letzte Ausführung, nicht 2)
+        # documents_processed should be 1 (last run only, not 2)
         assert pipeline.get_metrics().documents_processed == 1
 
     def test_get_metrics_returns_ingestion_metrics(self, pipeline):
-        """get_metrics() gibt IngestionMetrics zurück."""
+        """get_metrics() returns IngestionMetrics."""
         from src.pipeline.ingestion_pipeline import IngestionMetrics
         assert isinstance(pipeline.get_metrics(), IngestionMetrics)
 
     def test_chunk_document_fallback_no_crash(self):
-        """Fallback-Chunker (chunker=None) läuft ohne Fehler."""
+        """Fallback chunker (chunker=None) runs without error."""
         from src.pipeline.ingestion_pipeline import IngestionPipeline, IngestionConfig
         pipeline = IngestionPipeline(
             config=IngestionConfig(sentences_per_chunk=3, sentence_overlap=1),
             use_mocks=True,
         )
-        pipeline.chunker = None  # erzwinge Fallback
+        pipeline.chunker = None  # force fallback path
         chunks = pipeline._chunk_document(
             "Paris is the capital. France is in Europe. The Eiffel Tower is famous.",
             doc_id="doc1",
@@ -610,13 +697,19 @@ class TestIngestionPipeline:
         assert len(chunks) >= 1
 
     def test_chunk_document_fallback_step_zero_no_crash(self):
-        """Fallback-Chunker crasht nicht wenn sentences_per_chunk == sentence_overlap."""
+        """
+        Fallback chunker does not crash when sentences_per_chunk == sentence_overlap.
+
+        With sentences_per_chunk=2 and sentence_overlap=2, the regex fallback
+        computes step = max(1, 2 - 2) = max(1, 0) = 1. Without the max(1, ...)
+        guard this would produce an infinite loop. This test verifies the guard.
+        """
         from src.pipeline.ingestion_pipeline import (
             IngestionPipeline, IngestionConfig, MockEntityExtractor, MockEmbeddingGenerator
         )
         config = IngestionConfig(sentences_per_chunk=2, sentence_overlap=2)
-        # Chunker explizit als Mock übergeben, damit _init_chunker() nicht
-        # SpacySentenceChunker mit invalider Config aufruft (overlap >= per_chunk)
+        # Chunker passed explicitly as a mock so _init_chunker() does not
+        # call SpacySentenceChunker with an invalid config (overlap >= per_chunk)
         pipeline = IngestionPipeline(
             config=config,
             chunker=Mock(),
@@ -624,13 +717,13 @@ class TestIngestionPipeline:
             embedding_generator=MockEmbeddingGenerator(config.embedding_dim),
             hybrid_store=Mock(),
         )
-        pipeline.chunker = None  # Fallback-Pfad erzwingen
+        pipeline.chunker = None  # force fallback path
         chunks = pipeline._chunk_document(
             "Sentence one. Sentence two. Sentence three.",
             doc_id="doc1",
             metadata={}
         )
-        assert isinstance(chunks, list)  # kein ValueError
+        assert isinstance(chunks, list)  # no ValueError or infinite loop
 
 
 # ============================================================================
@@ -638,23 +731,23 @@ class TestIngestionPipeline:
 # ============================================================================
 
 class TestFactoryFunctions:
-    """Tests für create_pipeline() und create_ingestion_pipeline()."""
+    """Tests for create_pipeline() and create_ingestion_pipeline()."""
 
     def test_create_ingestion_pipeline_default(self):
-        """create_ingestion_pipeline() ohne Args gibt IngestionPipeline zurück."""
+        """create_ingestion_pipeline() without args returns an IngestionPipeline."""
         from src.pipeline.ingestion_pipeline import create_ingestion_pipeline, IngestionPipeline
         pipeline = create_ingestion_pipeline(use_mocks=True)
         assert isinstance(pipeline, IngestionPipeline)
 
     def test_create_ingestion_pipeline_with_config(self):
-        """create_ingestion_pipeline() mit YAML-Config übernimmt Werte."""
+        """create_ingestion_pipeline() with a YAML config applies the values."""
         from src.pipeline.ingestion_pipeline import create_ingestion_pipeline
-        cfg = {"chunking": {"sentence_chunking": {"sentences_per_chunk": 5}}}
+        cfg = {"ingestion": {"sentences_per_chunk": 5}}
         pipeline = create_ingestion_pipeline(config=cfg, use_mocks=True)
         assert pipeline.config.sentences_per_chunk == 5
 
     def test_create_pipeline_returns_agent_pipeline(self):
-        """create_pipeline() gibt AgentPipeline zurück."""
+        """create_pipeline() returns an AgentPipeline."""
         from src.pipeline.agent_pipeline import create_pipeline, AgentPipeline
         pipeline = create_pipeline()
         assert isinstance(pipeline, AgentPipeline)
@@ -663,12 +756,20 @@ class TestFactoryFunctions:
         assert pipeline.verifier is not None
 
     def test_pipeline_imports_from_init(self):
-        """__init__.py exportiert alle öffentlichen Klassen korrekt."""
+        """__init__.py exports all public classes correctly."""
         from src.pipeline import (
             AgentPipeline, PipelineResult, BatchProcessor,
             create_pipeline, create_full_pipeline,
             IngestionPipeline, IngestionConfig, IngestionMetrics,
-            DocumentLoader, EmbeddingGenerator, create_ingestion_pipeline,
+            DocumentLoader, MockEmbeddingGenerator, create_ingestion_pipeline,
         )
         assert AgentPipeline is not None
         assert IngestionPipeline is not None
+
+
+if __name__ == "__main__":
+    import sys
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
+

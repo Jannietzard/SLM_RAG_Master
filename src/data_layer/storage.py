@@ -1,90 +1,86 @@
 """
 Hybrid Storage Module: Vector Store (LanceDB) + Knowledge Graph (KuzuDB)
 
-Version: 3.0.0 - KUZU INTEGRATION
+Version: 3.1.0
 Author: Edge-RAG Research Project
-Last Modified: 2026-01-25
+Last Modified: 2026-04-08
 
 ===============================================================================
-MAJOR CHANGE: NetworkX → KuzuDB
+OVERVIEW
 ===============================================================================
 
-Previous Implementation (v2.1.0):
-    - NetworkX for in-memory graph
-    - GraphML file persistence
-    - Python-based traversal (slow for large graphs)
-    
-New Implementation (v3.0.0):
-    - KuzuDB embedded graph database
-    - Cypher query language
-    - Native multi-hop traversal (10-100x faster)
-    - ACID transactions
-    - Columnar storage (memory efficient)
+This module implements the dual-storage persistence layer of the Edge-RAG
+system.  Two embedded databases are combined under a single `HybridStore`
+facade:
 
-SCIENTIFIC RATIONALE:
+  - **LanceDB** (vector store): approximate nearest-neighbour search over
+    dense embeddings produced by nomic-embed-text via Ollama.
+    Reference: Malkov & Yashunin (2018). "Efficient and robust approximate
+    nearest neighbor search using hierarchical navigable small world graphs."
+    IEEE Transactions on Pattern Analysis and Machine Intelligence.
 
-KuzuDB advantages for Edge-RAG:
-1. Embedded: No server process (like LanceDB)
-2. Cypher: Standard graph query language
-3. Performance: Columnar storage, vectorized execution
-4. Multi-hop: Native path queries (vs BFS in Python)
+  - **KuzuDB** (knowledge graph): native Cypher-based multi-hop traversal
+    over a DocumentChunk–Entity graph constructed during ingestion.
+    Reference: Feng et al. (2023). "Kùzu Graph Database Management System."
+    CIDR 2023.
 
-Reference: Feng et al. (2023). "Kùzu Graph Database Management System."
-CIDR 2023.
+The combination supports the hybrid retrieval strategy described in thesis
+section 2.4: dense vector recall is augmented with graph-based entity
+expansion, enabling bridge-entity reasoning across documents without loading
+full document text into memory (< 16 GB RAM constraint).
+
+NetworkX is retained as a fallback for environments where KuzuDB is
+unavailable, but multi-hop Cypher retrieval is only available under KuzuDB.
 
 ===============================================================================
 GRAPH SCHEMA
 ===============================================================================
 
-Node Types:
-    - DocumentChunk: Text chunks from ingested documents
-    - SourceDocument: Original PDF/document files
-    - Entity: Extracted named entities (optional)
-    - Concept: Domain concepts (optional)
+Node Tables:
+    DocumentChunk(chunk_id PK, text, page_number, chunk_index, source_file)
+    SourceDocument(doc_id PK, filename, total_pages)
+    Entity(entity_id PK, name, type, confidence)
 
-Edge Types:
-    - FROM_SOURCE: DocumentChunk -> SourceDocument
-    - NEXT_CHUNK: DocumentChunk -> DocumentChunk (sequential)
-    - MENTIONS: DocumentChunk -> Entity
-    - RELATED_TO: Entity -> Entity
-    - SIMILAR_TO: DocumentChunk -> DocumentChunk (semantic similarity)
+Relationship Tables:
+    FROM_SOURCE:  DocumentChunk → SourceDocument
+    NEXT_CHUNK:   DocumentChunk → DocumentChunk  (sequential ordering)
+    MENTIONS:     DocumentChunk → Entity
+    RELATED_TO:   Entity → Entity                (with relation_type, confidence)
 
-Cypher Schema:
-    CREATE NODE TABLE DocumentChunk(
-        chunk_id STRING PRIMARY KEY,
-        text STRING,
-        page_number INT64,
-        chunk_index INT64,
-        embedding_id STRING
+===============================================================================
+USAGE
+===============================================================================
+
+    from storage import HybridStore, StorageConfig
+    from langchain_core.embeddings import Embeddings
+
+    config = StorageConfig(
+        vector_db_path=Path("./data/vector"),
+        graph_db_path=Path("./data/graph"),
     )
-    
-    CREATE NODE TABLE SourceDocument(
-        doc_id STRING PRIMARY KEY,
-        filename STRING,
-        total_pages INT64,
-        ingestion_timestamp TIMESTAMP
-    )
-    
-    CREATE REL TABLE FROM_SOURCE(
-        FROM DocumentChunk TO SourceDocument
-    )
+    store = HybridStore(config, embeddings)
+    store.add_documents(documents)
+    results = store.vector_search(query_embedding, top_k=5)
 
 ===============================================================================
 """
 
-import logging
+import collections
 import json
+import logging
 import shutil
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 from dataclasses import dataclass
+
+if TYPE_CHECKING:
+    from .entity_extraction import EntityExtractionPipeline
 
 import numpy as np
 from langchain_core.documents import Document
-from langchain.embeddings.base import Embeddings
+from langchain_core.embeddings import Embeddings
 
-# LanceDB for vector storage
 import lancedb
 
 # KuzuDB for graph storage
@@ -93,17 +89,15 @@ try:
     KUZU_AVAILABLE = True
 except ImportError:
     KUZU_AVAILABLE = False
-    logging.warning(
-        "KuzuDB not available. Install with: pip install kuzu"
-    )
+    logging.warning("KuzuDB not available. Install with: pip install kuzu")
 
-# Fallback to NetworkX if Kuzu not available
+# NetworkX fallback
 try:
     import networkx as nx
     NETWORKX_AVAILABLE = True
 except ImportError:
     NETWORKX_AVAILABLE = False
-
+    logging.warning("NetworkX not available. Install with: pip install networkx")
 
 logger = logging.getLogger(__name__)
 
@@ -112,21 +106,37 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # ============================================================================
 
-@dataclass
+@dataclass(frozen=True)
 class StorageConfig:
     """
-    Configuration for Hybrid Storage System.
-    
+    Configuration for the Hybrid Storage System.
+
+    Frozen dataclass: fields are immutable after construction, preventing
+    accidental mutation of shared config objects (e.g. in HybridStore.__init__).
+
+    All configurable thresholds should be read from config/settings.yaml
+    via a factory (e.g. create_hybrid_retriever in hybrid_retriever.py).
+    Defaults here serve as documented emergency fallbacks only.
+
     Attributes:
-        vector_db_path: Directory path for LanceDB vector database
-        graph_db_path: Container directory for KuzuDB (actual file: graph_KuzuDB inside it)
-        embedding_dim: Dimensionality of embedding vectors
-        similarity_threshold: Minimum similarity score for retrieval
-        normalize_embeddings: Whether to L2-normalize vectors
-        distance_metric: Distance metric for vector search
-        graph_backend: "kuzu" or "networkx" (fallback)
+        vector_db_path: Directory path for LanceDB.
+        graph_db_path: Container directory for KuzuDB
+                       (actual DB stored as graph_KuzuDB/ inside it).
+        embedding_dim: Embedding vector dimensionality (None = auto-detect).
+        similarity_threshold: Minimum cosine similarity for vector results.
+        normalize_embeddings: L2-normalise vectors before storage and search.
+        distance_metric: LanceDB distance metric ("cosine" or "l2").
+        graph_backend: "kuzu" or "networkx".
+        overfetch_factor: ANN over-fetch multiplier. LanceDB retrieves
+            top_k * overfetch_factor candidates; Python then re-ranks and
+            filters by similarity_threshold. Factor 3 balances recall vs
+            latency for typical top_k=5–10 queries (empirically validated).
+        graph_text_max_chars: Maximum characters stored in graph node text
+            field. Full text lives in the vector store; the graph field is
+            used only for lightweight context display.
         enable_entity_extraction: Enable GLiNER + REBEL entity extraction
-        entity_cache_path: Path to entity cache (None = auto-generate)
+            during ingestion (opt-in; can be injected via entity_pipeline).
+        entity_cache_path: Path to entity SQLite cache (None = auto-generate).
     """
     vector_db_path: Path
     graph_db_path: Path
@@ -134,95 +144,115 @@ class StorageConfig:
     similarity_threshold: float = 0.3
     normalize_embeddings: bool = True
     distance_metric: str = "cosine"
-    graph_backend: str = "kuzu"  # NEW: "kuzu" or "networkx"
-    
-    # Entity Extraction (NEW in v3.1.0)
-    enable_entity_extraction: bool = False  # Default OFF (opt-in)
+    graph_backend: str = "kuzu"
+    overfetch_factor: int = 3
+    graph_text_max_chars: int = 500
+    enable_entity_extraction: bool = False
     entity_cache_path: Optional[Path] = None
-    
-    def __post_init__(self):
+
+    def __post_init__(self) -> None:
         """Validate configuration parameters."""
         if self.embedding_dim is not None and self.embedding_dim <= 0:
-            raise ValueError(f"embedding_dim must be positive: {self.embedding_dim}")
-        
+            raise ValueError("embedding_dim must be positive: %d" % self.embedding_dim)
+
         if not (0.0 <= self.similarity_threshold <= 1.0):
-            raise ValueError(f"similarity_threshold must be in [0,1]: {self.similarity_threshold}")
-        
+            raise ValueError(
+                "similarity_threshold must be in [0,1]: %f" % self.similarity_threshold
+            )
+
         if self.distance_metric not in ("cosine", "l2"):
-            raise ValueError(f"distance_metric must be 'cosine' or 'l2': {self.distance_metric}")
-        
+            raise ValueError(
+                "distance_metric must be 'cosine' or 'l2': %s" % self.distance_metric
+            )
+
         if self.graph_backend not in ("kuzu", "networkx"):
-            raise ValueError(f"graph_backend must be 'kuzu' or 'networkx': {self.graph_backend}")
+            raise ValueError(
+                "graph_backend must be 'kuzu' or 'networkx': %s" % self.graph_backend
+            )
+
+        if self.overfetch_factor < 1:
+            raise ValueError(
+                "overfetch_factor must be >= 1: %d" % self.overfetch_factor
+            )
 
 
 # ============================================================================
-# VECTOR STORE ADAPTER (LanceDB) - UNCHANGED FROM v2.1.0
+# VECTOR STORE ADAPTER (LanceDB)
 # ============================================================================
 
 class VectorStoreAdapter:
     """
-    LanceDB Vector Store Adapter with correct distance metric handling.
-    [Same as v2.1.0 - no changes needed]
+    LanceDB Vector Store Adapter with distance-to-similarity conversion.
+
+    LanceDB returns raw distances (lower = more similar for cosine/L2).
+    This adapter converts them to similarity scores in [0, 1] so that
+    downstream components can apply a uniform threshold.
+
+    The ANN search over-fetches by `overfetch_factor` to allow threshold
+    filtering after similarity conversion without losing top candidates.
     """
 
-    SCHEMA_VERSION = "3.0.0"
+    SCHEMA_VERSION = "3.1.0"
     TABLE_NAME = "documents"
-    
+
     def __init__(
-        self, 
-        db_path: Path, 
+        self,
+        db_path: Path,
         embedding_dim: Optional[int] = None,
         normalize_embeddings: bool = True,
-        distance_metric: str = "cosine"
-    ):
+        distance_metric: str = "cosine",
+        overfetch_factor: int = 3,
+    ) -> None:
         if distance_metric not in ("cosine", "l2"):
-            raise ValueError(f"Unsupported distance metric: {distance_metric}")
-        
+            raise ValueError("Unsupported distance metric: %s" % distance_metric)
+
         db_path = Path(db_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         self.db = lancedb.connect(str(db_path))
         self.db_path = db_path
         self.embedding_dim = embedding_dim
         self.normalize_embeddings = normalize_embeddings
         self.distance_metric = distance_metric
+        self.overfetch_factor = overfetch_factor
         self.table = None
-        self.logger = logging.getLogger(__name__)
-        
-        self.logger.info(
-            f"VectorStoreAdapter initialized: "
-            f"path={db_path}, metric={distance_metric}"
+
+        logger.info(
+            "VectorStoreAdapter initialised: path=%s, metric=%s",
+            db_path,
+            distance_metric,
         )
 
         self._load_metadata()
 
-        # Open existing table if it exists
         try:
             table_names = self.db.table_names()
             if self.TABLE_NAME in table_names:
                 self.table = self.db.open_table(self.TABLE_NAME)
-                self.logger.info(
-                    f"Opened existing table '{self.TABLE_NAME}' with {len(self.table)} rows"
+                logger.info(
+                    "Opened existing table '%s' with %d rows",
+                    self.TABLE_NAME,
+                    len(self.table),
                 )
-        except Exception as e:
-            self.logger.debug(f"Could not open existing table: {e}")
+        except (RuntimeError, OSError) as exc:
+            logger.warning("Could not open existing table: %s", exc)
 
     def _get_metadata_path(self) -> Path:
         return self.db_path / "vector_store_metadata.json"
-    
+
     def _load_metadata(self) -> None:
         metadata_path = self._get_metadata_path()
         if not metadata_path.exists():
             return
         try:
-            with open(metadata_path, 'r', encoding='utf-8') as f:
-                metadata = json.load(f)
+            with open(metadata_path, "r", encoding="utf-8") as fh:
+                metadata = json.load(fh)
             stored_dim = metadata.get("embedding_dim")
             if stored_dim and self.embedding_dim is None:
                 self.embedding_dim = stored_dim
-        except Exception as e:
-            self.logger.debug(f"Could not load metadata: {e}")
-    
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.debug("Could not load metadata: %s", exc)
+
     def _save_metadata(self) -> None:
         if self.embedding_dim is None:
             return
@@ -236,13 +266,14 @@ class VectorStoreAdapter:
         }
         metadata_path = self._get_metadata_path()
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(metadata_path, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, indent=2)
+        with open(metadata_path, "w", encoding="utf-8") as fh:
+            json.dump(metadata, fh, indent=2)
 
     def _normalize_vectors(self, vectors: np.ndarray) -> np.ndarray:
         if not self.normalize_embeddings:
             return vectors
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        # Guard against zero-norm vectors (e.g. all-zero padding)
         norms = np.where(norms == 0, 1.0, norms)
         return vectors / norms
 
@@ -256,33 +287,41 @@ class VectorStoreAdapter:
             return
         if actual_dim != self.embedding_dim:
             raise ValueError(
-                f"EMBEDDING DIMENSION MISMATCH: expected {self.embedding_dim}, got {actual_dim}"
+                "EMBEDDING DIMENSION MISMATCH: expected %d, got %d"
+                % (self.embedding_dim, actual_dim)
             )
 
     def _distance_to_similarity(self, distance: float) -> float:
+        """
+        Convert a raw LanceDB distance to a similarity score in [0, 1].
+
+        Cosine: similarity = 1 - distance  (distance ∈ [0, 2] in unnormalised
+                space; ∈ [0, 1] after L2 normalisation).
+        L2:     similarity = 1 / (1 + distance).
+        """
         if self.distance_metric == "cosine":
             return max(0.0, min(1.0, 1.0 - distance))
         elif self.distance_metric == "l2":
             return max(0.0, min(1.0, 1.0 / (1.0 + distance)))
         else:
-            raise ValueError(f"Unknown distance metric: {self.distance_metric}")
+            raise ValueError("Unknown distance metric: %s" % self.distance_metric)
 
     def add_documents_with_embeddings(
         self,
         documents: List[Document],
         embeddings: Embeddings,
     ) -> None:
+        """Embed documents and insert them into the LanceDB table."""
         if not documents:
             return
 
         texts = [doc.page_content for doc in documents]
-        self.logger.info(f"Generating embeddings for {len(texts)} documents...")
-        
-        start_time = time.time()
+        logger.info("Generating embeddings for %d documents...", len(texts))
+
+        t0 = time.time()
         embeddings_list = embeddings.embed_documents(texts)
-        embed_time = time.time() - start_time
-        
-        self.logger.info(f"Embeddings generated in {embed_time:.2f}s")
+        logger.info("Embeddings generated in %.2fs", time.time() - t0)
+
         self._validate_embedding_dimension(embeddings_list)
 
         embeddings_array = np.array(embeddings_list, dtype=np.float32)
@@ -302,12 +341,14 @@ class VectorStoreAdapter:
 
         try:
             if self.table is None:
-                self.table = self.db.create_table(self.TABLE_NAME, data=data, mode="overwrite")
+                self.table = self.db.create_table(
+                    self.TABLE_NAME, data=data, mode="overwrite"
+                )
             else:
                 self.table.add(data)
             self._save_metadata()
-        except Exception as e:
-            self.logger.error(f"Failed to insert documents: {e}")
+        except Exception as exc:
+            logger.error("Failed to insert documents: %s", exc)
             raise
 
     def vector_search(
@@ -316,6 +357,12 @@ class VectorStoreAdapter:
         top_k: int = 5,
         threshold: float = 0.0,
     ) -> List[Dict[str, Any]]:
+        """
+        Perform ANN vector search with similarity threshold filtering.
+
+        Over-fetches by `overfetch_factor` before threshold filtering to
+        avoid losing top-k candidates when many results fall below threshold.
+        """
         if self.table is None:
             return []
 
@@ -324,26 +371,26 @@ class VectorStoreAdapter:
                 query_array = np.array([query_embedding], dtype=np.float32)
                 query_array = self._normalize_vectors(query_array)
                 query_embedding = query_array[0].tolist()
-            
+
             raw_results = (
                 self.table
                 .search(query_embedding)
                 .metric(self.distance_metric)
-                .limit(top_k * 3)
+                .limit(top_k * self.overfetch_factor)
                 .to_list()
             )
-            
+
             filtered_results = []
             for result in raw_results:
                 distance = result.get("_distance", 0.0)
                 similarity = self._distance_to_similarity(distance)
-                
+
                 if similarity >= threshold:
                     try:
                         metadata = json.loads(result.get("metadata", "{}"))
                     except (json.JSONDecodeError, TypeError):
                         metadata = {}
-                    
+
                     filtered_results.append({
                         "text": result.get("text", ""),
                         "similarity": similarity,
@@ -354,93 +401,72 @@ class VectorStoreAdapter:
             filtered_results.sort(key=lambda x: x["similarity"], reverse=True)
             return filtered_results[:top_k]
 
-        except Exception as e:
-            self.logger.error(f"Vector search failed: {e}")
+        except Exception as exc:
+            logger.error("Vector search failed: %s", exc)
             return []
 
 
 # ============================================================================
-# KUZU GRAPH STORE (NEW!)
+# KUZU GRAPH STORE
 # ============================================================================
 
 class KuzuGraphStore:
     """
     KuzuDB-based Knowledge Graph Store.
-    
-    ADVANTAGES OVER NETWORKX:
-    
-    1. Native Cypher Support:
-       - Standard graph query language
-       - Complex path queries in single statement
-       - Aggregations, filtering, projections
-    
-    2. Performance:
-       - Columnar storage (cache-efficient)
-       - Vectorized query execution
-       - Native multi-hop traversal
-       - 10-100x faster than Python BFS for large graphs
-    
-    3. Persistence:
-       - ACID transactions
-       - Crash recovery
-       - No need for manual save/load
-    
-    4. Memory Efficiency:
-       - Out-of-core processing
-       - Memory-mapped files
-       - Handles graphs larger than RAM
-    
-    SCHEMA:
-    
-    Node Tables:
-        DocumentChunk(chunk_id, text, page_number, chunk_index, source_file)
-        SourceDocument(doc_id, filename, total_pages)
-        Entity(entity_id, name, entity_type)
-    
-    Relationship Tables:
-        FROM_SOURCE(DocumentChunk -> SourceDocument)
-        NEXT_CHUNK(DocumentChunk -> DocumentChunk)
-        MENTIONS(DocumentChunk -> Entity)
-        RELATED_TO(Entity -> Entity, relation_type)
+
+    Provides Cypher-based multi-hop traversal over a DocumentChunk–Entity
+    graph.  Advantages over the NetworkX fallback:
+
+    - Native Cypher support for complex path queries.
+    - Columnar, vectorised query execution (10–100x faster for large graphs).
+    - ACID transactions and crash recovery.
+    - Out-of-core processing via memory-mapped files (handles graphs > RAM).
+
+    Reference: Feng et al. (2023). "Kùzu Graph Database Management System."
+               CIDR 2023.
+
+    Schema:
+        Nodes:  DocumentChunk, SourceDocument, Entity
+        Edges:  FROM_SOURCE, NEXT_CHUNK, MENTIONS, RELATED_TO
     """
-    
-    SCHEMA_VERSION = "3.0.0"
-    
-    def __init__(self, db_path: Path):
+
+    SCHEMA_VERSION = "3.1.0"
+    # Subdirectory inside graph_db_path where KuzuDB stores its files.
+    # Keeping it in a subdirectory allows sibling files (e.g. entity_cache.db)
+    # to share the same parent without confusing KuzuDB.
+    KUZU_DIR_NAME = "graph_KuzuDB"
+
+    def __init__(self, db_path: Path) -> None:
         """
-        Initialize KuzuDB graph store.
-        
+        Initialise KuzuDB graph store.
+
         Args:
-            db_path: Container directory for the graph store.
-                     The actual KuzuDB file is stored as graph_KuzuDB inside this directory.
+            db_path: Container directory.  KuzuDB files are stored at
+                     db_path / KUZU_DIR_NAME.
         """
         self.db_path = Path(db_path)
-        self.logger = logging.getLogger(__name__)
 
         if not KUZU_AVAILABLE:
             raise ImportError("KuzuDB not installed. Install with: pip install kuzu")
 
-        # db_path is the container directory; the actual KuzuDB file lives inside it.
-        # This allows sibling files (e.g. extraction_metadata.json) in the same folder.
         self.db_path.mkdir(parents=True, exist_ok=True)
-        kuzu_file = self.db_path / "graph_KuzuDB"
+        kuzu_file = self.db_path / self.KUZU_DIR_NAME
 
         self.db = kuzu.Database(str(kuzu_file))
         self.conn = kuzu.Connection(self.db)
 
-        # Initialize schema
         self._init_schema()
+        logger.info("KuzuGraphStore initialised: %s", kuzu_file)
 
-        self.logger.info(f"KuzuGraphStore initialized: {kuzu_file}")
-        
     def _init_schema(self) -> None:
         """
-        Initialize graph schema (creates tables if not exist).
-        
-        KuzuDB requires explicit schema definition before inserting data.
+        Create node and relationship tables if they do not yet exist.
+
+        KuzuDB requires explicit schema definition before INSERT/MERGE.
+        IF NOT EXISTS prevents errors on repeated initialisation; any
+        exception here is therefore unexpected and logged as a warning.
         """
         try:
-            # Node Tables
             self.conn.execute("""
                 CREATE NODE TABLE IF NOT EXISTS DocumentChunk(
                     chunk_id STRING,
@@ -451,7 +477,6 @@ class KuzuGraphStore:
                     PRIMARY KEY (chunk_id)
                 )
             """)
-            
             self.conn.execute("""
                 CREATE NODE TABLE IF NOT EXISTS SourceDocument(
                     doc_id STRING,
@@ -460,7 +485,6 @@ class KuzuGraphStore:
                     PRIMARY KEY (doc_id)
                 )
             """)
-            
             self.conn.execute("""
                 CREATE NODE TABLE IF NOT EXISTS Entity(
                     entity_id STRING,
@@ -470,26 +494,21 @@ class KuzuGraphStore:
                     PRIMARY KEY (entity_id)
                 )
             """)
-
-            # Relationship Tables
             self.conn.execute("""
                 CREATE REL TABLE IF NOT EXISTS FROM_SOURCE(
                     FROM DocumentChunk TO SourceDocument
                 )
             """)
-
             self.conn.execute("""
                 CREATE REL TABLE IF NOT EXISTS NEXT_CHUNK(
                     FROM DocumentChunk TO DocumentChunk
                 )
             """)
-
             self.conn.execute("""
                 CREATE REL TABLE IF NOT EXISTS MENTIONS(
                     FROM DocumentChunk TO Entity
                 )
             """)
-
             self.conn.execute("""
                 CREATE REL TABLE IF NOT EXISTS RELATED_TO(
                     FROM Entity TO Entity,
@@ -498,13 +517,17 @@ class KuzuGraphStore:
                     source_chunks STRING
                 )
             """)
-            
-            self.logger.debug("Graph schema initialized")
-            
-        except Exception as e:
-            # Tables might already exist
-            self.logger.debug(f"Schema init note: {e}")
-    
+            logger.debug("Graph schema initialised")
+
+        except Exception as exc:
+            # IF NOT EXISTS makes duplicate-table errors impossible;
+            # any exception here signals an unexpected problem.
+            logger.warning("Unexpected error during schema init: %s", exc)
+
+    # ========================================================================
+    # NODE WRITERS
+    # ========================================================================
+
     def add_document_chunk(
         self,
         chunk_id: str,
@@ -512,20 +535,15 @@ class KuzuGraphStore:
         page_number: int,
         chunk_index: int,
         source_file: str,
+        max_text_chars: int = 500,
     ) -> None:
         """
-        Add a document chunk node.
-        
-        Args:
-            chunk_id: Unique identifier for chunk
-            text: Chunk text content (truncated for storage)
-            page_number: Source page number
-            chunk_index: Sequential chunk index
-            source_file: Source document filename
+        MERGE a DocumentChunk node.
+
+        Full text is stored in the vector store; `text` here is a truncated
+        preview used for lightweight graph-side context display only.
         """
-        # Truncate text for graph storage (full text is in vector store)
-        truncated_text = text[:500] if len(text) > 500 else text
-        
+        truncated = text[:max_text_chars] if len(text) > max_text_chars else text
         try:
             self.conn.execute(
                 """
@@ -537,22 +555,23 @@ class KuzuGraphStore:
                 """,
                 {
                     "chunk_id": chunk_id,
-                    "text": truncated_text,
+                    "text": truncated,
                     "page_number": page_number,
                     "chunk_index": chunk_index,
                     "source_file": source_file,
-                }
+                },
             )
-        except Exception as e:
-            self.logger.error(f"Failed to add chunk {chunk_id}: {e}")
-    
+        except Exception as exc:
+            logger.error("Failed to add chunk %s: %s", chunk_id, exc)
+            raise
+
     def add_source_document(
         self,
         doc_id: str,
         filename: str,
         total_pages: int = 0,
     ) -> None:
-        """Add a source document node."""
+        """MERGE a SourceDocument node."""
         try:
             self.conn.execute(
                 """
@@ -560,15 +579,12 @@ class KuzuGraphStore:
                 SET d.filename = $filename,
                     d.total_pages = $total_pages
                 """,
-                {
-                    "doc_id": doc_id,
-                    "filename": filename,
-                    "total_pages": total_pages,
-                }
+                {"doc_id": doc_id, "filename": filename, "total_pages": total_pages},
             )
-        except Exception as e:
-            self.logger.error(f"Failed to add source doc {doc_id}: {e}")
-    
+        except Exception as exc:
+            logger.error("Failed to add source doc %s: %s", doc_id, exc)
+            raise
+
     def add_entity(
         self,
         entity_id: str,
@@ -576,7 +592,7 @@ class KuzuGraphStore:
         entity_type: str = "unknown",
         confidence: float = 0.0,
     ) -> None:
-        """Add an entity node."""
+        """MERGE an Entity node."""
         try:
             self.conn.execute(
                 """
@@ -590,11 +606,12 @@ class KuzuGraphStore:
                     "name": name,
                     "entity_type": entity_type,
                     "confidence": confidence,
-                }
+                },
             )
-        except Exception as e:
-            self.logger.error(f"Failed to add entity {entity_id}: {e}")
-    
+        except Exception as exc:
+            logger.error("Failed to add entity %s: %s", entity_id, exc)
+            raise
+
     def add_entity_from_metadata(
         self,
         entity_id: str,
@@ -602,10 +619,10 @@ class KuzuGraphStore:
         metadata: Dict[str, Any],
     ) -> None:
         """
-        Add an entity node from metadata (compatibility wrapper).
-        
-        Routes to appropriate add method based on entity_type.
-        Provides API compatibility with hybrid store interface.
+        Compatibility wrapper: routes to the typed add_* method based on
+        entity_type.  Used by HybridStore.add_documents when the NetworkX
+        code path is active (both KuzuGraphStore and NetworkXGraphStore
+        expose this method for interface consistency).
         """
         if entity_type == "document_chunk":
             self.add_document_chunk(
@@ -622,15 +639,18 @@ class KuzuGraphStore:
                 total_pages=metadata.get("total_pages", 0),
             )
         else:
-            # Generic entity
             self.add_entity(
                 entity_id=entity_id,
                 name=metadata.get("name", entity_id),
                 entity_type=entity_type,
             )
-    
+
+    # ========================================================================
+    # EDGE WRITERS
+    # ========================================================================
+
     def add_from_source_relation(self, chunk_id: str, doc_id: str) -> None:
-        """Create FROM_SOURCE relationship between chunk and document."""
+        """MERGE a FROM_SOURCE edge: DocumentChunk → SourceDocument."""
         try:
             self.conn.execute(
                 """
@@ -638,13 +658,13 @@ class KuzuGraphStore:
                 MATCH (d:SourceDocument {doc_id: $doc_id})
                 MERGE (c)-[:FROM_SOURCE]->(d)
                 """,
-                {"chunk_id": chunk_id, "doc_id": doc_id}
+                {"chunk_id": chunk_id, "doc_id": doc_id},
             )
-        except Exception as e:
-            self.logger.debug(f"FROM_SOURCE relation note: {e}")
-    
+        except Exception as exc:
+            logger.warning("FROM_SOURCE relation failed (%s → %s): %s", chunk_id, doc_id, exc)
+
     def add_next_chunk_relation(self, chunk_id: str, next_chunk_id: str) -> None:
-        """Create NEXT_CHUNK relationship for sequential ordering."""
+        """MERGE a NEXT_CHUNK edge for sequential ordering."""
         try:
             self.conn.execute(
                 """
@@ -652,13 +672,15 @@ class KuzuGraphStore:
                 MATCH (c2:DocumentChunk {chunk_id: $next_chunk_id})
                 MERGE (c1)-[:NEXT_CHUNK]->(c2)
                 """,
-                {"chunk_id": chunk_id, "next_chunk_id": next_chunk_id}
+                {"chunk_id": chunk_id, "next_chunk_id": next_chunk_id},
             )
-        except Exception as e:
-            self.logger.debug(f"NEXT_CHUNK relation note: {e}")
-    
+        except Exception as exc:
+            logger.warning(
+                "NEXT_CHUNK relation failed (%s → %s): %s", chunk_id, next_chunk_id, exc
+            )
+
     def add_mentions_relation(self, chunk_id: str, entity_id: str) -> None:
-        """Create MENTIONS relationship between chunk and entity."""
+        """MERGE a MENTIONS edge: DocumentChunk → Entity."""
         try:
             self.conn.execute(
                 """
@@ -666,18 +688,20 @@ class KuzuGraphStore:
                 MATCH (e:Entity {entity_id: $entity_id})
                 MERGE (c)-[:MENTIONS]->(e)
                 """,
-                {"chunk_id": chunk_id, "entity_id": entity_id}
+                {"chunk_id": chunk_id, "entity_id": entity_id},
             )
-        except Exception as e:
-            self.logger.debug(f"MENTIONS relation note: {e}")
-    
+        except Exception as exc:
+            logger.warning(
+                "MENTIONS relation failed (%s → %s): %s", chunk_id, entity_id, exc
+            )
+
     def add_related_to_relation(
         self,
         entity1_id: str,
         entity2_id: str,
         relation_type: str = "related",
     ) -> None:
-        """Create RELATED_TO relationship between entities."""
+        """MERGE a RELATED_TO edge: Entity → Entity."""
         try:
             self.conn.execute(
                 """
@@ -689,15 +713,37 @@ class KuzuGraphStore:
                     "entity1_id": entity1_id,
                     "entity2_id": entity2_id,
                     "relation_type": relation_type,
-                }
+                },
             )
-        except Exception as e:
-            self.logger.debug(f"RELATED_TO relation note: {e}")
-    
+        except Exception as exc:
+            logger.warning(
+                "RELATED_TO relation failed (%s → %s): %s", entity1_id, entity2_id, exc
+            )
+
+    def add_relation(
+        self,
+        source_id: str,
+        target_id: str,
+        relation_type: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Compatibility method: routes relation_type to the appropriate
+        typed add_*_relation method.
+        """
+        if relation_type == "from_source":
+            self.add_from_source_relation(source_id, target_id)
+        elif relation_type == "next_chunk":
+            self.add_next_chunk_relation(source_id, target_id)
+        elif relation_type == "mentions":
+            self.add_mentions_relation(source_id, target_id)
+        else:
+            self.add_related_to_relation(source_id, target_id, relation_type)
+
     # ========================================================================
-    # GRAPH TRAVERSAL (Cypher-based)
+    # GRAPH TRAVERSAL (Cypher)
     # ========================================================================
-    
+
     def graph_traversal(
         self,
         start_entity: str,
@@ -705,20 +751,28 @@ class KuzuGraphStore:
         max_hops: int = 2,
     ) -> Dict[str, int]:
         """
-        Perform multi-hop graph traversal using Cypher.
-        
+        Multi-hop graph traversal via Cypher.
+
+        Returns a mapping of node_id → hop_distance for all nodes reachable
+        from start_entity within max_hops steps.  start_entity is included
+        only if it exists as a DocumentChunk or Entity node.
+
         Args:
-            start_entity: Starting node ID (chunk_id or entity_id)
-            relation_types: Filter by relation types (None = all)
-            max_hops: Maximum traversal depth
-            
+            start_entity: Starting node ID (chunk_id or entity_id).
+            relation_types: Reserved for future filtering; not yet applied
+                            in the Cypher query.
+            max_hops: Maximum traversal depth.
+
         Returns:
-            Dict mapping node_id -> hop_distance
+            Dict mapping node_id -> hop_distance.
         """
-        visited = {start_entity: 0}
-        
+        visited: Dict[str, int] = {}
+
+        # Attempt 1: start_entity as DocumentChunk.
+        # If the query executes but returns 0 rows (e.g. start_entity is an
+        # entity ID, not a chunk ID), visited remains empty and Attempt 2
+        # runs unconditionally below.
         try:
-            # Try as DocumentChunk first - traverse via NEXT_CHUNK and FROM_SOURCE
             result = self.conn.execute(
                 f"""
                 MATCH (start:DocumentChunk {{chunk_id: $start_id}})
@@ -727,80 +781,86 @@ class KuzuGraphStore:
                     connected.chunk_id AS node_id,
                     length(path) AS hops
                 """,
-                {"start_id": start_entity}
+                {"start_id": start_entity},
             )
-            
+            # Include start node only if it actually exists in the graph
+            start_exists = False
             while result.has_next():
                 row = result.get_next()
                 node_id, hops = row[0], row[1]
-                if node_id and (node_id not in visited or visited[node_id] > hops):
-                    visited[node_id] = hops
-            
-        except Exception as e:
-            self.logger.debug(f"Traversal as DocumentChunk: {e}")
-            
-            # Try as Entity
+                if node_id:
+                    start_exists = True
+                    if node_id not in visited or visited[node_id] > hops:
+                        visited[node_id] = hops
+            if start_exists:
+                visited[start_entity] = 0
+
+        except Exception as exc:
+            logger.debug("Traversal as DocumentChunk failed: %s", exc)
+
+        # Attempt 2: start_entity as Entity.
+        # Runs whenever Attempt 1 found nothing (empty result OR exception),
+        # so entity-based traversal is not gated on a DocumentChunk error.
+        if not visited:
             try:
                 result = self.conn.execute(
                     f"""
                     MATCH (start:Entity {{entity_id: $start_id}})
                     MATCH path = (start)-[*1..{max_hops}]-(connected)
                     RETURN DISTINCT
-                        CASE 
+                        CASE
                             WHEN connected:DocumentChunk THEN connected.chunk_id
                             WHEN connected:Entity THEN connected.entity_id
                         END AS node_id,
                         length(path) AS hops
                     """,
-                    {"start_id": start_entity}
+                    {"start_id": start_entity},
                 )
-                
+                start_exists = False
                 while result.has_next():
                     row = result.get_next()
                     node_id, hops = row[0], row[1]
-                    if node_id and (node_id not in visited or visited[node_id] > hops):
-                        visited[node_id] = hops
-                        
-            except Exception as e2:
-                self.logger.debug(f"Traversal as Entity: {e2}")
-        
+                    if node_id:
+                        start_exists = True
+                        if node_id not in visited or visited[node_id] > hops:
+                            visited[node_id] = hops
+                if start_exists:
+                    visited[start_entity] = 0
+
+            except Exception as exc2:
+                logger.debug("Traversal as Entity failed: %s", exc2)
+
         return visited
-    
+
     def find_related_chunks(
         self,
         chunk_id: str,
         max_hops: int = 2,
     ) -> List[Dict[str, Any]]:
         """
-        Find chunks related to a given chunk through any path.
-        
-        Useful for expanding retrieval context.
-        
-        Args:
-            chunk_id: Starting chunk ID
-            max_hops: Maximum path length
-            
+        Find chunks reachable from chunk_id through any graph path.
+
+        Useful for manual context expansion in diagnostic tools.
+
         Returns:
-            List of related chunks with hop distance
+            List of dicts with chunk_id, text, source_file, hops.
         """
-        related = []
-        
+        related: List[Dict[str, Any]] = []
         try:
             result = self.conn.execute(
                 f"""
                 MATCH (start:DocumentChunk {{chunk_id: $chunk_id}})
                 MATCH path = (start)-[*1..{max_hops}]-(related:DocumentChunk)
                 WHERE related.chunk_id <> $chunk_id
-                RETURN DISTINCT 
+                RETURN DISTINCT
                     related.chunk_id AS chunk_id,
                     related.text AS text,
                     related.source_file AS source_file,
                     min(length(path)) AS hops
                 ORDER BY hops ASC
                 """,
-                {"chunk_id": chunk_id}
+                {"chunk_id": chunk_id},
             )
-            
             while result.has_next():
                 row = result.get_next()
                 related.append({
@@ -809,160 +869,156 @@ class KuzuGraphStore:
                     "source_file": row[2],
                     "hops": row[3],
                 })
-                
-        except Exception as e:
-            self.logger.error(f"find_related_chunks failed: {e}")
-        
+        except Exception as exc:
+            logger.error("find_related_chunks failed: %s", exc)
         return related
-    
-    def get_context_chunks(
-        self,
-        chunk_id: str,
-        window: int = 2,
-    ) -> List[str]:
+
+    def get_context_chunks(self, chunk_id: str, window: int = 2) -> List[str]:
         """
-        Get context chunks within a window using NEXT_CHUNK relations.
-        
-        Retrieves neighboring chunks both before and after the given chunk
-        by traversing NEXT_CHUNK relationships.
-        
+        Return chunk IDs within ±window positions via NEXT_CHUNK edges.
+
         Args:
-            chunk_id: Center chunk ID
-            window: Number of chunks before/after to include
-            
+            chunk_id: Centre chunk ID.
+            window: Number of neighbours before and after to include.
+
         Returns:
-            List of chunk IDs in sequential order
+            List of chunk IDs in document order (prev … centre … next).
         """
         context_chunks = [chunk_id]
-        
         try:
-            # Get forward chunks (following NEXT_CHUNK direction)
+            # Forward: follow NEXT_CHUNK edges
             result = self.conn.execute(
                 f"""
-                MATCH path = (start:DocumentChunk {{chunk_id: $chunk_id}})-[:NEXT_CHUNK*1..{window}]->(next:DocumentChunk)
+                MATCH path = (start:DocumentChunk {{chunk_id: $chunk_id}})
+                    -[:NEXT_CHUNK*1..{window}]->(next:DocumentChunk)
                 RETURN next.chunk_id AS chunk_id, length(path) AS distance
                 ORDER BY distance ASC
                 """,
-                {"chunk_id": chunk_id}
+                {"chunk_id": chunk_id},
             )
-            
             while result.has_next():
                 row = result.get_next()
                 if row[0] and row[0] not in context_chunks:
                     context_chunks.append(row[0])
-            
-            # Get backward chunks (reverse NEXT_CHUNK direction)
+
+            # Backward: reverse NEXT_CHUNK edges
             result = self.conn.execute(
                 f"""
-                MATCH path = (prev:DocumentChunk)-[:NEXT_CHUNK*1..{window}]->(end:DocumentChunk {{chunk_id: $chunk_id}})
+                MATCH path = (prev:DocumentChunk)
+                    -[:NEXT_CHUNK*1..{window}]->(end:DocumentChunk {{chunk_id: $chunk_id}})
                 RETURN prev.chunk_id AS chunk_id, length(path) AS distance
                 ORDER BY distance DESC
                 """,
-                {"chunk_id": chunk_id}
+                {"chunk_id": chunk_id},
             )
-            
-            backward_chunks = []
+            backward: List[str] = []
             while result.has_next():
                 row = result.get_next()
                 if row[0] and row[0] not in context_chunks:
-                    backward_chunks.append(row[0])
-            
-            # Prepend backward chunks to maintain order
-            context_chunks = backward_chunks + context_chunks
-                
-        except Exception as e:
-            self.logger.debug(f"get_context_chunks note: {e}")
-        
+                    backward.append(row[0])
+            context_chunks = backward + context_chunks
+
+        except Exception as exc:
+            logger.debug("get_context_chunks note: %s", exc)
+
         return context_chunks
-    
-    def find_chunks_by_entity(
-        self,
-        entity_name: str,
-        max_results: int = 10,
-    ) -> List[Dict[str, Any]]:
-        """
-        Find chunks that mention a specific entity.
-        
-        Args:
-            entity_name: Entity name to search for
-            max_results: Maximum results to return
-            
-        Returns:
-            List of chunks mentioning the entity
-        """
-        chunks = []
-        
-        try:
-            result = self.conn.execute(
-                """
-                MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity)
-                WHERE e.name CONTAINS $entity_name
-                RETURN c.chunk_id, c.text, c.source_file, e.name
-                LIMIT $limit
-                """,
-                {"entity_name": entity_name, "limit": max_results}
-            )
-            
-            while result.has_next():
-                row = result.get_next()
-                chunks.append({
-                    "chunk_id": row[0],
-                    "text": row[1],
-                    "source_file": row[2],
-                    "entity": row[3],
-                })
-                
-        except Exception as e:
-            self.logger.error(f"find_chunks_by_entity failed: {e}")
-        
-        return chunks
 
     def find_chunks_by_entity_multihop(
         self,
         entity_name: str,
-        max_results: int = 10,
+        max_results: int = 5,
     ) -> List[Dict[str, Any]]:
         """
-        3-Hop Suche: direkte Treffer (hops=0) + 2-Hop via RELATED_TO (hops=2)
-        + 3-Hop via zwei RELATED_TO-Kanten (hops=3).
+        3-hop entity search: returns chunks related to entity_name through
+        up to 3 hops of RELATED_TO edges.
 
-        Beispiel Bridge-Query:
-          e1 -[RELATED_TO]-> e2 -[RELATED_TO]-> e3 <-[MENTIONS]- Chunk
+        Hop=0 (direct):   DocumentChunk -[MENTIONS]-> Entity (name CONTAINS query)
+        Hop=2 (1 bridge): e1 -[RELATED_TO]- e2 <-[MENTIONS]- Chunk
+        Hop=3 (2 bridges): e1 -[REL]-> e2 -[REL]-> e3 <-[MENTIONS]- Chunk
+
+        This design enables bridge-entity reasoning as described in thesis
+        section 2.4 (original architectural contribution): a query about
+        "Scott Derrickson" can reach chunks about "Ed Wood" via an
+        intermediate director-relation hop, without loading all document
+        text into memory (< 16 GB RAM constraint).
+
+        Args:
+            entity_name: Entity name substring to match.
+            max_results: Maximum total results across all hops.
 
         Returns:
-            List of dicts with chunk_id, text, source_file, matched_entity,
-            hops, bridge_entity, relation_type
+            List of dicts: chunk_id, text, source_file, matched_entity,
+            hops, bridge_entity, relation_type.
         """
+        if not entity_name.strip():
+            return []
+
         chunks: List[Dict[str, Any]] = []
         seen: set = set()
 
-        try:
-            # ── 1-Hop: direkte MENTIONS ────────────────────────────────────
-            res = self.conn.execute(
-                """
-                MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity)
-                WHERE e.name CONTAINS $entity_name
-                RETURN c.chunk_id, c.text, c.source_file, e.name
-                LIMIT $limit
-                """,
-                {"entity_name": entity_name, "limit": max_results},
-            )
-            while res.has_next():
-                row = res.get_next()
-                cid = row[0]
-                if cid and cid not in seen:
-                    seen.add(cid)
-                    chunks.append({
-                        "chunk_id": cid,
-                        "text": row[1],
-                        "source_file": row[2],
-                        "matched_entity": row[3],
-                        "hops": 0,
-                        "bridge_entity": None,
-                        "relation_type": None,
-                    })
+        # Build a list of candidate name variants to try in order.
+        # This handles common alias patterns without a full alias table:
+        #   "Ed Wood"       → also try "Edward Wood", individual tokens
+        #   "Scott Derrickson" → also try "Derrickson"
+        # We stop extending as soon as at least one Hop-0 result is found.
+        def _name_variants(name: str) -> List[str]:
+            variants = [name]
+            tokens = name.split()
+            # Nickname expansion: two-token names where first token is short (≤3 chars)
+            # e.g. "Ed Wood" → "Edward Wood" (not deterministic, but worth trying)
+            if len(tokens) == 2 and len(tokens[0]) <= 3:
+                # Try last-name-only as fallback lookup
+                variants.append(tokens[-1])
+            # Multi-token: try each individual token ≥4 chars as fallback
+            if len(tokens) > 1:
+                for tok in tokens:
+                    if len(tok) >= 4 and tok not in variants:
+                        variants.append(tok)
+            return variants
 
-            # ── 2-Hop: via RELATED_TO (beide Richtungen) ──────────────────
+        name_variants = _name_variants(entity_name)
+
+        try:
+            # Hop 0: direct MENTIONS — try name variants until we get a hit
+            effective_name = entity_name  # will be updated on first hit
+            for candidate in name_variants:
+                res = self.conn.execute(
+                    """
+                    MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity)
+                    WHERE e.name CONTAINS $entity_name
+                    RETURN c.chunk_id, c.text, c.source_file, e.name
+                    LIMIT $limit
+                    """,
+                    {"entity_name": candidate, "limit": max_results},
+                )
+                hop0_rows = []
+                while res.has_next():
+                    hop0_rows.append(res.get_next())
+                if hop0_rows:
+                    effective_name = candidate
+                    if candidate != entity_name:
+                        logger.info(
+                            "Entity alias resolved: %r → %r", entity_name, candidate
+                        )
+                    for row in hop0_rows:
+                        cid = row[0]
+                        if cid and cid not in seen:
+                            seen.add(cid)
+                            chunks.append({
+                                "chunk_id": cid,
+                                "text": row[1],
+                                "source_file": row[2],
+                                "matched_entity": row[3],
+                                "hops": 0,
+                                "bridge_entity": None,
+                                "relation_type": None,
+                            })
+                    break  # stop trying variants once we have results
+
+            # Use effective_name (the variant that matched) for hop 2/3 queries
+            entity_name = effective_name  # noqa: PLW2901 — intentional rebinding for hop queries
+
+            # Hop 2: one RELATED_TO bridge (bidirectional)
             remaining = max_results - len(chunks)
             if remaining > 0:
                 res = self.conn.execute(
@@ -992,7 +1048,7 @@ class KuzuGraphStore:
                             "relation_type": row[4],
                         })
 
-            # ── 3-Hop: e1 -[REL]-> e2 -[REL]-> e3 <-[MENTIONS]- Chunk ───
+            # Hop 3: two RELATED_TO bridges
             remaining = max_results - len(chunks)
             if remaining > 0:
                 res = self.conn.execute(
@@ -1020,26 +1076,27 @@ class KuzuGraphStore:
                             "matched_entity": entity_name,
                             "hops": 3,
                             "bridge_entity": row[3],
+                            # row[4] is the intermediate entity (mid_entity);
+                            # row[5] is the relation type of the second edge.
                             "relation_type": row[5],
                         })
 
-        except Exception as e:
-            self.logger.error(f"find_chunks_by_entity_multihop failed: {e}")
+        except Exception as exc:
+            logger.error("find_chunks_by_entity_multihop failed: %s", exc)
 
         return chunks
 
     def get_document_structure(self, source_file: str) -> List[Dict[str, Any]]:
         """
-        Get ordered chunks for a document (for context expansion).
-        
+        Return ordered chunks for a document (useful for diagnostic tools).
+
         Args:
-            source_file: Source document filename
-            
+            source_file: Source document filename.
+
         Returns:
-            Ordered list of chunks from the document
+            Ordered list of chunk dicts (chunk_id, text, page_number, chunk_index).
         """
-        chunks = []
-        
+        chunks: List[Dict[str, Any]] = []
         try:
             result = self.conn.execute(
                 """
@@ -1047,9 +1104,8 @@ class KuzuGraphStore:
                 RETURN c.chunk_id, c.text, c.page_number, c.chunk_index
                 ORDER BY c.chunk_index ASC
                 """,
-                {"source_file": source_file}
+                {"source_file": source_file},
             )
-            
             while result.has_next():
                 row = result.get_next()
                 chunks.append({
@@ -1058,19 +1114,17 @@ class KuzuGraphStore:
                     "page_number": row[2],
                     "chunk_index": row[3],
                 })
-                
-        except Exception as e:
-            self.logger.error(f"get_document_structure failed: {e}")
-        
+        except Exception as exc:
+            logger.error("get_document_structure failed: %s", exc)
         return chunks
-    
+
     # ========================================================================
     # STATISTICS AND UTILITIES
     # ========================================================================
-    
+
     def get_statistics(self) -> Dict[str, int]:
-        """Get graph statistics."""
-        stats = {
+        """Return node and edge counts for all table types."""
+        stats: Dict[str, int] = {
             "document_chunks": 0,
             "source_documents": 0,
             "entities": 0,
@@ -1079,19 +1133,19 @@ class KuzuGraphStore:
             "mentions_edges": 0,
             "related_to_edges": 0,
         }
-        
+
         try:
-            # Count nodes
             for label, key in [
                 ("DocumentChunk", "document_chunks"),
                 ("SourceDocument", "source_documents"),
                 ("Entity", "entities"),
             ]:
-                result = self.conn.execute(f"MATCH (n:{label}) RETURN count(n)")
+                result = self.conn.execute(
+                    "MATCH (n:%s) RETURN count(n)" % label
+                )
                 if result.has_next():
                     stats[key] = result.get_next()[0]
-            
-            # Count edges
+
             for rel_type, key in [
                 ("FROM_SOURCE", "from_source_edges"),
                 ("NEXT_CHUNK", "next_chunk_edges"),
@@ -1099,106 +1153,41 @@ class KuzuGraphStore:
                 ("RELATED_TO", "related_to_edges"),
             ]:
                 try:
-                    result = self.conn.execute(f"MATCH ()-[r:{rel_type}]->() RETURN count(r)")
+                    result = self.conn.execute(
+                        "MATCH ()-[r:%s]->() RETURN count(r)" % rel_type
+                    )
                     if result.has_next():
                         stats[key] = result.get_next()[0]
-                except:
-                    pass
-                    
-        except Exception as e:
-            self.logger.error(f"get_statistics failed: {e}")
-        
+                except Exception as exc:
+                    logger.debug("Edge count for %s failed: %s", rel_type, exc)
+
+        except Exception as exc:
+            logger.error("get_statistics failed: %s", exc)
+
         return stats
-    
+
     def clear(self) -> None:
-        """Clear all data from graph."""
-        try:
-            # Delete all relationships first
-            for rel_type in ["FROM_SOURCE", "NEXT_CHUNK", "MENTIONS", "RELATED_TO"]:
-                try:
-                    self.conn.execute(f"MATCH ()-[r:{rel_type}]->() DELETE r")
-                except:
-                    pass
-            
-            # Delete all nodes
-            for label in ["DocumentChunk", "SourceDocument", "Entity"]:
-                try:
-                    self.conn.execute(f"MATCH (n:{label}) DELETE n")
-                except:
-                    pass
-            
-            self.logger.info("Graph cleared")
-        except Exception as e:
-            self.logger.error(f"clear failed: {e}")
-    
-    # ========================================================================
-    # COMPATIBILITY: NetworkX-like interface
-    # ========================================================================
-    
-    @property
-    def graph(self):
-        """
-        Compatibility property for code expecting NetworkX graph.
-        
-        Returns a minimal wrapper that provides basic graph interface.
-        """
-        return _KuzuGraphWrapper(self)
-    
-    def add_relation(
-        self,
-        source_id: str,
-        target_id: str,
-        relation_type: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """
-        Compatibility method for KnowledgeGraphStore interface.
-        
-        Maps relation_type to appropriate KuzuDB relationship.
-        """
-        if relation_type == "from_source":
-            self.add_from_source_relation(source_id, target_id)
-        elif relation_type == "next_chunk":
-            self.add_next_chunk_relation(source_id, target_id)
-        elif relation_type == "mentions":
-            self.add_mentions_relation(source_id, target_id)
-        else:
-            self.add_related_to_relation(source_id, target_id, relation_type)
-    
+        """Delete all nodes and edges from the graph."""
+        for rel_type in ["FROM_SOURCE", "NEXT_CHUNK", "MENTIONS", "RELATED_TO"]:
+            try:
+                self.conn.execute(
+                    "MATCH ()-[r:%s]->() DELETE r" % rel_type
+                )
+            except Exception as exc:
+                logger.warning("Failed to clear edges %s: %s", rel_type, exc)
+
+        for label in ["DocumentChunk", "SourceDocument", "Entity"]:
+            try:
+                self.conn.execute("MATCH (n:%s) DELETE n" % label)
+            except Exception as exc:
+                logger.warning("Failed to clear nodes %s: %s", label, exc)
+
+        logger.info("Graph cleared")
+
     def save(self) -> None:
-        """
-        Compatibility method - KuzuDB auto-persists.
-        """
-        self.logger.debug("KuzuDB auto-persists, no explicit save needed")
+        """No-op: KuzuDB auto-persists after every transaction."""
+        logger.debug("KuzuDB auto-persists; no explicit save required")
 
-
-class _KuzuGraphWrapper:
-    """
-    Minimal wrapper for KuzuDB to provide NetworkX-like interface.
-    
-    Used for backwards compatibility with existing code.
-    """
-    
-    def __init__(self, kuzu_store: KuzuGraphStore):
-        self._store = kuzu_store
-    
-    def number_of_nodes(self) -> int:
-        stats = self._store.get_statistics()
-        return (
-            stats.get("document_chunks", 0) +
-            stats.get("source_documents", 0) +
-            stats.get("entities", 0)
-        )
-    
-    def number_of_edges(self) -> int:
-        stats = self._store.get_statistics()
-        return (
-            stats.get("from_source_edges", 0) +
-            stats.get("next_chunk_edges", 0) +
-            stats.get("mentions_edges", 0) +
-            stats.get("related_to_edges", 0)
-        )
-    
 
 # ============================================================================
 # NETWORKX FALLBACK (for systems without KuzuDB)
@@ -1207,23 +1196,28 @@ class _KuzuGraphWrapper:
 class NetworkXGraphStore:
     """
     NetworkX-based Knowledge Graph (fallback).
-    
-    Use this if KuzuDB is not available.
-    Same interface as KuzuGraphStore for compatibility.
+
+    Provides the same public interface as KuzuGraphStore so that HybridStore
+    can use either backend.  Multi-hop Cypher retrieval is NOT available here;
+    graph_search falls back to simple BFS-based entity matching.
+
+    Note: the BFS queue uses collections.deque for O(1) popleft rather than
+    list.pop(0) which is O(n) — important for graphs with many nodes.
     """
-    
-    def __init__(self, graph_path: Path):
+
+    def __init__(self, graph_path: Path) -> None:
         self.graph_path = Path(graph_path)
         self.graph = nx.DiGraph()
-        self.logger = logging.getLogger(__name__)
-        
+
         if self.graph_path.exists():
             try:
                 self.graph = nx.read_graphml(str(self.graph_path))
-                self.logger.info(f"Loaded NetworkX graph: {self.graph.number_of_nodes()} nodes")
-            except Exception as e:
-                self.logger.error(f"Failed to load graph: {e}")
-    
+                logger.info(
+                    "Loaded NetworkX graph: %d nodes", self.graph.number_of_nodes()
+                )
+            except Exception as exc:
+                logger.error("Failed to load graph from %s: %s", self.graph_path, exc)
+
     def add_entity_from_metadata(
         self,
         entity_id: str,
@@ -1232,7 +1226,7 @@ class NetworkXGraphStore:
     ) -> None:
         """Add an entity node from metadata. API-compatible with KuzuGraphStore."""
         self.graph.add_node(entity_id, entity_type=entity_type, **metadata)
-    
+
     def add_relation(
         self,
         source_id: str,
@@ -1240,60 +1234,53 @@ class NetworkXGraphStore:
         relation_type: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        edge_data = {"relation_type": relation_type}
+        """Add a directed edge."""
+        edge_data: Dict[str, Any] = {"relation_type": relation_type}
         if metadata:
             edge_data.update(metadata)
         self.graph.add_edge(source_id, target_id, **edge_data)
-    
+
     def graph_traversal(
         self,
         start_entity: str,
         relation_types: Optional[List[str]] = None,
         max_hops: int = 2,
     ) -> Dict[str, int]:
+        """
+        BFS traversal from start_entity up to max_hops.
+
+        Uses collections.deque for O(1) dequeue (avoids O(n) list.pop(0)).
+        """
         if start_entity not in self.graph:
             return {}
-        
-        visited = {start_entity: 0}
-        queue = [(start_entity, 0)]
-        
+
+        visited: Dict[str, int] = {start_entity: 0}
+        queue: collections.deque = collections.deque([(start_entity, 0)])
+
         while queue:
-            current, hops = queue.pop(0)
+            current, hops = queue.popleft()
             if hops >= max_hops:
                 continue
-            
+
             for neighbor in self.graph.neighbors(current):
                 if neighbor not in visited:
                     edge_data = self.graph.get_edge_data(current, neighbor)
-                    rel_type = edge_data.get("relation_type")
-                    
+                    rel_type = edge_data.get("relation_type") if edge_data else None
+
                     if relation_types is None or rel_type in relation_types:
                         visited[neighbor] = hops + 1
                         queue.append((neighbor, hops + 1))
-        
+
         return visited
-    
-    def get_context_chunks(
-        self,
-        chunk_id: str,
-        window: int = 2,
-    ) -> List[str]:
-        """
-        Get context chunks within a window using next_chunk relations.
-        
-        Args:
-            chunk_id: Center chunk ID
-            window: Number of chunks before/after to include
-            
-        Returns:
-            List of chunk IDs in sequential order
-        """
+
+    def get_context_chunks(self, chunk_id: str, window: int = 2) -> List[str]:
+        """Return chunk IDs within ±window positions via next_chunk edges."""
         if chunk_id not in self.graph:
             return []
-        
+
         context_chunks = [chunk_id]
-        
-        # Forward traversal (following next_chunk edges)
+
+        # Forward traversal
         current = chunk_id
         for _ in range(window):
             found_next = False
@@ -1307,207 +1294,265 @@ class NetworkXGraphStore:
                         break
             if not found_next:
                 break
-        
-        # Backward traversal (reverse next_chunk edges)
+
+        # Backward traversal
         current = chunk_id
-        backward_chunks = []
+        backward: List[str] = []
         for _ in range(window):
             found_prev = False
             for predecessor in self.graph.predecessors(current):
                 edge_data = self.graph.get_edge_data(predecessor, current)
                 if edge_data and edge_data.get("relation_type") == "next_chunk":
-                    if predecessor not in context_chunks and predecessor not in backward_chunks:
-                        backward_chunks.insert(0, predecessor)
+                    if predecessor not in context_chunks and predecessor not in backward:
+                        backward.insert(0, predecessor)
                         current = predecessor
                         found_prev = True
                         break
             if not found_prev:
                 break
-        
-        return backward_chunks + context_chunks
-    
+
+        return backward + context_chunks
+
     def save(self) -> None:
+        """Persist graph to GraphML file."""
         self.graph_path.parent.mkdir(parents=True, exist_ok=True)
         nx.write_graphml(self.graph, str(self.graph_path))
-    
+
     def get_statistics(self) -> Dict[str, int]:
+        """
+        Return node and edge counts using the same key schema as
+        KuzuGraphStore.get_statistics() for interface consistency.
+
+        NetworkX does not differentiate node/edge types, so all
+        type-specific counts are approximated: total nodes map to
+        document_chunks, total edges map to from_source_edges; remaining
+        keys are 0.
+        """
         return {
-            "nodes": self.graph.number_of_nodes(),
-            "edges": self.graph.number_of_edges(),
+            "document_chunks": self.graph.number_of_nodes(),
+            "source_documents": 0,
+            "entities": 0,
+            "from_source_edges": self.graph.number_of_edges(),
+            "next_chunk_edges": 0,
+            "mentions_edges": 0,
+            "related_to_edges": 0,
         }
-    
+
     def clear(self) -> None:
         self.graph.clear()
 
 
 # ============================================================================
-# HYBRID STORE (Facade Pattern)
+# HYBRID STORE (Facade)
 # ============================================================================
 
 class HybridStore:
     """
-    Unified interface for Vector Store and Knowledge Graph.
-    
-    Automatically selects KuzuDB or NetworkX based on availability
-    and configuration.
+    Unified facade over VectorStoreAdapter and a graph store (KuzuDB or NetworkX).
+
+    Design pattern: Facade — hides storage heterogeneity from callers.
+    Callers interact exclusively with `add_documents`, `vector_search`, and
+    `graph_search`; the concrete storage backends are not exposed.
+
+    Backend selection follows a priority order:
+      1. KuzuDB  (config.graph_backend == "kuzu" and KUZU_AVAILABLE)
+      2. NetworkX (NETWORKX_AVAILABLE as fallback)
+      3. ImportError if neither is available
+
+    Note: isinstance(graph_store, KuzuGraphStore) checks in add_documents and
+    graph_search are intentional: the two backends differ in their write API
+    (typed vs generic nodes) and their read API (Cypher multihop vs BFS).
+    A Protocol/ABC refactor is tracked as future work.
     """
-    
-    def __init__(self, config: StorageConfig, embeddings: Embeddings):
+
+    def __init__(
+        self,
+        config: StorageConfig,
+        embeddings: Embeddings,
+        entity_pipeline: "Optional[EntityExtractionPipeline]" = None,
+    ) -> None:
+        """
+        Initialise the hybrid store.
+
+        Args:
+            config: StorageConfig instance.
+            embeddings: Embeddings model used for both ingestion and
+                        dimension auto-detection.
+            entity_pipeline: Optional pre-constructed EntityExtractionPipeline.
+                             If None and config.enable_entity_extraction is True,
+                             the pipeline is constructed internally.
+        """
         self.config = config
         self.embeddings = embeddings
-        self.logger = logging.getLogger(__name__)
-        
-        # Auto-detect embedding dimension
-        if config.embedding_dim is None:
+
+        # Auto-detect embedding dimension from the live model if not set.
+        # Use a local variable to avoid mutating the caller's StorageConfig
+        # object — a side effect that could confuse shared config instances.
+        embedding_dim = config.embedding_dim
+        if embedding_dim is None:
             test_emb = embeddings.embed_query("dimension test")
-            config.embedding_dim = len(test_emb)
-            self.logger.info(f"Detected embedding dim: {config.embedding_dim}")
-        
-        # Initialize Vector Store
+            embedding_dim = len(test_emb)
+            logger.info("Detected embedding dim: %d", embedding_dim)
+        self.embedding_dim: int = embedding_dim
+
+        # Vector store
         self.vector_store = VectorStoreAdapter(
             db_path=config.vector_db_path,
-            embedding_dim=config.embedding_dim,
+            embedding_dim=embedding_dim,
             normalize_embeddings=config.normalize_embeddings,
             distance_metric=config.distance_metric,
+            overfetch_factor=config.overfetch_factor,
         )
-        
-        # Initialize Graph Store (KuzuDB or NetworkX)
+
+        # Graph store — KuzuDB preferred, NetworkX as fallback
         if config.graph_backend == "kuzu" and KUZU_AVAILABLE:
-            self.graph_store = KuzuGraphStore(config.graph_db_path)
-            self.logger.info("Using KuzuDB for graph storage")
+            self.graph_store: Union[KuzuGraphStore, NetworkXGraphStore] = (
+                KuzuGraphStore(config.graph_db_path)
+            )
+            logger.info("Using KuzuDB for graph storage")
         elif NETWORKX_AVAILABLE:
             if config.graph_backend == "kuzu":
-                self.logger.warning(
-                    "FALLBACK: KuzuDB konfiguriert aber nicht verfügbar "
-                    "→ NetworkX wird verwendet. Installiere mit: pip install kuzu"
+                logger.warning(
+                    "KuzuDB requested but not available — falling back to NetworkX. "
+                    "Install with: pip install kuzu. "
+                    "Note: multi-hop Cypher retrieval is NOT available in NetworkX mode."
                 )
             self.graph_store = NetworkXGraphStore(config.graph_db_path)
-            self.logger.info("Using NetworkX for graph storage")
+            logger.info("Using NetworkX for graph storage")
         else:
-            raise ImportError("No graph backend available!")
-        
-        # Initialize Entity Extraction Pipeline (optional, NEW in v3.1.0)
-        self.entity_pipeline = None
-        if config.enable_entity_extraction:
-            try:
-                # Lazy import to avoid hard dependency
-                from src.data_layer.entity_extraction import EntityExtractionPipeline, ExtractionConfig
+            raise ImportError("No graph backend available. Install kuzu or networkx.")
 
-                # Auto-generate cache path if not provided
-                from pathlib import Path as _Path
-                cache_path = config.entity_cache_path
-                if cache_path is None:
-                    cache_path = _Path(config.graph_db_path).parent / "entity_cache.db"
+        # Entity extraction pipeline (optional)
+        self.entity_pipeline: Optional["EntityExtractionPipeline"] = entity_pipeline
+        if self.entity_pipeline is None and config.enable_entity_extraction:
+            self.entity_pipeline = self._init_entity_pipeline(config)
 
-                extraction_config = ExtractionConfig(
-                    cache_enabled=True,
-                    cache_path=str(cache_path),
-                    # Defaults aus ExtractionConfig verwenden (threshold=0.15, lowercase types)
-                    ner_batch_size=16,
-                    re_batch_size=8,
-                    min_entities_for_re=2,
-                    selective_re=True,
-                )
+        logger.info("HybridStore initialised: dim=%d", embedding_dim)
 
-                self.entity_pipeline = EntityExtractionPipeline(extraction_config)
-                self.logger.info(
-                    f"Entity extraction enabled (GLiNER + REBEL, cache: {cache_path})"
-                )
-                
-            except ImportError as e:
-                self.logger.warning(
-                    f"Entity extraction not available: {e}. "
-                    f"Install with: pip install gliner transformers"
-                )
-            except Exception as e:
-                self.logger.warning(f"Failed to initialize entity pipeline: {e}")
-        else:
-            self.logger.debug("Entity extraction disabled")
-        
-        self.logger.info(f"HybridStore initialized: dim={config.embedding_dim}")
-    
+    def _init_entity_pipeline(self, config: StorageConfig) -> Optional[Any]:
+        """
+        Construct EntityExtractionPipeline from settings when not injected.
+
+        Separated from __init__ to keep the constructor readable and to make
+        the pipeline injectable for testing (Dependency Inversion Principle).
+        """
+        try:
+            from .entity_extraction import EntityExtractionPipeline, ExtractionConfig
+
+            cache_path = config.entity_cache_path
+            if cache_path is None:
+                cache_path = Path(config.graph_db_path).parent / "entity_cache.db"
+
+            extraction_config = ExtractionConfig(
+                cache_enabled=True,
+                cache_path=str(cache_path),
+                # All NER/RE parameters sourced from settings.yaml via ExtractionConfig
+                # defaults; override by passing a pre-configured pipeline instead.
+            )
+            pipeline = EntityExtractionPipeline(extraction_config)
+            logger.info("Entity extraction pipeline initialised (cache: %s)", cache_path)
+            return pipeline
+
+        except ImportError as exc:
+            logger.warning(
+                "Entity extraction not available: %s. "
+                "Install with: pip install gliner transformers",
+                exc,
+            )
+        except Exception as exc:
+            logger.warning("Failed to initialise entity pipeline: %s", exc)
+
+        return None
+
     def add_documents(self, documents: List[Document]) -> None:
-        """Add documents to both vector and graph stores."""
+        """
+        Ingest documents into both the vector store and the knowledge graph.
+
+        For KuzuDB: creates DocumentChunk, SourceDocument nodes, FROM_SOURCE
+        and NEXT_CHUNK edges, and optionally MENTIONS / RELATED_TO edges via
+        the entity extraction pipeline.
+
+        For NetworkX (fallback): stores generic nodes and edges only; no
+        entity-level graph structure.
+        """
         if not documents:
             return
-        
-        # Add to vector store
+
+        # Embed and insert into vector store
         self.vector_store.add_documents_with_embeddings(documents, self.embeddings)
-        
-        # Add to graph store
-        prev_chunk_id = None
-        
+
+        max_chars = self.config.graph_text_max_chars
+        prev_chunk_id: Optional[str] = None
+
         for doc in documents:
             chunk_id = str(doc.metadata.get("chunk_id", "unknown"))
             source_file = doc.metadata.get("source_file", "unknown")
-            
-            # Add document chunk node
+
             if isinstance(self.graph_store, KuzuGraphStore):
                 self.graph_store.add_document_chunk(
                     chunk_id=chunk_id,
-                    text=doc.page_content[:500],
+                    text=doc.page_content,
                     page_number=doc.metadata.get("page_number", 0),
                     chunk_index=doc.metadata.get("chunk_index", 0),
                     source_file=source_file,
+                    max_text_chars=max_chars,
                 )
-                
-                # Add source document node
                 self.graph_store.add_source_document(
                     doc_id=source_file,
                     filename=source_file,
                     total_pages=doc.metadata.get("total_pages", 0),
                 )
-                
-                # Add FROM_SOURCE relation
                 self.graph_store.add_from_source_relation(chunk_id, source_file)
-                
-                # Add NEXT_CHUNK relation (sequential ordering)
                 if prev_chunk_id:
                     self.graph_store.add_next_chunk_relation(prev_chunk_id, chunk_id)
-                
+
             else:
-                # NetworkX fallback
-                self.graph_store.add_entity_from_metadata(chunk_id, "document_chunk", {"source_file": source_file})
-                self.graph_store.add_entity_from_metadata(source_file, "source_document", {})
+                # NetworkX fallback: generic node/edge API
+                self.graph_store.add_entity_from_metadata(
+                    chunk_id, "document_chunk", {"source_file": source_file}
+                )
+                self.graph_store.add_entity_from_metadata(
+                    source_file, "source_document", {}
+                )
                 self.graph_store.add_relation(chunk_id, source_file, "from_source")
-            
+
             prev_chunk_id = chunk_id
-        
-        # Entity Extraction & Graph Integration (NEW in v3.1.0)
+
+        # Entity extraction and graph integration (KuzuDB only)
         if self.entity_pipeline and isinstance(self.graph_store, KuzuGraphStore):
             try:
                 entity_stats = self._integrate_entities(documents)
-                self.logger.info(
-                    f"Entity integration: {entity_stats.get('unique_entities', 0)} entities, "
-                    f"{entity_stats.get('total_mentions', 0)} mentions, "
-                    f"{entity_stats.get('total_relations', 0)} relations"
+                logger.info(
+                    "Entity integration: %d entities, %d mentions, %d relations",
+                    entity_stats.get("unique_entities", 0),
+                    entity_stats.get("total_mentions", 0),
+                    entity_stats.get("total_relations", 0),
                 )
-            except Exception as e:
-                self.logger.warning(f"Entity integration failed: {e}")
-        
-        self.logger.info(f"Added {len(documents)} documents to hybrid store")
-    
+            except Exception as exc:
+                logger.warning("Entity integration failed: %s", exc)
+
+        logger.info("Added %d documents to hybrid store", len(documents))
+
     def _integrate_entities(self, documents: List[Document]) -> Dict[str, Any]:
         """
-        Integrate extracted entities into the Knowledge Graph.
-        
-        Pipeline (Masterthesis Abschnitt 2.5):
-        1. Entity Extraction with GLiNER (batch processing, 16 docs/batch)
-        2. Add Entities to Graph (unique entity_ids only)
-        3. Create MENTIONS relations (Chunk -> Entity)
-        4. Relation Extraction with REBEL (selective, min 2 entities)
-        5. Create RELATED_TO relations (Entity -> Entity)
-        
+        Extract entities and relations and integrate them into the graph.
+
+        Pipeline (thesis section 2.5):
+        1. Batch entity extraction with GLiNER (configured batch size).
+        2. Add unique Entity nodes (deduplicated by entity_id).
+        3. Create MENTIONS edges: DocumentChunk → Entity.
+        4. Create RELATED_TO edges from REBEL relation extraction.
+
         Args:
-            documents: List of LangChain Documents (already in vector/graph store)
-            
+            documents: Documents already present in vector and graph stores.
+
         Returns:
-            Statistics dictionary with extraction metrics
+            Statistics dict with extraction metrics.
         """
         if not self.entity_pipeline:
             return {}
-        
-        stats = {
+
+        stats: Dict[str, Any] = {
             "total_chunks": len(documents),
             "chunks_with_entities": 0,
             "total_entities": 0,
@@ -1515,39 +1560,33 @@ class HybridStore:
             "total_mentions": 0,
             "total_relations": 0,
         }
-        
+
         if not documents:
             return stats
-        
-        # Prepare for batch processing
+
         texts = [doc.page_content for doc in documents]
         chunk_ids = [
-            str(doc.metadata.get("chunk_id", f"chunk_{i}")) 
+            str(doc.metadata.get("chunk_id", "chunk_%d" % i))
             for i, doc in enumerate(documents)
         ]
-        
-        # STEP 1 & 2: Batch Entity Extraction (GLiNER)
-        self.logger.debug(f"Extracting entities from {len(documents)} chunks...")
+
+        logger.debug("Extracting entities from %d chunks...", len(documents))
         extraction_results = self.entity_pipeline.process_chunks_batch(texts, chunk_ids)
-        
-        # Track unique entities
-        seen_entities = set()
-        entity_name_to_id = {}  # For relation mapping
-        
-        # STEP 3 & 4: Add Entities + MENTIONS relations
+
+        seen_entities: set = set()
+        entity_name_to_id: Dict[str, str] = {}
+
+        # Add entity nodes and MENTIONS edges
         for result in extraction_results:
             if not result.entities:
                 continue
-            
+
             stats["chunks_with_entities"] += 1
-            
+
             for entity in result.entities:
                 stats["total_entities"] += 1
-                
-                # Store name -> id mapping for relations
                 entity_name_to_id[entity.name.lower()] = entity.entity_id
-                
-                # Add entity to graph (only once per entity_id)
+
                 if entity.entity_id not in seen_entities:
                     try:
                         self.graph_store.add_entity(
@@ -1558,20 +1597,30 @@ class HybridStore:
                         )
                         seen_entities.add(entity.entity_id)
                         stats["unique_entities"] += 1
-                    except Exception as e:
-                        self.logger.debug(f"Entity add failed (may exist): {entity.entity_id}")
-                
-                # Create MENTIONS relation: Chunk -> Entity
+                    except Exception as exc:
+                        logger.debug(
+                            "Entity add failed (may exist): %s — %s",
+                            entity.entity_id,
+                            exc,
+                        )
+
                 try:
                     self.graph_store.add_mentions_relation(
                         chunk_id=result.chunk_id,
                         entity_id=entity.entity_id,
                     )
                     stats["total_mentions"] += 1
-                except Exception as e:
-                    self.logger.debug(f"MENTIONS relation failed: {e}")
-        
-        # STEP 5a: RELATED_TO relations via REBEL (falls vorhanden)
+                except Exception as exc:
+                    logger.debug("MENTIONS relation failed: %s", exc)
+
+        # Add RELATED_TO edges from REBEL relation extraction.
+        # NOTE (known limitation): entity_name_to_id is populated only from
+        # the current batch.  If a relation's subject or object was extracted
+        # in a previous ingestion batch, its entity_id will not be found here
+        # and the relation is silently skipped.  For full cross-document
+        # relation coverage, a single-batch ingestion (or a post-hoc graph
+        # repair pass) is required.  This limitation is documented in thesis
+        # section 2.5.
         for result in extraction_results:
             for relation in result.relations:
                 try:
@@ -1584,71 +1633,75 @@ class HybridStore:
                             relation_type=relation.relation_type,
                         )
                         stats["total_relations"] += 1
-                except Exception as e:
-                    self.logger.debug(f"RELATED_TO relation failed: {e}")
+                except Exception as exc:
+                    logger.debug("RELATED_TO relation failed: %s", exc)
 
         return stats
-    
+
     def vector_search(
         self,
         query_embedding: List[float],
-        top_k: int = 5,
-        threshold: float = 0.0,
+        top_k: int = 10,
+        threshold: float = 0.3,
     ) -> List[Dict[str, Any]]:
         """
-        Perform vector similarity search.
-        
-        Wrapper method that delegates to VectorStoreAdapter.
-        
+        Delegate to VectorStoreAdapter.vector_search.
+
         Args:
-            query_embedding: Query embedding vector
-            top_k: Number of results to return
-            threshold: Minimum similarity threshold
-            
+            query_embedding: Dense query vector (same dim as stored embeddings).
+            top_k: Maximum results to return.
+            threshold: Minimum similarity score.
+
         Returns:
-            List of search results with text, similarity, and metadata
+            List of dicts with text, similarity, document_id, metadata.
         """
         return self.vector_store.vector_search(
             query_embedding=query_embedding,
             top_k=top_k,
             threshold=threshold,
         )
-    
+
     def graph_search(
         self,
         entities: List[str],
         max_hops: int = 2,
-        top_k: int = 10,
+        top_k: int = 5,
     ) -> List[Dict[str, Any]]:
         """
-        Perform graph-based search using entity mentions.
-        
-        Finds chunks that mention the given entities and related chunks.
-        
+        Entity-driven graph retrieval.
+
+        For KuzuDB: uses find_chunks_by_entity_multihop (up to 3 hops).
+        For NetworkX: falls back to BFS-based entity string matching.
+
+        Results are sorted by hop distance (0 = direct mention = best).
+
         Args:
-            entities: List of entity names to search for
-            max_hops: Maximum hops for graph traversal
-            top_k: Maximum results to return
-            
+            entities: Entity name strings extracted from the query.
+            max_hops: Maximum hop depth (used by NetworkX fallback only;
+                      KuzuDB multihop is fixed at 3).
+            top_k: Maximum results to return.
+
         Returns:
-            List of chunks with entity matches and hop distances
+            List of dicts: chunk_id, text, source_file, matched_entity,
+            hops, bridge_entity, relation_type.
         """
-        results = []
-        seen_chunks = set()
-        
+        results: List[Dict[str, Any]] = []
+        seen_chunks: set = set()
+
         for entity_name in entities:
             if isinstance(self.graph_store, KuzuGraphStore):
-                # Multi-Hop: 1-Hop direkte MENTIONS + 2-Hop via RELATED_TO
                 entity_chunks = self.graph_store.find_chunks_by_entity_multihop(
                     entity_name=entity_name,
                     max_results=top_k,
                 )
             else:
-                # NetworkX fallback
+                # NetworkX fallback: BFS from any node whose ID contains entity_name
                 entity_chunks = []
                 for node in self.graph_store.graph.nodes():
                     if entity_name.lower() in str(node).lower():
-                        neighbors = self.graph_store.graph_traversal(node, max_hops=max_hops)
+                        neighbors = self.graph_store.graph_traversal(
+                            node, max_hops=max_hops
+                        )
                         for neighbor, hops in neighbors.items():
                             if neighbor not in seen_chunks:
                                 entity_chunks.append({
@@ -1674,35 +1727,34 @@ class HybridStore:
                         "bridge_entity": chunk.get("bridge_entity"),
                         "relation_type": chunk.get("relation_type"),
                     })
-        
-        # Sort by hops (closer = better) and limit results
+
         results.sort(key=lambda x: x.get("hops", 999))
         return results[:top_k]
-    
+
     def save(self) -> None:
-        """Persist stores to disk."""
+        """Persist the graph store (no-op for KuzuDB; writes GraphML for NetworkX)."""
         self.graph_store.save()
-    
+
     def reset_vector_store(self) -> None:
-        """Reset vector store for ablation studies."""
+        """Wipe and re-create the vector store (used for ablation studies)."""
         if self.config.vector_db_path.exists():
             shutil.rmtree(self.config.vector_db_path)
-        
         self.vector_store = VectorStoreAdapter(
             self.config.vector_db_path,
-            self.config.embedding_dim,
+            self.embedding_dim,
             self.config.normalize_embeddings,
             self.config.distance_metric,
+            self.config.overfetch_factor,
         )
-        self.logger.info("Vector store reset")
-    
+        logger.info("Vector store reset")
+
     def reset_graph_store(self) -> None:
-        """Reset graph store for ablation studies."""
+        """Clear all graph data (used for ablation studies)."""
         self.graph_store.clear()
-        self.logger.info("Graph store reset")
-    
+        logger.info("Graph store reset")
+
     def reset_all(self) -> None:
-        """Reset both stores."""
+        """Reset both vector and graph stores."""
         self.reset_vector_store()
         self.reset_graph_store()
 
@@ -1712,899 +1764,180 @@ class HybridStore:
 # ============================================================================
 
 def run_diagnostics(config: StorageConfig, embeddings: Embeddings) -> Dict[str, Any]:
-    """Run diagnostic checks on storage configuration."""
-    results = {
+    """
+    Run diagnostic checks on storage configuration.
+
+    Args:
+        config: StorageConfig to validate.
+        embeddings: Embeddings model to probe for dimension detection.
+
+    Returns:
+        Dict with embedding_dim, graph_backend, availability flags, issues list.
+    """
+    results: Dict[str, Any] = {
         "embedding_dim": None,
         "graph_backend": config.graph_backend,
         "kuzu_available": KUZU_AVAILABLE,
         "networkx_available": NETWORKX_AVAILABLE,
         "issues": [],
     }
-    
+
     try:
         test_emb = embeddings.embed_query("diagnostic test")
         results["embedding_dim"] = len(test_emb)
-    except Exception as e:
-        results["issues"].append(f"Embedding failed: {e}")
-    
+    except Exception as exc:
+        results["issues"].append("Embedding failed: %s" % exc)
+
     if config.graph_backend == "kuzu" and not KUZU_AVAILABLE:
         results["issues"].append("KuzuDB requested but not installed")
-    
+
     return results
 
 
 # ============================================================================
-# COMPREHENSIVE TEST SUITE FOR STORAGE.PY
+# FACTORY
 # ============================================================================
 
-if __name__ == "__main__":
+def create_storage_config(
+    cfg: Optional[Dict[str, Any]] = None,
+    dataset: str = "default",
+) -> "StorageConfig":
+    """
+    Build a StorageConfig from a settings.yaml configuration dictionary.
+
+    This is the canonical way to construct StorageConfig in production code.
+    It keeps storage.py decoupled from YAML-loading and ensures all paths and
+    thresholds are sourced from config/settings.yaml rather than scattered
+    across caller code.
+
+    Parameter mapping from settings.yaml:
+        vector_store.db_path          → vector_db_path  (with dataset sub-dir)
+        graph.graph_path              → graph_db_path   (with dataset sub-dir)
+        embeddings.embedding_dim      → embedding_dim
+        vector_store.similarity_threshold  → similarity_threshold
+        vector_store.normalize_embeddings  → normalize_embeddings
+        vector_store.distance_metric       → distance_metric
+        graph.backend                      → graph_backend
+        ingestion.extract_entities         → enable_entity_extraction
+
+    Args:
+        cfg:     Full settings dict as loaded from config/settings.yaml.
+                 Pass None or {} to fall back to class-level defaults.
+                 Paths will then resolve to ./data/default/vector_db and
+                 ./data/default/knowledge_graph.
+        dataset: Dataset sub-directory name (e.g. "hotpotqa"). Appended to
+                 the base paths from settings.yaml so each dataset gets an
+                 isolated store, preventing cross-dataset data leakage.
+
+    Returns:
+        StorageConfig (frozen dataclass).
+    """
+    cfg = cfg or {}
+    vs_cfg = cfg.get("vector_store", {})
+    gr_cfg = cfg.get("graph", {})
+    emb_cfg = cfg.get("embeddings", {})
+    ing_cfg = cfg.get("ingestion", {})
+
+    base_vector = Path(vs_cfg.get("db_path", "./data/vector_db"))
+    base_graph = Path(gr_cfg.get("graph_path", "./data/knowledge_graph"))
+
+    # Append dataset sub-directory when a named dataset is specified
+    if dataset and dataset != "default":
+        vector_db_path = base_vector.parent / dataset / base_vector.name
+        graph_db_path = base_graph.parent / dataset / base_graph.name
+    else:
+        vector_db_path = base_vector
+        graph_db_path = base_graph
+
+    return StorageConfig(
+        vector_db_path=vector_db_path,
+        graph_db_path=graph_db_path,
+        embedding_dim=emb_cfg.get("embedding_dim", None),
+        similarity_threshold=vs_cfg.get("similarity_threshold", 0.3),
+        normalize_embeddings=vs_cfg.get("normalize_embeddings", True),
+        distance_metric=vs_cfg.get("distance_metric", "cosine"),
+        graph_backend=gr_cfg.get("backend", "kuzu"),
+        enable_entity_extraction=ing_cfg.get("extract_entities", False),
+    )
+
+
+# ============================================================================
+# SELF-VERIFICATION
+# ============================================================================
+
+def _main() -> None:
+    """Smoke demo and test runner for direct module invocation."""
     import sys
+    import subprocess
     import tempfile
-    import shutil
-    from pathlib import Path
-    from typing import List
-    
-    # Setup logging for tests
+
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    
-    print("\n" + "=" * 80)
-    print("STORAGE.PY - COMPREHENSIVE TEST SUITE")
-    print("=" * 80)
-    print(f"Version: {VectorStoreAdapter.SCHEMA_VERSION}")
-    print(f"KuzuDB Available: {KUZU_AVAILABLE}")
-    print(f"NetworkX Available: {NETWORKX_AVAILABLE}")
-    print("=" * 80 + "\n")
-    
-    # ========================================================================
-    # MOCK EMBEDDINGS FOR TESTING
-    # ========================================================================
-    
-    class MockEmbeddings(Embeddings):
-        """Mock embedding model for testing."""
-        
-        def __init__(self, dim: int = 768):
+
+    # --- smoke demo -----------------------------------------------------------
+    class _MockEmbeddings:
+        """Deterministic mock embeddings for smoke testing."""
+        def __init__(self, dim: int = 64) -> None:
             self.dim = dim
-        
-        def embed_documents(self, texts: List[str]) -> List[List[float]]:
-            """Generate random embeddings for documents."""
-            embeddings = []
+
+        def embed_documents(self, texts):
+            results = []
             for text in texts:
-                # Deterministic based on text length for reproducibility
-                np.random.seed(len(text))
+                np.random.seed(len(text) % 1000)
                 vec = np.random.randn(self.dim).astype(np.float32)
-                vec = vec / np.linalg.norm(vec)  # L2 normalize
-                embeddings.append(vec.tolist())
-            return embeddings
-        
-        def embed_query(self, text: str) -> List[float]:
-            """Generate random embedding for query."""
-            np.random.seed(len(text))
-            vec = np.random.randn(self.dim).astype(np.float32)
-            vec = vec / np.linalg.norm(vec)
-            return vec.tolist()
-    
-    # ========================================================================
-    # TEST UTILITIES
-    # ========================================================================
-    
-    class TestResult:
-        """Track test results."""
-        def __init__(self):
-            self.passed = 0
-            self.failed = 0
-            self.errors = []
-        
-        def assert_true(self, condition: bool, message: str):
-            """Assert condition is true."""
-            if condition:
-                self.passed += 1
-                print(f"  ✓ {message}")
-            else:
-                self.failed += 1
-                self.errors.append(message)
-                print(f"  ✗ FAILED: {message}")
-        
-        def assert_equal(self, actual, expected, message: str):
-            """Assert values are equal."""
-            if actual == expected:
-                self.passed += 1
-                print(f"  ✓ {message}")
-            else:
-                self.failed += 1
-                error = f"{message} (expected: {expected}, got: {actual})"
-                self.errors.append(error)
-                print(f"  ✗ FAILED: {error}")
-        
-        def assert_greater(self, actual, threshold, message: str):
-            """Assert value is greater than threshold."""
-            if actual > threshold:
-                self.passed += 1
-                print(f"  ✓ {message}")
-            else:
-                self.failed += 1
-                error = f"{message} (expected > {threshold}, got: {actual})"
-                self.errors.append(error)
-                print(f"  ✗ FAILED: {error}")
-        
-        def assert_in_range(self, actual, min_val, max_val, message: str):
-            """Assert value is in range."""
-            if min_val <= actual <= max_val:
-                self.passed += 1
-                print(f"  ✓ {message}")
-            else:
-                self.failed += 1
-                error = f"{message} (expected [{min_val}, {max_val}], got: {actual})"
-                self.errors.append(error)
-                print(f"  ✗ FAILED: {error}")
-        
-        def print_summary(self):
-            """Print test summary."""
-            total = self.passed + self.failed
-            print("\n" + "=" * 80)
-            print("TEST SUMMARY")
-            print("=" * 80)
-            print(f"Total Tests: {total}")
-            print(f"Passed: {self.passed} ({self.passed/total*100:.1f}%)")
-            print(f"Failed: {self.failed} ({self.failed/total*100:.1f}%)")
-            
-            if self.failed > 0:
-                print("\nFailed Tests:")
-                for error in self.errors:
-                    print(f"  - {error}")
-            
-            print("=" * 80)
-            
-            if self.failed == 0:
-                print("\n✓✓✓ ALL TESTS PASSED! ✓✓✓\n")
-                return True
-            else:
-                print(f"\n✗✗✗ {self.failed} TESTS FAILED! ✗✗✗\n")
-                return False
-    
-    # ========================================================================
-    # TEST 1: STORAGE CONFIG VALIDATION
-    # ========================================================================
-    
-    def test_storage_config():
-        """Test StorageConfig validation."""
-        print("\n" + "-" * 80)
-        print("TEST 1: StorageConfig Validation")
-        print("-" * 80)
-        
-        result = TestResult()
-        temp_dir = Path(tempfile.mkdtemp())
-        
-        try:
-            # Valid configuration
-            config = StorageConfig(
-                vector_db_path=temp_dir / "vector",
-                graph_db_path=temp_dir / "graph",
-                embedding_dim=768,
-                similarity_threshold=0.5,
-                distance_metric="cosine",
-                graph_backend="kuzu"
+                vec /= np.linalg.norm(vec) + 1e-8
+                results.append(vec.tolist())
+            return results
+
+        def embed_query(self, text):
+            return self.embed_documents([text])[0]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = StorageConfig(
+            vector_db_path=Path(tmpdir) / "vector",
+            graph_db_path=Path(tmpdir) / "graph",
+            embedding_dim=64,
+        )
+        store = HybridStore(config, _MockEmbeddings(dim=64))
+
+        docs = [
+            Document(
+                page_content="Albert Einstein developed the theory of relativity.",
+                metadata={"chunk_id": "c1", "source_file": "physics.pdf",
+                          "chunk_index": 0, "page_number": 1},
+            ),
+            Document(
+                page_content="He received the Nobel Prize in Physics in 1921.",
+                metadata={"chunk_id": "c2", "source_file": "physics.pdf",
+                          "chunk_index": 1, "page_number": 1},
+            ),
+        ]
+        store.add_documents(docs)
+
+        query_emb = _MockEmbeddings(dim=64).embed_query("relativity")
+        results = store.vector_search(query_emb, top_k=2)
+        assert results, "Expected at least one vector result"
+        logger.info("Smoke demo: vector_search returned %d results", len(results))
+
+        if KUZU_AVAILABLE:
+            graph_results = store.graph_search(["Einstein"], top_k=5)
+            logger.info(
+                "Smoke demo: graph_search returned %d results", len(graph_results)
             )
-            result.assert_true(True, "Valid configuration created")
-            
-            # Test invalid embedding_dim
-            try:
-                invalid_config = StorageConfig(
-                    vector_db_path=temp_dir / "vector",
-                    graph_db_path=temp_dir / "graph",
-                    embedding_dim=-1
-                )
-                result.assert_true(False, "Should reject negative embedding_dim")
-            except ValueError:
-                result.assert_true(True, "Rejected negative embedding_dim")
-            
-            # Test invalid similarity_threshold
-            try:
-                invalid_config = StorageConfig(
-                    vector_db_path=temp_dir / "vector",
-                    graph_db_path=temp_dir / "graph",
-                    similarity_threshold=1.5
-                )
-                result.assert_true(False, "Should reject similarity_threshold > 1.0")
-            except ValueError:
-                result.assert_true(True, "Rejected invalid similarity_threshold")
-            
-            # Test invalid distance_metric
-            try:
-                invalid_config = StorageConfig(
-                    vector_db_path=temp_dir / "vector",
-                    graph_db_path=temp_dir / "graph",
-                    distance_metric="invalid"
-                )
-                result.assert_true(False, "Should reject invalid distance_metric")
-            except ValueError:
-                result.assert_true(True, "Rejected invalid distance_metric")
-            
-            # Test invalid graph_backend
-            try:
-                invalid_config = StorageConfig(
-                    vector_db_path=temp_dir / "vector",
-                    graph_db_path=temp_dir / "graph",
-                    graph_backend="invalid"
-                )
-                result.assert_true(False, "Should reject invalid graph_backend")
-            except ValueError:
-                result.assert_true(True, "Rejected invalid graph_backend")
-        
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        
-        return result
-    
-    # ========================================================================
-    # TEST 2: VECTOR STORE ADAPTER
-    # ========================================================================
-    
-    def test_vector_store():
-        """Test VectorStoreAdapter functionality."""
-        print("\n" + "-" * 80)
-        print("TEST 2: VectorStoreAdapter")
-        print("-" * 80)
-        
-        result = TestResult()
-        temp_dir = Path(tempfile.mkdtemp())
-        
-        try:
-            # Initialize vector store
-            vector_store = VectorStoreAdapter(
-                db_path=temp_dir / "vector_test",
-                embedding_dim=768,
-                normalize_embeddings=True,
-                distance_metric="cosine"
-            )
-            result.assert_true(True, "VectorStoreAdapter initialized")
-            
-            # Create mock embeddings
-            embeddings = MockEmbeddings(dim=768)
-            
-            # Create test documents
-            test_docs = [
-                Document(
-                    page_content="Albert Einstein developed the theory of relativity.",
-                    metadata={"chunk_id": "chunk_001", "source_file": "physics.pdf"}
-                ),
-                Document(
-                    page_content="Marie Curie discovered radium and polonium.",
-                    metadata={"chunk_id": "chunk_002", "source_file": "chemistry.pdf"}
-                ),
-                Document(
-                    page_content="Isaac Newton formulated the laws of motion.",
-                    metadata={"chunk_id": "chunk_003", "source_file": "physics.pdf"}
-                ),
-            ]
-            
-            # Test: Add documents
-            vector_store.add_documents_with_embeddings(test_docs, embeddings)
-            result.assert_true(True, "Documents added successfully")
-            
-            # Test: Verify metadata saved
-            metadata_path = vector_store._get_metadata_path()
-            result.assert_true(metadata_path.exists(), "Metadata file created")
-            
-            # Test: Dimension validation
-            try:
-                wrong_dim_embeddings = MockEmbeddings(dim=512)
-                vector_store.add_documents_with_embeddings([test_docs[0]], wrong_dim_embeddings)
-                result.assert_true(False, "Should reject wrong embedding dimension")
-            except ValueError as e:
-                if "DIMENSION MISMATCH" in str(e):
-                    result.assert_true(True, "Dimension mismatch detected")
-                else:
-                    result.assert_true(False, f"Wrong error message: {e}")
-            
-            # Test: Vector search
-            query_embedding = embeddings.embed_query("relativity physics Einstein")
-            search_results = vector_store.vector_search(query_embedding, top_k=3)
-            
-            result.assert_greater(len(search_results), 0, "Search returned results")
-            result.assert_true(
-                all("similarity" in r for r in search_results),
-                "All results have similarity scores"
-            )
-            result.assert_true(
-                all(0 <= r["similarity"] <= 1 for r in search_results),
-                "All similarity scores in valid range [0,1]"
-            )
-            
-            # Test: Distance to similarity conversion
-            cosine_sim_0 = vector_store._distance_to_similarity(0.0)
-            result.assert_equal(cosine_sim_0, 1.0, "Distance 0.0 -> Similarity 1.0")
-            
-            cosine_sim_1 = vector_store._distance_to_similarity(1.0)
-            result.assert_equal(cosine_sim_1, 0.0, "Distance 1.0 -> Similarity 0.0")
-            
-            # Test: Normalization
-            test_vectors = np.random.randn(5, 768).astype(np.float32)
-            normalized = vector_store._normalize_vectors(test_vectors)
-            norms = np.linalg.norm(normalized, axis=1)
-            result.assert_true(
-                np.allclose(norms, 1.0, atol=1e-5),
-                "Vectors normalized to unit length"
-            )
-        
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        
-        return result
-    
-    # ========================================================================
-    # TEST 3: KUZU GRAPH STORE
-    # ========================================================================
-    
-    def test_kuzu_graph_store():
-        """Test KuzuGraphStore functionality."""
-        print("\n" + "-" * 80)
-        print("TEST 3: KuzuGraphStore")
-        print("-" * 80)
-        
-        result = TestResult()
-        
-        if not KUZU_AVAILABLE:
-            print("  ⚠ KuzuDB not available, skipping tests")
-            return result
-        
-        temp_dir = Path(tempfile.mkdtemp())
-        graph_store = None
-        
-        try:
-            # Initialize graph store
-            try:
-                graph_store = KuzuGraphStore(temp_dir / "graph_test")
-                result.assert_true(True, "KuzuGraphStore initialized")
-            except Exception as e:
-                print(f"  ⚠ KuzuDB initialization failed: {e}")
-                print(f"  ⚠ Skipping remaining KuzuDB tests")
-                return result
-            
-            # Test: Add document chunks (with error handling)
-            chunk_added = False
-            try:
-                graph_store.add_document_chunk(
-                    chunk_id="chunk_001",
-                    text="Einstein was born in Ulm, Germany.",
-                    page_number=1,
-                    chunk_index=0,
-                    source_file="einstein_bio.pdf"
-                )
-                chunk_added = True
-                result.assert_true(True, "Document chunk added")
-            except Exception as e:
-                result.assert_true(False, f"Failed to add document chunk: {e}")
-            
-            if chunk_added:
-                try:
-                    graph_store.add_document_chunk(
-                        chunk_id="chunk_002",
-                        text="He worked at Princeton University.",
-                        page_number=1,
-                        chunk_index=1,
-                        source_file="einstein_bio.pdf"
-                    )
-                    result.assert_true(True, "Second document chunk added")
-                except Exception as e:
-                    result.assert_true(False, f"Failed to add second chunk: {e}")
-            
-            # Test: Add source document
-            try:
-                graph_store.add_source_document(
-                    doc_id="einstein_bio.pdf",
-                    filename="einstein_bio.pdf",
-                    total_pages=10
-                )
-                result.assert_true(True, "Source document added")
-            except Exception as e:
-                result.assert_true(False, f"Failed to add source document: {e}")
-            
-            # Test: Add FROM_SOURCE relation
-            if chunk_added:
-                try:
-                    graph_store.add_from_source_relation("chunk_001", "einstein_bio.pdf")
-                    result.assert_true(True, "FROM_SOURCE relation added")
-                except Exception as e:
-                    result.assert_true(False, f"Failed to add FROM_SOURCE relation: {e}")
-            
-            # Test: Add NEXT_CHUNK relation
-            if chunk_added:
-                try:
-                    graph_store.add_next_chunk_relation("chunk_001", "chunk_002")
-                    result.assert_true(True, "NEXT_CHUNK relation added")
-                except Exception as e:
-                    result.assert_true(False, f"Failed to add NEXT_CHUNK relation: {e}")
-            
-            # Test: Add entities
-            entity_added = False
-            try:
-                graph_store.add_entity(
-                    entity_id="entity_einstein",
-                    name="Albert Einstein",
-                    entity_type="PERSON"
-                )
-                entity_added = True
-                result.assert_true(True, "Entity added")
-            except Exception as e:
-                result.assert_true(False, f"Failed to add entity: {e}")
-            
-            # Test: Add MENTIONS relation
-            if chunk_added and entity_added:
-                try:
-                    graph_store.add_mentions_relation("chunk_001", "entity_einstein")
-                    result.assert_true(True, "MENTIONS relation added")
-                except Exception as e:
-                    result.assert_true(False, f"Failed to add MENTIONS relation: {e}")
-            
-            # Test: Add RELATED_TO relation
-            if entity_added:
-                try:
-                    graph_store.add_entity(
-                        entity_id="entity_princeton",
-                        name="Princeton University",
-                        entity_type="ORGANIZATION"
-                    )
-                    graph_store.add_related_to_relation(
-                        "entity_einstein",
-                        "entity_princeton",
-                        "works_for"
-                    )
-                    result.assert_true(True, "RELATED_TO relation added")
-                except Exception as e:
-                    result.assert_true(False, f"Failed to add RELATED_TO relation: {e}")
-            
-            # Test: Get statistics
-            try:
-                stats = graph_store.get_statistics()
-                if chunk_added:
-                    result.assert_greater(stats.get('document_chunks', 0), 0, "Document chunks counted")
-                    result.assert_greater(stats.get('source_documents', 0), 0, "Source documents counted")
-                if entity_added:
-                    result.assert_greater(stats.get('entities', 0), 0, "Entities counted")
-            except Exception as e:
-                result.assert_true(False, f"Failed to get statistics: {e}")
-            
-            # Test: Graph traversal
-            if chunk_added:
-                try:
-                    visited = graph_store.graph_traversal("chunk_001", max_hops=2)
-                    result.assert_true("chunk_001" in visited, "Start node in traversal results")
-                    if "chunk_001" in visited:
-                        result.assert_equal(visited["chunk_001"], 0, "Start node at hop 0")
-                except Exception as e:
-                    result.assert_true(False, f"Graph traversal failed: {e}")
-            
-            # Test: Find related chunks
-            if chunk_added:
-                try:
-                    related = graph_store.find_related_chunks("chunk_001", max_hops=1)
-                    result.assert_true(isinstance(related, list), "Find related chunks returns list")
-                except Exception as e:
-                    result.assert_true(False, f"Find related chunks failed: {e}")
-            
-            # Test: Find chunks by entity
-            if chunk_added and entity_added:
-                try:
-                    entity_chunks = graph_store.find_chunks_by_entity("Einstein", max_results=5)
-                    result.assert_true(isinstance(entity_chunks, list), "Find by entity returns list")
-                except Exception as e:
-                    result.assert_true(False, f"Find chunks by entity failed: {e}")
-            
-            # Test: Get document structure
-            if chunk_added:
-                try:
-                    doc_structure = graph_store.get_document_structure("einstein_bio.pdf")
-                    result.assert_greater(len(doc_structure), 0, "Document structure retrieved")
-                except Exception as e:
-                    result.assert_true(False, f"Get document structure failed: {e}")
-            
-            # Test: Clear graph
-            try:
-                graph_store.clear()
-                stats_after_clear = graph_store.get_statistics()
-                result.assert_equal(
-                    stats_after_clear.get('document_chunks', 0), 0,
-                    "Graph cleared successfully"
-                )
-            except Exception as e:
-                result.assert_true(False, f"Clear graph failed: {e}")
-        
-        except Exception as e:
-            result.assert_true(False, f"Unexpected error in KuzuDB tests: {e}")
-        
-        finally:
-            # Cleanup
-            try:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            except:
-                pass
-        
-        return result
-    
-    # ========================================================================
-    # TEST 4: NETWORKX GRAPH STORE (FALLBACK)
-    # ========================================================================
-    
-    def test_networkx_graph_store():
-        """Test NetworkXGraphStore functionality."""
-        print("\n" + "-" * 80)
-        print("TEST 4: NetworkXGraphStore (Fallback)")
-        print("-" * 80)
-        
-        result = TestResult()
-        
-        if not NETWORKX_AVAILABLE:
-            print("  ⚠ NetworkX not available, skipping tests")
-            return result
-        
-        temp_dir = Path(tempfile.mkdtemp())
-        
-        try:
-            # Initialize NetworkX graph store
-            graph_store = NetworkXGraphStore(temp_dir / "graph_nx.graphml")
-            result.assert_true(True, "NetworkXGraphStore initialized")
-            
-            # Test: Add entities
-            graph_store.add_entity_from_metadata(
-                "chunk_001",
-                "document_chunk",
-                {"text": "Test chunk", "source_file": "test.pdf"}
-            )
-            result.assert_true(True, "Entity added")
-            
-            # Test: Add relations
-            graph_store.add_entity_from_metadata("source_001", "source_document", {})
-            graph_store.add_relation("chunk_001", "source_001", "from_source")
-            result.assert_true(True, "Relation added")
-            
-            # Test: Graph traversal
-            visited = graph_store.graph_traversal("chunk_001", max_hops=1)
-            result.assert_true("chunk_001" in visited, "Traversal includes start node")
-            
-            # Test: Statistics
-            stats = graph_store.get_statistics()
-            result.assert_greater(stats['nodes'], 0, "Nodes counted")
-            result.assert_greater(stats['edges'], 0, "Edges counted")
-            
-            # Test: Save and load
-            graph_store.save()
-            result.assert_true(
-                graph_store.graph_path.exists(),
-                "Graph saved to file"
-            )
-            
-            # Load in new instance
-            graph_store_2 = NetworkXGraphStore(temp_dir / "graph_nx.graphml")
-            stats_2 = graph_store_2.get_statistics()
-            result.assert_equal(
-                stats_2['nodes'], stats['nodes'],
-                "Graph loaded correctly"
-            )
-            
-            # Test: Clear
-            graph_store.clear()
-            stats_clear = graph_store.get_statistics()
-            result.assert_equal(stats_clear['nodes'], 0, "Graph cleared")
-        
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        
-        return result
-    
-    # ========================================================================
-    # TEST 5: HYBRID STORE INTEGRATION
-    # ========================================================================
-    
-    def test_hybrid_store():
-        """Test HybridStore integration."""
-        print("\n" + "-" * 80)
-        print("TEST 5: HybridStore Integration")
-        print("-" * 80)
-        
-        result = TestResult()
-        temp_dir = Path(tempfile.mkdtemp())
-        
-        try:
-            # Create config
-            config = StorageConfig(
-                vector_db_path=temp_dir / "hybrid_vector",
-                graph_db_path=temp_dir / "hybrid_graph",
-                embedding_dim=768,
-                graph_backend="kuzu" if KUZU_AVAILABLE else "networkx"
-            )
-            
-            # Create embeddings
-            embeddings = MockEmbeddings(dim=768)
-            
-            # Initialize hybrid store
-            hybrid_store = HybridStore(config, embeddings)
-            result.assert_true(True, "HybridStore initialized")
-            
-            # Verify vector store
-            result.assert_true(
-                hybrid_store.vector_store is not None,
-                "Vector store created"
-            )
-            
-            # Verify graph store
-            result.assert_true(
-                hybrid_store.graph_store is not None,
-                "Graph store created"
-            )
-            
-            # Verify embedding dimension auto-detection
-            result.assert_equal(
-                config.embedding_dim, 768,
-                "Embedding dimension detected"
-            )
-            
-            # Test: Add documents
-            test_docs = [
-                Document(
-                    page_content="Einstein developed relativity theory.",
-                    metadata={
-                        "chunk_id": "chunk_001",
-                        "source_file": "physics.pdf",
-                        "chunk_index": 0,
-                        "page_number": 1
-                    }
-                ),
-                Document(
-                    page_content="He received the Nobel Prize in 1921.",
-                    metadata={
-                        "chunk_id": "chunk_002",
-                        "source_file": "physics.pdf",
-                        "chunk_index": 1,
-                        "page_number": 1
-                    }
-                ),
-                Document(
-                    page_content="Marie Curie discovered radioactivity.",
-                    metadata={
-                        "chunk_id": "chunk_003",
-                        "source_file": "chemistry.pdf",
-                        "chunk_index": 0,
-                        "page_number": 1
-                    }
-                ),
-            ]
-            
-            hybrid_store.add_documents(test_docs)
-            result.assert_true(True, "Documents added to hybrid store")
-            
-            # Verify vector store has documents
-            query_emb = embeddings.embed_query("physics Einstein")
-            vector_results = hybrid_store.vector_store.vector_search(query_emb, top_k=3)
-            result.assert_greater(
-                len(vector_results), 0,
-                "Vector store contains documents"
-            )
-            
-            # Verify graph store has nodes
-            graph_stats = hybrid_store.graph_store.get_statistics()
-            if KUZU_AVAILABLE:
-                result.assert_greater(
-                    graph_stats['document_chunks'], 0,
-                    "Graph store contains chunks"
-                )
-                result.assert_greater(
-                    graph_stats['source_documents'], 0,
-                    "Graph store contains source documents"
-                )
-            else:
-                result.assert_greater(
-                    graph_stats['nodes'], 0,
-                    "Graph store contains nodes"
-                )
-            
-            # Test: Save
-            hybrid_store.save()
-            result.assert_true(True, "Hybrid store saved")
-            
-            # Test: Reset vector store
-            hybrid_store.reset_vector_store()
-            result.assert_true(True, "Vector store reset")
-            
-            # Test: Reset graph store
-            hybrid_store.reset_graph_store()
-            graph_stats_reset = hybrid_store.graph_store.get_statistics()
-            if KUZU_AVAILABLE:
-                result.assert_equal(
-                    graph_stats_reset['document_chunks'], 0,
-                    "Graph store reset"
-                )
-            else:
-                result.assert_equal(
-                    graph_stats_reset['nodes'], 0,
-                    "Graph store reset"
-                )
-        
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        
-        return result
-    
-    # ========================================================================
-    # TEST 6: DIAGNOSTICS
-    # ========================================================================
-    
-    def test_diagnostics():
-        """Test diagnostic function."""
-        print("\n" + "-" * 80)
-        print("TEST 6: Diagnostics")
-        print("-" * 80)
-        
-        result = TestResult()
-        temp_dir = Path(tempfile.mkdtemp())
-        
-        try:
-            config = StorageConfig(
-                vector_db_path=temp_dir / "diag_vector",
-                graph_db_path=temp_dir / "diag_graph",
-                graph_backend="kuzu" if KUZU_AVAILABLE else "networkx"
-            )
-            
-            embeddings = MockEmbeddings(dim=768)
-            
-            # Run diagnostics
-            diag_results = run_diagnostics(config, embeddings)
-            
-            result.assert_true(
-                "embedding_dim" in diag_results,
-                "Diagnostics include embedding_dim"
-            )
-            result.assert_equal(
-                diag_results["embedding_dim"], 768,
-                "Embedding dimension detected correctly"
-            )
-            result.assert_true(
-                "graph_backend" in diag_results,
-                "Diagnostics include graph_backend"
-            )
-            result.assert_true(
-                "kuzu_available" in diag_results,
-                "Diagnostics include kuzu_available"
-            )
-            result.assert_true(
-                "networkx_available" in diag_results,
-                "Diagnostics include networkx_available"
-            )
-            result.assert_true(
-                isinstance(diag_results["issues"], list),
-                "Diagnostics include issues list"
-            )
-        
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        
-        return result
-    
-    # ========================================================================
-    # TEST 7: PERFORMANCE BENCHMARKS
-    # ========================================================================
-    
-    def test_performance():
-        """Test performance benchmarks."""
-        print("\n" + "-" * 80)
-        print("TEST 7: Performance Benchmarks")
-        print("-" * 80)
-        
-        result = TestResult()
-        temp_dir = Path(tempfile.mkdtemp())
-        
-        try:
-            config = StorageConfig(
-                vector_db_path=temp_dir / "perf_vector",
-                graph_db_path=temp_dir / "perf_graph",
-                embedding_dim=768
-            )
-            
-            embeddings = MockEmbeddings(dim=768)
-            hybrid_store = HybridStore(config, embeddings)
-            
-            # Create 100 test documents
-            num_docs = 100
-            test_docs = []
-            for i in range(num_docs):
-                test_docs.append(
-                    Document(
-                        page_content=f"This is test document number {i} about various topics.",
-                        metadata={
-                            "chunk_id": f"chunk_{i:03d}",
-                            "source_file": f"test_{i//10}.pdf",
-                            "chunk_index": i % 10,
-                            "page_number": 1
-                        }
-                    )
-                )
-            
-            # Benchmark: Document insertion
-            import time
-            start_time = time.time()
-            hybrid_store.add_documents(test_docs)
-            insert_time = (time.time() - start_time) * 1000
-            
-            result.assert_true(
-                insert_time < 30000,  # 30 seconds for 100 docs
-                f"Document insertion time acceptable ({insert_time:.0f}ms for {num_docs} docs)"
-            )
-            
-            # Benchmark: Vector search
-            query_emb = embeddings.embed_query("test document topics")
-            start_time = time.time()
-            search_results = hybrid_store.vector_store.vector_search(query_emb, top_k=10)
-            search_time = (time.time() - start_time) * 1000
-            
-            result.assert_true(
-                search_time < 100,  # 100ms
-                f"Vector search time acceptable ({search_time:.1f}ms)"
-            )
-            
-            result.assert_greater(
-                len(search_results), 0,
-                f"Search returned {len(search_results)} results"
-            )
-            
-            # Benchmark: Graph traversal (if KuzuDB available)
-            if KUZU_AVAILABLE:
-                start_time = time.time()
-                visited = hybrid_store.graph_store.graph_traversal("chunk_000", max_hops=2)
-                traversal_time = (time.time() - start_time) * 1000
-                
-                result.assert_true(
-                    traversal_time < 50,  # 50ms
-                    f"Graph traversal time acceptable ({traversal_time:.1f}ms)"
-                )
-        
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        
-        return result
-    
-    # ========================================================================
-    # RUN ALL TESTS
-    # ========================================================================
-    
-    def run_all_tests():
-        """Run all test suites."""
-        all_results = []
-        
-        # Run each test suite
-        all_results.append(test_storage_config())
-        all_results.append(test_vector_store())
-        all_results.append(test_kuzu_graph_store())
-        all_results.append(test_networkx_graph_store())
-        all_results.append(test_hybrid_store())
-        all_results.append(test_diagnostics())
-        all_results.append(test_performance())
-        
-        # Aggregate results
-        total_passed = sum(r.passed for r in all_results)
-        total_failed = sum(r.failed for r in all_results)
-        total_tests = total_passed + total_failed
-        
-        # Print final summary
-        print("\n" + "=" * 80)
-        print("FINAL TEST SUMMARY")
-        print("=" * 80)
-        print(f"Total Test Suites: {len(all_results)}")
-        print(f"Total Tests: {total_tests}")
-        print(f"Total Passed: {total_passed} ({total_passed/total_tests*100:.1f}%)")
-        print(f"Total Failed: {total_failed} ({total_failed/total_tests*100:.1f}%)")
-        print("=" * 80)
-        
-        if total_failed == 0:
-            print("\n🎉🎉🎉 ALL TESTS PASSED! 🎉🎉🎉\n")
-            print("Storage.py is working correctly!")
-            return 0
-        else:
-            print(f"\n⚠️⚠️⚠️ {total_failed} TESTS FAILED! ⚠️⚠️⚠️\n")
-            print("Please review the failed tests above.")
-            return 1
-    
-    # Execute all tests
-    exit_code = run_all_tests()
-    sys.exit(exit_code)
+
+    logger.info("Smoke demo passed.")
+
+    # --- pytest ---------------------------------------------------------------
+    test_file = Path(__file__).parent / "test_data_layer.py"
+    proc = subprocess.run(
+        [sys.executable, "-X", "utf8", "-m", "pytest", str(test_file),
+         "-v", "-k", "storage or Storage or VectorStore or HybridStore"],
+        check=False,
+    )
+    sys.exit(proc.returncode)
+
+
+if __name__ == "__main__":
+    _main()
