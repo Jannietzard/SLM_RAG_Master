@@ -63,6 +63,15 @@ USAGE
     results = store.vector_search(query_embedding, top_k=5)
 
 ===============================================================================
+REVIEW HISTORY
+===============================================================================
+
+    Last Reviewed:  2026-04-19
+    Review Result:  0 CRITICAL, 4 IMPORTANT, 3 RECOMMENDED
+    Reviewer:       Code Review Prompt v2.1
+    Next Review:    After schema changes or graph backend refactoring
+
+===============================================================================
 """
 
 import collections
@@ -89,17 +98,11 @@ try:
     KUZU_AVAILABLE = True
 except ImportError:
     KUZU_AVAILABLE = False
-    logging.warning("KuzuDB not available. Install with: pip install kuzu")
-
-# NetworkX fallback
-try:
-    import networkx as nx
-    NETWORKX_AVAILABLE = True
-except ImportError:
-    NETWORKX_AVAILABLE = False
-    logging.warning("NetworkX not available. Install with: pip install networkx")
 
 logger = logging.getLogger(__name__)
+
+if not KUZU_AVAILABLE:
+    logger.warning("KuzuDB not available. Install with: pip install kuzu")
 
 
 # ============================================================================
@@ -126,7 +129,7 @@ class StorageConfig:
         similarity_threshold: Minimum cosine similarity for vector results.
         normalize_embeddings: L2-normalise vectors before storage and search.
         distance_metric: LanceDB distance metric ("cosine" or "l2").
-        graph_backend: "kuzu" or "networkx".
+        graph_backend: Storage backend — only "kuzu" is supported.
         overfetch_factor: ANN over-fetch multiplier. LanceDB retrieves
             top_k * overfetch_factor candidates; Python then re-ranks and
             filters by similarity_threshold. Factor 3 balances recall vs
@@ -165,9 +168,9 @@ class StorageConfig:
                 "distance_metric must be 'cosine' or 'l2': %s" % self.distance_metric
             )
 
-        if self.graph_backend not in ("kuzu", "networkx"):
+        if self.graph_backend != "kuzu":
             raise ValueError(
-                "graph_backend must be 'kuzu' or 'networkx': %s" % self.graph_backend
+                "graph_backend must be 'kuzu' (NetworkX fallback removed): %s" % self.graph_backend
             )
 
         if self.overfetch_factor < 1:
@@ -401,9 +404,30 @@ class VectorStoreAdapter:
             filtered_results.sort(key=lambda x: x["similarity"], reverse=True)
             return filtered_results[:top_k]
 
-        except Exception as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             logger.error("Vector search failed: %s", exc)
             return []
+
+
+def _entity_name_variants(name: str) -> List[str]:
+    """
+    Build a prioritised list of name variants for alias-tolerant entity lookup.
+
+    Handles common patterns without a full alias table:
+      "Ed Wood"          → also try "Wood" (last-name-only for short first names)
+      "Scott Derrickson" → also try "Derrickson" (multi-token fallback)
+
+    Used by KuzuGraphStore.find_chunks_by_entity_multihop.
+    """
+    variants = [name]
+    tokens = name.split()
+    if len(tokens) == 2 and len(tokens[0]) <= 3:
+        variants.append(tokens[-1])
+    if len(tokens) > 1:
+        for tok in tokens:
+            if len(tok) >= 4 and tok not in variants:
+                variants.append(tok)
+    return variants
 
 
 # ============================================================================
@@ -619,10 +643,8 @@ class KuzuGraphStore:
         metadata: Dict[str, Any],
     ) -> None:
         """
-        Compatibility wrapper: routes to the typed add_* method based on
-        entity_type.  Used by HybridStore.add_documents when the NetworkX
-        code path is active (both KuzuGraphStore and NetworkXGraphStore
-        expose this method for interface consistency).
+        Compatibility wrapper: routes entity_type string to the typed
+        add_document_chunk or add_source_document method.
         """
         if entity_type == "document_chunk":
             self.add_document_chunk(
@@ -954,29 +976,9 @@ class KuzuGraphStore:
             return []
 
         chunks: List[Dict[str, Any]] = []
-        seen: set = set()
+        seen: set[str] = set()
 
-        # Build a list of candidate name variants to try in order.
-        # This handles common alias patterns without a full alias table:
-        #   "Ed Wood"       → also try "Edward Wood", individual tokens
-        #   "Scott Derrickson" → also try "Derrickson"
-        # We stop extending as soon as at least one Hop-0 result is found.
-        def _name_variants(name: str) -> List[str]:
-            variants = [name]
-            tokens = name.split()
-            # Nickname expansion: two-token names where first token is short (≤3 chars)
-            # e.g. "Ed Wood" → "Edward Wood" (not deterministic, but worth trying)
-            if len(tokens) == 2 and len(tokens[0]) <= 3:
-                # Try last-name-only as fallback lookup
-                variants.append(tokens[-1])
-            # Multi-token: try each individual token ≥4 chars as fallback
-            if len(tokens) > 1:
-                for tok in tokens:
-                    if len(tok) >= 4 and tok not in variants:
-                        variants.append(tok)
-            return variants
-
-        name_variants = _name_variants(entity_name)
+        name_variants = _entity_name_variants(entity_name)
 
         try:
             # Hop 0: direct MENTIONS — try name variants until we get a hit
@@ -1190,179 +1192,21 @@ class KuzuGraphStore:
 
 
 # ============================================================================
-# NETWORKX FALLBACK (for systems without KuzuDB)
-# ============================================================================
-
-class NetworkXGraphStore:
-    """
-    NetworkX-based Knowledge Graph (fallback).
-
-    Provides the same public interface as KuzuGraphStore so that HybridStore
-    can use either backend.  Multi-hop Cypher retrieval is NOT available here;
-    graph_search falls back to simple BFS-based entity matching.
-
-    Note: the BFS queue uses collections.deque for O(1) popleft rather than
-    list.pop(0) which is O(n) — important for graphs with many nodes.
-    """
-
-    def __init__(self, graph_path: Path) -> None:
-        self.graph_path = Path(graph_path)
-        self.graph = nx.DiGraph()
-
-        if self.graph_path.exists():
-            try:
-                self.graph = nx.read_graphml(str(self.graph_path))
-                logger.info(
-                    "Loaded NetworkX graph: %d nodes", self.graph.number_of_nodes()
-                )
-            except Exception as exc:
-                logger.error("Failed to load graph from %s: %s", self.graph_path, exc)
-
-    def add_entity_from_metadata(
-        self,
-        entity_id: str,
-        entity_type: str,
-        metadata: Dict[str, Any],
-    ) -> None:
-        """Add an entity node from metadata. API-compatible with KuzuGraphStore."""
-        self.graph.add_node(entity_id, entity_type=entity_type, **metadata)
-
-    def add_relation(
-        self,
-        source_id: str,
-        target_id: str,
-        relation_type: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Add a directed edge."""
-        edge_data: Dict[str, Any] = {"relation_type": relation_type}
-        if metadata:
-            edge_data.update(metadata)
-        self.graph.add_edge(source_id, target_id, **edge_data)
-
-    def graph_traversal(
-        self,
-        start_entity: str,
-        relation_types: Optional[List[str]] = None,
-        max_hops: int = 2,
-    ) -> Dict[str, int]:
-        """
-        BFS traversal from start_entity up to max_hops.
-
-        Uses collections.deque for O(1) dequeue (avoids O(n) list.pop(0)).
-        """
-        if start_entity not in self.graph:
-            return {}
-
-        visited: Dict[str, int] = {start_entity: 0}
-        queue: collections.deque = collections.deque([(start_entity, 0)])
-
-        while queue:
-            current, hops = queue.popleft()
-            if hops >= max_hops:
-                continue
-
-            for neighbor in self.graph.neighbors(current):
-                if neighbor not in visited:
-                    edge_data = self.graph.get_edge_data(current, neighbor)
-                    rel_type = edge_data.get("relation_type") if edge_data else None
-
-                    if relation_types is None or rel_type in relation_types:
-                        visited[neighbor] = hops + 1
-                        queue.append((neighbor, hops + 1))
-
-        return visited
-
-    def get_context_chunks(self, chunk_id: str, window: int = 2) -> List[str]:
-        """Return chunk IDs within ±window positions via next_chunk edges."""
-        if chunk_id not in self.graph:
-            return []
-
-        context_chunks = [chunk_id]
-
-        # Forward traversal
-        current = chunk_id
-        for _ in range(window):
-            found_next = False
-            for neighbor in self.graph.neighbors(current):
-                edge_data = self.graph.get_edge_data(current, neighbor)
-                if edge_data and edge_data.get("relation_type") == "next_chunk":
-                    if neighbor not in context_chunks:
-                        context_chunks.append(neighbor)
-                        current = neighbor
-                        found_next = True
-                        break
-            if not found_next:
-                break
-
-        # Backward traversal
-        current = chunk_id
-        backward: List[str] = []
-        for _ in range(window):
-            found_prev = False
-            for predecessor in self.graph.predecessors(current):
-                edge_data = self.graph.get_edge_data(predecessor, current)
-                if edge_data and edge_data.get("relation_type") == "next_chunk":
-                    if predecessor not in context_chunks and predecessor not in backward:
-                        backward.insert(0, predecessor)
-                        current = predecessor
-                        found_prev = True
-                        break
-            if not found_prev:
-                break
-
-        return backward + context_chunks
-
-    def save(self) -> None:
-        """Persist graph to GraphML file."""
-        self.graph_path.parent.mkdir(parents=True, exist_ok=True)
-        nx.write_graphml(self.graph, str(self.graph_path))
-
-    def get_statistics(self) -> Dict[str, int]:
-        """
-        Return node and edge counts using the same key schema as
-        KuzuGraphStore.get_statistics() for interface consistency.
-
-        NetworkX does not differentiate node/edge types, so all
-        type-specific counts are approximated: total nodes map to
-        document_chunks, total edges map to from_source_edges; remaining
-        keys are 0.
-        """
-        return {
-            "document_chunks": self.graph.number_of_nodes(),
-            "source_documents": 0,
-            "entities": 0,
-            "from_source_edges": self.graph.number_of_edges(),
-            "next_chunk_edges": 0,
-            "mentions_edges": 0,
-            "related_to_edges": 0,
-        }
-
-    def clear(self) -> None:
-        self.graph.clear()
-
-
-# ============================================================================
 # HYBRID STORE (Facade)
 # ============================================================================
 
 class HybridStore:
     """
-    Unified facade over VectorStoreAdapter and a graph store (KuzuDB or NetworkX).
+    Unified facade over VectorStoreAdapter (LanceDB) and KuzuDB.
 
     Design pattern: Facade — hides storage heterogeneity from callers.
     Callers interact exclusively with `add_documents`, `vector_search`, and
-    `graph_search`; the concrete storage backends are not exposed.
+    `graph_search`.
 
-    Backend selection follows a priority order:
-      1. KuzuDB  (config.graph_backend == "kuzu" and KUZU_AVAILABLE)
-      2. NetworkX (NETWORKX_AVAILABLE as fallback)
-      3. ImportError if neither is available
-
-    Note: isinstance(graph_store, KuzuGraphStore) checks in add_documents and
-    graph_search are intentional: the two backends differ in their write API
-    (typed vs generic nodes) and their read API (Cypher multihop vs BFS).
-    A Protocol/ABC refactor is tracked as future work.
+    KuzuDB is the only supported graph backend. If KuzuDB is not installed,
+    HybridStore raises RuntimeError immediately rather than falling back to an
+    alternative.  This is intentional: the thesis evaluates a specific system
+    configuration; silent fallbacks would invalidate the evaluation results.
     """
 
     def __init__(
@@ -1404,23 +1248,14 @@ class HybridStore:
             overfetch_factor=config.overfetch_factor,
         )
 
-        # Graph store — KuzuDB preferred, NetworkX as fallback
-        if config.graph_backend == "kuzu" and KUZU_AVAILABLE:
-            self.graph_store: Union[KuzuGraphStore, NetworkXGraphStore] = (
-                KuzuGraphStore(config.graph_db_path)
+        # Graph store — KuzuDB only. No fallback by design.
+        if not KUZU_AVAILABLE:
+            raise RuntimeError(
+                "KuzuDB not available. Install with: pip install kuzu. "
+                "No fallback is provided — the thesis evaluation requires KuzuDB."
             )
-            logger.info("Using KuzuDB for graph storage")
-        elif NETWORKX_AVAILABLE:
-            if config.graph_backend == "kuzu":
-                logger.warning(
-                    "KuzuDB requested but not available — falling back to NetworkX. "
-                    "Install with: pip install kuzu. "
-                    "Note: multi-hop Cypher retrieval is NOT available in NetworkX mode."
-                )
-            self.graph_store = NetworkXGraphStore(config.graph_db_path)
-            logger.info("Using NetworkX for graph storage")
-        else:
-            raise ImportError("No graph backend available. Install kuzu or networkx.")
+        self.graph_store: KuzuGraphStore = KuzuGraphStore(config.graph_db_path)
+        logger.info("Using KuzuDB for graph storage")
 
         # Entity extraction pipeline (optional)
         self.entity_pipeline: Optional["EntityExtractionPipeline"] = entity_pipeline
@@ -1429,7 +1264,7 @@ class HybridStore:
 
         logger.info("HybridStore initialised: dim=%d", embedding_dim)
 
-    def _init_entity_pipeline(self, config: StorageConfig) -> Optional[Any]:
+    def _init_entity_pipeline(self, config: StorageConfig) -> "Optional[EntityExtractionPipeline]":
         """
         Construct EntityExtractionPipeline from settings when not injected.
 
@@ -1468,12 +1303,10 @@ class HybridStore:
         """
         Ingest documents into both the vector store and the knowledge graph.
 
-        For KuzuDB: creates DocumentChunk, SourceDocument nodes, FROM_SOURCE
+        Ingests into both the vector store (LanceDB) and the knowledge graph
+        (KuzuDB): creates DocumentChunk, SourceDocument nodes, FROM_SOURCE
         and NEXT_CHUNK edges, and optionally MENTIONS / RELATED_TO edges via
         the entity extraction pipeline.
-
-        For NetworkX (fallback): stores generic nodes and edges only; no
-        entity-level graph structure.
         """
         if not documents:
             return
@@ -1488,38 +1321,27 @@ class HybridStore:
             chunk_id = str(doc.metadata.get("chunk_id", "unknown"))
             source_file = doc.metadata.get("source_file", "unknown")
 
-            if isinstance(self.graph_store, KuzuGraphStore):
-                self.graph_store.add_document_chunk(
-                    chunk_id=chunk_id,
-                    text=doc.page_content,
-                    page_number=doc.metadata.get("page_number", 0),
-                    chunk_index=doc.metadata.get("chunk_index", 0),
-                    source_file=source_file,
-                    max_text_chars=max_chars,
-                )
-                self.graph_store.add_source_document(
-                    doc_id=source_file,
-                    filename=source_file,
-                    total_pages=doc.metadata.get("total_pages", 0),
-                )
-                self.graph_store.add_from_source_relation(chunk_id, source_file)
-                if prev_chunk_id:
-                    self.graph_store.add_next_chunk_relation(prev_chunk_id, chunk_id)
-
-            else:
-                # NetworkX fallback: generic node/edge API
-                self.graph_store.add_entity_from_metadata(
-                    chunk_id, "document_chunk", {"source_file": source_file}
-                )
-                self.graph_store.add_entity_from_metadata(
-                    source_file, "source_document", {}
-                )
-                self.graph_store.add_relation(chunk_id, source_file, "from_source")
+            self.graph_store.add_document_chunk(
+                chunk_id=chunk_id,
+                text=doc.page_content,
+                page_number=doc.metadata.get("page_number", 0),
+                chunk_index=doc.metadata.get("chunk_index", 0),
+                source_file=source_file,
+                max_text_chars=max_chars,
+            )
+            self.graph_store.add_source_document(
+                doc_id=source_file,
+                filename=source_file,
+                total_pages=doc.metadata.get("total_pages", 0),
+            )
+            self.graph_store.add_from_source_relation(chunk_id, source_file)
+            if prev_chunk_id:
+                self.graph_store.add_next_chunk_relation(prev_chunk_id, chunk_id)
 
             prev_chunk_id = chunk_id
 
-        # Entity extraction and graph integration (KuzuDB only)
-        if self.entity_pipeline and isinstance(self.graph_store, KuzuGraphStore):
+        # Entity extraction and graph integration
+        if self.entity_pipeline:
             try:
                 entity_stats = self._integrate_entities(documents)
                 logger.info(
@@ -1670,15 +1492,12 @@ class HybridStore:
         """
         Entity-driven graph retrieval.
 
-        For KuzuDB: uses find_chunks_by_entity_multihop (up to 3 hops).
-        For NetworkX: falls back to BFS-based entity string matching.
-
+        Uses KuzuDB find_chunks_by_entity_multihop (up to 3 hops).
         Results are sorted by hop distance (0 = direct mention = best).
 
         Args:
             entities: Entity name strings extracted from the query.
-            max_hops: Maximum hop depth (used by NetworkX fallback only;
-                      KuzuDB multihop is fixed at 3).
+            max_hops: Unused (KuzuDB multihop is fixed at 3 hops internally).
             top_k: Maximum results to return.
 
         Returns:
@@ -1689,30 +1508,10 @@ class HybridStore:
         seen_chunks: set = set()
 
         for entity_name in entities:
-            if isinstance(self.graph_store, KuzuGraphStore):
-                entity_chunks = self.graph_store.find_chunks_by_entity_multihop(
-                    entity_name=entity_name,
-                    max_results=top_k,
-                )
-            else:
-                # NetworkX fallback: BFS from any node whose ID contains entity_name
-                entity_chunks = []
-                for node in self.graph_store.graph.nodes():
-                    if entity_name.lower() in str(node).lower():
-                        neighbors = self.graph_store.graph_traversal(
-                            node, max_hops=max_hops
-                        )
-                        for neighbor, hops in neighbors.items():
-                            if neighbor not in seen_chunks:
-                                entity_chunks.append({
-                                    "chunk_id": neighbor,
-                                    "text": "",
-                                    "source_file": "",
-                                    "matched_entity": entity_name,
-                                    "hops": hops,
-                                    "bridge_entity": None,
-                                    "relation_type": None,
-                                })
+            entity_chunks = self.graph_store.find_chunks_by_entity_multihop(
+                entity_name=entity_name,
+                max_results=top_k,
+            )
 
             for chunk in entity_chunks:
                 chunk_id = chunk.get("chunk_id")
@@ -1732,7 +1531,7 @@ class HybridStore:
         return results[:top_k]
 
     def save(self) -> None:
-        """Persist the graph store (no-op for KuzuDB; writes GraphML for NetworkX)."""
+        """Persist the graph store (no-op for KuzuDB — data is written on each operation)."""
         self.graph_store.save()
 
     def reset_vector_store(self) -> None:
@@ -1776,9 +1575,7 @@ def run_diagnostics(config: StorageConfig, embeddings: Embeddings) -> Dict[str, 
     """
     results: Dict[str, Any] = {
         "embedding_dim": None,
-        "graph_backend": config.graph_backend,
         "kuzu_available": KUZU_AVAILABLE,
-        "networkx_available": NETWORKX_AVAILABLE,
         "issues": [],
     }
 
@@ -1788,8 +1585,8 @@ def run_diagnostics(config: StorageConfig, embeddings: Embeddings) -> Dict[str, 
     except Exception as exc:
         results["issues"].append("Embedding failed: %s" % exc)
 
-    if config.graph_backend == "kuzu" and not KUZU_AVAILABLE:
-        results["issues"].append("KuzuDB requested but not installed")
+    if not KUZU_AVAILABLE:
+        results["issues"].append("KuzuDB not installed — install with: pip install kuzu")
 
     return results
 
@@ -1885,8 +1682,10 @@ def _main() -> None:
         def embed_documents(self, texts):
             results = []
             for text in texts:
-                np.random.seed(len(text) % 1000)
-                vec = np.random.randn(self.dim).astype(np.float32)
+                # Content-based seed: deterministic across processes, no global RNG mutation.
+                seed = sum(ord(c) for c in text[:64]) % 10000
+                rng = np.random.default_rng(seed)
+                vec = rng.standard_normal(self.dim).astype(np.float32)
                 vec /= np.linalg.norm(vec) + 1e-8
                 results.append(vec.tolist())
             return results
@@ -1917,7 +1716,8 @@ def _main() -> None:
         store.add_documents(docs)
 
         query_emb = _MockEmbeddings(dim=64).embed_query("relativity")
-        results = store.vector_search(query_emb, top_k=2)
+        # threshold=0.0: smoke test verifies plumbing, not semantic quality.
+        results = store.vector_search(query_emb, top_k=2, threshold=0.0)
         assert results, "Expected at least one vector result"
         logger.info("Smoke demo: vector_search returned %d results", len(results))
 

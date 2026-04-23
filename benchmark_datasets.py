@@ -124,7 +124,7 @@ PIPELINE_AVAILABLE = False
 AgentPipeline = None
 
 try:
-    from src.pipeline.agent_pipeline import AgentPipeline, create_full_pipeline
+    from src.pipeline import AgentPipeline, create_full_pipeline
     PIPELINE_AVAILABLE = True
 except ImportError:
     pass

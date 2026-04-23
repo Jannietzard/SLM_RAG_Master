@@ -179,10 +179,9 @@ class HotpotQAEvaluator:
 
         self.config["rag"]["retrieval_mode"] = retrieval_mode
 
-        from src.data_layer.storage import HybridStore, StorageConfig
-        from src.data_layer.embeddings import BatchedOllamaEmbeddings
-        from src.data_layer.hybrid_retriever import HybridRetriever, RetrievalConfig, RetrievalMode
-        from src.pipeline.agent_pipeline import create_full_pipeline
+        from src.data_layer import HybridStore, StorageConfig, BatchedOllamaEmbeddings
+        from src.data_layer import HybridRetriever, RetrievalConfig, RetrievalMode
+        from src.pipeline import create_full_pipeline
 
         # Build storage
         vector_path = PROJECT_ROOT / "data" / "hotpotqa" / "vector"

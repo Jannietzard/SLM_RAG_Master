@@ -61,7 +61,7 @@ construction time:
 USAGE
 ================================================================================
 
-    from src.pipeline.agent_pipeline import create_full_pipeline
+    from src.pipeline import create_full_pipeline
 
     pipeline = create_full_pipeline(
         hybrid_retriever=retriever,
@@ -154,6 +154,56 @@ def _create_passthrough_plan(query: str) -> "RetrievalPlan":
 
 
 # ============================================================================
+# PIPELINE CONFIGURATION
+# ============================================================================
+
+@dataclass
+class AgentPipelineConfig:
+    """
+    Pipeline-level configuration sourced from settings.yaml → agent.*.
+
+    Analogous to IngestionConfig for the ingestion side. All parameters have
+    dataclass defaults that match the thesis evaluation settings; in production
+    always construct via from_yaml() so settings.yaml is the single source of
+    truth.
+
+    Attributes:
+        enable_planner: When False, S_P is skipped and a passthrough
+            RetrievalPlan (HYBRID, MULTI_HOP) is used instead.
+        enable_verifier: When False, S_V is skipped and the top retrieved
+            chunk is returned directly as the answer.
+        enable_caching: Cache query results keyed by SHA-256 of the
+            normalised query string (FIFO eviction).
+        cache_max_size: Maximum number of cached entries before the oldest
+            is evicted.
+    """
+    enable_planner: bool = True
+    enable_verifier: bool = True
+    enable_caching: bool = True
+    cache_max_size: int = 1000
+
+    @classmethod
+    def from_yaml(cls, config: Dict[str, Any]) -> "AgentPipelineConfig":
+        """
+        Construct AgentPipelineConfig from a settings.yaml dict.
+
+        Args:
+            config: Full settings.yaml dict (or the relevant sub-dict). Missing
+                keys fall back to dataclass defaults.
+
+        Returns:
+            AgentPipelineConfig populated from config[\"agent\"].
+        """
+        agent = config.get("agent", {})
+        return cls(
+            enable_planner=agent.get("enable_planner", True),
+            enable_verifier=agent.get("enable_verifier", True),
+            enable_caching=agent.get("enable_caching", True),
+            cache_max_size=agent.get("cache_max_size", 1000),
+        )
+
+
+# ============================================================================
 # PIPELINE RESULT
 # ============================================================================
 
@@ -239,7 +289,8 @@ class AgentPipeline:
     VerifierConfig.max_iterations (sourced from settings.yaml:
     agent.max_verification_iterations). This pipeline calls
     generate_and_verify() exactly once per query.
-    Reference: Madaan, A. et al. (2023). "Self-Refine." NeurIPS 2023.
+    Reference: Madaan, A. et al. (2023). "Self-Refine: Iterative Refinement
+    with Self-Feedback." NeurIPS 2023. DOI: 10.48550/arXiv.2303.17651
 
     Thread safety: Not thread-safe. This pipeline is designed for the
     single-threaded edge deployment described in the thesis. Do not share
@@ -253,36 +304,21 @@ class AgentPipeline:
         verifier: Optional["Verifier"] = None,
         hybrid_retriever: Optional[Any] = None,
         graph_store: Optional[Any] = None,
-        enable_caching: bool = True,
-        cache_max_size: int = 1000,
         config: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Initialise the pipeline.
 
-        Parameters
-        ----------
-        planner : Planner, optional
-            S_P agent. Created lazily on first process() call if None.
-        navigator : Navigator, optional
-            S_N agent. Created lazily if None.
-        verifier : Verifier, optional
-            S_V agent. Created lazily if None.
-        hybrid_retriever : HybridRetriever, optional
-            Injected into Navigator for retrieval. If None, Navigator is
-            created but will fail on first retrieval call.
-        graph_store : KuzuGraphStore, optional
-            Injected into Verifier for provenance lookup.
-        enable_caching : bool
-            Cache query results (FIFO, keyed by SHA-256 of normalised query).
-            Source: settings.yaml → agent.enable_caching (default True).
-        cache_max_size : int
-            Maximum number of cached results before FIFO eviction.
-            Source: settings.yaml → agent.cache_max_size.
-        config : dict, optional
-            Full settings.yaml dict. If None or empty, all agent configs use
-            hardcoded fallback defaults — including max_iterations=2 (thesis
-            self-correction default). A warning is emitted in this case.
+        Args:
+            planner: S_P agent. Created lazily on first process() call if None.
+            navigator: S_N agent. Created lazily if None.
+            verifier: S_V agent. Created lazily if None.
+            hybrid_retriever: Injected into Navigator for retrieval. If None,
+                Navigator is created but will fail on first retrieval call.
+            graph_store: Injected into Verifier for provenance lookup.
+            config: Full settings.yaml dict. If None or empty, all agent configs
+                use hardcoded fallback defaults — including max_iterations=2 (thesis
+                self-correction default). A warning is emitted in this case.
         """
         self.config: Dict[str, Any] = config or {}
         if not self.config:
@@ -292,11 +328,11 @@ class AgentPipeline:
                 "Pass settings.yaml content for reproducible results."
             )
 
-        # Ablation flags — read from config so benchmark_datasets.py can
-        # override per-run without reconstructing the pipeline object.
-        agent_cfg = self.config.get("agent", {})
-        self.enable_planner: bool = agent_cfg.get("enable_planner", True)
-        self.enable_verifier: bool = agent_cfg.get("enable_verifier", True)
+        # Resolve pipeline-level flags via AgentPipelineConfig so all reads
+        # from settings.yaml → agent.* go through a single, typed path.
+        _pipeline_cfg = AgentPipelineConfig.from_yaml(self.config)
+        self.enable_planner: bool = _pipeline_cfg.enable_planner
+        self.enable_verifier: bool = _pipeline_cfg.enable_verifier
 
         # Agent instances (injected or lazy-created on first process() call)
         self.planner: Optional["Planner"] = planner
@@ -311,14 +347,15 @@ class AgentPipeline:
         # Python 3.7+ dicts preserve insertion order, so next(iter(cache))
         # reliably evicts the oldest entry. This is FIFO, not LRU — adequate
         # for the benchmark evaluation pattern where queries are processed once.
-        self.enable_caching: bool = enable_caching
+        self.enable_caching: bool = _pipeline_cfg.enable_caching
         self._cache: Dict[str, PipelineResult] = {}
-        self._cache_max_size: int = cache_max_size
+        self._cache_max_size: int = _pipeline_cfg.cache_max_size
 
         # Online statistics — use Welford's incremental mean for avg_latency_ms
         # to avoid storing all latency values.
         # Reference: Welford, B.P. (1962). "Note on a method for calculating
         # corrected sums of squares and products." Technometrics, 4(3), 419-420.
+        # DOI: 10.2307/1266577
         self._stats: Dict[str, Any] = {
             "total_queries": 0,
             "cache_hits": 0,
@@ -328,7 +365,7 @@ class AgentPipeline:
         logger.info(
             "AgentPipeline initialised: caching=%s, cache_max_size=%d, "
             "planner=%s, verifier=%s",
-            enable_caching, cache_max_size,
+            self.enable_caching, self._cache_max_size,
             self.enable_planner, self.enable_verifier,
         )
 
@@ -371,20 +408,22 @@ class AgentPipeline:
         """
         Process a single query through the full S_P → S_N → S_V pipeline.
 
-        Parameters
-        ----------
-        query : str
-            Natural language question (must be non-empty).
+        Inference-time errors (LLM unavailable, OOM, network timeout) are
+        caught and returned as a structured PipelineResult with
+        ``confidence="error"`` rather than propagating as unhandled exceptions.
+        This protects callers that invoke process() directly (as opposed to
+        going through BatchProcessor, which has its own per-query guard).
 
-        Returns
-        -------
-        PipelineResult
-            Contains the final answer, per-stage metadata, and timing.
+        Args:
+            query: Natural language question (must be non-empty).
 
-        Raises
-        ------
-        ValueError
-            If query is None or empty.
+        Returns:
+            PipelineResult with the final answer, per-stage metadata, and
+            timing. On inference failure the answer is ``"Error: <message>"``
+            and confidence is ``"error"``.
+
+        Raises:
+            ValueError: If query is None or empty.
         """
         if not query or not query.strip():
             raise ValueError("query must be a non-empty string")
@@ -407,126 +446,149 @@ class AgentPipeline:
         # ── Lazy agent initialisation ─────────────────────────────────────────
         self._lazy_init_agents()
 
-        # ── Stage 1: S_P (Planner) ────────────────────────────────────────────
-        planner_start = time.time()
-        if self.enable_planner:
-            plan = self.planner.plan(query)
-            planner_result = plan.to_dict()
-            logger.debug(
-                "S_P completed: type=%s strategy=%s (%.2fms)",
-                plan.query_type.value, plan.strategy.value,
-                (time.time() - planner_start) * 1000,
-            )
-        else:
-            # Ablation: --no-planner mode. Forces HYBRID strategy without
-            # any LLM call. Documented in TECHNICAL_ARCHITECTURE.md §5.1.
-            plan = _create_passthrough_plan(query)
-            from ..logic_layer.planner import QueryType, RetrievalStrategy
-            planner_result = {
-                "planner_skipped": True,
-                "query_type": QueryType.MULTI_HOP.value,
-                "strategy": RetrievalStrategy.HYBRID.value,
-            }
-            logger.info("S_P skipped (enable_planner=False)")
-        planner_time = (time.time() - planner_start) * 1000
+        # ── Inference stages (S_P → S_N → S_V) ───────────────────────────────
+        # Wrapped in a single try/except so that infrastructure failures
+        # (LLM unavailable, OOM, Ollama timeout) return a structured error
+        # result instead of propagating an unhandled exception to the caller.
+        # ValueError from query validation above is intentionally excluded —
+        # invalid queries must fail loudly.
+        planner_time: float = 0.0
+        navigator_time: float = 0.0
+        verifier_time: float = 0.0
+        planner_result: Dict[str, Any] = {}
+        navigator_result: Dict[str, Any] = {}
+        verifier_result: Dict[str, Any] = {}
+        answer: str = ""
+        confidence_val: str = "low"
 
-        # ── Stage 2: S_N (Navigator) ──────────────────────────────────────────
-        # Extract sub-queries from the planner's hop_sequence. For single-hop
-        # queries or passthrough plans the hop_sequence is empty, so the
-        # original query is used directly.
-        sub_queries: List[str] = (
-            [h.sub_query for h in plan.hop_sequence]
-            if plan.hop_sequence
-            else [query]
-        )
-
-        if self.enable_planner and not plan.hop_sequence:
-            logger.debug(
-                "Planner returned empty hop_sequence — using original query "
-                "as single sub-query."
-            )
-
-        navigator_start = time.time()
-        nav_result = self.navigator.navigate(plan, sub_queries)
-        navigator_time = (time.time() - navigator_start) * 1000
-
-        # asdict() performs a deep copy and recursively converts nested
-        # dataclasses, but converts Enum fields to their raw Enum objects
-        # (not .value strings). NavigatorResult currently contains only
-        # str/int/float/list/bool fields, so json.dumps() in to_json() is
-        # safe. If NavigatorResult gains Enum fields in the future, add an
-        # explicit Enum→str conversion here (see verifier_result handling
-        # at line ~501 for the pattern).
-        navigator_result = asdict(nav_result)
-        logger.debug(
-            "S_N completed: %d chunks (%.2fms)",
-            len(nav_result.filtered_context), navigator_time,
-        )
-
-        # ── Stage 3: S_V (Verifier) ───────────────────────────────────────────
-        # process() calls generate_and_verify() exactly once. The self-correction
-        # loop (up to max_verification_iterations rounds) is managed entirely
-        # inside the Verifier. An outer retry loop would be a no-op because
-        # temperature=0.1 makes the LLM nearly deterministic.
-        # See TECHNICAL_ARCHITECTURE.md §12.2.
-        verifier_start = time.time()
-        if self.enable_verifier:
-            # Extract entities and hop_sequence from the plan so the Verifier
-            # can run entity-path validation (enable_entity_path_validation in
-            # settings.yaml). Without these, pre-validation is silently skipped.
-            plan_entities: List[str] = (
-                [e.text for e in plan.entities] if plan.entities else []
-            )
-            plan_hop_sequence = plan.hop_sequence if plan.hop_sequence else None
-
-            gen_result = self.verifier.generate_and_verify(
-                query=query,
-                context=nav_result.filtered_context,
-                entities=plan_entities,
-                hop_sequence=plan_hop_sequence,
-            )
-            # asdict() deep-copies the dataclass but converts Enum fields to raw
-            # Enum objects, not .value strings. Override every Enum field explicitly
-            # so json.dumps() in to_json() never raises TypeError.
-            gen_dict = asdict(gen_result)
-            # Top-level: confidence (ConfidenceLevel enum)
-            gen_dict["confidence"] = gen_result.confidence.value
-            # Nested: pre_validation.status (ValidationStatus enum), when present
-            if gen_result.pre_validation is not None and gen_dict.get("pre_validation"):
-                gen_dict["pre_validation"]["status"] = (
-                    gen_result.pre_validation.status.value
+        try:
+            # ── Stage 1: S_P (Planner) ────────────────────────────────────────
+            planner_start = time.time()
+            if self.enable_planner:
+                plan = self.planner.plan(query)
+                planner_result = plan.to_dict()
+                logger.debug(
+                    "S_P completed: type=%s strategy=%s (%.2fms)",
+                    plan.query_type.value, plan.strategy.value,
+                    (time.time() - planner_start) * 1000,
                 )
-            verifier_result: Dict[str, Any] = gen_dict
-            answer: str = gen_result.answer
-            confidence_val: str = gen_result.confidence.value
+            else:
+                # Ablation: --no-planner mode. Forces HYBRID strategy without
+                # any LLM call. Documented in TECHNICAL_ARCHITECTURE.md §5.1.
+                plan = _create_passthrough_plan(query)
+                from ..logic_layer.planner import QueryType, RetrievalStrategy
+                planner_result = {
+                    "planner_skipped": True,
+                    "query_type": QueryType.MULTI_HOP.value,
+                    "strategy": RetrievalStrategy.HYBRID.value,
+                }
+                logger.info("S_P skipped (enable_planner=False)")
+            planner_time = (time.time() - planner_start) * 1000
+
+            # ── Stage 2: S_N (Navigator) ──────────────────────────────────────
+            # Extract sub-queries from the planner's hop_sequence. For single-hop
+            # queries or passthrough plans the hop_sequence is empty, so the
+            # original query is used directly.
+            sub_queries: List[str] = (
+                [h.sub_query for h in plan.hop_sequence]
+                if plan.hop_sequence
+                else [query]
+            )
+            if self.enable_planner and not plan.hop_sequence:
+                logger.debug(
+                    "Planner returned empty hop_sequence — using original query "
+                    "as single sub-query."
+                )
+
+            navigator_start = time.time()
+            nav_result = self.navigator.navigate(plan, sub_queries)
+            navigator_time = (time.time() - navigator_start) * 1000
+
+            # asdict() performs a deep copy and recursively converts nested
+            # dataclasses, but converts Enum fields to their raw Enum objects
+            # (not .value strings). NavigatorResult currently contains only
+            # str/int/float/list/bool fields, so json.dumps() in to_json() is
+            # safe. If NavigatorResult gains Enum fields in the future, add an
+            # explicit Enum→str conversion here (see verifier_result handling
+            # below for the pattern).
+            navigator_result = asdict(nav_result)
             logger.debug(
-                "S_V completed: confidence=%s iterations=%d (%.2fms)",
-                confidence_val, gen_result.iterations,
-                (time.time() - verifier_start) * 1000,
+                "S_N completed: %d chunks (%.2fms)",
+                len(nav_result.filtered_context), navigator_time,
             )
-        else:
-            # Ablation: --no-verifier mode. Return the highest-ranked retrieved
-            # chunk as a direct answer. Confidence is set to "low" since no
-            # consistency check has been performed.
-            answer = (
-                nav_result.filtered_context[0].strip()
-                if nav_result.filtered_context
-                else "No answer found."
+
+            # ── Stage 3: S_V (Verifier) ───────────────────────────────────────
+            # process() calls generate_and_verify() exactly once. The self-correction
+            # loop (up to max_verification_iterations rounds) is managed entirely
+            # inside the Verifier. An outer retry loop would be a no-op because
+            # temperature=0.1 makes the LLM nearly deterministic.
+            # See TECHNICAL_ARCHITECTURE.md §12.2.
+            verifier_start = time.time()
+            if self.enable_verifier:
+                # Extract entities and hop_sequence from the plan so the Verifier
+                # can run entity-path validation (enable_entity_path_validation in
+                # settings.yaml). Without these, pre-validation is silently skipped.
+                plan_entities: List[str] = (
+                    [e.text for e in plan.entities] if plan.entities else []
+                )
+                plan_hop_sequence = plan.hop_sequence if plan.hop_sequence else None
+
+                gen_result = self.verifier.generate_and_verify(
+                    query=query,
+                    context=nav_result.filtered_context,
+                    entities=plan_entities,
+                    hop_sequence=plan_hop_sequence,
+                )
+                # asdict() deep-copies the dataclass but converts Enum fields to raw
+                # Enum objects, not .value strings. Override every Enum field explicitly
+                # so json.dumps() in to_json() never raises TypeError.
+                gen_dict = asdict(gen_result)
+                gen_dict["confidence"] = gen_result.confidence.value
+                if gen_result.pre_validation is not None and gen_dict.get("pre_validation"):
+                    gen_dict["pre_validation"]["status"] = (
+                        gen_result.pre_validation.status.value
+                    )
+                verifier_result = gen_dict
+                answer = gen_result.answer
+                confidence_val = gen_result.confidence.value
+                logger.debug(
+                    "S_V completed: confidence=%s iterations=%d (%.2fms)",
+                    confidence_val, gen_result.iterations,
+                    (time.time() - verifier_start) * 1000,
+                )
+            else:
+                # Ablation: --no-verifier mode.
+                answer = (
+                    nav_result.filtered_context[0].strip()
+                    if nav_result.filtered_context
+                    else "No answer found."
+                )
+                confidence_val = "low"
+                verifier_result = {
+                    "verifier_skipped": True,
+                    "answer": answer,
+                    "confidence": "low",
+                }
+                logger.info("S_V skipped (enable_verifier=False)")
+            verifier_time = (time.time() - verifier_start) * 1000
+
+        except Exception as exc:  # noqa: BLE001
+            # Structured error result — never swallowed silently.
+            # Callers detect failure via result.confidence == "error".
+            logger.error(
+                "Pipeline inference error for query '%.60s': %s",
+                query, exc, exc_info=True,
             )
-            confidence_val = "low"
-            verifier_result = {
-                "verifier_skipped": True,
-                "answer": answer,
-                "confidence": "low",
-            }
-            logger.info("S_V skipped (enable_verifier=False)")
-        verifier_time = (time.time() - verifier_start) * 1000
+            answer = f"Error: {exc}"
+            confidence_val = "error"
+            verifier_result = {"error": str(exc), "confidence": "error"}
 
         total_time = (time.time() - start_time) * 1000
 
         # ── Welford online mean for avg_latency_ms ────────────────────────────
         # Avoids accumulating all latency values in a list.
-        # Reference: Welford (1962), Technometrics 4(3), 419-420.
+        # Reference: Welford, B.P. (1962). Technometrics, 4(3), 419-420.
+        # DOI: 10.2307/1266577
         n = self._stats["total_queries"]
         self._stats["avg_latency_ms"] += (
             (total_time - self._stats["avg_latency_ms"]) / n
@@ -631,17 +693,14 @@ class BatchProcessor:
         """
         Process a list of queries sequentially.
 
-        Parameters
-        ----------
-        queries : List[str]
-        return_details : bool
-            If True, return full PipelineResult dicts; otherwise return
-            simplified {query, answer, confidence, latency_ms} dicts.
+        Args:
+            queries: List of natural language questions.
+            return_details: If True, return full PipelineResult dicts;
+                otherwise return simplified {query, answer, confidence,
+                latency_ms} dicts.
 
-        Returns
-        -------
-        List[Dict]
-            One entry per query; failed queries contain an "error" key.
+        Returns:
+            One dict per query; failed queries contain an ``"error"`` key.
         """
         results: List[Dict[str, Any]] = []
         total = len(queries)
@@ -716,22 +775,24 @@ def create_full_pipeline(
     """
     Primary factory for a fully configured AgentPipeline.
 
-    Creates Planner, Navigator, and Verifier with injected stores and
-    settings.yaml-sourced configuration. This is the entry point called by
-    benchmark_datasets.py for all evaluation runs.
+    Injects ``hybrid_retriever`` and ``graph_store`` into the pipeline, then
+    calls ``_lazy_init_agents()`` to construct all three agents using the same
+    code path as the lazy-init route in ``process()``. This ensures that
+    ``create_full_pipeline`` and lazy initialisation always produce identical
+    agent configurations (DRY principle).
 
-    Parameters
-    ----------
-    hybrid_retriever : HybridRetriever
-        Data-layer retriever (LanceDB + KuzuDB) for Navigator.
-    graph_store : KuzuGraphStore
-        Graph store for Verifier provenance lookup.
-    config : dict, optional
-        Full settings.yaml dict. Pass None only for unit tests.
+    This is the entry point called by benchmark_datasets.py and
+    evaluate_hotpotqa.py for all evaluation runs.
 
-    Returns
-    -------
-    AgentPipeline
+    Args:
+        hybrid_retriever: Data-layer retriever (LanceDB + KuzuDB) for Navigator.
+        graph_store: Graph store for Verifier provenance lookup.
+        config: Full settings.yaml dict. Pass None only for unit tests — doing
+            so applies all hardcoded defaults, which may not match the thesis
+            evaluation configuration.
+
+    Returns:
+        Fully initialised AgentPipeline with all three agents wired.
     """
     config = config or {}
     if not config:
@@ -741,73 +802,14 @@ def create_full_pipeline(
             "Pass settings.yaml content for reproducible evaluation results."
         )
 
-    from ..logic_layer.planner import create_planner
-    from ..logic_layer.navigator import Navigator
-    from ..logic_layer.verifier import Verifier
-
-    planner = create_planner(config)
-
-    nav_config = _navigator_config_from_cfg(config)
-    navigator = Navigator(nav_config)
-    navigator.set_retriever(hybrid_retriever)
-
-    verifier_config = _verifier_config_from_cfg(config)
-    verifier = Verifier(config=verifier_config, graph_store=graph_store)
-
-    agent_cfg = config.get("agent", {})
-    enable_caching: bool = agent_cfg.get("enable_caching", True)
-    cache_max_size: int = agent_cfg.get("cache_max_size", 1000)
-
-    return AgentPipeline(
-        planner=planner,
-        navigator=navigator,
-        verifier=verifier,
+    pipeline = AgentPipeline(
         hybrid_retriever=hybrid_retriever,
         graph_store=graph_store,
-        enable_caching=enable_caching,
-        cache_max_size=cache_max_size,
         config=config,
     )
-
-
-def create_pipeline(
-    planner: Optional[Any] = None,
-    navigator: Optional[Any] = None,
-    verifier: Optional[Any] = None,
-    hybrid_retriever: Optional[Any] = None,
-    graph_store: Optional[Any] = None,
-    config: Optional[Dict[str, Any]] = None,
-) -> AgentPipeline:
-    """
-    Backward-compatible no-arg factory — creates an AgentPipeline and eagerly
-    initialises all three agents with default configs.
-
-    .. deprecated:: v4.1.0
-        Introduced to preserve the pre-4.1.0 test interface. New code must
-        use :func:`create_full_pipeline`, which accepts a full settings.yaml
-        dict and properly wired ``hybrid_retriever``/``graph_store``.
-        ``create_pipeline`` will be removed in a future release.
-
-        Still called in ``benchmark_datasets.py`` at lines ~1107, ~1198, and
-        ~1235 — migrate those call sites to ``create_full_pipeline`` before
-        removing this function.
-
-    Notes
-    -----
-    When called without a ``config`` argument, all agent configs fall back to
-    hardcoded defaults (see ``_verifier_config_from_cfg``). Results produced
-    this way are not reproducible from ``settings.yaml`` and must not be used
-    for thesis evaluation.
-    """
-    pipeline = AgentPipeline(
-        planner=planner,
-        navigator=navigator,
-        verifier=verifier,
-        hybrid_retriever=hybrid_retriever,
-        graph_store=graph_store,
-        config=config or {},
-    )
-    # Eagerly build agents so callers can inspect pipeline.planner etc.
+    # Eagerly build all three agents using the shared _lazy_init_agents() path.
+    # This is the only place where agent construction should occur so that
+    # create_full_pipeline() and the lazy-init path stay in sync.
     pipeline._lazy_init_agents()
     return pipeline
 
@@ -902,7 +904,7 @@ def _main() -> None:
     logger.info("Smoke demo passed.")
 
     # ── pytest ────────────────────────────────────────────────────────────────
-    test_file = Path(__file__).parent / "test_pipeline.py"
+    test_file = Path(__file__).parent.parent.parent / "test_system" / "test_pipeline.py"
     proc = subprocess.run(
         [sys.executable, "-X", "utf8", "-m", "pytest", str(test_file), "-v"],
         check=False,

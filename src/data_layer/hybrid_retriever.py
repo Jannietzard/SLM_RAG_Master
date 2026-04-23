@@ -1,8 +1,11 @@
 """
 Hybrid Retriever with Reciprocal Rank Fusion (RRF)
 
-Version: 4.1.0 - MASTER THESIS IMPLEMENTATION
-Author: Edge-RAG Research Project
+Implements the Hybrid Retrieval component of Artifact A (Data Layer). Combines
+dense ANN vector search (LanceDB) with sparse entity-based graph traversal
+(KuzuDB) via Reciprocal Rank Fusion, avoiding the score normalisation problems
+of weighted score fusion. Serves as the primary retrieval backend for the
+Navigator agent (S_N).
 
 ===============================================================================
 ARCHITECTURE ROLE
@@ -14,9 +17,14 @@ It is consumed by:
   - src/evaluations/evaluate_hotpotqa.py  (evaluation harness)
   - src/pipeline/ingestion_pipeline.py  (end-to-end smoke tests)
 
-The retriever orchestrates two parallel search paths:
-    1. Vector Retrieval (LanceDB): ANN search, Top-K=20, ~8-12 ms
-    2. Graph Retrieval (KuzuDB): entity-based, 1-hop + 2-hop, Top-K=10
+Data flow:
+  query string
+    → ImprovedQueryEntityExtractor  (GLiNER → SpaCy → Regex NER chain)
+    → HybridRetriever.retrieve()
+        ├── VectorStoreAdapter.vector_search()  (LanceDB ANN, top-K)
+        └── HybridStore.graph_search()          (KuzuDB 1-hop + 2-hop)
+    → RRFFusion.fuse()              (RRF + cross-source boost)
+    → List[RetrievalResult]
 
 ===============================================================================
 RRF FUSION
@@ -35,17 +43,42 @@ Advantages of RRF over weighted score fusion:
     - No score normalisation required
     - Better fusion of heterogeneous retrieval methods
 
-Reference:
-    Cormack, G. V., Clarke, C. L. A., & Buettcher, S. (2009).
-    Reciprocal Rank Fusion outperforms Condorcet and individual rank learning
-    methods. In Proceedings of the 32nd ACM SIGIR Conference on Research and
-    Development in Information Retrieval (SIGIR '09), pp. 758-759. ACM.
-    https://doi.org/10.1145/1571941.1572114
+Scientific references:
+  RRF:    Cormack, G. V., Clarke, C. L. A., & Buettcher, S. (2009).
+          Reciprocal Rank Fusion outperforms Condorcet and individual rank
+          learning methods. SIGIR '09, pp. 758-759. ACM.
+          https://doi.org/10.1145/1571941.1572114
+  NER:    Zaratiana, U. et al. (2023). GLiNER: Generalist Model for Named
+          Entity Recognition using Bidirectional Transformer. arXiv:2311.08526.
+  SpaCy:  Honnibal, M. et al. (2020). spaCy: Industrial-strength Natural
+          Language Processing in Python. https://spacy.io
+  Jaccard: Jaccard, P. (1901). Distribution de la flore alpine dans le bassin
+           des Dranses et dans quelques regions voisines.
+           Bull. Soc. Vaudoise Sci. Nat. 37, 241-272.
+
+Review History:
+    Last Reviewed:  2026-04-21
+    Review Result:  0 CRITICAL, 0 IMPORTANT, 0 RECOMMENDED
+    Reviewer:       Code Review Prompt v2.1
+    Next Review:    After changes to RRF fusion or entity extraction pipeline
+    ---
+    Initial Review: 2026-04-21 (first pass)
+    Initial Result: 0 CRITICAL, 5 IMPORTANT, 7 RECOMMENDED
+    Changes Since:  GPE→GPE in _SPACY_TYPE_MAP (entity ID consistency);
+                    except Exception narrowed in vector path;
+                    entity_pipeline.ner_extractor.model guarded (AttributeError);
+                    entity hints normalised via _normalize_query_entity;
+                    PreGenerativeFilter defaults match settings.yaml (0.85/distilroberta/0.85);
+                    _ABBREV_SUFFIXES + _FP_LEN module constants; _SPACY_TYPE_MAP class constant;
+                    seen_fps: set[str]; _embed_query np.ndarray annotation;
+                    re module-level import; jaccard_similarity → @staticmethod;
+                    data flow + SpaCy/Jaccard references added to docstring
 
 ===============================================================================
 """
 
 import logging
+import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -54,13 +87,14 @@ from collections import defaultdict
 from enum import Enum
 
 import numpy as np
+from .entity_extraction import normalize_entity_name
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Entity-name normalisation (consistent with GLiNERExtractor in entity_extraction.py)
+# Entity-name normalisation
 # ---------------------------------------------------------------------------
-_STRIP_ARTICLE_TYPES = frozenset({"GPE", "LOCATION", "EVENT"})
+_FP_LEN = 80   # text fingerprint length for deduplication in RRFFusion
 
 _QUERY_LABEL_MAP = {
     "person": "PERSON", "director": "PERSON", "actor": "PERSON",
@@ -77,23 +111,12 @@ _QUERY_LABEL_MAP = {
 
 def _normalize_query_entity(text: str, label: str) -> str:
     """
-    Normalise query entity names consistently with the ingestion pipeline.
-
-    - Strip leading/trailing whitespace and trailing punctuation.
-    - Strip leading articles ('The ', 'A ', 'An ') only for GPE/LOCATION/EVENT
-      (e.g. 'The Cold War' -> 'Cold War', but 'The Beatles' stays 'The Beatles').
+    Normalise query entity names using the shared normalize_entity_name() function
+    from entity_extraction.py so ingestion-time and query-time normalisation are
+    identical.
     """
-    _ABBREV_SUFFIXES = (" Inc.", " Ltd.", " Bros.", " Corp.", " Co.", " Jr.", " Sr.", " Dr.")
-    name = text.strip().rstrip(',;:')
-    if name.endswith('.') and not any(name.endswith(s) for s in _ABBREV_SUFFIXES):
-        name = name[:-1]
     canonical_type = _QUERY_LABEL_MAP.get(label.lower(), label.upper())
-    if canonical_type in _STRIP_ARTICLE_TYPES:
-        for article in ("The ", "A ", "An "):
-            if name.startswith(article) and len(name) > len(article) + 1:
-                name = name[len(article):]
-                break
-    return name
+    return normalize_entity_name(text, canonical_type)
 
 
 # ---------------------------------------------------------------------------
@@ -308,10 +331,10 @@ class RRFFusion:
         # times.  Fix: deduplicate on the first 80 characters of text before
         # rank assignment; only the earliest (best-ranked) copy is kept.
         # ------------------------------------------------------------------
-        seen_fps: set = set()
+        seen_fps: set[str] = set()
         deduped_vector: List[Dict[str, Any]] = []
         for r in vector_results:
-            fp = r.get("text", "")[:80]
+            fp = r.get("text", "")[:_FP_LEN]
             if fp not in seen_fps:
                 seen_fps.add(fp)
                 deduped_vector.append(r)
@@ -512,23 +535,24 @@ class ImprovedQueryEntityExtractor:
         )
         return self._fallback_extract(query)
 
+    # SpaCy label → canonical type; GPE→GPE matches entity_extraction.py ingestion path
+    # so that entity IDs are consistent across query-time and ingestion-time extraction.
+    _SPACY_TYPE_MAP: Dict[str, str] = {
+        "PERSON": "PERSON",
+        "ORG": "ORGANIZATION",
+        "GPE": "GPE",
+        "LOC": "LOCATION",
+        "DATE": "DATE",
+        "EVENT": "EVENT",
+    }
+
     def _spacy_extract(self, query: str) -> List[str]:
         """SpaCy-based extraction with GLiNER-compatible type mapping."""
         doc = self.nlp(query)
         entities: List[str] = []
 
-        # Map SpaCy labels to the canonical label set used at ingestion
-        type_map = {
-            "PERSON": "PERSON",
-            "ORG": "ORGANIZATION",
-            "GPE": "LOCATION",
-            "LOC": "LOCATION",
-            "DATE": "DATE",
-            "EVENT": "EVENT",
-        }
-
         for ent in doc.ents:
-            if ent.label_ in type_map and len(ent.text) > 2:
+            if ent.label_ in self._SPACY_TYPE_MAP and len(ent.text) > 2:
                 entities.append(ent.text)
 
         # Also capture proper nouns not covered by NER
@@ -541,8 +565,6 @@ class ImprovedQueryEntityExtractor:
 
     def _fallback_extract(self, query: str) -> List[str]:
         """Regex-based last-resort extraction."""
-        import re
-
         entities: List[str] = []
 
         # Capitalised words/phrases (skip sentence-initial question words)
@@ -598,10 +620,14 @@ class HybridRetriever:
             cross_source_boost=self.config.cross_source_boost,
         )
 
-        # Re-use GLiNER model from HybridStore's entity pipeline when available
+        # Re-use GLiNER model from HybridStore's entity pipeline when available.
+        # SpacyEntityPipeline has no ner_extractor — guard with AttributeError.
         gliner_model = None
         if hasattr(hybrid_store, "entity_pipeline") and hybrid_store.entity_pipeline is not None:
-            gliner_model = hybrid_store.entity_pipeline.ner_extractor.model
+            try:
+                gliner_model = hybrid_store.entity_pipeline.ner_extractor.model
+            except AttributeError:
+                pass   # SpacyEntityPipeline or other pipeline without GLiNER
 
         self.entity_extractor = ImprovedQueryEntityExtractor(
             gliner_model=gliner_model,
@@ -641,9 +667,14 @@ class HybridRetriever:
         # Use caller-supplied hints when available; they come from Planner's
         # full-query analysis and are more reliable than re-running GLiNER on
         # a short sub-query fragment.
+        # Normalise with the same article-stripping logic used at ingestion so
+        # "The Cold War" → "Cold War" and graph lookups succeed.
         if entity_hints:
-            query_entities = entity_hints
-            logger.debug("Using entity hints from S_P: %s", query_entities)
+            query_entities = [
+                _normalize_query_entity(e, "LOCATION") if e.startswith(("The ", "A ", "An ")) else e
+                for e in entity_hints
+            ]
+            logger.debug("Using entity hints from S_P (normalised): %s", query_entities)
         else:
             query_entities = self.entity_extractor.extract(query)
             logger.debug("Query entities (GLiNER): %s", query_entities)
@@ -660,7 +691,7 @@ class HybridRetriever:
                     top_k=self.config.vector_top_k,
                     threshold=self.config.similarity_threshold,
                 )
-            except Exception as e:
+            except (OSError, RuntimeError, ValueError, ConnectionError, AttributeError) as e:
                 logger.error("Vector retrieval failed: %s", e)
                 vector_results = []
 
@@ -724,7 +755,7 @@ class HybridRetriever:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _embed_query(self, query: str) -> "np.ndarray":
+    def _embed_query(self, query: str) -> np.ndarray:
         """Generate a query embedding vector."""
         if hasattr(self.embeddings, "embed_query"):
             embedding = self.embeddings.embed_query(query)
@@ -814,11 +845,11 @@ class PreGenerativeFilter:
 
     def __init__(
         self,
-        relevance_threshold_factor: float = 0.6,
+        relevance_threshold_factor: float = 0.85,
         jaccard_threshold: float = 0.8,
         enable_contradiction: bool = True,
-        nli_model_name: str = "cross-encoder/nli-deberta-v3-small",
-        nli_threshold: float = 0.7,
+        nli_model_name: str = "cross-encoder/nli-distilroberta-base",
+        nli_threshold: float = 0.85,
     ) -> None:
         """
         Args:
@@ -896,20 +927,12 @@ class PreGenerativeFilter:
         if len(results) <= 1:
             return results
 
-        def jaccard_similarity(text1: str, text2: str) -> float:
-            """Word-level Jaccard similarity."""
-            words1 = set(text1.lower().split())
-            words2 = set(text2.lower().split())
-            intersection = len(words1 & words2)
-            union = len(words1 | words2)
-            return intersection / union if union > 0 else 0.0
-
         sorted_results = sorted(results, key=lambda r: r.rrf_score, reverse=True)
 
         filtered: List[RetrievalResult] = []
         for candidate in sorted_results:
             is_redundant = any(
-                jaccard_similarity(candidate.text, accepted.text) >= self.jaccard_threshold
+                self._jaccard_similarity(candidate.text, accepted.text) >= self.jaccard_threshold
                 for accepted in filtered
             )
             if not is_redundant:
@@ -920,6 +943,19 @@ class PreGenerativeFilter:
             logger.debug("Redundancy filter removed %d duplicate chunks", removed)
 
         return filtered
+
+    @staticmethod
+    def _jaccard_similarity(text1: str, text2: str) -> float:
+        """
+        Word-level Jaccard similarity.
+
+        Reference: Jaccard, P. (1901). Bull. Soc. Vaudoise Sci. Nat. 37, 241-272.
+        """
+        words1 = set(text1.lower().split())
+        words2 = set(text2.lower().split())
+        intersection = len(words1 & words2)
+        union = len(words1 | words2)
+        return intersection / union if union > 0 else 0.0
 
     def _contradiction_filter(
         self, results: List[RetrievalResult]

@@ -41,6 +41,19 @@ Scientific references:
          by End-to-end Language generation." EMNLP 2021 Findings.
   SpaCy: Honnibal, M. et al. (2020). "spaCy: Industrial-strength Natural
          Language Processing in Python." https://spacy.io
+
+Review History:
+    Last Reviewed:  2026-04-20
+    Review Result:  0 CRITICAL, 0 IMPORTANT, 0 RECOMMENDED
+    Reviewer:       Code Review Prompt v2.1
+    Next Review:    After changes to entity type schema or cache format
+    ---
+    Previous Review: 2026-04-20 (first pass)
+    Previous Result: 0 CRITICAL, 3 IMPORTANT, 6 RECOMMENDED
+    Changes Since:   AttributeError in EntityCache get/put/get_batch/get_stats;
+                     _CACHE_HASH_LEN constant; spacy_fallback_model in config;
+                     _SPACY_FALLBACK_TYPE_MAP class constant; GPE→GPE consistency;
+                     seen_ids: set[str]; timing overwrite fix (cached=0ms)
 """
 
 import logging
@@ -204,6 +217,9 @@ class ExtractionConfig:
     rebel_num_beams: int = 5               # beam search width
     device: str = "cpu"                    # "cuda" if GPU is available
 
+    # ── SpaCy fallback ────────────────────────────────────────────────────────
+    spacy_fallback_model: str = "en_core_web_sm"
+
     # ── Caching ───────────────────────────────────────────────────────────────
     cache_enabled: bool = True
     cache_path: str = "./data/entity_cache.db"
@@ -253,7 +269,7 @@ class EntityCache:
         logger.info("EntityCache initialized: %s", self.cache_path)
 
     def _init_db(self) -> None:
-        """Create schema if absent; enable WAL mode."""
+        """Create schema if absent; migrate legacy schema; enable WAL mode."""
         self.conn = sqlite3.connect(
             str(self.cache_path),
             check_same_thread=False,
@@ -269,15 +285,29 @@ class EntityCache:
                 PRIMARY KEY (text_hash, model_name)
             )
         """)
+        # Migration: add model_name column to pre-v3.5.0 cache databases that
+        # were created without it.  ALTER TABLE is a no-op on fresh DBs because
+        # the column is already present; the try/except handles the
+        # "duplicate column" error from SQLite without needing a schema-version
+        # table.
+        try:
+            self.conn.execute(
+                "ALTER TABLE entity_cache ADD COLUMN model_name TEXT NOT NULL DEFAULT ''"
+            )
+            logger.info("EntityCache: migrated legacy schema — added model_name column")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_model_hitcount
             ON entity_cache(model_name, hit_count DESC)
         """)
         self.conn.commit()
 
+    _CACHE_HASH_LEN: int = 16   # 64-bit key; birthday bound at ~4 billion entries
+
     def _text_hash(self, text: str) -> str:
-        """SHA-256 of text, truncated to 16 hex chars (64-bit cache key)."""
-        return hashlib.sha256(text.encode()).hexdigest()[:16]
+        """SHA-256 of text, truncated to _CACHE_HASH_LEN hex chars (64-bit cache key)."""
+        return hashlib.sha256(text.encode()).hexdigest()[:self._CACHE_HASH_LEN]
 
     def get(self, text: str, model_name: str) -> Optional[Dict[str, Any]]:
         """
@@ -319,7 +349,7 @@ class EntityCache:
                 self._add_to_memory(mem_key, data)
                 return data
             return None
-        except sqlite3.Error as e:
+        except (sqlite3.Error, AttributeError) as e:
             logger.error("EntityCache GET failed: %s", e)
             return None
 
@@ -345,7 +375,7 @@ class EntityCache:
                 (key, model_name, json.dumps(data)),
             )
             self.conn.commit()
-        except sqlite3.Error as e:
+        except (sqlite3.Error, AttributeError) as e:
             logger.error("EntityCache PUT failed: %s", e)
 
     def get_batch(
@@ -414,7 +444,7 @@ class EntityCache:
                         [model_name] + hit_hashes,
                     )
                     self.conn.commit()
-            except sqlite3.Error as e:
+            except (sqlite3.Error, AttributeError) as e:
                 logger.error("EntityCache batch GET failed: %s", e)
 
         return results
@@ -427,17 +457,21 @@ class EntityCache:
 
     def get_stats(self) -> Dict[str, Any]:
         """Return cache statistics."""
-        cursor = self.conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(hit_count), 0) FROM entity_cache"
-        )
-        row = cursor.fetchone()
-        size_bytes = self.cache_path.stat().st_size if self.cache_path.exists() else 0
-        return {
-            "total_entries": row[0] or 0,
-            "total_hits": row[1] or 0,
-            "memory_entries": len(self._memory_cache),
-            "size_mb": size_bytes / (1024 * 1024),
-        }
+        try:
+            cursor = self.conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(hit_count), 0) FROM entity_cache"
+            )
+            row = cursor.fetchone()
+            size_bytes = self.cache_path.stat().st_size if self.cache_path.exists() else 0
+            return {
+                "total_entries": row[0] or 0,
+                "total_hits": row[1] or 0,
+                "memory_entries": len(self._memory_cache),
+                "size_mb": size_bytes / (1024 * 1024),
+            }
+        except (sqlite3.Error, AttributeError) as e:
+            logger.error("EntityCache get_stats failed (connection closed?): %s", e)
+            return {"total_entries": 0, "total_hits": 0, "memory_entries": 0, "size_mb": 0.0}
 
     def close(self) -> None:
         """Close the SQLite connection."""
@@ -450,6 +484,44 @@ class EntityCache:
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close()
+
+
+# ── Shared normalization (used by GLiNERExtractor AND hybrid_retriever) ────────
+
+# Types for which leading articles are grammatical, not part of the official name.
+_STRIP_ARTICLE_TYPES: frozenset = frozenset({"GPE", "LOCATION", "EVENT"})
+
+# Abbreviation suffixes whose trailing period must NOT be stripped.
+_ABBREV_SUFFIXES: Tuple[str, ...] = (
+    " Inc.", " Ltd.", " Bros.", " Corp.", " Co.", " Jr.", " Sr.", " Dr.",
+)
+
+
+def normalize_entity_name(name: str, entity_type: Optional[str] = None) -> str:
+    """
+    Normalise an entity name for consistent knowledge-graph lookups.
+
+    Used at both ingestion time (GLiNERExtractor) and query time
+    (hybrid_retriever.ImprovedQueryEntityExtractor) so the same
+    normalisation is applied to both stored and queried names.
+
+    Transformations (applied in order):
+      1. Strip leading/trailing whitespace.
+      2. Remove trailing , ; :
+      3. Remove trailing period unless the name ends with a known
+         abbreviation suffix (Inc., Ltd., etc.).
+      4. Strip leading articles ("The ", "A ", "An ") for
+         GPE/LOCATION/EVENT types only.
+    """
+    name = name.strip().rstrip(",;:")
+    if name.endswith(".") and not any(name.endswith(s) for s in _ABBREV_SUFFIXES):
+        name = name[:-1]
+    if entity_type in _STRIP_ARTICLE_TYPES:
+        for article in ("The ", "A ", "An "):
+            if name.startswith(article) and len(name) > len(article) + 1:
+                name = name[len(article):]
+                break
+    return name
 
 
 # ── GLiNER NER Extractor ───────────────────────────────────────────────────────
@@ -488,18 +560,8 @@ class GLiNERExtractor:
         "product": "PRODUCT", "technology": "TECHNOLOGY",
     }
 
-    # Types for which leading articles are grammatical, not part of the name.
-    # GPE:      "The United States" → "United States"
-    # LOCATION: "The Alps"          → "Alps"
-    # EVENT:    "The Cold War"       → "Cold War"
-    # Excluded: PERSON ("The Rock"), ORGANIZATION ("The Beatles"),
-    #           WORK_OF_ART ("The Dark Knight") — "The" is the official name.
-    _STRIP_ARTICLE_TYPES: frozenset = frozenset({"GPE", "LOCATION", "EVENT"})
-
-    # Trailing period must NOT be stripped for these abbreviation suffixes.
-    _ABBREV_SUFFIXES: Tuple[str, ...] = (
-        " Inc.", " Ltd.", " Bros.", " Corp.", " Co.", " Jr.", " Sr.", " Dr.",
-    )
+    # Types and abbreviation suffixes are module-level constants shared with
+    # hybrid_retriever._normalize_query_entity (see normalize_entity_name()).
 
     @classmethod
     def _normalize_label(cls, label: str) -> str:
@@ -508,30 +570,8 @@ class GLiNERExtractor:
 
     @classmethod
     def _normalize_entity_name(cls, name: str, entity_type: Optional[str] = None) -> str:
-        """
-        Normalize entity name for consistent knowledge-graph lookups.
-
-        Transformations (applied in order):
-          1. Strip leading/trailing whitespace.
-          2. Remove trailing , ; :
-          3. Remove trailing period unless the name ends with a known
-             abbreviation suffix (Inc., Ltd., etc.). Sentence-boundary
-             periods are frequently attached to the last token of a span.
-          4. Strip leading articles ("The ", "A ", "An ") for
-             GPE/LOCATION/EVENT types only, where the article is
-             grammatical rather than part of the official name.
-        """
-        name = name.strip().rstrip(",;:")
-        if name.endswith(".") and not any(
-            name.endswith(s) for s in cls._ABBREV_SUFFIXES
-        ):
-            name = name[:-1]
-        if entity_type in cls._STRIP_ARTICLE_TYPES:
-            for article in ("The ", "A ", "An "):
-                if name.startswith(article) and len(name) > len(article) + 1:
-                    name = name[len(article):]
-                    break
-        return name
+        """Delegate to module-level normalize_entity_name() for DRY normalisation."""
+        return normalize_entity_name(name, entity_type)
 
     def __init__(self, config: ExtractionConfig) -> None:
         self.config = config
@@ -561,12 +601,13 @@ class GLiNERExtractor:
 
     def _load_spacy(self) -> Optional[Any]:
         """Load SpaCy model once; return None on failure."""
+        model_name = self.config.spacy_fallback_model
         try:
-            nlp = spacy.load("en_core_web_sm")
-            logger.info("SpaCy fallback model loaded (en_core_web_sm)")
+            nlp = spacy.load(model_name)
+            logger.info("SpaCy fallback model loaded (%s)", model_name)
             return nlp
         except (OSError, ImportError) as e:
-            logger.warning("SpaCy model 'en_core_web_sm' unavailable: %s", e)
+            logger.warning("SpaCy model '%s' unavailable: %s", model_name, e)
             return None
 
     def extract(self, text: str, chunk_id: str) -> List[ExtractedEntity]:
@@ -630,7 +671,7 @@ class GLiNERExtractor:
             batch_texts = texts[i : i + self.config.ner_batch_size]
             batch_ids = chunk_ids[i : i + self.config.ner_batch_size]
             try:
-                batch_entities = self.model.batch_predict_entities(
+                batch_entities = self.model.inference(
                     batch_texts,
                     self.config.entity_types,
                     threshold=self.config.ner_confidence_threshold,
@@ -670,6 +711,15 @@ class GLiNERExtractor:
             return self._spacy_extract(text, chunk_id)
         return self._regex_extract(text, chunk_id)
 
+    # SpaCy label → canonical internal type.
+    # GPE maps to "GPE" (not "LOCATION") so entity IDs are consistent with the
+    # primary GLiNER path, which normalises "gpe" → "GPE" via _LABEL_MAP.
+    _SPACY_FALLBACK_TYPE_MAP: Dict[str, str] = {
+        "PERSON": "PERSON", "ORG": "ORGANIZATION",
+        "GPE": "GPE", "LOC": "LOCATION",
+        "DATE": "DATE", "EVENT": "EVENT",
+    }
+
     def _spacy_extract(self, text: str, chunk_id: str) -> List[ExtractedEntity]:
         """
         SpaCy-based NER fallback.
@@ -677,16 +727,11 @@ class GLiNERExtractor:
         Confidence is set to 0.7 as a sentinel value: SpaCy en_core_web_sm
         is a supervised pipeline-model but does not emit per-span probabilities.
         """
-        _TYPE_MAP = {
-            "PERSON": "PERSON", "ORG": "ORGANIZATION",
-            "GPE": "LOCATION", "LOC": "LOCATION",
-            "DATE": "DATE", "EVENT": "EVENT",
-        }
         try:
             doc = self._nlp(text)
             results = []
             for ent in doc.ents:
-                ent_type = _TYPE_MAP.get(ent.label_, "CONCEPT")
+                ent_type = self._SPACY_FALLBACK_TYPE_MAP.get(ent.label_, "CONCEPT")
                 results.append(ExtractedEntity(
                     entity_id=_generate_entity_id(ent.text, ent_type),
                     name=ent.text,
@@ -1121,10 +1166,14 @@ class EntityExtractionPipeline:
         final_results = [r[1] for r in results]
 
         total_elapsed = (time.time() - start) * 1000
-        avg_per_chunk = total_elapsed / len(texts) if texts else 0.0
+        uncached_count = len(uncached_texts)
+        avg_per_chunk = total_elapsed / uncached_count if uncached_count else 0.0
         self.stats["last_batch_avg_ms"] = avg_per_chunk
-        for result in final_results:
-            result.extraction_time_ms = avg_per_chunk
+        # Only stamp uncached results — cached hits truthfully cost 0 ms.
+        uncached_idx_set = set(uncached_indices)
+        for i, (orig_idx, result) in enumerate(results):
+            if orig_idx in uncached_idx_set:
+                result.extraction_time_ms = avg_per_chunk
 
         logger.info(
             "Batch extraction: %d chunks, %d entities, %d relations, "
@@ -1262,7 +1311,7 @@ class SpacyEntityPipeline:
         appearing multiple times produces only one ExtractedEntity per chunk.
         """
         entities: List[ExtractedEntity] = []
-        seen_ids: set = set()
+        seen_ids: set[str] = set()
 
         for ent in doc.ents:
             ent_type = self._LABEL_MAP.get(ent.label_)

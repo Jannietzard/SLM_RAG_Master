@@ -50,6 +50,16 @@ USAGE
     pytest test_data_layer.py --cov=src.data_layer --cov-report=html
 
 ===============================================================================
+
+Review History:
+    Last Reviewed:  2026-04-21
+    Review Result:  0 CRITICAL, 3 IMPORTANT, 10 RECOMMENDED
+    Reviewer:       Code Review Prompt v2.1
+    All findings applied: get_batch coverage added, TestHybridRetriever
+    pre-populated, logging.basicConfig removed, typing modernised.
+    Next Review:    After adding ImprovedQueryEntityExtractor end-to-end tests
+
+===============================================================================
 """
 
 import logging
@@ -57,15 +67,13 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Generator, List
+from typing import Generator
 
 import numpy as np
 import pytest
 
 from langchain_core.documents import Document
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -82,7 +90,7 @@ def temp_dir() -> Generator[Path, None, None]:
 
 
 @pytest.fixture
-def sample_texts() -> List[str]:
+def sample_texts() -> list[str]:
     """Five science-biography sentences covering distinct topics."""
     return [
         "Albert Einstein was born in Ulm, Germany in 1879. He developed the theory of relativity.",
@@ -94,7 +102,7 @@ def sample_texts() -> List[str]:
 
 
 @pytest.fixture
-def sample_documents() -> List[Document]:
+def sample_documents() -> list[Document]:
     """Three LangChain Documents with metadata required by the storage schema."""
     return [
         Document(
@@ -128,13 +136,13 @@ def mock_embeddings():
         def __init__(self, dim: int = 768) -> None:
             self.dim = dim
 
-        def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
             return [self._make_embedding(text) for text in texts]
 
-        def embed_query(self, text: str) -> List[float]:
+        def embed_query(self, text: str) -> list[float]:
             return self._make_embedding(text)
 
-        def _make_embedding(self, text: str) -> List[float]:
+        def _make_embedding(self, text: str) -> list[float]:
             # Seed per text for determinism; modulo avoids negative seeds.
             rng = np.random.default_rng(abs(hash(text)) % (2 ** 32))
             vec = rng.standard_normal(self.dim).astype(np.float32)
@@ -168,7 +176,7 @@ class TestVectorStore:
         assert store.distance_metric == "cosine"
 
     def test_add_and_search(
-        self, temp_dir: Path, sample_documents: List[Document], mock_embeddings
+        self, temp_dir: Path, sample_documents: list[Document], mock_embeddings
     ) -> None:
         """Adding documents and searching returns similarity-scored results."""
         from src.data_layer.storage import VectorStoreAdapter
@@ -196,7 +204,7 @@ class TestVectorStore:
         # 512 != 768 — deliberately wrong dimension for error-injection test
         wrong_embeddings = [[0.1] * 512]
 
-        with pytest.raises(ValueError, match="DIMENSION MISMATCH"):
+        with pytest.raises(ValueError, match=r"(?i)dimension"):
             store._validate_embedding_dimension(wrong_embeddings)
 
     def test_distance_to_similarity(self, temp_dir: Path) -> None:
@@ -311,6 +319,8 @@ class TestKuzuGraphStore:
         assert visited["trav_0"] == 0
         assert "trav_1" in visited
         assert visited["trav_1"] == 1
+        assert "trav_2" in visited
+        assert visited.get("trav_2") == 2
 
     def test_statistics(self, temp_dir: Path) -> None:
         """get_statistics returns a dict with at least the document_chunks count."""
@@ -348,7 +358,7 @@ class TestHybridStore:
     def test_add_documents(
         self,
         temp_dir: Path,
-        sample_documents: List[Document],
+        sample_documents: list[Document],
         mock_embeddings,
     ) -> None:
         """add_documents writes to both vector and graph stores."""
@@ -434,6 +444,63 @@ class TestEmbeddingInfrastructure:
         assert metrics.avg_time_per_text_ms == pytest.approx(5.0)
 
 
+class TestEmbeddingCacheBatch:
+    """Tests for EmbeddingCache.get_batch() — the critical bulk-lookup path.
+
+    get_batch() issues a single SQL query for N texts and is the hot path for
+    large ingestion runs.  Zero test coverage here would leave the most-used
+    cache code path completely unvalidated.
+    """
+
+    def test_get_batch_returns_all_cached_items(self, temp_dir: Path) -> None:
+        """get_batch returns dict keyed by position index with all embeddings when every key is cached."""
+        from src.data_layer.embeddings import EmbeddingCache
+
+        cache = EmbeddingCache(temp_dir / "embed_batch_all.db")
+        texts = ["text A", "text B", "text C"]
+        embeddings = [[float(i)] * 768 for i in range(len(texts))]
+
+        for text, emb in zip(texts, embeddings):
+            cache.put(text, emb, "model-v1")
+
+        results = cache.get_batch(texts, "model-v1")
+        assert len(results) == len(texts)
+        assert all(i in results for i in range(len(texts)))
+        assert results[0] == pytest.approx(embeddings[0])
+        cache.close()
+
+    def test_get_batch_partial_miss(self, temp_dir: Path) -> None:
+        """get_batch returns entry for cached text; missing text absent from dict."""
+        from src.data_layer.embeddings import EmbeddingCache
+
+        cache = EmbeddingCache(temp_dir / "embed_batch_partial.db")
+        cache.put("cached text", [0.1] * 768, "model-v1")
+
+        results = cache.get_batch(["cached text", "missing text"], "model-v1")
+        assert 0 in results
+        assert 1 not in results
+        cache.close()
+
+    def test_get_batch_empty_input(self, temp_dir: Path) -> None:
+        """get_batch([]) returns an empty dict."""
+        from src.data_layer.embeddings import EmbeddingCache
+
+        cache = EmbeddingCache(temp_dir / "embed_batch_empty.db")
+        assert cache.get_batch([], "model-v1") == {}
+        cache.close()
+
+    def test_get_batch_wrong_model_is_miss(self, temp_dir: Path) -> None:
+        """get_batch omits the entry when model_name differs from stored model."""
+        from src.data_layer.embeddings import EmbeddingCache
+
+        cache = EmbeddingCache(temp_dir / "embed_batch_model.db")
+        cache.put("text", [0.5] * 768, "model-v1")
+
+        results = cache.get_batch(["text"], "model-v2")
+        assert 0 not in results
+        cache.close()
+
+
 # ============================================================================
 # 3. CHUNKING TESTS
 # ============================================================================
@@ -443,7 +510,7 @@ class TestSentenceChunking:
 
     def test_sentence_chunker_basic(self) -> None:
         """SentenceChunker produces at least two chunks and includes 'text' key."""
-        from src.data_layer import SentenceChunker
+        from src.data_layer.chunking import SentenceChunker
 
         chunker = SentenceChunker(
             sentences_per_chunk=2,
@@ -618,6 +685,160 @@ class TestEntityExtraction:
         assert retrieved["entities"][0]["name"] == "Einstein"
 
         cache.close()
+
+
+class TestEntityCacheBatch:
+    """Tests for EntityCache.get_batch() — bulk entity lookup path.
+
+    EntityCache.get_batch() is the hot path inside process_chunks_batch().
+    Without coverage here a regression in the bulk path would only surface
+    at integration-test time, making the root cause hard to isolate.
+    """
+
+    def test_get_batch_returns_all_cached_entities(self, temp_dir: Path) -> None:
+        """get_batch returns dict keyed by position index with all entries when every key is cached."""
+        from src.data_layer.entity_extraction import EntityCache
+
+        cache = EntityCache(temp_dir / "entity_batch_all.db", max_size=100)
+        texts = ["text about Paris", "text about Einstein"]
+        data = [
+            {"entities": [{"name": "Paris", "entity_type": "GPE"}], "relations": []},
+            {"entities": [{"name": "Einstein", "entity_type": "PERSON"}], "relations": []},
+        ]
+        model = "urchade/gliner_small-v2.1"
+        for text, d in zip(texts, data):
+            cache.put(text, d, model)
+
+        results = cache.get_batch(texts, model)
+        assert len(results) == 2
+        assert all(i in results for i in range(len(texts)))
+        assert results[0]["entities"][0]["name"] == "Paris"
+        cache.close()
+
+    def test_get_batch_empty_input_returns_empty(self, temp_dir: Path) -> None:
+        """get_batch([]) returns an empty dict."""
+        from src.data_layer.entity_extraction import EntityCache
+
+        cache = EntityCache(temp_dir / "entity_batch_empty.db", max_size=100)
+        assert cache.get_batch([], "model") == {}
+        cache.close()
+
+    def test_get_batch_partial_miss_returns_only_hits(self, temp_dir: Path) -> None:
+        """get_batch has entry for cached text; uncached text is absent from dict."""
+        from src.data_layer.entity_extraction import EntityCache
+
+        cache = EntityCache(temp_dir / "entity_batch_partial.db", max_size=100)
+        model = "urchade/gliner_small-v2.1"
+        cached_data = {"entities": [{"name": "Berlin", "entity_type": "GPE"}], "relations": []}
+        cache.put("cached text", cached_data, model)
+
+        results = cache.get_batch(["cached text", "uncached text"], model)
+        assert 0 in results
+        assert 1 not in results
+        cache.close()
+
+
+class TestEntityCacheStats:
+    """Tests for EntityCache.get_stats(), including after-close safety."""
+
+    def test_get_stats_returns_expected_keys(self, temp_dir: Path) -> None:
+        """get_stats returns dict with total_entries, total_hits, memory_entries, size_mb."""
+        from src.data_layer.entity_extraction import EntityCache
+
+        cache = EntityCache(temp_dir / "entity_stats.db", max_size=100)
+        cache.put("text", {"entities": [], "relations": []}, "model")
+
+        stats = cache.get_stats()
+        for key in ("total_entries", "total_hits", "memory_entries", "size_mb"):
+            assert key in stats, f"Missing key '{key}' in get_stats()"
+        assert stats["total_entries"] >= 1
+        cache.close()
+
+    def test_get_stats_after_close_returns_zeros(self, temp_dir: Path) -> None:
+        """get_stats after close() returns zero-filled dict without raising."""
+        from src.data_layer.entity_extraction import EntityCache
+
+        cache = EntityCache(temp_dir / "entity_stats_closed.db", max_size=100)
+        cache.close()
+
+        stats = cache.get_stats()
+        assert stats["total_entries"] == 0
+        assert stats["size_mb"] == pytest.approx(0.0)
+
+
+class TestExtractionConfigNewFields:
+    """Tests for ExtractionConfig fields added in v3.5.0+."""
+
+    def test_spacy_fallback_model_default(self) -> None:
+        """spacy_fallback_model defaults to 'en_core_web_sm'."""
+        from src.data_layer.entity_extraction import ExtractionConfig
+
+        config = ExtractionConfig()
+        assert config.spacy_fallback_model == "en_core_web_sm"
+
+    def test_spacy_fallback_model_override(self) -> None:
+        """spacy_fallback_model can be overridden at construction time."""
+        from src.data_layer.entity_extraction import ExtractionConfig
+
+        config = ExtractionConfig(spacy_fallback_model="en_core_web_lg")
+        assert config.spacy_fallback_model == "en_core_web_lg"
+
+
+class TestNormalizeQueryEntity:
+    """Tests for _normalize_query_entity() — strips leading articles for graph lookup."""
+
+    def test_strips_the_article(self) -> None:
+        """'The Cold War' → 'Cold War'."""
+        from src.data_layer.hybrid_retriever import _normalize_query_entity
+
+        assert _normalize_query_entity("The Cold War", "EVENT") == "Cold War"
+
+    def test_strips_a_article(self) -> None:
+        """'A Conference' with EVENT type → 'Conference' (only stripped for GPE/LOCATION/EVENT)."""
+        from src.data_layer.hybrid_retriever import _normalize_query_entity
+
+        assert _normalize_query_entity("A Conference", "EVENT") == "Conference"
+
+    def test_no_strip_for_non_article(self) -> None:
+        """Names not starting with articles are returned unchanged."""
+        from src.data_layer.hybrid_retriever import _normalize_query_entity
+
+        assert _normalize_query_entity("Albert Einstein", "PERSON") == "Albert Einstein"
+
+    def test_abbreviation_whitelist_preserved(self) -> None:
+        """'Warner Bros.' is not stripped — leading word is not an article."""
+        from src.data_layer.hybrid_retriever import _normalize_query_entity
+
+        assert _normalize_query_entity("Warner Bros.", "ORGANIZATION") == "Warner Bros."
+
+    def test_empty_string_returns_empty(self) -> None:
+        """Empty string input returns empty string."""
+        from src.data_layer.hybrid_retriever import _normalize_query_entity
+
+        assert _normalize_query_entity("", "PERSON") == ""
+
+
+class TestContradictionFilterPassthrough:
+    """Tests for PreGenerativeFilter._contradiction_filter()."""
+
+    def test_filter_with_contradiction_disabled_passes_all(self) -> None:
+        """_contradiction_filter with enable_contradiction=False returns all results unchanged."""
+        from src.data_layer.hybrid_retriever import PreGenerativeFilter, RetrievalResult
+
+        pf = PreGenerativeFilter(enable_contradiction=False)
+        results = [
+            RetrievalResult("c1", "Paris is the capital of France.", "a", 0, rrf_score=1.0),
+            RetrievalResult("c2", "France is not a country.", "a", 1, rrf_score=0.9),
+        ]
+        filtered = pf._contradiction_filter(results)
+        assert len(filtered) == len(results)
+
+    def test_filter_empty_list_returns_empty(self) -> None:
+        """_contradiction_filter on empty input returns empty list."""
+        from src.data_layer.hybrid_retriever import PreGenerativeFilter
+
+        pf = PreGenerativeFilter()
+        assert pf._contradiction_filter([]) == []
 
 
 # ============================================================================
@@ -795,7 +1016,12 @@ class TestHybridRetriever:
     """Tests for the full hybrid retrieval pipeline."""
 
     def test_retrieval_modes(self, temp_dir: Path, mock_embeddings) -> None:
-        """All three RetrievalMode values execute without errors."""
+        """All three RetrievalMode values execute without errors and return lists.
+
+        Store is pre-populated so GRAPH and HYBRID modes have indexed data to
+        traverse; without documents, graph_search always returns [] and the
+        mode distinction is meaningless.
+        """
         from src.data_layer.hybrid_retriever import (
             HybridRetriever,
             RetrievalConfig,
@@ -809,13 +1035,26 @@ class TestHybridRetriever:
         )
         store = HybridStore(storage_config, mock_embeddings)
 
+        # Pre-populate so GRAPH and HYBRID have indexed data to traverse.
+        docs = [
+            Document(
+                page_content="Einstein developed the theory of relativity.",
+                metadata={"source_file": "physics.txt", "chunk_id": "r1",
+                          "chunk_index": 0, "page_number": 1},
+            ),
+            Document(
+                page_content="Marie Curie discovered radium and polonium.",
+                metadata={"source_file": "bio.txt", "chunk_id": "r2",
+                          "chunk_index": 0, "page_number": 1},
+            ),
+        ]
+        store.add_documents(docs)
+
         for mode in [RetrievalMode.VECTOR, RetrievalMode.GRAPH, RetrievalMode.HYBRID]:
             retrieval_config = RetrievalConfig(
                 mode=mode,
                 vector_top_k=5,
                 graph_top_k=3,
-                vector_weight=0.7,
-                graph_weight=0.3,
                 # threshold=0.0 avoids mock-embedding score variability
                 similarity_threshold=0.0,
             )
@@ -840,7 +1079,7 @@ class TestFullPipeline:
     def test_ingestion_to_retrieval(
         self,
         temp_dir: Path,
-        sample_texts: List[str],
+        sample_texts: list[str],
         mock_embeddings,
     ) -> None:
         """Full pipeline: chunked ingestion followed by vector retrieval returns results."""
@@ -909,6 +1148,10 @@ class TestFullPipeline:
 
         This test encodes thesis section 2 parameter values as assertions so that
         any future change to defaults is caught immediately.
+
+        Note: ExtractionConfig assertions duplicate TestEntityExtraction.test_extraction_config.
+        Both are kept intentionally: test_extraction_config is the canonical unit test;
+        this test provides an end-to-end compliance snapshot that must match the thesis.
         """
         from src.data_layer.entity_extraction import ExtractionConfig
         from src.data_layer.chunking import SentenceChunkingConfig
@@ -949,7 +1192,7 @@ class TestPerformance:
     """
 
     def test_embedding_latency(
-        self, mock_embeddings, sample_texts: List[str]
+        self, mock_embeddings, sample_texts: list[str]
     ) -> None:
         """Mock embedding generation completes within 100 ms per batch."""
         start = time.time()
@@ -965,7 +1208,7 @@ class TestPerformance:
         assert elapsed < 100  # ms — relaxed threshold for CI; not a thesis claim
 
     def test_vector_search_latency(
-        self, temp_dir: Path, sample_texts: List[str], mock_embeddings
+        self, temp_dir: Path, sample_texts: list[str], mock_embeddings
     ) -> None:
         """LanceDB ANN search over 100 documents completes within 100 ms."""
         from src.data_layer.storage import VectorStoreAdapter
@@ -1188,6 +1431,173 @@ class TestDocumentIngestionPipeline:
         stats = pipeline.get_stats()
         assert stats["chunking_strategy"] == "sentence"
         assert "chunking_module_available" in stats
+
+
+
+
+# ============================================================================
+# IngestionPipeline extended coverage (Finding 10)
+# ============================================================================
+
+class TestIngestionPipelineExtended:
+    """Additional coverage for DocumentIngestionPipeline paths."""
+
+    def test_process_text_sentence_spacy_strategy(self):
+        from src.data_layer import create_data_layer_pipeline
+        p = create_data_layer_pipeline(strategy="sentence_spacy", min_chunk_size=10)
+        chunks = p.process_text("Albert Einstein was a physicist. He won the Nobel Prize.", {})
+        assert len(chunks) >= 1
+        assert all("text" in c for c in chunks)
+
+    def test_process_text_fixed_strategy(self):
+        from src.data_layer import create_data_layer_pipeline
+        p = create_data_layer_pipeline(strategy="fixed", chunk_size=50, min_chunk_size=5)
+        chunks = p.process_text("A" * 200, {})
+        assert len(chunks) >= 1
+
+    def test_process_text_recursive_strategy(self):
+        from src.data_layer import create_data_layer_pipeline
+        p = create_data_layer_pipeline(strategy="recursive", chunk_size=200, min_chunk_size=5)
+        chunks = p.process_text("Word " * 40, {})
+        assert len(chunks) >= 1
+
+    def test_process_texts_returns_list_of_same_length(self):
+        from src.data_layer import create_data_layer_pipeline
+        p = create_data_layer_pipeline(strategy="sentence", min_chunk_size=5)
+        texts = ["Sentence one.", "Sentence two.", "Sentence three."]
+        results = p.process_texts(texts, [{"src": i} for i in range(3)])
+        assert isinstance(results, list)
+
+    def test_empty_text_returns_empty_list(self):
+        from src.data_layer import create_data_layer_pipeline
+        p = create_data_layer_pipeline(strategy="sentence_spacy")
+        chunks = p.process_text("", {})
+        assert chunks == []
+
+    def test_create_ingestion_config_path_independent(self):
+        """create_ingestion_config() must not depend on CWD."""
+        import os
+        from src.data_layer import create_ingestion_config
+        original_cwd = os.getcwd()
+        try:
+            os.chdir("/")
+            cfg = create_ingestion_config({"ingestion": {"chunk_size": 512}})
+            assert cfg.chunk_size == 512
+        finally:
+            os.chdir(original_cwd)
+
+
+# ============================================================================
+# normalize_entity_name (Finding 7 — shared function)
+# ============================================================================
+
+class TestNormalizeEntityNameShared:
+    """Tests for the module-level normalize_entity_name() in entity_extraction.py."""
+
+    def test_strips_whitespace(self):
+        from src.data_layer import normalize_entity_name
+        assert normalize_entity_name("  Einstein  ") == "Einstein"
+
+    def test_strips_trailing_punctuation(self):
+        from src.data_layer import normalize_entity_name
+        assert normalize_entity_name("Germany,") == "Germany"
+        assert normalize_entity_name("Germany;") == "Germany"
+
+    def test_strips_trailing_period(self):
+        from src.data_layer import normalize_entity_name
+        assert normalize_entity_name("Germany.") == "Germany"
+
+    def test_preserves_abbreviation_period(self):
+        from src.data_layer import normalize_entity_name
+        assert normalize_entity_name("Warner Bros.").endswith(".")
+
+    def test_strips_article_for_gpe(self):
+        from src.data_layer import normalize_entity_name
+        assert normalize_entity_name("The United States", "GPE") == "United States"
+
+    def test_strips_article_for_event(self):
+        from src.data_layer import normalize_entity_name
+        assert normalize_entity_name("The Cold War", "EVENT") == "Cold War"
+
+    def test_preserves_article_for_person(self):
+        from src.data_layer import normalize_entity_name
+        assert normalize_entity_name("The Rock", "PERSON") == "The Rock"
+
+    def test_preserves_article_for_work_of_art(self):
+        from src.data_layer import normalize_entity_name
+        assert normalize_entity_name("The Dark Knight", "WORK_OF_ART") == "The Dark Knight"
+
+    def test_no_entity_type_preserves_article(self):
+        from src.data_layer import normalize_entity_name
+        assert normalize_entity_name("The Beatles") == "The Beatles"
+
+
+# ============================================================================
+# run_diagnostics
+# ============================================================================
+
+class TestRunDiagnostics:
+    """Tests for storage.run_diagnostics()."""
+
+    def test_returns_required_keys(self):
+        """run_diagnostics() always returns the required keys."""
+        from src.data_layer.storage import run_diagnostics, StorageConfig
+        from pathlib import Path
+        import tempfile
+
+        class _MockEmb:
+            def embed_query(self, text):
+                return [0.1] * 64
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = StorageConfig(
+                vector_db_path=Path(tmpdir) / "v",
+                graph_db_path=Path(tmpdir) / "g",
+                embedding_dim=64,
+            )
+            result = run_diagnostics(cfg, _MockEmb())
+        assert "embedding_dim" in result
+        assert "kuzu_available" in result
+        assert "issues" in result
+
+    def test_embedding_dim_detected(self):
+        """run_diagnostics() detects embedding dimension from the model."""
+        from src.data_layer.storage import run_diagnostics, StorageConfig
+        from pathlib import Path
+        import tempfile
+
+        class _MockEmb:
+            def embed_query(self, text):
+                return [0.1] * 128
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = StorageConfig(
+                vector_db_path=Path(tmpdir) / "v",
+                graph_db_path=Path(tmpdir) / "g",
+                embedding_dim=128,
+            )
+            result = run_diagnostics(cfg, _MockEmb())
+        assert result["embedding_dim"] == 128
+
+    def test_failing_embedding_appends_issue(self):
+        """run_diagnostics() records embedding errors in the issues list."""
+        from src.data_layer.storage import run_diagnostics, StorageConfig
+        from pathlib import Path
+        import tempfile
+
+        class _BrokenEmb:
+            def embed_query(self, text):
+                raise RuntimeError("connection refused")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = StorageConfig(
+                vector_db_path=Path(tmpdir) / "v",
+                graph_db_path=Path(tmpdir) / "g",
+                embedding_dim=64,
+            )
+            result = run_diagnostics(cfg, _BrokenEmb())
+        assert len(result["issues"]) >= 1
+        assert any("Embedding" in issue for issue in result["issues"])
 
 
 # ============================================================================

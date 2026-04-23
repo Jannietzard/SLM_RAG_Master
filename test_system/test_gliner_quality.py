@@ -18,7 +18,6 @@ from src.data_layer.entity_extraction import EntityExtractionPipeline, Extractio
 config_current = ExtractionConfig(
     ner_confidence_threshold=0.5,
     re_confidence_threshold=0.7,
-    selective_re=True,
     entity_types=[
         "PERSON", "ORGANIZATION", "GPE", "LOCATION", "PLACE",
         "DATE", "EVENT", "CONCEPT", "WORK_OF_ART", "STRUCTURE",
@@ -30,7 +29,6 @@ config_current = ExtractionConfig(
 config_improved = ExtractionConfig(
     ner_confidence_threshold=0.35,   # niedriger: Paris/France werden erkannt
     re_confidence_threshold=0.6,
-    selective_re=True,
     entity_types=[                   # nur nützliche Typen für HotpotQA
         "PERSON", "ORGANIZATION", "GPE", "LOCATION",
         "WORK_OF_ART", "EVENT", "PRODUCT"

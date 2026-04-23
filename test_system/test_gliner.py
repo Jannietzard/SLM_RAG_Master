@@ -11,7 +11,7 @@ logging.disable(logging.CRITICAL)
 from src.data_layer.entity_extraction import EntityExtractionPipeline, ExtractionConfig
 
 t0 = time.time()
-config = ExtractionConfig(re_confidence_threshold=0.7, selective_re=True, cache_enabled=False)
+config = ExtractionConfig(re_confidence_threshold=0.7, cache_enabled=False)
 pipe = EntityExtractionPipeline(config)
 init_ms = (time.time()-t0)*1000
 

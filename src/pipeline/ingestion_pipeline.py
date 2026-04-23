@@ -63,7 +63,7 @@ ABLATION / TEST FLAGS
 USAGE
 ================================================================================
 
-    from src.pipeline.ingestion_pipeline import create_ingestion_pipeline
+    from src.pipeline import create_ingestion_pipeline
     import yaml
 
     with open("config/settings.yaml") as f:
@@ -157,8 +157,12 @@ class IngestionConfig:
         """
         Construct IngestionConfig from a settings.yaml dict.
 
-        Key paths match the actual settings.yaml structure. Any missing key
-        falls back to the dataclass default (which emits a log warning).
+        Args:
+            config: Full settings.yaml dict (or relevant sub-dict). Missing
+                keys fall back to the dataclass default.
+
+        Returns:
+            IngestionConfig populated from the provided settings dict.
         """
         _d = cls()  # defaults for fallback
 
@@ -289,21 +293,15 @@ class DocumentLoader:
         """
         Load document(s) from a file path or directory.
 
-        Parameters
-        ----------
-        path : str
-            Path to a file or directory. Directories are searched recursively
-            for files with supported extensions.
+        Args:
+            path: Path to a file or directory. Directories are searched
+                recursively for files with supported extensions.
 
-        Yields
-        ------
-        dict
-            {"id": str, "text": str, "metadata": dict}
+        Yields:
+            dict: ``{"id": str, "text": str, "metadata": dict}``
 
-        Raises
-        ------
-        FileNotFoundError
-            If path does not exist.
+        Raises:
+            FileNotFoundError: If path does not exist.
         """
         p = Path(path)
 
@@ -444,7 +442,7 @@ class DocumentLoader:
 # MOCK COMPONENTS (for tests — never use for thesis evaluation)
 # ============================================================================
 
-class MockEmbeddingGenerator:
+class _MockEmbeddingGenerator:
     """
     Mock embedding generator for unit tests that require no GPU or Ollama.
 
@@ -465,13 +463,14 @@ class MockEmbeddingGenerator:
         """
         Return L2-normalised random embedding vectors.
 
-        Parameters
-        ----------
-        texts : list of str
-        show_progress : bool
-            Ignored; present for interface compatibility with BatchedOllamaEmbeddings.
-        seed : int, optional
-            Set for reproducible test output.
+        Args:
+            texts: List of text strings to embed.
+            show_progress: Ignored; present for interface compatibility with
+                BatchedOllamaEmbeddings.
+            seed: Set for reproducible test output.
+
+        Returns:
+            Float32 array of shape ``(len(texts), embedding_dim)``.
         """
         if not texts:
             return np.empty((0, self.embedding_dim), dtype=np.float32)
@@ -486,7 +485,7 @@ class MockEmbeddingGenerator:
         return self.embed(texts).tolist()
 
 
-class MockEntityExtractor:
+class _MockEntityExtractor:
     """
     Mock entity extractor for unit tests.
 
@@ -528,6 +527,11 @@ class MockEntityExtractor:
         return entities, []
 
 
+# Public aliases for test files that import these classes by name.
+# Not exported from __init__.py — these are test helpers, not production API.
+MockEmbeddingGenerator = _MockEmbeddingGenerator
+MockEntityExtractor = _MockEntityExtractor
+
 # ============================================================================
 # MAIN INGESTION PIPELINE
 # ============================================================================
@@ -561,22 +565,19 @@ class IngestionPipeline:
         """
         Initialise the ingestion pipeline.
 
-        Parameters
-        ----------
-        config : IngestionConfig, optional
-            Pipeline configuration. Constructed from hardcoded defaults when
-            omitted — not recommended for production use.
-        chunker : SpacySentenceChunker, optional
-            Sentence-based chunker. Created from config when None.
-        entity_extractor : EntityExtractionPipeline, optional
-            GLiNER + REBEL extractor. Created from config when None.
-        embedding_generator : BatchedOllamaEmbeddings or MockEmbeddingGenerator, optional
-            Embedding model. Created from config when None.
-        hybrid_store : HybridStore, optional
-            LanceDB + KuzuDB dual store. Created from config when None.
-        use_mocks : bool
-            When True, substitutes MockEmbeddingGenerator and MockEntityExtractor.
-            Intended for unit tests only. Results must not be used for evaluation.
+        Args:
+            config: Pipeline configuration. Constructed from hardcoded defaults
+                when omitted — not recommended for production use.
+            chunker: Sentence-based chunker. Created from config when None.
+            entity_extractor: GLiNER + REBEL extractor. Created from config
+                when None.
+            embedding_generator: Embedding model (BatchedOllamaEmbeddings or
+                _MockEmbeddingGenerator). Created from config when None.
+            hybrid_store: LanceDB + KuzuDB dual store. Created from config
+                when None.
+            use_mocks: When True, substitutes mock embedding generator and mock
+                entity extractor. Intended for unit tests only — results must
+                not be used for thesis evaluation.
         """
         self.config = config or IngestionConfig()
         self.use_mocks = use_mocks
@@ -748,22 +749,16 @@ class IngestionPipeline:
         avoid materialising the full corpus in memory — important on the
         < 16 GB RAM edge target hardware.
 
-        Parameters
-        ----------
-        source : str
-            Path to a file or directory.
-        show_progress : bool
-            When True, pass progress display through to the embedding generator.
+        Args:
+            source: Path to a file or directory.
+            show_progress: When True, pass progress display through to the
+                embedding generator.
 
-        Returns
-        -------
-        IngestionMetrics
+        Returns:
             Per-stage timing and count statistics for this run.
 
-        Raises
-        ------
-        FileNotFoundError
-            If source path does not exist.
+        Raises:
+            FileNotFoundError: If source path does not exist.
         """
         start_time = time.time()
         self._reset_metrics()
@@ -988,18 +983,15 @@ def create_ingestion_pipeline(
     """
     Factory for a fully configured IngestionPipeline.
 
-    Parameters
-    ----------
-    config : dict, optional
-        Full settings.yaml dict. Pass None only for unit tests — doing so
-        applies all hardcoded defaults, which may not match the thesis
-        evaluation configuration.
-    use_mocks : bool
-        When True, substitutes mock components (no GPU or Ollama required).
+    Args:
+        config: Full settings.yaml dict. Pass None only for unit tests — doing
+            so applies all hardcoded defaults, which may not match the thesis
+            evaluation configuration.
+        use_mocks: When True, substitutes mock components (no GPU or Ollama
+            required).
 
-    Returns
-    -------
-    IngestionPipeline
+    Returns:
+        Fully configured IngestionPipeline.
     """
     if config:
         ingestion_config = IngestionConfig.from_yaml(config)

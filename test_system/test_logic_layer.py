@@ -1808,10 +1808,9 @@ class TestAgentPipeline:
     def test_pipeline_imports(self) -> None:
         """AgentPipeline and factory functions are importable."""
         from src.pipeline.agent_pipeline import (
-            AgentPipeline, create_pipeline, create_full_pipeline,
+            AgentPipeline, create_full_pipeline,
         )
         assert AgentPipeline is not None
-        assert create_pipeline is not None
         assert create_full_pipeline is not None
 
     def test_batch_processor_importable(self) -> None:
@@ -1885,10 +1884,10 @@ class TestThesisCompliance:
         assert required.issubset(set(annotations.keys()))
 
     def test_navigator_relevance_threshold_default(self) -> None:
-        """ControllerConfig default relevance_threshold_factor matches settings.yaml value 0.6."""
+        """ControllerConfig default relevance_threshold_factor matches settings.yaml value 0.85."""
         from src.logic_layer.navigator import ControllerConfig
         config = ControllerConfig()
-        assert config.relevance_threshold_factor == 0.6
+        assert config.relevance_threshold_factor == 0.85
 
     def test_navigator_redundancy_threshold_default(self) -> None:
         """ControllerConfig default redundancy_threshold matches settings.yaml value 0.8."""

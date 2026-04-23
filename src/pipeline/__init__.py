@@ -14,27 +14,28 @@ Features:
 
 from .agent_pipeline import (
     AgentPipeline,
+    AgentPipelineConfig,
     PipelineResult,
     BatchProcessor,
-    create_pipeline,
-    create_full_pipeline
+    create_full_pipeline,
 )
 from .ingestion_pipeline import (
     IngestionPipeline,
     IngestionConfig,
     IngestionMetrics,
     DocumentLoader,
-    MockEmbeddingGenerator,
-    MockEntityExtractor,
     create_ingestion_pipeline,
 )
+
+__version__ = "4.0.0"
+__author__ = "Jan Nietzard"
 
 __all__ = [
     # Agent Pipeline
     "AgentPipeline",
+    "AgentPipelineConfig",
     "PipelineResult",
     "BatchProcessor",
-    "create_pipeline",
     "create_full_pipeline",
 
     # Ingestion Pipeline
@@ -42,7 +43,5 @@ __all__ = [
     "IngestionConfig",
     "IngestionMetrics",
     "DocumentLoader",
-    "MockEmbeddingGenerator",
-    "MockEntityExtractor",
     "create_ingestion_pipeline",
 ]

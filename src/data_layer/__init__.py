@@ -69,8 +69,11 @@ from .embeddings import BatchedOllamaEmbeddings, create_embeddings
 from .hybrid_retriever import (
     HybridRetriever,
     RetrievalConfig,
+    RetrievalMode,
     RetrievalResult,
     RetrievalMetrics,
+    PreGenerativeFilter,
+    ImprovedQueryEntityExtractor,
 )
 
 # ── Entity Extraction ─────────────────────────────────────────────────────────
@@ -78,24 +81,22 @@ from .entity_extraction import (
     EntityExtractionPipeline,
     ExtractionConfig,
     create_extraction_pipeline,
+    normalize_entity_name,
 )
 
 # ── Chunking ──────────────────────────────────────────────────────────────────
+# Public API: SpacySentenceChunker and create_sentence_chunker.
+# SemanticChunker / FixedSizeChunker / RecursiveChunker / SentenceChunker are
+# internal implementation details consumed only by ingestion.py.
 from .chunking import (
     SpacySentenceChunker,
     SentenceChunkingConfig,
     SentenceChunk,
-    SentenceInfo,
-    SemanticChunker,
-    SentenceChunker,
-    FixedSizeChunker,
-    RecursiveChunker,
     create_sentence_chunker,
-    create_semantic_chunker,
 )
 
 # ── Ingestion Pipeline ────────────────────────────────────────────────────────
-from .Ingestion import (
+from .ingestion import (
     DocumentIngestionPipeline,
     IngestionConfig,
     ChunkingStrategy,
@@ -116,23 +117,24 @@ __all__ = [
     # Retrieval
     "HybridRetriever",
     "RetrievalConfig",
+    "RetrievalMode",
     "RetrievalResult",
     "RetrievalMetrics",
+    "PreGenerativeFilter",
+    "ImprovedQueryEntityExtractor",
     # Entity Extraction
     "EntityExtractionPipeline",
     "ExtractionConfig",
     "create_extraction_pipeline",
-    # Chunking — primary
+    "normalize_entity_name",
+    # Chunking — public API
     "SpacySentenceChunker",
     "SentenceChunkingConfig",
     "SentenceChunk",
-    "SemanticChunker",
-    # Chunking — utilities
-    "SentenceChunker",
-    "FixedSizeChunker",
-    "RecursiveChunker",
     "create_sentence_chunker",
-    "create_semantic_chunker",
+    # SemanticChunker, SentenceChunker, FixedSizeChunker, RecursiveChunker,
+    # SentenceInfo, create_semantic_chunker are internal implementation details
+    # used only by ingestion.py — not part of the public API.
     # Ingestion pipeline
     "DocumentIngestionPipeline",
     "IngestionConfig",

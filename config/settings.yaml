@@ -169,7 +169,7 @@ rag:
 # ============================================================================
 llm:
   # Active model — override with --model flag on CLI
-  model_name: "phi3"
+  model_name: "qwen2:1.5b"   # TEST 2026-04-15: phi3 times out on CPU; qwen2:1.5b expected ~10-20s
 
   base_url: "http://localhost:11434"
   temperature: 0.1    # Low for factual responses

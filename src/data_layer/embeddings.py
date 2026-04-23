@@ -39,6 +39,18 @@ Classes:
   EmbeddingMetrics          — dataclass for cumulative performance counters
   EmbeddingCache            — SQLite-based persistent embedding store
   BatchedOllamaEmbeddings   — LangChain-compatible embedding client
+
+Review History:
+    Last Reviewed:  2026-04-19
+    Review Result:  0 CRITICAL, 4 IMPORTANT, 3 RECOMMENDED
+    Reviewer:       Code Review Prompt v2.1
+    Next Review:    After changes to cache schema or Ollama API integration
+    ---
+    Previous Review: 2026-04-04
+    Previous Result: 3 CRITICAL, 6 IMPORTANT, 3 RECOMMENDED
+    Changes Since:   All prior findings addressed (get_batch bulk lookup,
+                     total_texts counter, logger.info for print_metrics,
+                     context manager, exception narrowing, get_stats guard)
 """
 
 import logging
@@ -240,8 +252,8 @@ class EmbeddingCache:
             Embedding vector as list of floats, or None.
         """
         text_hash = self._hash_text(text)
-        cursor = self.conn.cursor()
         try:
+            cursor = self.conn.cursor()
             cursor.execute(
                 "SELECT embedding FROM embeddings "
                 "WHERE text_hash = ? AND model_name = ?",
@@ -258,7 +270,7 @@ class EmbeddingCache:
                 self.conn.commit()
                 return embedding
             return None
-        except sqlite3.Error as e:
+        except (sqlite3.Error, AttributeError) as e:
             logger.error("Cache GET failed: %s", e)
             return None
 
@@ -273,8 +285,8 @@ class EmbeddingCache:
         """
         text_hash = self._hash_text(text)
         embedding_json = json.dumps(embedding)
-        cursor = self.conn.cursor()
         try:
+            cursor = self.conn.cursor()
             cursor.execute(
                 """
                 INSERT OR REPLACE INTO embeddings
@@ -284,7 +296,7 @@ class EmbeddingCache:
                 (text_hash, text, embedding_json, model_name),
             )
             self.conn.commit()
-        except sqlite3.Error as e:
+        except (sqlite3.Error, AttributeError) as e:
             logger.error("Cache PUT failed: %s", e)
 
     def get_batch(
@@ -318,8 +330,8 @@ class EmbeddingCache:
         hashes = list(hash_to_idxs.keys())
 
         placeholders = ",".join(["?"] * len(hashes))
-        cursor = self.conn.cursor()
         try:
+            cursor = self.conn.cursor()
             cursor.execute(
                 f"SELECT text_hash, embedding FROM embeddings "
                 f"WHERE model_name = ? AND text_hash IN ({placeholders})",
@@ -347,7 +359,7 @@ class EmbeddingCache:
                 self.conn.commit()
 
             return results
-        except sqlite3.Error as e:
+        except (sqlite3.Error, AttributeError) as e:
             logger.error("Cache batch GET failed: %s", e)
             return {}
 
@@ -358,12 +370,12 @@ class EmbeddingCache:
         Intended for ablation studies requiring reproducible fresh timings.
         This operation is irreversible.
         """
-        cursor = self.conn.cursor()
         try:
+            cursor = self.conn.cursor()
             cursor.execute("DELETE FROM embeddings")
             self.conn.commit()
             logger.info("Embedding cache cleared")
-        except sqlite3.Error as e:
+        except (sqlite3.Error, AttributeError) as e:
             logger.error("Cache CLEAR failed: %s", e)
 
     def get_stats(self) -> Dict[str, Any]:
@@ -372,19 +384,24 @@ class EmbeddingCache:
 
         Returns:
             Dict with keys: total_entries, total_accesses, size_bytes, size_mb.
+            Returns zero-valued dict if the connection is closed or unavailable.
         """
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT COUNT(*), COALESCE(SUM(access_count), 0) FROM embeddings"
-        )
-        row = cursor.fetchone()
-        size_bytes = self.cache_path.stat().st_size if self.cache_path.exists() else 0
-        return {
-            "total_entries": row[0] or 0,
-            "total_accesses": row[1] or 0,
-            "size_bytes": size_bytes,
-            "size_mb": size_bytes / (1024 * 1024),
-        }
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*), COALESCE(SUM(access_count), 0) FROM embeddings"
+            )
+            row = cursor.fetchone()
+            size_bytes = self.cache_path.stat().st_size if self.cache_path.exists() else 0
+            return {
+                "total_entries": row[0] or 0,
+                "total_accesses": row[1] or 0,
+                "size_bytes": size_bytes,
+                "size_mb": size_bytes / (1024 * 1024),
+            }
+        except (sqlite3.Error, AttributeError) as e:
+            logger.error("Cache get_stats failed (connection closed?): %s", e)
+            return {"total_entries": 0, "total_accesses": 0, "size_bytes": 0, "size_mb": 0.0}
 
     def close(self) -> None:
         """Close the SQLite connection."""
@@ -539,6 +556,8 @@ class BatchedOllamaEmbeddings(Embeddings):
         Raises:
             RuntimeError: API error, count mismatch, or request timeout.
         """
+        if not texts:
+            return []
         try:
             response = requests.post(
                 f"{self.base_url}/api/embed",
@@ -565,8 +584,8 @@ class BatchedOllamaEmbeddings(Embeddings):
                 f"Ollama API timeout after {self.timeout}s. "
                 f"Consider reducing batch_size or increasing timeout."
             )
-        except Exception as e:
-            logger.error("Batch embedding failed: %s", e)
+        except requests.exceptions.RequestException as e:
+            logger.error("Batch embedding failed (network/API error): %s", e)
             raise
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
@@ -789,13 +808,14 @@ def create_embeddings(
     perf_cfg = cfg.get("performance", {})
     llm_cfg = cfg.get("llm", {})
 
+    _D = BatchedOllamaEmbeddings
     return BatchedOllamaEmbeddings(
-        model_name=emb_cfg.get("model_name", "nomic-embed-text"),
-        base_url=emb_cfg.get("base_url", "http://localhost:11434"),
-        batch_size=perf_cfg.get("batch_size", 64),
+        model_name=emb_cfg.get("model_name", _D.DEFAULT_MODEL),
+        base_url=emb_cfg.get("base_url", _D.DEFAULT_URL),
+        batch_size=perf_cfg.get("batch_size", _D.DEFAULT_BATCH_SIZE),
         cache_path=Path(emb_cfg.get("cache_path", "./cache/embeddings.db")),
         device=perf_cfg.get("device", "cpu"),
-        timeout=llm_cfg.get("timeout", 60),
+        timeout=llm_cfg.get("timeout", _D.DEFAULT_TIMEOUT),
     )
 
 
@@ -838,11 +858,13 @@ if __name__ == "__main__":
                 cache_path=db_path,
             ) as emb:
                 vecs = emb.embed_documents(texts)
-                print(f"── embed_documents ──  {len(vecs)} vectors, dim={len(vecs[0])}")
+                logger.info("── embed_documents ──  %d vectors, dim=%d", len(vecs), len(vecs[0]))
 
                 # Second call — all from cache, no API side_effect needed
                 with patch("requests.post", side_effect=RuntimeError("should not call API")):
                     vecs2 = emb.embed_documents(texts)
-                    print(f"── cache-only call ──  {len(vecs2)} vectors (all from cache)")
+                    logger.info("── cache-only call ──  %d vectors (all from cache)", len(vecs2))
 
-        emb.print_metrics()
+                # print_metrics() must be called while the context manager is still open
+                # so the SQLite connection is available for get_stats().
+                emb.print_metrics()

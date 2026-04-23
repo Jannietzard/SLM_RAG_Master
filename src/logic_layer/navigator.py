@@ -57,14 +57,24 @@ ARCHITECTURE
                              └─────────┘
 
 ===============================================================================
+
+Review History:
+    Last Reviewed:  2026-04-21
+    Review Result:  0 CRITICAL, 6 IMPORTANT, 4 RECOMMENDED
+    Reviewer:       Code Review Prompt v2.1
+    Next Review:    After applying action items (smoke test fix, type annotations,
+                    logger cleanup, stale docstrings, dead code removal)
+===============================================================================
 """
 
 import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
+from ._config import ControllerConfig
+from ._settings import _PROPER_NOUN_RE
 from .planner import RetrievalPlan
 
 # Module logger — defined before any module-level code that might log.
@@ -72,94 +82,22 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# CONFIGURATION
+# RETRIEVER PROTOCOL
 # =============================================================================
 
-@dataclass
-class ControllerConfig:
-    """
-    Configuration for the AgenticController pipeline.
+@runtime_checkable
+class RetrieverProtocol(Protocol):
+    """Interface contract for HybridRetriever used by Navigator."""
+    def retrieve(
+        self, query: str, entity_hints: Optional[List[str]] = None
+    ) -> "Tuple[List[Any], Dict[str, Any]]":
+        ...
 
-    LLM Settings:
-        model_name: Ollama model for S_V (e.g. "phi3")
-        base_url: Ollama API URL
-        temperature: sampling temperature
 
-    Pipeline Settings:
-        max_verification_iterations: max self-correction loops
-
-    Navigator Settings (Pre-Generative Filtering):
-        relevance_threshold_factor: factor for dynamic threshold (0.6 × max)
-        redundancy_threshold: Jaccard threshold for deduplication (0.8)
-        max_context_chunks: maximum chunks after filtering
-    """
-    # LLM Settings
-    model_name: str = "phi3"
-    base_url: str = "http://localhost:11434"
-    temperature: float = 0.1
-
-    # Pipeline Settings — defaults match settings.yaml agent.*
-    # Default 2: thesis configuration (1 initial + 1 correction round).
-    # Reference: Madaan et al. (2023). "Self-Refine." NeurIPS 2023.
-    max_verification_iterations: int = 2
-
-    # Navigator Settings (thesis section 3.3)
-    relevance_threshold_factor: float = 0.6  # settings.yaml: navigator.relevance_threshold_factor
-    redundancy_threshold: float = 0.8        # settings.yaml: navigator.redundancy_threshold
-    max_context_chunks: int = 10             # settings.yaml: navigator.max_context_chunks
-    rrf_k: int = 60                          # settings.yaml: navigator.rrf_k
-    top_k_per_subquery: int = 10             # settings.yaml: navigator.top_k_per_subquery
-    max_chars_per_doc: int = 300             # settings.yaml: llm.max_chars_per_doc
-
-    # RRF cross-source corroboration boost weights.
-    # Chunks appearing in multiple sources/sub-queries receive a multiplicative
-    # boost: 1 + source_weight*(sources-1) + query_weight*(queries-1).
-    # Empirically chosen on HotpotQA dev set; see thesis section 3.3.
-    corroboration_source_weight: float = 0.1   # settings.yaml: navigator.corroboration_source_weight
-    corroboration_query_weight: float = 0.05   # settings.yaml: navigator.corroboration_query_weight
-
-    # Contradiction filter thresholds (numeric heuristic, original contribution).
-    # Two chunks are contradictory when word-overlap > overlap_threshold AND
-    # the ratio of their differing numbers > ratio_threshold AND both numbers
-    # exceed min_value (filters out trivial small-number differences).
-    contradiction_overlap_threshold: float = 0.3   # settings.yaml: navigator.contradiction_overlap_threshold
-    contradiction_ratio_threshold: float = 2.0     # settings.yaml: navigator.contradiction_ratio_threshold
-    contradiction_min_value: float = 10.0          # settings.yaml: navigator.contradiction_min_value
-
-    @classmethod
-    def from_yaml(cls, config: "Dict[str, Any]") -> "ControllerConfig":
-        """
-        Build a ControllerConfig from a settings.yaml dict.
-
-        Reads the ``navigator``, ``llm``, and ``agent`` blocks. All defaults
-        match the thesis evaluation settings documented in settings.yaml.
-        Follows the same pattern as IngestionConfig.from_yaml().
-
-        Parameters
-        ----------
-        config : dict
-            Full settings.yaml dict (or the relevant sub-dict).
-        """
-        nav = config.get("navigator", {})
-        llm = config.get("llm", {})
-        agent = config.get("agent", {})
-        return cls(
-            model_name=llm.get("model_name", "phi3"),
-            base_url=llm.get("base_url", "http://localhost:11434"),
-            temperature=llm.get("temperature", 0.1),
-            max_verification_iterations=agent.get("max_verification_iterations", 2),
-            relevance_threshold_factor=nav.get("relevance_threshold_factor", 0.6),
-            redundancy_threshold=nav.get("redundancy_threshold", 0.8),
-            max_context_chunks=nav.get("max_context_chunks", 10),
-            rrf_k=nav.get("rrf_k", 60),
-            top_k_per_subquery=nav.get("top_k_per_subquery", 10),
-            max_chars_per_doc=llm.get("max_chars_per_doc", 300),
-            corroboration_source_weight=nav.get("corroboration_source_weight", 0.1),
-            corroboration_query_weight=nav.get("corroboration_query_weight", 0.05),
-            contradiction_overlap_threshold=nav.get("contradiction_overlap_threshold", 0.3),
-            contradiction_ratio_threshold=nav.get("contradiction_ratio_threshold", 2.0),
-            contradiction_min_value=nav.get("contradiction_min_value", 10.0),
-        )
+# ControllerConfig is defined in _config.py and imported above.
+# It is re-exported here so that existing imports of the form
+#   from src.logic_layer.navigator import ControllerConfig
+# continue to work without change.
 
 
 @dataclass
@@ -218,13 +156,11 @@ class Navigator:
             config: ControllerConfig with navigator settings
         """
         self.config = config
-        self.logger = logging.getLogger(__name__)
 
         # Retriever is injected later via set_retriever()
-        self.retriever = None
-        self.documents = {}  # doc_id → text mapping
+        self.retriever: Optional[RetrieverProtocol] = None
 
-        self.logger.info(
+        logger.info(
             "Navigator initialized: relevance_factor=%s, redundancy_threshold=%s",
             config.relevance_threshold_factor,
             config.redundancy_threshold,
@@ -232,29 +168,20 @@ class Navigator:
 
     def set_retriever(
         self,
-        retriever: Any,  # typed Any to avoid cross-layer import; callers pass HybridRetriever
-        documents: Optional[Dict[str, str]] = None,
+        retriever: RetrieverProtocol,
     ) -> None:
         """
         Attach a HybridRetriever to this Navigator.
 
-        The parameter is typed ``Any`` deliberately to avoid a cross-layer
-        import of ``HybridRetriever`` from the data layer into the logic layer.
-        Callers are expected to pass a ``HybridRetriever`` instance whose
-        ``retrieve(query: str) -> Tuple[List, Dict]`` interface is used below.
-
         Args:
-            retriever: HybridRetriever instance
-            documents: optional dict mapping doc_id → text
+            retriever: HybridRetriever instance implementing RetrieverProtocol
         """
         self.retriever = retriever
-        if documents:
-            self.documents = documents
-        self.logger.info("HybridRetriever connected")
+        logger.info("HybridRetriever connected")
 
     def navigate(
         self,
-        retrieval_plan: RetrievalPlan,
+        retrieval_plan: Optional[RetrievalPlan],
         sub_queries: List[str],
         entity_names: Optional[List[str]] = None,
     ) -> NavigatorResult:
@@ -284,17 +211,16 @@ class Navigator:
         result.metadata["retrieval_plan"] = retrieval_plan.to_dict() if retrieval_plan else None
 
         if self.retriever is None:
-            self.logger.warning("[Navigator] No retriever set — returning empty result")
+            logger.warning("[Navigator] No retriever set — returning empty result")
             return result
 
         # ─────────────────────────────────────────────────────────────────────
         # STAGE 1: HYBRID RETRIEVAL
         # ─────────────────────────────────────────────────────────────────────
 
-        self.logger.info("[Navigator] Retrieval for %d sub-queries", len(sub_queries))
+        logger.info("[Navigator] Retrieval for %d sub-queries", len(sub_queries))
 
         all_results = []
-        retrieval_scores: Dict[str, float] = {}  # text → highest score seen (deduplication)
 
         # Entity hints from S_P passed to retriever so GLiNER is not re-run
         # on short sub-query fragments (e.g. "What is the nationality of Ed Wood?")
@@ -317,10 +243,6 @@ class Navigator:
                         else 1.0
                     )
 
-                    # Track highest score per text for deduplication
-                    if text not in retrieval_scores or score > retrieval_scores[text]:
-                        retrieval_scores[text] = score
-
                     all_results.append({
                         "text": text,
                         "score": score,
@@ -336,7 +258,7 @@ class Navigator:
                 # Broad catch is intentional: retriever errors (network, DB, model)
                 # must not abort the pipeline; missing sub-query results degrade
                 # gracefully — remaining sub-queries still contribute context.
-                self.logger.error(
+                logger.error(
                     "[Navigator] Retrieval error for sub-query %r: %s", sub_query, e, exc_info=True
                 )
                 result.metadata["retrieval_errors"] = (
@@ -347,7 +269,7 @@ class Navigator:
         # STAGE 2: RRF FUSION
         # ─────────────────────────────────────────────────────────────────────
 
-        self.logger.info("[Navigator] RRF fusion of %d results", len(all_results))
+        logger.info("[Navigator] RRF fusion of %d results", len(all_results))
 
         fused_results = self._rrf_fusion(all_results)
 
@@ -360,7 +282,7 @@ class Navigator:
         # STAGE 3: PRE-GENERATIVE FILTERING
         # ─────────────────────────────────────────────────────────────────────
 
-        self.logger.info("[Navigator] Pre-generative filtering")
+        logger.info("[Navigator] Pre-generative filtering")
 
         filter_start = time.time()
 
@@ -405,7 +327,7 @@ class Navigator:
         result.metadata["filter_time_ms"] = (time.time() - filter_start) * 1000
         result.metadata["total_time_ms"] = (time.time() - start_time) * 1000
 
-        self.logger.info(
+        logger.info(
             "[Navigator] Done: %d chunks (from %d raw) in %.0f ms",
             len(result.filtered_context),
             len(all_results),
@@ -417,7 +339,7 @@ class Navigator:
     def _rrf_fusion(
         self,
         results: List[Dict[str, Any]],
-        k: int = None,
+        k: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         Reciprocal Rank Fusion (RRF) of retrieval results.
@@ -528,7 +450,7 @@ class Navigator:
 
         filtered = [r for r in results if r["rrf_score"] >= threshold]
 
-        self.logger.debug(
+        logger.debug(
             "[Navigator] Relevance filter: threshold=%.4f, kept %d/%d",
             threshold, len(filtered), len(results),
         )
@@ -574,7 +496,7 @@ class Navigator:
                 filtered.append(r)
                 seen_texts.append(text)
 
-        self.logger.debug(
+        logger.debug(
             "[Navigator] Redundancy filter: kept %d/%d unique",
             len(filtered), len(results),
         )
@@ -613,6 +535,7 @@ class Navigator:
 
         Original contribution (thesis section 3.3); ablation results in
         thesis Table 4.2 show a +1.4 EM improvement when this filter is active.
+        (Table number to be confirmed in final thesis draft.)
         Two chunks are considered contradictory when they share high word overlap
         (topic similarity) but contain strongly differing numeric values (factual
         conflict). The chunk with the lower RRF score is dropped.
@@ -674,14 +597,14 @@ class Navigator:
         filtered = [r for idx, r in enumerate(results) if idx not in contradicting]
 
         if contradicting:
-            self.logger.debug(
+            logger.debug(
                 "[Navigator] Contradiction filter: removed %d, kept %d/%d",
                 len(contradicting), len(filtered), len(results),
             )
 
         if not filtered:
             # Safety: if all chunks were contradicted, return original list.
-            self.logger.debug(
+            logger.debug(
                 "[Navigator] Contradiction filter: all chunks removed — returning all"
             )
             return results
@@ -698,6 +621,7 @@ class Navigator:
 
         Original contribution (thesis section 3.3); ablation results in
         thesis Table 4.2 show a +0.8 EM improvement when this filter is active.
+        (Table number to be confirmed in final thesis draft.)
         If entities(Chunk_B) ⊆ entities(Chunk_A) and score(A) > score(B),
         Chunk_B is informationally redundant and is removed.
 
@@ -708,6 +632,8 @@ class Navigator:
             return results
 
         def extract_entities(text: str) -> set:
+            # Intentional variant of _PROPER_NOUN_RE: uses [a-zA-Z] (allows mixed-case
+            # continuations like "MacDonald") and * (includes single-word proper nouns).
             tokens = re.findall(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b", text)
             return {t.lower() for t in tokens if len(t) > 2}
 
@@ -734,7 +660,7 @@ class Navigator:
                 pruned.add(i)
 
         if pruned:
-            self.logger.debug(
+            logger.debug(
                 "[Navigator] Entity overlap pruning: removed %d, kept %d/%d",
                 len(pruned), len(kept), len(results),
             )
@@ -751,6 +677,7 @@ class Navigator:
 
         Original contribution (thesis section 3.3); ablation results in
         thesis Table 4.2 show a +2.1 EM improvement when this filter is active
+        (Table number to be confirmed in final thesis draft.)
         on bridge questions. A chunk passes if it contains at least one token
         (≥ 5 chars) from any query entity name as a whole word.
 
@@ -806,14 +733,14 @@ class Navigator:
         if filtered:
             removed = len(results) - len(filtered)
             if removed:
-                self.logger.debug(
+                logger.debug(
                     "[Navigator] Entity-mention filter: removed %d, kept %d/%d",
                     removed, len(filtered), len(results),
                 )
             return filtered
 
         # Safety: if all chunks were filtered out, return all (never empty context)
-        self.logger.debug(
+        logger.debug(
             "[Navigator] Entity-mention filter: all chunks filtered — returning all"
         )
         return results
@@ -828,10 +755,11 @@ class Navigator:
 
         Original contribution (thesis section 3.3); ablation results in
         thesis Table 4.3 show a 34% reduction in S_V latency with no EM loss
+        (Table number to be confirmed in final thesis draft.)
         (entity-containing sentences carry the key facts for HotpotQA).
         Edge optimization: smaller context = fewer input tokens = faster LLM
-        inference on CPU. Directly reduces the phi3 prompt size from ~900 chars
-        toward the 300-char budget set in llm.max_chars_per_doc.
+        inference on CPU. Directly reduces the LLM prompt size toward the 500-char
+        budget set in llm.max_chars_per_doc.
 
         Strategy:
         1. Split into sentences (punctuation-based heuristic)
@@ -911,7 +839,7 @@ if __name__ == "__main__":
             self.source = source
 
     class _MockRetriever:
-        def retrieve(self, query: str):
+        def retrieve(self, query: str, entity_hints=None):
             return (
                 [
                     _MockResult("Paris is the capital of France.", 0.9, "doc_france"),

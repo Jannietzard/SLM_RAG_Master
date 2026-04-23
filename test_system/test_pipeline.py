@@ -41,10 +41,10 @@ HOW TO RUN
 ================================================================================
 
     # From the project root (Entwicklungfolder):
-    python -X utf8 -m pytest src/pipeline/test_pipeline.py -v
+    python -X utf8 -m pytest test_system/test_pipeline.py -v
 
     # With coverage:
-    python -X utf8 -m pytest src/pipeline/test_pipeline.py -v --cov=src/pipeline
+    python -X utf8 -m pytest test_system/test_pipeline.py -v --cov=src/pipeline
 
 ================================================================================
 """
@@ -177,7 +177,7 @@ class TestAgentPipeline:
             planner=planner,
             navigator=navigator,
             verifier=verifier,
-            enable_caching=False,
+            config={"agent": {"enable_caching": False}},
         )
 
     def test_initialization_stores_agents(self, mock_agents):
@@ -253,7 +253,7 @@ class TestAgentPipeline:
         planner, navigator, verifier = mock_agents
         pipeline = AgentPipeline(
             planner=planner, navigator=navigator, verifier=verifier,
-            enable_caching=True,
+            config={"agent": {"enable_caching": True}},
         )
         with patch.object(pipeline.verifier, '_call_llm', return_value=("Answer.", 0.05)):
             result1 = pipeline.process("What is Python?")
@@ -275,6 +275,39 @@ class TestAgentPipeline:
         with patch.object(pipeline.verifier, '_call_llm', return_value=("Answer.", 0.05)):
             result = pipeline.process("Who invented the telephone?")
         assert "confidence" in result.verifier_result
+
+    def test_welford_avg_latency(self, mock_agents):
+        """avg_latency_ms converges via Welford incremental mean after two queries."""
+        from src.pipeline import AgentPipeline
+        planner, navigator, verifier = mock_agents
+        pipeline = AgentPipeline(
+            planner=planner, navigator=navigator, verifier=verifier,
+            config={"agent": {"enable_caching": False}},
+        )
+        with patch.object(pipeline.verifier, '_call_llm', return_value=("A.", 0.05)):
+            pipeline.process("Q1?")
+            pipeline.process("Q2?")
+        stats = pipeline.get_stats()
+        assert stats["total_queries"] == 2
+        assert stats["avg_latency_ms"] > 0.0
+
+    def test_fifo_eviction(self, mock_agents):
+        """Cache evicts oldest entry when max_size is reached."""
+        from src.pipeline import AgentPipeline
+        planner, navigator, verifier = mock_agents
+        pipeline = AgentPipeline(
+            planner=planner, navigator=navigator, verifier=verifier,
+            config={"agent": {"enable_caching": True, "cache_max_size": 2}},
+        )
+        with patch.object(pipeline.verifier, '_call_llm', return_value=("A.", 0.05)):
+            pipeline.process("Alpha?")
+            pipeline.process("Beta?")
+            pipeline.process("Gamma?")  # must evict "Alpha?"
+        assert len(pipeline._cache) == 2
+        alpha_key = pipeline._get_cache_key("Alpha?")
+        assert alpha_key not in pipeline._cache
+        gamma_key = pipeline._get_cache_key("Gamma?")
+        assert gamma_key in pipeline._cache
 
 
 # ============================================================================
@@ -747,9 +780,10 @@ class TestFactoryFunctions:
         assert pipeline.config.sentences_per_chunk == 5
 
     def test_create_pipeline_returns_agent_pipeline(self):
-        """create_pipeline() returns an AgentPipeline."""
-        from src.pipeline.agent_pipeline import create_pipeline, AgentPipeline
-        pipeline = create_pipeline()
+        """AgentPipeline() + _lazy_init_agents() wires all three agents."""
+        from src.pipeline import AgentPipeline
+        pipeline = AgentPipeline()
+        pipeline._lazy_init_agents()
         assert isinstance(pipeline, AgentPipeline)
         assert pipeline.planner is not None
         assert pipeline.navigator is not None
@@ -758,12 +792,13 @@ class TestFactoryFunctions:
     def test_pipeline_imports_from_init(self):
         """__init__.py exports all public classes correctly."""
         from src.pipeline import (
-            AgentPipeline, PipelineResult, BatchProcessor,
-            create_pipeline, create_full_pipeline,
+            AgentPipeline, AgentPipelineConfig, PipelineResult, BatchProcessor,
+            create_full_pipeline,
             IngestionPipeline, IngestionConfig, IngestionMetrics,
-            DocumentLoader, MockEmbeddingGenerator, create_ingestion_pipeline,
+            DocumentLoader, create_ingestion_pipeline,
         )
         assert AgentPipeline is not None
+        assert AgentPipelineConfig is not None
         assert IngestionPipeline is not None
 
 

@@ -17,116 +17,88 @@ Usage:
 """
 
 # =============================================================================
-# PLANNER (S_P) - Query Analysis & Planning
+# PLANNER (S_P) — Query Analysis & Planning
 # =============================================================================
 from .planner import (
-    # Main class
     Planner,
-    
-    # Factory function
     create_planner,
-    
-    # Enums
     QueryType,
     RetrievalStrategy,
-    
-    # Data classes
     EntityInfo,
     HopStep,
     RetrievalPlan,
-    
-    # Component classes (for advanced use)
-    QueryClassifier,
-    EntityExtractor,
-    PlanGenerator,
+    # QueryClassifier, EntityExtractor, PlanGenerator are internal
+    # sub-components of Planner — not part of the public API.
 )
 
 # =============================================================================
-# VERIFIER (S_V) - Validation & Generation
+# NAVIGATOR (S_N) — Retrieval & Pre-Generative Filtering
+# =============================================================================
+from .navigator import (
+    Navigator,
+    NavigatorResult,
+)
+
+# ControllerConfig is defined in _config.py; import from there to keep the
+# public API stable regardless of which production file is refactored.
+from ._config import ControllerConfig
+
+# =============================================================================
+# VERIFIER (S_V) — Validation & Generation
 # =============================================================================
 from .verifier import (
-    # Main class
     Verifier,
-    
-    # Factory function
     create_verifier,
-    
-    # Config
     VerifierConfig,
-    
-    # Enums
     ValidationStatus,
-    
-    # Data classes
+    ConfidenceLevel,
     SourceCredibility,
     PreValidationResult,
     VerificationResult,
-    
-    # Component classes
     PreGenerationValidator,
 )
 
 # =============================================================================
-# Navigator (S_N) - Retrieval & Pre-Generative Filtering
-# =============================================================================
-from .navigator import (
-    # Main class
-    Navigator,
-
-    # Data classes
-    NavigatorResult,
-    ControllerConfig,
-)
-
-# =============================================================================
-# Controller (S_P → S_N → S_V) - Pipeline Orchestration
+# CONTROLLER (S_P → S_N → S_V) — Pipeline Orchestration
 # =============================================================================
 from .controller import (
-    # Main class
     AgenticController,
-
-    # Factory function
     create_controller,
-
-    # State (for LangGraph integration)
     AgentState,
 )
 
 # =============================================================================
-# CONVENIENCE EXPORTS
+# PUBLIC API
 # =============================================================================
 
 __all__ = [
     # Planner
-    'Planner',
-    'create_planner',
-    'QueryType',
-    'RetrievalStrategy',
-    'EntityInfo',
-    'HopStep',
-    'RetrievalPlan',
-    'QueryClassifier',
-    'EntityExtractor',
-    'PlanGenerator',
-    
+    "Planner",
+    "create_planner",
+    "QueryType",
+    "RetrievalStrategy",
+    "EntityInfo",
+    "HopStep",
+    "RetrievalPlan",
+    # Navigator
+    "Navigator",
+    "NavigatorResult",
+    "ControllerConfig",
     # Verifier
-    'Verifier',
-    'create_verifier',
-    'VerifierConfig',
-    'ValidationStatus',
-    'SourceCredibility',
-    'PreValidationResult',
-    'VerificationResult',
-    'PreGenerationValidator',
-    
-    # Agent
-    'Navigator',
-    'AgenticController',
-    'create_controller',
-    'NavigatorResult',
-    'ControllerConfig',
-    'AgentState',
+    "Verifier",
+    "create_verifier",
+    "VerifierConfig",
+    "ValidationStatus",
+    "ConfidenceLevel",
+    "SourceCredibility",
+    "PreValidationResult",
+    "VerificationResult",
+    "PreGenerationValidator",
+    # Controller
+    "AgenticController",
+    "create_controller",
+    "AgentState",
 ]
 
-__version__ = '2.0.0'
-__author__ = 'Jan Nietzard'
+__version__ = "4.0.0"
+__author__ = "Jan Nietzard"

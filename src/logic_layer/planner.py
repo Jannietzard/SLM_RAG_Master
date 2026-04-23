@@ -74,7 +74,17 @@ ACADEMIC REFERENCES
 - Khattab, O., et al. (2022). "Demonstrate-Search-Predict: Composing retrieval
   and language models for knowledge-intensive NLP." arXiv:2212.14024.
   (Motivation for structured query decomposition in RAG pipelines.)
+- Weischedel, R., et al. (2013). "OntoNotes Release 5.0." LDC2013T19.
+  (Label-level NER confidence estimates for en_core_web_sm in
+  EntityExtractor._estimate_confidence; see _LABEL_CONFIDENCE dict.)
 
+===============================================================================
+Review History:
+    Last Reviewed:  2026-04-21
+    Review Result:  0 CRITICAL, 4 IMPORTANT, 7 RECOMMENDED
+    Reviewer:       Code Review Prompt v2.1
+    Next Review:    After re-ingestion with updated entity types or SpaCy lazy-load
+                    refactor (Finding 7)
 ===============================================================================
 """
 
@@ -87,6 +97,9 @@ from enum import Enum
 import json
 
 logger = logging.getLogger(__name__)
+
+
+from ._settings import _load_settings, _PROPER_NOUN_RE
 
 
 # =============================================================================
@@ -110,9 +123,12 @@ try:
     import spacy
     from spacy.matcher import Matcher
 
-    # Default model name — can be overridden via PlannerConfig.spacy_model.
-    # The module-level load uses this default; runtime override requires
-    # lazy loading (not implemented here; add if needed for edge deployment).
+    # Model loaded once at import time using this default.
+    # KNOWN LIMITATION: PlannerConfig.spacy_model (from settings.yaml →
+    # ingestion.spacy_model) cannot affect this module-level load — the
+    # setting is read after the model is already in memory. A lazy-load
+    # refactor (module-level _NLP = None + _get_nlp() accessor) would fix
+    # this but is deferred; en_core_web_sm matches settings.yaml currently.
     _DEFAULT_SPACY_MODEL = "en_core_web_sm"
 
     try:
@@ -283,7 +299,12 @@ class RetrievalPlan:
         }
 
     def to_json(self) -> str:
-        """Serialise to a JSON string."""
+        """
+        Serialise to a JSON string.
+
+        Public API convenience method for external consumers (e.g. REST endpoints,
+        logging pipelines). Internal pipeline code uses to_dict() directly.
+        """
         return json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
 
 
@@ -351,10 +372,11 @@ class PlannerConfig:
         All defaults match the thesis evaluation settings documented in
         settings.yaml. Follows the same pattern as IngestionConfig.from_yaml().
 
-        Parameters
-        ----------
-        config : dict
-            Full settings.yaml dict (or the relevant sub-dict).
+        Args:
+            config: Full settings.yaml dict (or the relevant sub-dict).
+
+        Returns:
+            PlannerConfig populated from the provided settings dict.
         """
         planner = config.get("planner", {})
         ingestion = config.get("ingestion", {})
@@ -666,10 +688,21 @@ class EntityExtractor:
     ENTITY_PATTERNS = (
         (r'"([^"]+)"',                             "QUOTED"),  # double-quoted strings
         (r"'([^']+)'",                             "QUOTED"),  # single-quoted strings
-        (r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", "PROPN"),   # multi-word proper nouns
+        (_PROPER_NOUN_RE.pattern,                   "PROPN"),   # multi-word proper nouns (shared from _settings)
         (r"\b([A-Z][a-z]{2,})\b",                  "PROPN"),   # single proper nouns
         (r"\b(\d{4})\b",                           "DATE"),    # four-digit years
     )
+
+    # Common stopwords that must not be extracted as named entities.
+    # Built once as a frozenset class constant to avoid per-call reconstruction
+    # (called for every regex-matched candidate in extract()).
+    _STOPWORDS: frozenset = frozenset({
+        'the', 'a', 'an', 'this', 'that', 'these', 'those',
+        'however', 'therefore', 'furthermore', 'moreover',
+        'although', 'because', 'since', 'while', 'when',
+        'what', 'which', 'who', 'whom', 'whose', 'where',
+        'how', 'why', 'if', 'then', 'else', 'but', 'and', 'or',
+    })
 
     # Per-label confidence estimates.
     # Values are approximate — SpaCy does not expose per-entity confidence scores.
@@ -886,14 +919,7 @@ class EntityExtractor:
 
     def _is_stopword(self, text: str) -> bool:
         """Return True if text is a common stopword that should not be extracted."""
-        stopwords = {
-            'the', 'a', 'an', 'this', 'that', 'these', 'those',
-            'however', 'therefore', 'furthermore', 'moreover',
-            'although', 'because', 'since', 'while', 'when',
-            'what', 'which', 'who', 'whom', 'whose', 'where',
-            'how', 'why', 'if', 'then', 'else', 'but', 'and', 'or',
-        }
-        return text.lower() in stopwords
+        return text.lower() in self._STOPWORDS
 
 
 # =============================================================================
@@ -955,6 +981,30 @@ class PlanGenerator:
          "What country is {entity} from?"),
         (re.compile(r'\bsame\s+(?:religion|faith|belief)\b', re.IGNORECASE),
          "What is the religion of {entity}?"),
+    )
+
+    # ── Pattern C: "for a/an/the [category] [description]" ──────────────────────
+    # Handles hidden-bridge queries where the bridge entity is described but not
+    # named, e.g. "What year did GNR do a promo for a movie starring Schwarzenegger?"
+    # → bridge_query = "movie starring Schwarzenegger as NY police detective"
+    # → final_query  = original (controller injects bridge name at runtime)
+    _CATEGORY_WORDS = (
+        "film|movie|show|song|album|game|book|video|series|documentary"
+    )
+    _FOR_CAT = re.compile(
+        r'\bfor (?:a|an|the)\s+(?P<cat>' + _CATEGORY_WORDS + r')\b'
+        r'(?P<desc>.{5,}?)(?:\?|$)',
+        re.IGNORECASE,
+    )
+
+    # ── Pattern D: "What [role] with/having [qualifier] [verb]..." ─────────────
+    # Handles: "What screenwriter with credits for X co-wrote a film ...?"
+    # The role + qualifier identifies the unknown bridge person.
+    _ROLE_PAT = re.compile(
+        r'^(?:what|which|who)\s+(?P<role>\w+(?:\s+\w+)?)\s+'
+        r'(?:with|having|known for|who)\s+(?P<qual>.+?)\s+'
+        r'(?:co-?wrote|wrote|directed|produced|starred|co-?directed)\b',
+        re.IGNORECASE,
     )
 
     # Pre-compiled regexes for _form_sub_query (called on every multi-hop step)
@@ -1176,21 +1226,9 @@ class PlanGenerator:
             parts = [p.strip() for p in new_parts if p.strip() and len(p.strip()) > 5]
 
         # ── Pattern C: "for a/an/the [category] [description]" ──────────────────
-        # Handles hidden-bridge queries where the bridge entity is described
-        # but not named, e.g.:
-        #   "What year did GNR do a promo for a movie starring Schwarzenegger?"
-        #   → bridge_query = "movie starring Schwarzenegger as NY police detective"
-        #   → final_query  = original (controller injects bridge name at runtime)
-        _CATEGORY_WORDS = (
-            "film|movie|show|song|album|game|book|video|series|documentary"
-        )
-        _FOR_CAT = re.compile(
-            r'\bfor (?:a|an|the)\s+(?P<cat>' + _CATEGORY_WORDS + r')\b'
-            r'(?P<desc>.{5,}?)(?:\?|$)',
-            re.IGNORECASE,
-        )
+        # See class-level _FOR_CAT for full rationale.
         if len(parts) <= 1:
-            cm = _FOR_CAT.search(query)
+            cm = self._FOR_CAT.search(query)
             if cm:
                 bridge_q = f"{cm.group('cat')} {cm.group('desc').strip()}"
                 hop_sequence = [
@@ -1215,16 +1253,9 @@ class PlanGenerator:
                 return hop_sequence, [bridge_q, query]
 
         # ── Pattern D: "What [role] with/having [qualifier] [verb]..." ────────
-        # Handles: "What screenwriter with credits for X co-wrote a film ...?"
-        # The role + qualifier identifies the unknown bridge person.
-        _ROLE_PAT = re.compile(
-            r'^(?:what|which|who)\s+(?P<role>\w+(?:\s+\w+)?)\s+'
-            r'(?:with|having|known for|who)\s+(?P<qual>.+?)\s+'
-            r'(?:co-?wrote|wrote|directed|produced|starred|co-?directed)\b',
-            re.IGNORECASE,
-        )
+        # See class-level _ROLE_PAT for full rationale.
         if len(parts) <= 1 and entities:
-            rm = _ROLE_PAT.match(query)
+            rm = self._ROLE_PAT.match(query)
             if rm:
                 bridge_q = f"{rm.group('role')} {rm.group('qual').strip()}"
                 hop_sequence = [
@@ -1611,6 +1642,8 @@ class Planner:
         """
         start_time = time.perf_counter()
 
+        if query is None:
+            return self._empty_plan("")
         query = query.strip()
         if not query:
             return self._empty_plan(query)
@@ -1674,7 +1707,7 @@ class Planner:
             hop_sequence=[],
             sub_queries=[query] if query else [],
             constraints={},
-            estimated_hops=1,
+            estimated_hops=0,  # consistent with empty hop_sequence
             confidence=0.0,
         )
 
@@ -1684,30 +1717,33 @@ class Planner:
 # =============================================================================
 
 def create_planner(
+    cfg: Optional[Dict[str, Any]] = None,
     model_name: Optional[str] = None,  # ignored — API compatibility
     base_url: Optional[str] = None,    # ignored — API compatibility
-    **kwargs,
 ) -> Planner:
     """
     Factory function for Planner.
 
-    Creates a configured Planner instance. ``model_name`` and ``base_url``
-    are accepted but ignored for API compatibility with LLM-based planner
-    signatures.
+    When ``cfg`` is None, settings.yaml is auto-loaded from
+    ``config/settings.yaml`` relative to the project root — so a bare
+    ``create_planner()`` call always picks up the live settings.yaml values
+    without any hardcoded fallbacks in the call site.
+
+    ``model_name`` and ``base_url`` are accepted but ignored for API
+    compatibility with LLM-based planner signatures (the Planner is
+    rule-based and does not call an LLM).
 
     Args:
-        model_name: Ignored.
-        base_url:   Ignored.
-        **kwargs:   PlannerConfig field overrides. All keyword arguments are
-                    forwarded directly to PlannerConfig(). Note: ``default_strategy``
-                    must be a ``RetrievalStrategy`` enum value, not a plain string
-                    (e.g. use ``default_strategy=RetrievalStrategy.HYBRID``, not
-                    ``default_strategy="hybrid"``).
+        cfg:        Full settings.yaml dict.  Auto-loaded when None.
+        model_name: Ignored (API compatibility shim).
+        base_url:   Ignored (API compatibility shim).
 
     Returns:
         Configured Planner instance.
     """
-    config = PlannerConfig(**kwargs) if kwargs else None
+    if cfg is None:
+        cfg = _load_settings()
+    config = PlannerConfig.from_yaml(cfg)
     return Planner(config=config)
 
 
@@ -1737,7 +1773,7 @@ if __name__ == "__main__":
     print(f"SpaCy available: {SPACY_AVAILABLE}")
     print("=" * 70)
 
-    planner = Planner()
+    planner = create_planner()  # auto-loads config/settings.yaml
 
     total_time = 0
     correct = 0

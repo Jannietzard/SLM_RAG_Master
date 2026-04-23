@@ -677,9 +677,7 @@ def build_pipeline(cfg: dict):
     from src.data_layer.embeddings import BatchedOllamaEmbeddings
     from src.data_layer.hybrid_retriever import HybridRetriever, RetrievalConfig, RetrievalMode
     from src.data_layer.storage import HybridStore, StorageConfig
-    from src.logic_layer.controller import AgenticController, ControllerConfig
-    from src.logic_layer.planner import create_planner
-    from src.logic_layer.verifier import create_verifier
+    from src.logic_layer import AgenticController, ControllerConfig, create_planner, create_verifier
 
     vector_path = PROJECT_ROOT / "data" / "hotpotqa" / "vector"
     graph_path  = PROJECT_ROOT / "data" / "hotpotqa" / "graph"
@@ -791,7 +789,7 @@ def main():
         patch_verifier(verifier)
     else:
         def _skip_verifier(query, context, entities=None, hop_sequence=None):
-            from src.logic_layer.verifier import VerificationResult
+            from src.logic_layer import VerificationResult
             section("S_V — VERIFIER  (übersprungen via --skip-llm)")
             field("Kontext-Chunks", len(context))
             if context:

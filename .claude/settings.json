@@ -26,7 +26,17 @@
       "Bash(python -X utf8 diagnose_verbose.py --idx 0 --skip-llm --trace-calls --no-color)",
       "Bash(python -X utf8 diagnose_verbose.py --idx 11 --skip-llm)",
       "Bash(python -X utf8 -m pytest src/data_layer/test_data_layer.py src/logic_layer/test_logic_layer.py -q --tb=short)",
-      "Bash(python -X utf8 diagnose_ingestion.py --indices 11,12)"
+      "Bash(python -X utf8 diagnose_ingestion.py --indices 11,12)",
+      "Bash(python -X utf8 src/data_layer/hybrid_retriever.py)",
+      "Bash(git mv *)",
+      "Bash(python -X utf8 -m pytest test_system/test_data_layer.py test_system/test_chunking.py test_system/test_embeddings.py test_system/test_planner_semantic.py test_system/test_verifier_semantic.py src/logic_layer/test_logic_layer.py -q)",
+      "Bash(python -X utf8 -m pytest test_system/ src/ -q)",
+      "Bash(python -X utf8 -m pytest test_system/ src/ --ignore=test_system/test_gliner.py -q --timeout=120)",
+      "Bash(python -X utf8 -m pytest test_system/ src/ --ignore=test_system/test_gliner.py -q)",
+      "Bash(python -X utf8 -m pytest test_system/ src/ --ignore=test_system/test_gliner_quality.py -q)",
+      "Bash(python -X utf8 -m pytest test_system/ src/ --ignore=test_system/test_gliner_quality.py --ignore=test_system/test_gliner.py -q)",
+      "Read(//c/Users/JANNIE~1/AppData/Local/Temp/claude/c--Users-Jan-Nietzard-Documents-FOM-FOM-Masterarbeit-Masterarbeit-Edge-Entwicklungfolder/b5bea62f-1e58-422a-a597-1780c2bd07a0/tasks/**)",
+      "Bash(python -X utf8 -m pytest test_system/ src/ --ignore=test_system/test_gliner_quality.py --ignore=src/evaluations/ -q)"
     ]
   }
 }

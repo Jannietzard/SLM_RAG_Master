@@ -72,7 +72,7 @@ def load_sample_question(idx: int = 0) -> dict:
 def test_embedding(query: str):
     header("LAYER 1 — Embedding (nomic-embed-text via Ollama)")
 
-    from src.data_layer.embeddings import BatchedOllamaEmbeddings
+    from src.data_layer import BatchedOllamaEmbeddings
 
     emb_cfg = config.get("embeddings", {})
     cache_path = Path(f"./cache/{DATASET}_embeddings.db")
@@ -115,7 +115,7 @@ def test_embedding(query: str):
 def test_vector_search(query: str, embeddings):
     header("LAYER 2 — Vector Search (LanceDB direkt)")
 
-    from src.data_layer.storage import HybridStore, StorageConfig
+    from src.data_layer import HybridStore, StorageConfig
 
     emb_cfg  = config.get("embeddings", {})
     vec_cfg  = config.get("vector_store", {})
@@ -175,7 +175,7 @@ def test_graph_search(query: str, store):
     header("LAYER 3 — Graph Search (KuzuDB direkt)")
 
     # GLiNER-Entitätsextraktion (konsistent mit Ingestion)
-    from src.data_layer.hybrid_retriever import ImprovedQueryEntityExtractor
+    from src.data_layer import ImprovedQueryEntityExtractor
     _qee = ImprovedQueryEntityExtractor()
     entities = _qee.extract(query)
     if not entities:
@@ -215,9 +215,7 @@ def test_graph_search(query: str, store):
 def test_hybrid_retriever(query: str, store, embeddings):
     header("LAYER 4 — HybridRetriever (RRF Fusion)")
 
-    from src.data_layer.hybrid_retriever import (
-        HybridRetriever, RetrievalConfig, RetrievalMode
-    )
+    from src.data_layer import HybridRetriever, RetrievalConfig, RetrievalMode
 
     rag_cfg = config.get("rag", {})
     vec_cfg = config.get("vector_store", {})
@@ -270,7 +268,7 @@ def test_hybrid_retriever(query: str, store, embeddings):
 def test_planner(query: str):
     header("LAYER 5 — Planner / S_P (Query Decomposition, kein LLM)")
 
-    from src.logic_layer.planner import create_planner
+    from src.logic_layer import create_planner
 
     try:
         t0 = time.time()
@@ -306,7 +304,7 @@ def test_planner(query: str):
 def test_navigator(query: str, plan, retriever):
     header("LAYER 6 — Navigator / S_N (Retrieval + Pre-Gen Filtering)")
 
-    from src.logic_layer.navigator import Navigator, ControllerConfig
+    from src.logic_layer import Navigator, ControllerConfig
 
     if retriever is None:
         fail("Kein HybridRetriever verfügbar — Layer 4 muss zuerst erfolgreich sein")
@@ -380,7 +378,7 @@ def test_verifier(query: str, gold_answer: str, context: list, skip_llm: bool):
         warn("--skip-llm aktiv: Verifier-Test übersprungen")
         return
 
-    from src.logic_layer.verifier import create_verifier
+    from src.logic_layer import create_verifier
 
     # Wenn kein echtes Context vorhanden, nutze Dummy
     if not context:
@@ -450,12 +448,10 @@ def test_full_pipeline(query: str, gold_answer: str, skip_llm: bool,
         warn("--skip-llm aktiv: Full Pipeline übersprungen")
         return
 
-    from src.pipeline.agent_pipeline import create_full_pipeline
-    from src.data_layer.storage import HybridStore, StorageConfig
-    from src.data_layer.embeddings import BatchedOllamaEmbeddings
-    from src.data_layer.hybrid_retriever import (
-        HybridRetriever, RetrievalConfig, RetrievalMode
-    )
+    from src.pipeline import create_full_pipeline
+    from src.data_layer import HybridStore, StorageConfig
+    from src.data_layer import BatchedOllamaEmbeddings
+    from src.data_layer import HybridRetriever, RetrievalConfig, RetrievalMode
 
     emb_cfg = config.get("embeddings", {})
     vec_cfg = config.get("vector_store", {})
@@ -570,8 +566,8 @@ def test_graph_quality(n_questions: int):
     else:
         warn("Keine extraction_metadata.json — Graph-Stats unbekannt")
 
-    from src.data_layer.storage import HybridStore, StorageConfig
-    from src.data_layer.embeddings import BatchedOllamaEmbeddings
+    from src.data_layer import HybridStore, StorageConfig
+    from src.data_layer import BatchedOllamaEmbeddings
 
     emb_cfg = config.get("embeddings", {})
     vec_cfg = config.get("vector_store", {})
@@ -852,8 +848,8 @@ def test_multi_vector(n_questions: int):
     n_questions = min(n_questions, len(all_qs))
     info(f"Verfügbare Fragen: {len(all_qs)} — teste {n_questions}")
 
-    from src.data_layer.embeddings import BatchedOllamaEmbeddings
-    from src.data_layer.storage import HybridStore, StorageConfig
+    from src.data_layer import BatchedOllamaEmbeddings
+    from src.data_layer import HybridStore, StorageConfig
 
     emb_cfg = config.get("embeddings", {})
     vec_cfg = config.get("vector_store", {})

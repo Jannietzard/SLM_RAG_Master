@@ -61,19 +61,35 @@ S_N → S_V:
     - Retrieval metadata (scores, provenance)
 
 ===============================================================================
+
+Review History:
+    Last Reviewed:  2026-04-21
+    Review Result:  0 CRITICAL, 4 IMPORTANT, 9 RECOMMENDED
+    Reviewer:       Code Review Prompt v2.1
+    All findings applied: create_controller() defaults aligned to
+    settings.yaml, iterative multi-hop silent failure fixed, module
+    structure cleaned up.
+    Next Review:    After thesis section numbers are finalized
+
+===============================================================================
 """
 
 import logging
+import re
 import time
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict, cast
 
-from .navigator import ControllerConfig, Navigator, NavigatorResult
+from ._config import ControllerConfig
+from .navigator import Navigator, NavigatorResult
 from .planner import Planner, QueryType, RetrievalPlan, RetrievalStrategy, create_planner
 from .verifier import Verifier, create_verifier
 
 # Module logger — defined before the LangGraph import block so that the
 # ImportError warning uses the module-namespaced logger (Action 2).
 logger = logging.getLogger(__name__)
+
+
+from ._settings import _load_settings, _PROPER_NOUN_RE
 
 # LangGraph is optional: when absent the controller falls back to a sequential
 # _run_simple_pipeline.  The thesis evaluation was conducted in fallback mode.
@@ -192,10 +208,11 @@ class AgenticController:
                 a minimal cfg is constructed from the ControllerConfig fields.
         """
         self.config = config or ControllerConfig()
-        self.logger = logging.getLogger(__name__)
 
-        # Initialize pipeline components
-        self.planner = planner or create_planner()
+        # Initialize pipeline components — pass full_cfg so each component
+        # reads its own block from the same settings.yaml dict rather than
+        # triggering a second file-load.
+        self.planner = planner or create_planner(cfg=full_cfg)
 
         if verifier is not None:
             self.verifier = verifier
@@ -232,21 +249,20 @@ class AgenticController:
         # Build Workflow
         if LANGGRAPH_AVAILABLE:
             self.app = self._build_workflow()
-            self.logger.info("Pipeline controller initialized with LangGraph")
+            logger.info("Pipeline controller initialized with LangGraph")
         else:
             self.app = None
-            self.logger.info("Pipeline controller initialized with simple pipeline fallback")
+            logger.info("Pipeline controller initialized with simple pipeline fallback")
 
-    def set_retriever(self, retriever: Any, documents: Optional[Dict[str, str]] = None) -> None:
+    def set_retriever(self, retriever: Any) -> None:
         """
         Attach a HybridRetriever to the Navigator.
 
         Args:
             retriever: HybridRetriever instance (typed Any to avoid cross-layer import)
-            documents: optional dict mapping doc_id → text
         """
-        self.navigator.set_retriever(retriever, documents)
-        self.logger.info("HybridRetriever connected to Navigator")
+        self.navigator.set_retriever(retriever)
+        logger.info("HybridRetriever connected to Navigator")
 
     def set_graph_store(self, graph_store: Any) -> None:
         """
@@ -257,7 +273,7 @@ class AgenticController:
                 avoid cross-layer import)
         """
         self.verifier.set_graph_store(graph_store)
-        self.logger.info("GraphStore connected to Verifier")
+        logger.info("GraphStore connected to Verifier")
 
     # ─────────────────────────────────────────────────────────────────────────
     # LANGGRAPH WORKFLOW
@@ -290,7 +306,7 @@ class AgenticController:
         Input:  query
         Output: retrieval_plan, sub_queries, entities, query_type
         """
-        self.logger.info("--- [S_P PLANNER] Query Analysis ---")
+        logger.info("--- [S_P PLANNER] Query Analysis ---")
 
         start_time = time.time()
 
@@ -301,12 +317,12 @@ class AgenticController:
             entities = [e.text for e in plan.entities]
             query_type = plan.query_type.value
 
-            self.logger.info("[S_P] Query type: %s", query_type)
-            self.logger.info("[S_P] Strategy: %s", plan.strategy.value)
-            self.logger.info("[S_P] Entities: %s", entities)
-            self.logger.info("[S_P] Sub-queries: %d", len(sub_queries))
+            logger.info("[S_P] Query type: %s", query_type)
+            logger.info("[S_P] Strategy: %s", plan.strategy.value)
+            logger.info("[S_P] Entities: %s", entities)
+            logger.info("[S_P] Sub-queries: %d", len(sub_queries))
             for i, sq in enumerate(sub_queries, 1):
-                self.logger.info("      %d. %s", i, sq)
+                logger.info("      %d. %s", i, sq)
 
             elapsed = (time.time() - start_time) * 1000
 
@@ -322,7 +338,7 @@ class AgenticController:
             # Broad catch is intentional: Planner errors (SpaCy, malformed query)
             # must not abort the pipeline — fall back to treating the raw query
             # as a single sub-query so retrieval can still proceed.
-            self.logger.error("[S_P] Error: %s", e, exc_info=True)
+            logger.error("[S_P] Error: %s", e, exc_info=True)
             elapsed = (time.time() - start_time) * 1000
             return {
                 "retrieval_plan": None,
@@ -348,13 +364,17 @@ class AgenticController:
 
         Returns:
             Up to 3 candidate bridge entity strings.
+
+        Note: The Title-Case regex captures sequences of 2+ "Xx Yy" tokens only.
+        ALL-CAPS entities (NATO, FBI) and names with lowercase prepositions
+        (Tower of London) are missed — known recall trade-off for a zero-weight
+        heuristic that avoids loading a second NER model at inference time.
         """
-        import re as _re
         exclude_lower = {e.lower() for e in exclude}
-        seen: set = set()
+        seen: set[str] = set()
         candidates: List[str] = []
         for chunk in chunks:
-            for m in _re.finditer(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b', chunk):
+            for m in _PROPER_NOUN_RE.finditer(chunk):
                 phrase = m.group(1)
                 phrase_lower = phrase.lower()
                 if (
@@ -385,7 +405,10 @@ class AgenticController:
         step 0 retrieves B, the controller extracts B's name, and step 1 uses
         B's name to retrieve the final answer.
 
-        Reference: multi-hop retrieval augmentation; thesis section 3.x.
+        Reference: iterative multi-hop retrieval; thesis Section 4.2
+        (TECHNICAL_ARCHITECTURE.md, pending implementation plan).
+        Trivedi et al. (2022). "Interleaving Retrieval with Chain-of-Thought
+        Reasoning for Knowledge-Intensive Multi-Step Questions." ACL 2023.
         """
         accumulated_raw: List[str] = []
         accumulated_context: List[str] = []
@@ -400,7 +423,7 @@ class AgenticController:
             is_bridge = hop.get("is_bridge", False)
             step_id = hop.get("step_id", 0)
 
-            self.logger.info(
+            logger.info(
                 "[S_N Iterative] Step %d (bridge=%s) query=%r  hints=%s",
                 step_id, is_bridge, sub_query[:60], current_hints,
             )
@@ -421,13 +444,13 @@ class AgenticController:
                 plan = None
 
             try:
-                nav_result = self.navigator.navigate(
+                nav_result: NavigatorResult = self.navigator.navigate(
                     retrieval_plan=plan,
                     sub_queries=[sub_query],
                     entity_names=current_hints,
                 )
             except Exception as e:
-                self.logger.error("[S_N Iterative] Step %d failed: %s", step_id, e)
+                logger.error("[S_N Iterative] Step %d failed: %s", step_id, e)
                 continue
 
             # Accumulate unique chunks
@@ -448,23 +471,37 @@ class AgenticController:
                     exclude=current_hints,
                 )
                 if bridge_entities:
-                    self.logger.info(
+                    logger.info(
                         "[S_N Iterative] Bridge entities discovered: %s",
                         bridge_entities,
                     )
                     current_hints = current_hints + bridge_entities
 
         elapsed = (time.time() - start_time) * 1000
-        self.logger.info(
+        logger.info(
             "[S_N Iterative] %d steps done — %d raw / %d filtered chunks, %.1f ms",
             len(hops), len(accumulated_raw), len(accumulated_context), elapsed,
         )
 
+        errors: List[str] = list(state.get("errors", []))
+        if not accumulated_context:
+            # All hops failed or produced no results — surface in state.errors so
+            # S_V and callers can detect the failure rather than silently receiving
+            # an empty context with no explanation.
+            errors.append(
+                f"Iterative navigator: all {len(hops)} hop(s) produced no context"
+            )
+            logger.warning("[S_N Iterative] All hops produced empty context")
+
         return {
             "raw_context": accumulated_raw,
             "context": accumulated_context,
+            # retrieval_scores: per-hop RRF scores are not aggregated across steps;
+            # downstream receives [] for iterative multi-hop queries.
+            # Future work: accumulate nav_result.scores per step.
             "retrieval_scores": [],
             "retrieval_metadata": {"iterative_hints": current_hints, "hop_count": len(hops)},
+            "errors": errors,
             "stage_timings": {
                 **state.get("stage_timings", {}),
                 "navigator_ms": elapsed,
@@ -482,12 +519,12 @@ class AgenticController:
         Input:  retrieval_plan, sub_queries
         Output: raw_context, context, retrieval_scores, retrieval_metadata
         """
-        self.logger.info("--- [S_N NAVIGATOR] Hybrid Retrieval + Filtering ---")
+        logger.info("--- [S_N NAVIGATOR] Hybrid Retrieval + Filtering ---")
 
         start_time = time.time()
 
         if self.navigator.retriever is None:
-            self.logger.warning("[S_N] No retriever set — returning empty context")
+            logger.warning("[S_N] No retriever set — returning empty context")
             return {
                 "raw_context": [],
                 "context": [],
@@ -514,7 +551,7 @@ class AgenticController:
                 h.get("depends_on") for h in hop_sequence_raw
             )
             if has_bridge_deps and len(hop_sequence_raw) > 1:
-                self.logger.info(
+                logger.info(
                     "[S_N] Iterative multi-hop: %d dependent steps detected",
                     len(hop_sequence_raw),
                 )
@@ -540,14 +577,14 @@ class AgenticController:
             else:
                 plan = None
 
-            nav_result = self.navigator.navigate(
+            nav_result: NavigatorResult = self.navigator.navigate(
                 retrieval_plan=plan,
                 sub_queries=state["sub_queries"],
                 entity_names=entity_names,
             )
 
-            self.logger.info("[S_N] Raw context: %d chunks", len(nav_result.raw_context))
-            self.logger.info(
+            logger.info("[S_N] Raw context: %d chunks", len(nav_result.raw_context))
+            logger.info(
                 "[S_N] Filtered context: %d chunks", len(nav_result.filtered_context)
             )
 
@@ -569,7 +606,7 @@ class AgenticController:
             # filter exceptions) must not abort the pipeline — an empty context
             # will cause S_V to produce a low-confidence answer, which is the
             # correct degraded behaviour.
-            self.logger.error("[S_N] Error: %s", e, exc_info=True)
+            logger.error("[S_N] Error: %s", e, exc_info=True)
             elapsed = (time.time() - start_time) * 1000
             return {
                 "raw_context": [],
@@ -590,7 +627,7 @@ class AgenticController:
         Input:  query, context, entities
         Output: answer, iterations, verified_claims, violated_claims, all_verified
         """
-        self.logger.info("--- [S_V VERIFIER] Pre-Validation + Generation ---")
+        logger.info("--- [S_V VERIFIER] Pre-Validation + Generation ---")
 
         start_time = time.time()
 
@@ -606,10 +643,10 @@ class AgenticController:
                 hop_sequence=hop_sequence,
             )
 
-            self.logger.info("[S_V] Iterations: %d", result.iterations)
-            self.logger.info("[S_V] All verified: %s", result.all_verified)
-            self.logger.info("[S_V] Verified claims: %d", len(result.verified_claims))
-            self.logger.info("[S_V] Violated claims: %d", len(result.violated_claims))
+            logger.info("[S_V] Iterations: %d", result.iterations)
+            logger.info("[S_V] All verified: %s", result.all_verified)
+            logger.info("[S_V] Verified claims: %d", len(result.verified_claims))
+            logger.info("[S_V] Violated claims: %d", len(result.violated_claims))
 
             elapsed = (time.time() - start_time) * 1000
 
@@ -639,7 +676,7 @@ class AgenticController:
             # Broad catch is intentional: Verifier errors (Ollama timeout, NLI
             # model failure) must not surface as unhandled exceptions — the
             # pipeline returns a clearly marked error answer instead.
-            self.logger.error("[S_V] Error: %s", e, exc_info=True)
+            logger.error("[S_V] Error: %s", e, exc_info=True)
             elapsed = (time.time() - start_time) * 1000
             return {
                 "answer": f"[Error: {e}]",
@@ -716,22 +753,20 @@ class AgenticController:
         Returns:
             AgentState with answer and full pipeline metadata
         """
-        self.logger.info("--- Pipeline start ---")
-        self.logger.info("Query: %s", query)
+        logger.info("--- Pipeline start ---")
+        logger.info("Query: %s", query)
 
         start_time = time.time()
 
-        initial_state: AgentState = self._make_initial_state(query)
-
         if self.app is not None:
-            final_state = self.app.invoke(initial_state)
+            final_state = self.app.invoke(self._make_initial_state(query))
         else:
             final_state = self._run_simple_pipeline(query)
 
         total_time = (time.time() - start_time) * 1000
         final_state["total_time_ms"] = total_time
 
-        self.logger.info(
+        logger.info(
             "--- Pipeline complete: %.0f ms | context=%d | iterations=%d | verified=%s ---",
             total_time,
             len(final_state["context"]),
@@ -752,54 +787,63 @@ class AgenticController:
 
 def create_controller(
     cfg: Optional[Dict[str, Any]] = None,
-    model_name: str = "phi3",
-    base_url: str = "http://localhost:11434",
-    max_iterations: int = 2,
-    relevance_threshold: float = 0.6,
-    redundancy_threshold: float = 0.8,
+    model_name: Optional[str] = None,
+    base_url: Optional[str] = None,
+    max_iterations: Optional[int] = None,
+    relevance_threshold: Optional[float] = None,
+    redundancy_threshold: Optional[float] = None,
+    max_chars_per_doc: Optional[int] = None,
 ) -> AgenticController:
     """
     Factory function for AgenticController.
 
-    When ``cfg`` is provided (full settings.yaml dict), all pipeline settings
-    including the ``verifier:`` block are read from it — this is the
-    reproducible entry point that honours every parameter in settings.yaml.
+    When ``cfg`` is None, ``config/settings.yaml`` is auto-loaded from the
+    project root — so a bare ``create_controller()`` call always picks up the
+    live settings.yaml values without any hardcoded fallbacks in the call site.
 
-    When ``cfg`` is None, individual keyword arguments act as overrides on top
-    of the ControllerConfig defaults.  **Important:** the keyword arguments only
-    cover five of the fifteen ControllerConfig fields (model_name, base_url,
-    max_iterations, relevance_threshold, redundancy_threshold).  The remaining
-    ten fields — corroboration weights, contradiction thresholds, rrf_k,
-    top_k_per_subquery, max_chars_per_doc, and max_context_chunks — use the
-    ControllerConfig dataclass defaults and cannot be overridden without
-    passing a full ``cfg`` dict.  For evaluation runs, always pass ``cfg``.
+    Optional keyword arguments are **overrides** applied after loading from
+    settings.yaml (useful for testing or single-parameter ablations).  They
+    are only applied when explicitly passed (i.e. not None); otherwise the
+    value from settings.yaml is used for every field.
+
+    For evaluation runs, passing ``cfg`` directly is recommended so all
+    fifteen ControllerConfig fields — including corroboration weights,
+    contradiction thresholds, rrf_k, and top_k_per_subquery — are sourced
+    from the same settings.yaml rather than only the six covered by the
+    keyword arguments.
 
     Args:
-        cfg: full settings.yaml dict (recommended for evaluation runs).
-        model_name: Ollama model for S_V (ignored when cfg is provided).
-        base_url: Ollama API URL (ignored when cfg is provided).
-        max_iterations: max self-correction iterations — thesis default: 2
-            (Madaan et al., 2023). Ignored when cfg is provided.
-        relevance_threshold: factor for relevance filter (0.6 × max score).
-            Ignored when cfg is provided.
-        redundancy_threshold: Jaccard threshold for deduplication.
-            Ignored when cfg is provided.
+        cfg:                  Full settings.yaml dict.  Auto-loaded when None.
+        model_name:           Override for llm.model_name.
+        base_url:             Override for llm.base_url.
+        max_iterations:       Override for agent.max_verification_iterations.
+        relevance_threshold:  Override for navigator.relevance_threshold_factor.
+        redundancy_threshold: Override for navigator.redundancy_threshold.
+        max_chars_per_doc:    Override for llm.max_chars_per_doc.
 
     Returns:
         Configured pipeline controller instance.
     """
-    if cfg is not None:
-        config = ControllerConfig.from_yaml(cfg)
-        return AgenticController(config=config, full_cfg=cfg)
+    if cfg is None:
+        cfg = _load_settings()
 
-    config = ControllerConfig(
-        model_name=model_name,
-        base_url=base_url,
-        max_verification_iterations=max_iterations,
-        relevance_threshold_factor=relevance_threshold,
-        redundancy_threshold=redundancy_threshold,
-    )
-    return AgenticController(config=config)
+    config = ControllerConfig.from_yaml(cfg)
+
+    # Apply explicit keyword overrides (only when the caller passed a value).
+    if model_name is not None:
+        config.model_name = model_name
+    if base_url is not None:
+        config.base_url = base_url
+    if max_iterations is not None:
+        config.max_verification_iterations = max_iterations
+    if relevance_threshold is not None:
+        config.relevance_threshold_factor = relevance_threshold
+    if redundancy_threshold is not None:
+        config.redundancy_threshold = redundancy_threshold
+    if max_chars_per_doc is not None:
+        config.max_chars_per_doc = max_chars_per_doc
+
+    return AgenticController(config=config, full_cfg=cfg)
 
 
 # =============================================================================
@@ -818,11 +862,8 @@ if __name__ == "__main__":
     print(f"LangGraph available: {LANGGRAPH_AVAILABLE}")
     print("=" * 70)
 
-    controller = create_controller(
-        max_iterations=2,
-        relevance_threshold=0.6,
-        redundancy_threshold=0.8,
-    )
+    # No keyword overrides needed — all values come from config/settings.yaml.
+    controller = create_controller()
 
     # Planner-only test (no retriever needed)
     print("\n--- Planner-only test (no retriever) ---")

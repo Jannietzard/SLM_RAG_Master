@@ -261,7 +261,9 @@ def create_ingestion_config(cfg: Dict[str, Any]) -> IngestionConfig:
     Example
     -------
         import yaml
-        with open("config/settings.yaml") as f:
+        from pathlib import Path
+        settings_path = Path(__file__).parent.parent.parent / "config" / "settings.yaml"
+        with open(settings_path, encoding="utf-8") as f:
             settings = yaml.safe_load(f)
         config = create_ingestion_config(settings.get("ingestion", {}))
     """

@@ -29,7 +29,7 @@ The Verifier (S_V) is the final stage of the three-agent RAG pipeline
       to avoid the ~270 MB NLI model download; a numeric-divergence
       heuristic serves as the offline fallback.
       Reference: Bowman et al. (2015). arXiv:1508.05326 (NLI task);
-      Reimers & Gurevych (2019). arXiv:1908.10084 (cross-encoder model).
+      Reimers & Gurevych (2019). arXiv:1908.10084 (cross-encoder model)..
 
    c) Source Credibility Scoring
       Weighted combination (40 % cross-references, 30 % entity-mention
@@ -124,6 +124,15 @@ REFERENCES
   Abstractive Text Summarization." EMNLP 2020. arXiv:1910.12840.
 
 ===============================================================================
+
+===============================================================================
+Review History:
+    Last Reviewed:  2026-04-21
+    Review Result:  1 CRITICAL, 4 IMPORTANT, 7 RECOMMENDED
+    Reviewer:       Code Review Prompt v2.1
+    Next Review:    After implementing multi-hop graph-path planning and
+                    forwarding retrieval-source metadata from Navigator to S_V
+===============================================================================
 """
 
 import logging
@@ -138,27 +147,45 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+from ._settings import _load_settings, _PROPER_NOUN_RE
+
+
 # =============================================================================
 # OPTIONAL DEPENDENCIES
 # =============================================================================
 
 _DEFAULT_SPACY_MODEL = "en_core_web_sm"
 
+# KNOWN LIMITATION: _DEFAULT_SPACY_MODEL (from this constant) cannot be
+# overridden by settings.yaml at module load time because this block runs
+# at import before any config is read.  Changing the SpaCy model requires
+# editing _DEFAULT_SPACY_MODEL here directly.  The same limitation applies
+# to planner.py and navigator.py.  A future refactor could defer the load
+# into __init__ and read the model name from VerifierConfig.
+
 # SpaCy: used for sentence splitting in _extract_claims and for NER-based
 # entity density in _compute_credibility.
 try:
     import spacy
-    NLP = spacy.load(_DEFAULT_SPACY_MODEL)
-    SPACY_AVAILABLE = True
-    logger.info("SpaCy model '%s' loaded for claim extraction", _DEFAULT_SPACY_MODEL)
-except (OSError, IOError):
+    try:
+        NLP = spacy.load(_DEFAULT_SPACY_MODEL)
+        SPACY_AVAILABLE = True
+        logger.info("SpaCy model '%s' loaded for claim extraction", _DEFAULT_SPACY_MODEL)
+    except (OSError, IOError):
+        NLP = None
+        SPACY_AVAILABLE = False
+        logger.warning(
+            "SpaCy model '%s' not found. Install with:\n"
+            "  python -m spacy download en_core_web_sm\n"
+            "Regex fallbacks will be used for claim extraction and credibility scoring.",
+            _DEFAULT_SPACY_MODEL,
+        )
+except ImportError:
     NLP = None
     SPACY_AVAILABLE = False
     logger.warning(
-        "SpaCy model '%s' not found. Install with:\n"
-        "  python -m spacy download en_core_web_sm\n"
-        "Regex fallbacks will be used for claim extraction and credibility scoring.",
-        _DEFAULT_SPACY_MODEL,
+        "SpaCy not installed. Regex fallbacks will be used for claim "
+        "extraction and credibility scoring. Install with: pip install spacy"
     )
 
 # Transformers: used only when enable_contradiction_detection is True.
@@ -346,8 +373,8 @@ class VerifierConfig:
     max_key_phrases : Maximum key phrases per chunk in cross-reference scoring.
     """
 
-    # LLM settings
-    model_name: str = "phi3"
+    # LLM settings — emergency fallbacks; live values read from settings.yaml via from_yaml()
+    model_name: str = "qwen2:1.5b"          # settings.yaml: llm.model_name
     base_url: str = "http://localhost:11434"
     temperature: float = 0.1
     max_tokens: int = 200
@@ -356,7 +383,7 @@ class VerifierConfig:
     # Context settings
     max_context_chars: int = 900
     max_docs: int = 3
-    max_chars_per_doc: int = 300
+    max_chars_per_doc: int = 500             # settings.yaml: llm.max_chars_per_doc
 
     # Pre-validation flags
     enable_entity_path_validation: bool = True
@@ -380,7 +407,6 @@ class VerifierConfig:
 
     # Agentic loop
     max_iterations: int = 2
-    stop_on_first_success: bool = True
 
     # Confidence thresholds
     confidence_high_threshold: float = 0.8
@@ -390,6 +416,16 @@ class VerifierConfig:
     min_claim_chars: int = 15
     max_entities_to_verify: int = 5
     max_key_phrases: int = 10
+
+    # Heuristic contradiction threshold (Finding 6)
+    heuristic_contradiction_threshold: float = 0.5  # settings.yaml: verifier.heuristic_contradiction_threshold
+
+    # Sentence-boundary fraction for context truncation (Finding 7)
+    format_sentence_boundary_fraction: float = 0.7  # settings.yaml: verifier.format_sentence_boundary_fraction
+
+    # Entity-density normalizers for credibility scoring (Finding 8)
+    credibility_entity_freq_normalizer_spacy: float = 5.0   # settings.yaml: verifier.credibility_entity_freq_normalizer_spacy
+    credibility_entity_freq_normalizer_regex: float = 10.0  # settings.yaml: verifier.credibility_entity_freq_normalizer_regex
 
     @classmethod
     def from_yaml(cls, config: Dict[str, Any]) -> "VerifierConfig":
@@ -401,23 +437,24 @@ class VerifierConfig:
         serve as emergency fallbacks when a block is absent.  Follows the
         same pattern as PlannerConfig.from_yaml().
 
-        Parameters
-        ----------
-        config : dict
-            Full settings.yaml dict (or any compatible sub-dict).
+        Args:
+            config: Full settings.yaml dict (or any compatible sub-dict).
+
+        Returns:
+            VerifierConfig populated from the provided settings dict.
         """
         llm = config.get("llm", {})
         agent = config.get("agent", {})
         v = config.get("verifier", {})
         return cls(
-            model_name=llm.get("model_name", "phi3"),
+            model_name=llm.get("model_name", "qwen2:1.5b"),
             base_url=llm.get("base_url", "http://localhost:11434"),
             temperature=llm.get("temperature", 0.1),
             max_tokens=llm.get("max_tokens", 200),
             timeout=llm.get("timeout", 60),
             max_context_chars=llm.get("max_context_chars", 900),
             max_docs=llm.get("max_docs", 3),
-            max_chars_per_doc=llm.get("max_chars_per_doc", 300),
+            max_chars_per_doc=llm.get("max_chars_per_doc", 500),
             max_iterations=agent.get("max_verification_iterations", 2),
             enable_entity_path_validation=v.get("enable_entity_path_validation", True),
             enable_contradiction_detection=v.get("enable_contradiction_detection", False),
@@ -438,6 +475,10 @@ class VerifierConfig:
             min_claim_chars=v.get("min_claim_chars", 15),
             max_entities_to_verify=v.get("max_entities_to_verify", 5),
             max_key_phrases=v.get("max_key_phrases", 10),
+            heuristic_contradiction_threshold=v.get("heuristic_contradiction_threshold", 0.5),
+            format_sentence_boundary_fraction=v.get("format_sentence_boundary_fraction", 0.7),
+            credibility_entity_freq_normalizer_spacy=v.get("credibility_entity_freq_normalizer_spacy", 5.0),
+            credibility_entity_freq_normalizer_regex=v.get("credibility_entity_freq_normalizer_regex", 10.0),
         )
 
 
@@ -637,7 +678,7 @@ class PreGenerationValidator:
                 result.filtered_context = self._resolve_contradictions(
                     context, contradictions
                 )
-                if not result.filtered_context:
+                if len(result.filtered_context) < len(context):
                     result.status = ValidationStatus.CONTRADICTION_DETECTED
 
         # ── Check 3: Source Credibility Scoring ───────────────────────────────
@@ -782,8 +823,7 @@ class PreGenerationValidator:
                 return self._heuristic_contradiction_detection(context)
         else:
             logger.warning(
-                "Transformers unavailable or contradiction detection disabled; "
-                "using heuristic contradiction detection."
+                "Transformers unavailable — falling back to heuristic contradiction detection."
             )
             return self._heuristic_contradiction_detection(context)
 
@@ -818,7 +858,7 @@ class PreGenerationValidator:
                     v1, v2 = values[j][1], values[k][1]
                     if min(v1, v2) > 0:
                         diff = abs(v1 - v2) / max(v1, v2)
-                        if diff > 0.5:
+                        if diff > self.config.heuristic_contradiction_threshold:
                             contradictions.append(
                                 (values[j][0], values[k][0], min(1.0, diff))
                             )
@@ -845,11 +885,11 @@ class PreGenerationValidator:
             contradiction_counts[idx2] = contradiction_counts.get(idx2, 0) + 1
         if not contradiction_counts:
             return context
-        min_count = min(contradiction_counts.values())
+        max_count = max(contradiction_counts.values())
         filtered = [
             chunk
             for i, chunk in enumerate(context)
-            if contradiction_counts.get(i, 0) <= min_count
+            if contradiction_counts.get(i, 0) < max_count
         ]
         return filtered if filtered else context
 
@@ -888,10 +928,10 @@ class PreGenerationValidator:
             # Entity-frequency signal.
             if SPACY_AVAILABLE and NLP:
                 doc = NLP(chunk[: self.config.spacy_max_chars])
-                cred.entity_frequency = min(1.0, len(doc.ents) / 5.0)
+                cred.entity_frequency = min(1.0, len(doc.ents) / self.config.credibility_entity_freq_normalizer_spacy)
             else:
                 proper_count = len(self._PROPER_NOUN_PATTERN.findall(chunk))
-                cred.entity_frequency = min(1.0, proper_count / 10.0)
+                cred.entity_frequency = min(1.0, proper_count / self.config.credibility_entity_freq_normalizer_regex)
 
             # Provenance: always False (see docstring).
             cred.is_graph_based = False
@@ -979,10 +1019,8 @@ Please provide a partial answer based on the available evidence, clearly indicat
     # ── Class-Level Compiled Regex Constants ──────────────────────────────────
     # Hoisted from per-call compilation in _verify_claim for performance.
 
-    # Multi-word proper noun sequences (e.g. "Albert Einstein").
-    _MULTI_PROPER_NOUN_RE = re.compile(
-        r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b"
-    )
+    # Multi-word proper noun sequences — shared constant from _settings.py.
+    _MULTI_PROPER_NOUN_RE = _PROPER_NOUN_RE
     # Single capitalised proper nouns of at least 3 characters.
     _SINGLE_PROPER_NOUN_RE = re.compile(r"\b([A-Z][a-z]{2,})\b")
     # Quoted strings treated as entity mentions.
@@ -997,6 +1035,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
         "The", "This", "That", "These", "Those",
         "However", "Therefore", "Furthermore", "Moreover", "Although",
         "American", "British", "European", "Australian", "Canadian",
+        "Yes", "No",
     })
 
     def __init__(
@@ -1098,7 +1137,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
             if len(doc) > self.config.max_chars_per_doc:
                 truncated = doc[: self.config.max_chars_per_doc]
                 last_period = truncated.rfind(". ")
-                if last_period > self.config.max_chars_per_doc * 0.7:
+                if last_period > self.config.max_chars_per_doc * self.config.format_sentence_boundary_fraction:
                     truncated = truncated[: last_period + 1]
                 else:
                     last_space = truncated.rfind(" ")
@@ -1284,6 +1323,8 @@ Please provide a partial answer based on the available evidence, clearly indicat
         -------
         VerificationResult
         """
+        if query is None:
+            query = ""
         start_time = time.time()
         logger.info("[Verifier] query='%s'", query[:60])
         logger.info("[Verifier] context docs: %d", len(context))
@@ -1506,7 +1547,8 @@ def create_verifier(
     -------
     Verifier
     """
-    cfg = cfg or {}
+    if cfg is None:
+        cfg = _load_settings()
     config = VerifierConfig.from_yaml(cfg)
     if enable_pre_validation:
         config.enable_entity_path_validation = True

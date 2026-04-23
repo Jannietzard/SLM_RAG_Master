@@ -2,10 +2,10 @@
 FILE REVIEW — COMPLETE ANALYSIS WITH SELF-VERIFICATION
 ================================================================================
 
-FILE TO ANALYZE: {{FILEPATH}}
+FILE TO ANALYZE: {{src/data_layer/hybrid_retriever.py}}
 TODAY'S DATE:    {{TODAY}}
-LAST REVIEWED:   {{DATE_OF_LAST_REVIEW or "NEVER"}}
-REVIEW TRIGGER:  {{REASON — e.g. "Initial review", "Post-refactor", "Pre-publication cleanup"}}
+LAST REVIEWED:   {{"NEVER"}}
+REVIEW TRIGGER:  {{"Initial review"}}
 PREVIOUS FINDINGS (if any):
 {{PASTE_PREVIOUS_ACTION_LIST — or "N/A" if first review}}
 
@@ -348,5 +348,3 @@ GENERAL REQUIREMENTS
 - Self-correction: Phase 2 exists because Phase 1 analysis is
   imperfect. Do not skip or abbreviate Phase 2. The final outputs
   in Step 12 are the only deliverables that matter.
-
-CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
