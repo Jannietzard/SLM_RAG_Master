@@ -41,7 +41,7 @@ This design follows the Self-Refine paradigm:
 Crucially, the self-correction loop is implemented EXCLUSIVELY inside
 Verifier.generate_and_verify(). AgentPipeline.process() calls this method
 exactly once. There is no outer retry loop — a previous outer retry was removed
-because a near-deterministic LLM (temperature=0.1) produces identical outputs
+because a fully deterministic LLM (temperature=0.0) produces identical outputs
 for identical inputs, so outer repetition provides no correction benefit.
 See TECHNICAL_ARCHITECTURE.md §12.2 for the full rationale.
 
@@ -729,7 +729,13 @@ class BatchProcessor:
 
     @staticmethod
     def _exact_match(prediction: str, ground_truth: str) -> bool:
-        """Case-insensitive exact match after stripping whitespace."""
+        """
+        Quick sanity-check EM: case-insensitive strip comparison.
+
+        For thesis evaluation numbers use src.evaluations.metrics.compute_exact_match
+        which applies the full HotpotQA normalisation pipeline (articles, punctuation,
+        whitespace, word-boundary containment).
+        """
         return prediction.strip().lower() == ground_truth.strip().lower()
 
     def evaluate(
@@ -740,9 +746,9 @@ class BatchProcessor:
         """
         Run exact-match evaluation over a question/answer list.
 
-        Note: Use benchmark_datasets.py for thesis results — it applies full
-        EM/F1 normalisation (articles, punctuation). This method uses a simple
-        case-insensitive exact match and is intended for quick sanity checks only.
+        Uses _exact_match (simple strip/lowercase) for quick sanity checks.
+        For publication-grade thesis results use src/evaluations/evaluate_hotpotqa.py
+        which applies the canonical metrics from src/evaluations/metrics.py.
         """
         if len(questions) != len(ground_truths):
             raise ValueError(

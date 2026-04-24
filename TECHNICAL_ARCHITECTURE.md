@@ -4,7 +4,7 @@
 **Author:** Jan Nietzard
 **Institution:** FOM Hochschule, Master of Science
 **Version:** 4.0.0
-**Last Updated:** 2026-04-11
+**Last Updated:** 2026-04-23
 
 ---
 
@@ -836,7 +836,7 @@ The Verifier receives the filtered context window and is responsible for generat
 ```python
 @dataclass
 class VerifierConfig:
-    model_name: str = "phi3"
+    model_name: str = "qwen2:1.5b"
     base_url: str = "http://localhost:11434"
     temperature: float = 0.1
     max_tokens: int = 200            # Increased from 50; prevents answer truncation
@@ -873,7 +873,7 @@ if status == INSUFFICIENT:
 # Schritt 1: Initiale Antwortgenerierung
 context_str = build_context(context, max_chars=max_context_chars,
                             max_docs=max_docs, max_chars_per_doc=max_chars_per_doc)
-answer = call_llm(GENERATION_PROMPT, query, context_str)   # phi3 via Ollama
+answer = call_llm(GENERATION_PROMPT, query, context_str)   # qwen2:1.5b via Ollama
 
 # Schritt 2: Bis zu (max_iterations - 1) Korrektur-Runden
 # Bei max_iterations=2: maximal 1 Korrektur-Runde
@@ -1127,7 +1127,7 @@ rag:
 
 # ── LANGUAGE MODEL (LLM) ───────────────────────────────────────────────────
 llm:
-  model_name: "phi3"
+  model_name: "qwen2:1.5b"
   base_url: "http://localhost:11434"
   temperature: 0.1
   max_tokens: 200              # Erhöht von 50 auf 200; verhindert Antwort-Truncation
@@ -1188,6 +1188,41 @@ benchmark:
 ```
 
 **Configuration loading** is handled by `benchmark_datasets.load_config_file()` and `ingestion.load_ingestion_config()`. Both functions accept the YAML path and fall back to sensible defaults if the file is absent, ensuring graceful degradation.
+
+---
+
+## 6.x Evaluation Layer — Artifact C
+
+**Package:** `src/evaluations/`
+
+The evaluation layer (Artifact C) provides the shared metric functions and experiment runners used across all thesis experiments.
+
+### 6.x.1 Module Overview
+
+| Module | Purpose |
+|---|---|
+| `metrics.py` | Canonical EM and F1 implementations shared by all evaluators |
+| `evaluate_hotpotqa.py` | End-to-end HotpotQA benchmark runner |
+| `ablation_study.py` | Configurable ablation study (vector/graph weights, verifier on/off) |
+| `ollama_performance_diagnostic.py` | Embedding-dimension and LLM latency diagnostics |
+
+### 6.x.2 Metric Functions (`metrics.py`)
+
+All three functions are the single canonical implementation imported via `src.evaluations`:
+
+- **`normalize_answer(s)`** — lowercase, strip articles, punctuation, and whitespace; following the official HotpotQA evaluation script.
+- **`compute_exact_match(pred, gold)`** — normalised string equality with word-boundary substring fallback (handles cases where the gold answer is a proper subset of the predicted span).
+- **`compute_f1(pred, gold)`** — token-level F1 matching the official HotpotQA evaluator (precision × recall harmonic mean over unigram bag-of-words overlap).
+
+### 6.x.3 Ablation Study (`ablation_study.py`)
+
+`AblationStudy.run()` accepts a `pipeline_factory` callable and a list of `(name, vector_weight, graph_weight)` configurations. For each configuration it:
+1. Instantiates a fresh pipeline via `pipeline_factory`.
+2. Evaluates `samples_per_dataset` questions.
+3. Aggregates per-question EM/F1 into a `ConfigurationResult`.
+4. Optionally saves raw JSON, CSV summaries, Markdown report, and LaTeX tables.
+
+Random seed `42` is set at module import (`random.seed(42)`, `numpy.random.seed(42)`) to ensure reproducible question sampling across runs.
 
 ---
 
@@ -1286,7 +1321,7 @@ python benchmark_datasets.py ingest \
 python benchmark_datasets.py evaluate \
   --dataset hotpotqa \
   --samples 100 \
-  --model phi3 \
+  --model qwen2:1.5b \
   --vector-weight 0.7 \
   --graph-weight 0.3
 
@@ -1448,10 +1483,10 @@ Erzeugt `test_system/graph_preview.png` mit matplotlib (dpi=200). Für Druckqual
 | Service | Model | Purpose |
 |---|---|---|
 | Ollama | `nomic-embed-text` | 768-dim dense text embeddings |
-| Ollama | `phi3` | Answer generation (3.8B parameters) |
+| Ollama | `qwen2:1.5b` | Answer generation (1.5B parameters) |
 | SpaCy | `en_core_web_sm` | Query parsing in Planner and Navigator |
 
-Both Ollama models run entirely on CPU and require no GPU. `phi3` is loaded as a 4-bit GGUF quantisation via llama.cpp (Ollama backend), fitting within a 4 GB memory budget.
+Both Ollama models run entirely on CPU and require no GPU. `qwen2:1.5b` is loaded as a 4-bit GGUF quantisation via llama.cpp (Ollama backend), fitting within a 2 GB memory budget.
 
 ### 8.3 Design Rationale: Database Selection
 
@@ -1609,7 +1644,7 @@ Both Ollama models run entirely on CPU and require no GPU. `phi3` is loaded as a
   │      Context: <chunk_1> ... <chunk_n>                   │
   │      Answer:"                                           │
   │                                                         │
-  │  3. POST /api/generate → phi3 (Ollama)                  │
+  │  3. POST /api/generate → qwen2:1.5b (Ollama)             │
   │     temperature: 0.1, max_tokens: 200                   │
   │     → initial_answer: "[director] was born in [city]"  │
   │                                                         │
@@ -1663,10 +1698,10 @@ For a HotpotQA subset of 500 questions (~10,000 chunks):
 | RRF fusion | ~0.5 ms | Pure Python, O(N log N) |
 | PreGenerativeFilter | ~1–3 ms | Jaccard + NLI |
 | **Total retrieval** | **~40–110 ms** | Without LLM generation |
-| LLM generation (phi3) | ~200 ms–62 s | CPU, 4-bit quantised; context size and KV-cache allocation dominate |
+| LLM generation (qwen2:1.5b) | ~200 ms–62 s | CPU, 4-bit quantised; context size and KV-cache allocation dominate |
 | **End-to-end** | **~250 ms–65 s** | Full pipeline; LLM is the dominant bottleneck on CPU |
 
-> **LLM timeout note:** Ollama allocates the full KV-cache context window regardless of prompt length. On CPU, phi3 runs at approximately 8 tokens/second. A 2,400-character context (~600 tokens) can produce 60+ second responses. The system applies a 60-second `timeout` to Ollama HTTP calls; exceeding it returns the partial output. In practice, responses for bridge-resolved multi-hop queries with full context fit within 45 seconds.
+> **LLM timeout note:** Ollama allocates the full KV-cache context window regardless of prompt length. On CPU, `qwen2:1.5b` runs at approximately 8–15 tokens/second. A 2,400-character context (~600 tokens) can produce 60+ second responses. The system applies a 60-second `timeout` to Ollama HTTP calls; exceeding it returns the partial output. In practice, responses for bridge-resolved multi-hop queries with full context fit within 45 seconds.
 
 ### 10.3 Embedding Cache Efficiency
 
@@ -2075,6 +2110,32 @@ python -X utf8 diagnose_ingestion.py --indices 0-9 --dataset 2wikimultihop
 
 ---
 
+### 12.20 Shared Utility Module: `src/utils.py` (2026-04-24)
+
+**Motivation:** `jaccard_similarity` was independently implemented in both `hybrid_retriever.py` (as a `@staticmethod`) and `navigator.py` (as an instance method). Dual implementations risk silent divergence when one copy is updated.
+
+**Change:** Created `src/utils.py` as the canonical shared utilities module.
+
+```python
+# src/utils.py
+def jaccard_similarity(text1: str, text2: str) -> float:
+    """Word-set Jaccard similarity in [0.0, 1.0]."""
+    words1 = set(text1.lower().split())
+    words2 = set(text2.lower().split())
+    if not words1 or not words2:
+        return 0.0
+    union = len(words1 | words2)
+    return len(words1 & words2) / union if union > 0 else 0.0
+```
+
+**Consumers:**
+- `src/data_layer/hybrid_retriever.py` — deduplication step in RRF fusion
+- `src/logic_layer/navigator.py` — MMR diversity scoring in `_mmr_rerank()`
+
+**Design note:** The function uses word-set overlap (not character n-grams) which is appropriate for multi-hop retrieval deduplication: two retrieval results are considered duplicates when they share the majority of their content words, regardless of minor surface-form variation.
+
+---
+
 *End of Technical Architecture Documentation*
 
 ---
@@ -2088,7 +2149,8 @@ python -X utf8 diagnose_ingestion.py --indices 0-9 --dataset 2wikimultihop
 | `src/pipeline/test_pipeline.py` | 54 | ✓ |
 | `test_system/test_chunking.py` | 29 | ✓ |
 | `test_system/test_embeddings.py` | 34 | ✓ |
-| **Total** | **~200** | **✓** |
+| `test_system/test_missing_coverage.py` | 7 | ✓ |
+| **Total** | **~207** | **✓** |
 
 ---
 

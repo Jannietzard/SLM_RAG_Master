@@ -28,7 +28,7 @@ class ControllerConfig:
     LLM Settings:
         model_name: Ollama model for S_V (e.g. "qwen2:1.5b").
         base_url: Ollama API endpoint.
-        temperature: Sampling temperature (0.1 = near-deterministic).
+        temperature: Sampling temperature (0.0 = fully deterministic).
 
     Pipeline Settings:
         max_verification_iterations: Maximum self-correction rounds.
@@ -53,7 +53,7 @@ class ControllerConfig:
     # LLM Settings — emergency fallbacks; live values read from settings.yaml
     model_name: str = "qwen2:1.5b"           # settings.yaml: llm.model_name
     base_url: str = "http://localhost:11434"
-    temperature: float = 0.1
+    temperature: float = 0.0
 
     # Pipeline Settings
     max_verification_iterations: int = 2      # settings.yaml: agent.max_verification_iterations
@@ -70,6 +70,15 @@ class ControllerConfig:
     contradiction_overlap_threshold: float = 0.3   # settings.yaml: navigator.contradiction_overlap_threshold
     contradiction_ratio_threshold: float = 2.0     # settings.yaml: navigator.contradiction_ratio_threshold
     contradiction_min_value: float = 10.0          # settings.yaml: navigator.contradiction_min_value
+
+    def __post_init__(self) -> None:
+        import warnings as _warnings
+        if self.temperature != 0.0:
+            _warnings.warn(
+                "ControllerConfig: temperature=%g — use 0.0 for deterministic "
+                "thesis evaluation. Set llm.temperature in config/settings.yaml." % self.temperature,
+                stacklevel=2,
+            )
 
     @classmethod
     def from_yaml(cls, config: Dict[str, Any]) -> "ControllerConfig":
@@ -92,7 +101,7 @@ class ControllerConfig:
         return cls(
             model_name=llm.get("model_name", "qwen2:1.5b"),
             base_url=llm.get("base_url", "http://localhost:11434"),
-            temperature=llm.get("temperature", 0.1),
+            temperature=llm.get("temperature", 0.0),
             max_verification_iterations=agent.get("max_verification_iterations", 2),
             relevance_threshold_factor=nav.get("relevance_threshold_factor", 0.85),
             redundancy_threshold=nav.get("redundancy_threshold", 0.8),

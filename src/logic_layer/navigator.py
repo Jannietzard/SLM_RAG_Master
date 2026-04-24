@@ -76,6 +76,7 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 from ._config import ControllerConfig
 from ._settings import _PROPER_NOUN_RE
 from .planner import RetrievalPlan
+from src.utils import jaccard_similarity
 
 # Module logger — defined before any module-level code that might log.
 logger = logging.getLogger(__name__)
@@ -304,11 +305,15 @@ class Navigator:
 
         # Filter 5: Entity-Mention Filter — drop chunks with no query-entity reference.
         # entity_names param takes precedence (used when plan is reconstructed from state dict).
+        # DATE/TIME/CARDINAL/ORDINAL labels are excluded: numeric/temporal tokens (e.g.
+        # "1992") match irrelevant chunks and produce false positives on HotpotQA.
+        _SKIP_NER_LABELS = {"DATE", "TIME", "CARDINAL", "ORDINAL", "PERCENT", "MONEY", "QUANTITY"}
         if entity_names is not None:
             query_entity_names = entity_names
         else:
             query_entity_names = (
-                [e.text for e in retrieval_plan.entities]
+                [e.text for e in retrieval_plan.entities
+                 if e.label.upper() not in _SKIP_NER_LABELS]
                 if (retrieval_plan and retrieval_plan.entities)
                 else []
             )
@@ -487,7 +492,7 @@ class Navigator:
 
             # Compare against all already-accepted chunks
             for seen in seen_texts:
-                similarity = self._jaccard_similarity(text, seen)
+                similarity = jaccard_similarity(text, seen)
                 if similarity > self.config.redundancy_threshold:
                     is_duplicate = True
                     break
@@ -502,29 +507,6 @@ class Navigator:
         )
 
         return filtered
-
-    def _jaccard_similarity(self, text1: str, text2: str) -> float:
-        """
-        Compute word-set similarity between two texts.
-
-        similarity(A, B) = |A ∩ B| / |A ∪ B|
-
-        where A and B are the word-token sets of each text.
-        Reference: Jaccard, P. (1901). "Étude comparative de la distribution
-        florale dans une portion des Alpes et du Jura." Bull. Soc. Vaud. Sci.
-        Nat., 37, 547–579.
-        See _redundancy_filter for usage context.
-        """
-        words1 = set(text1.lower().split())
-        words2 = set(text2.lower().split())
-
-        if not words1 or not words2:
-            return 0.0
-
-        intersection = len(words1 & words2)
-        union = len(words1 | words2)
-
-        return intersection / union if union > 0 else 0.0
 
     def _contradiction_filter(
         self,

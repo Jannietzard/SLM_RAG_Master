@@ -11,7 +11,7 @@ Navigator agent (S_N).
 ARCHITECTURE ROLE
 ===============================================================================
 
-This module implements the Hybrid Retrieval component of Artefakt A (Data Layer).
+This module implements the Hybrid Retrieval component of Artifact A (Data Layer).
 It is consumed by:
   - src/logic_layer/navigator.py  (S_N agent, primary consumer)
   - src/evaluations/evaluate_hotpotqa.py  (evaluation harness)
@@ -88,6 +88,8 @@ from enum import Enum
 
 import numpy as np
 from .entity_extraction import normalize_entity_name
+from .entity_types import GLINER_LABEL_MAP, SPACY_LABEL_MAP
+from src.utils import jaccard_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -96,17 +98,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _FP_LEN = 80   # text fingerprint length for deduplication in RRFFusion
 
-_QUERY_LABEL_MAP = {
-    "person": "PERSON", "director": "PERSON", "actor": "PERSON",
-    "organization": "ORGANIZATION", "company": "ORGANIZATION", "studio": "ORGANIZATION",
-    "city": "GPE", "country": "GPE", "state": "GPE",
-    "location": "LOCATION", "place": "LOCATION",
-    "landmark": "LOCATION", "monument": "LOCATION", "building": "LOCATION",
-    "film": "WORK_OF_ART", "movie": "WORK_OF_ART", "album": "WORK_OF_ART",
-    "work of art": "WORK_OF_ART", "work_of_art": "WORK_OF_ART",
-    "award": "WORK_OF_ART", "prize": "WORK_OF_ART",
-    "event": "EVENT",
-}
+_QUERY_LABEL_MAP = GLINER_LABEL_MAP
 
 
 def _normalize_query_entity(text: str, label: str) -> str:
@@ -537,14 +529,7 @@ class ImprovedQueryEntityExtractor:
 
     # SpaCy label → canonical type; GPE→GPE matches entity_extraction.py ingestion path
     # so that entity IDs are consistent across query-time and ingestion-time extraction.
-    _SPACY_TYPE_MAP: Dict[str, str] = {
-        "PERSON": "PERSON",
-        "ORG": "ORGANIZATION",
-        "GPE": "GPE",
-        "LOC": "LOCATION",
-        "DATE": "DATE",
-        "EVENT": "EVENT",
-    }
+    _SPACY_TYPE_MAP: Dict[str, str] = SPACY_LABEL_MAP
 
     def _spacy_extract(self, query: str) -> List[str]:
         """SpaCy-based extraction with GLiNER-compatible type mapping."""
@@ -932,7 +917,7 @@ class PreGenerativeFilter:
         filtered: List[RetrievalResult] = []
         for candidate in sorted_results:
             is_redundant = any(
-                self._jaccard_similarity(candidate.text, accepted.text) >= self.jaccard_threshold
+                jaccard_similarity(candidate.text, accepted.text) >= self.jaccard_threshold
                 for accepted in filtered
             )
             if not is_redundant:
@@ -943,19 +928,6 @@ class PreGenerativeFilter:
             logger.debug("Redundancy filter removed %d duplicate chunks", removed)
 
         return filtered
-
-    @staticmethod
-    def _jaccard_similarity(text1: str, text2: str) -> float:
-        """
-        Word-level Jaccard similarity.
-
-        Reference: Jaccard, P. (1901). Bull. Soc. Vaudoise Sci. Nat. 37, 241-272.
-        """
-        words1 = set(text1.lower().split())
-        words2 = set(text2.lower().split())
-        intersection = len(words1 & words2)
-        union = len(words1 | words2)
-        return intersection / union if union > 0 else 0.0
 
     def _contradiction_filter(
         self, results: List[RetrievalResult]

@@ -1513,7 +1513,7 @@ class RecursiveChunker:
                 )
             else:
                 logger.warning(
-                    "⚠ FALLBACK AKTIV: LangChain not available — "
+                    "⚠ FALLBACK ACTIVE: LangChain not available — "
                     "RecursiveChunker using simple fixed-size fallback. "
                     "Install with: pip install langchain-text-splitters"
                 )

@@ -71,6 +71,8 @@ logger = logging.getLogger(__name__)
 
 # ── Optional dependency flags ──────────────────────────────────────────────────
 
+from .entity_types import GLINER_LABEL_MAP, SPACY_LABEL_MAP, SPACY_LABEL_MAP_FLAT
+
 try:
     from gliner import GLiNER
     GLINER_AVAILABLE = True
@@ -544,21 +546,7 @@ class GLiNERExtractor:
     """
 
     # Natural-language GLiNER output label → canonical internal type.
-    _LABEL_MAP: Dict[str, str] = {
-        "person": "PERSON", "director": "PERSON", "actor": "PERSON",
-        "politician": "PERSON", "scientist": "PERSON", "athlete": "PERSON",
-        "organization": "ORGANIZATION", "company": "ORGANIZATION",
-        "studio": "ORGANIZATION", "institution": "ORGANIZATION",
-        "city": "GPE", "country": "GPE", "state": "GPE", "gpe": "GPE",
-        "location": "LOCATION", "place": "LOCATION",
-        "film": "WORK_OF_ART", "movie": "WORK_OF_ART", "book": "WORK_OF_ART",
-        "album": "WORK_OF_ART", "song": "WORK_OF_ART",
-        "work_of_art": "WORK_OF_ART", "work of art": "WORK_OF_ART",
-        "landmark": "LOCATION", "monument": "LOCATION", "building": "LOCATION",
-        "award": "WORK_OF_ART", "prize": "WORK_OF_ART",
-        "event": "EVENT",
-        "product": "PRODUCT", "technology": "TECHNOLOGY",
-    }
+    _LABEL_MAP: Dict[str, str] = GLINER_LABEL_MAP
 
     # Types and abbreviation suffixes are module-level constants shared with
     # hybrid_retriever._normalize_query_entity (see normalize_entity_name()).
@@ -714,11 +702,7 @@ class GLiNERExtractor:
     # SpaCy label → canonical internal type.
     # GPE maps to "GPE" (not "LOCATION") so entity IDs are consistent with the
     # primary GLiNER path, which normalises "gpe" → "GPE" via _LABEL_MAP.
-    _SPACY_FALLBACK_TYPE_MAP: Dict[str, str] = {
-        "PERSON": "PERSON", "ORG": "ORGANIZATION",
-        "GPE": "GPE", "LOC": "LOCATION",
-        "DATE": "DATE", "EVENT": "EVENT",
-    }
+    _SPACY_FALLBACK_TYPE_MAP: Dict[str, str] = SPACY_LABEL_MAP
 
     def _spacy_extract(self, text: str, chunk_id: str) -> List[ExtractedEntity]:
         """
@@ -1241,16 +1225,7 @@ class SpacyEntityPipeline:
       (CARDINAL, ORDINAL, MONEY, PERCENT, QUANTITY are omitted)
     """
 
-    _LABEL_MAP: Dict[str, str] = {
-        "PERSON":      "PERSON",
-        "ORG":         "ORGANIZATION",
-        "GPE":         "LOCATION",
-        "LOC":         "LOCATION",
-        "DATE":        "DATE",
-        "EVENT":       "EVENT",
-        "WORK_OF_ART": "WORK_OF_ART",
-        "FAC":         "LOCATION",
-    }
+    _LABEL_MAP: Dict[str, str] = SPACY_LABEL_MAP_FLAT
 
     def __init__(
         self,

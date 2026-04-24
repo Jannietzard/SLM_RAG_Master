@@ -326,7 +326,7 @@ class VerifierConfig:
     ------------
     model_name : Ollama model name.
     base_url : Ollama API endpoint.
-    temperature : Sampling temperature (0.1 = near-deterministic).
+    temperature : Sampling temperature (0.0 = fully deterministic).
     max_tokens : Maximum answer tokens.
     timeout : HTTP timeout in seconds for a single Ollama call.
 
@@ -376,13 +376,13 @@ class VerifierConfig:
     # LLM settings — emergency fallbacks; live values read from settings.yaml via from_yaml()
     model_name: str = "qwen2:1.5b"          # settings.yaml: llm.model_name
     base_url: str = "http://localhost:11434"
-    temperature: float = 0.1
+    temperature: float = 0.0
     max_tokens: int = 200
     timeout: int = 60
 
     # Context settings
     max_context_chars: int = 900
-    max_docs: int = 3
+    max_docs: int = 5
     max_chars_per_doc: int = 500             # settings.yaml: llm.max_chars_per_doc
 
     # Pre-validation flags
@@ -449,11 +449,11 @@ class VerifierConfig:
         return cls(
             model_name=llm.get("model_name", "qwen2:1.5b"),
             base_url=llm.get("base_url", "http://localhost:11434"),
-            temperature=llm.get("temperature", 0.1),
+            temperature=llm.get("temperature", 0.0),
             max_tokens=llm.get("max_tokens", 200),
             timeout=llm.get("timeout", 60),
             max_context_chars=llm.get("max_context_chars", 900),
-            max_docs=llm.get("max_docs", 3),
+            max_docs=llm.get("max_docs", 5),
             max_chars_per_doc=llm.get("max_chars_per_doc", 500),
             max_iterations=agent.get("max_verification_iterations", 2),
             enable_entity_path_validation=v.get("enable_entity_path_validation", True),

@@ -1,9 +1,9 @@
 """
 Hybrid Storage Module: Vector Store (LanceDB) + Knowledge Graph (KuzuDB)
 
-Version: 3.1.0
-Author: Edge-RAG Research Project
-Last Modified: 2026-04-08
+Version: 4.0.0
+Author: Jan Nietzard
+Last Modified: 2026-04-24
 
 ===============================================================================
 OVERVIEW
@@ -74,7 +74,6 @@ REVIEW HISTORY
 ===============================================================================
 """
 
-import collections
 import json
 import logging
 import shutil
@@ -100,6 +99,26 @@ except ImportError:
     KUZU_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+# Expected storage-layer exception types.
+#
+# Used in all except-clauses throughout this module instead of bare
+# `except Exception` so that programming bugs (AttributeError, NameError,
+# IndexError) are NOT silently swallowed alongside legitimate DB/IO errors.
+#
+# SystemExit, KeyboardInterrupt, and MemoryError are already excluded by
+# `Exception`, but this alias further excludes AssertionError and the broad
+# catch-all for library-internal exceptions that should propagate.
+_STORAGE_ERRORS: tuple = (
+    OSError,        # file-system / IPC failures
+    IOError,        # alias for OSError, explicit for clarity
+    RuntimeError,   # KuzuDB / LanceDB internal errors
+    ValueError,     # type mismatch, out-of-range inputs
+    TypeError,      # wrong argument type from DB layer
+    KeyError,       # missing column / field in result row
+)
+if KUZU_AVAILABLE and hasattr(kuzu, "Error"):
+    _STORAGE_ERRORS = (*_STORAGE_ERRORS, kuzu.Error)
 
 if not KUZU_AVAILABLE:
     logger.warning("KuzuDB not available. Install with: pip install kuzu")
@@ -350,7 +369,7 @@ class VectorStoreAdapter:
             else:
                 self.table.add(data)
             self._save_metadata()
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.error("Failed to insert documents: %s", exc)
             raise
 
@@ -543,7 +562,7 @@ class KuzuGraphStore:
             """)
             logger.debug("Graph schema initialised")
 
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             # IF NOT EXISTS makes duplicate-table errors impossible;
             # any exception here signals an unexpected problem.
             logger.warning("Unexpected error during schema init: %s", exc)
@@ -585,7 +604,7 @@ class KuzuGraphStore:
                     "source_file": source_file,
                 },
             )
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.error("Failed to add chunk %s: %s", chunk_id, exc)
             raise
 
@@ -605,7 +624,7 @@ class KuzuGraphStore:
                 """,
                 {"doc_id": doc_id, "filename": filename, "total_pages": total_pages},
             )
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.error("Failed to add source doc %s: %s", doc_id, exc)
             raise
 
@@ -632,7 +651,7 @@ class KuzuGraphStore:
                     "confidence": confidence,
                 },
             )
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.error("Failed to add entity %s: %s", entity_id, exc)
             raise
 
@@ -682,7 +701,7 @@ class KuzuGraphStore:
                 """,
                 {"chunk_id": chunk_id, "doc_id": doc_id},
             )
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.warning("FROM_SOURCE relation failed (%s → %s): %s", chunk_id, doc_id, exc)
 
     def add_next_chunk_relation(self, chunk_id: str, next_chunk_id: str) -> None:
@@ -696,7 +715,7 @@ class KuzuGraphStore:
                 """,
                 {"chunk_id": chunk_id, "next_chunk_id": next_chunk_id},
             )
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.warning(
                 "NEXT_CHUNK relation failed (%s → %s): %s", chunk_id, next_chunk_id, exc
             )
@@ -712,7 +731,7 @@ class KuzuGraphStore:
                 """,
                 {"chunk_id": chunk_id, "entity_id": entity_id},
             )
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.warning(
                 "MENTIONS relation failed (%s → %s): %s", chunk_id, entity_id, exc
             )
@@ -737,7 +756,7 @@ class KuzuGraphStore:
                     "relation_type": relation_type,
                 },
             )
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.warning(
                 "RELATED_TO relation failed (%s → %s): %s", entity1_id, entity2_id, exc
             )
@@ -817,7 +836,7 @@ class KuzuGraphStore:
             if start_exists:
                 visited[start_entity] = 0
 
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.debug("Traversal as DocumentChunk failed: %s", exc)
 
         # Attempt 2: start_entity as Entity.
@@ -849,7 +868,7 @@ class KuzuGraphStore:
                 if start_exists:
                     visited[start_entity] = 0
 
-            except Exception as exc2:
+            except _STORAGE_ERRORS as exc2:
                 logger.debug("Traversal as Entity failed: %s", exc2)
 
         return visited
@@ -891,7 +910,7 @@ class KuzuGraphStore:
                     "source_file": row[2],
                     "hops": row[3],
                 })
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.error("find_related_chunks failed: %s", exc)
         return related
 
@@ -940,7 +959,7 @@ class KuzuGraphStore:
                     backward.append(row[0])
             context_chunks = backward + context_chunks
 
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.debug("get_context_chunks note: %s", exc)
 
         return context_chunks
@@ -1083,7 +1102,7 @@ class KuzuGraphStore:
                             "relation_type": row[5],
                         })
 
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.error("find_chunks_by_entity_multihop failed: %s", exc)
 
         return chunks
@@ -1116,7 +1135,7 @@ class KuzuGraphStore:
                     "page_number": row[2],
                     "chunk_index": row[3],
                 })
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.error("get_document_structure failed: %s", exc)
         return chunks
 
@@ -1160,10 +1179,10 @@ class KuzuGraphStore:
                     )
                     if result.has_next():
                         stats[key] = result.get_next()[0]
-                except Exception as exc:
+                except _STORAGE_ERRORS as exc:
                     logger.debug("Edge count for %s failed: %s", rel_type, exc)
 
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.error("get_statistics failed: %s", exc)
 
         return stats
@@ -1175,13 +1194,13 @@ class KuzuGraphStore:
                 self.conn.execute(
                     "MATCH ()-[r:%s]->() DELETE r" % rel_type
                 )
-            except Exception as exc:
+            except _STORAGE_ERRORS as exc:
                 logger.warning("Failed to clear edges %s: %s", rel_type, exc)
 
         for label in ["DocumentChunk", "SourceDocument", "Entity"]:
             try:
                 self.conn.execute("MATCH (n:%s) DELETE n" % label)
-            except Exception as exc:
+            except _STORAGE_ERRORS as exc:
                 logger.warning("Failed to clear nodes %s: %s", label, exc)
 
         logger.info("Graph cleared")
@@ -1294,7 +1313,7 @@ class HybridStore:
                 "Install with: pip install gliner transformers",
                 exc,
             )
-        except Exception as exc:
+        except _STORAGE_ERRORS as exc:
             logger.warning("Failed to initialise entity pipeline: %s", exc)
 
         return None
@@ -1350,7 +1369,7 @@ class HybridStore:
                     entity_stats.get("total_mentions", 0),
                     entity_stats.get("total_relations", 0),
                 )
-            except Exception as exc:
+            except _STORAGE_ERRORS as exc:
                 logger.warning("Entity integration failed: %s", exc)
 
         logger.info("Added %d documents to hybrid store", len(documents))
@@ -1419,7 +1438,7 @@ class HybridStore:
                         )
                         seen_entities.add(entity.entity_id)
                         stats["unique_entities"] += 1
-                    except Exception as exc:
+                    except _STORAGE_ERRORS as exc:
                         logger.debug(
                             "Entity add failed (may exist): %s — %s",
                             entity.entity_id,
@@ -1432,7 +1451,7 @@ class HybridStore:
                         entity_id=entity.entity_id,
                     )
                     stats["total_mentions"] += 1
-                except Exception as exc:
+                except _STORAGE_ERRORS as exc:
                     logger.debug("MENTIONS relation failed: %s", exc)
 
         # Add RELATED_TO edges from REBEL relation extraction.
@@ -1455,7 +1474,7 @@ class HybridStore:
                             relation_type=relation.relation_type,
                         )
                         stats["total_relations"] += 1
-                except Exception as exc:
+                except _STORAGE_ERRORS as exc:
                     logger.debug("RELATED_TO relation failed: %s", exc)
 
         return stats

@@ -2,22 +2,22 @@
 # EDGE-RAG UNIFIED CONFIGURATION
 # ============================================================================
 #
-# Version: 3.1.0 - UNIFIED
-# Author: Edge-RAG Research Project
-# Last Modified: 2026-01-25
+# Version: 4.0.0
+# Author: Jan Nietzard
+# Last Modified: 2026-04-24
 #
-# CONSOLIDATION: settings.yaml + settings_kuzu.yaml → UNIFIED settings.yaml
+# Single source of truth for all runtime parameters.
+# All Python modules read this file via src/logic_layer/_settings.py
+# or via yaml.safe_load() — no values are hardcoded in production code.
 #
-# This configuration supports both KuzuDB and NetworkX graph backends.
-# Select your preferred backend in the 'graph' section below.
-#
+# For thesis evaluation: use requirements_frozen.txt and this file unchanged.
 # ============================================================================
 
 # ============================================================================
 # EMBEDDING MODEL
 # ============================================================================
 embeddings:
-  # Model name (must match Ollama installed model)
+  # Model name (must match an Ollama installed model)
   model_name: "nomic-embed-text"
 
   # Ollama API endpoint
@@ -29,7 +29,7 @@ embeddings:
   # bge-base-en: 768
   embedding_dim: 768
 
-  # SQLite Cache für Embedding-Ergebnisse (persistiert über Runs hinweg)
+  # SQLite cache for embedding results (persists across runs)
   cache_path: "./cache/embeddings.db"
 
 # ============================================================================
@@ -38,19 +38,19 @@ embeddings:
 chunking:
   # Mode: "standard" (fixed size) or "semantic" (structure-aware)
   mode: "standard"
-  
+
   # Standard chunking parameters
   chunk_size: 512         # Characters per chunk
   chunk_overlap: 128      # Overlap between chunks
-  
-  # Semantic chunking parameters (if mode="semantic")
+
+  # Semantic chunking parameters (used when mode="semantic")
   semantic:
     min_chunk_size: 200
     max_chunk_size: 1000
     detect_structure: true
     quality_filter: true
-  
-  # Content to filter out
+
+  # Content patterns to filter out during ingestion
   filter_patterns:
     - "^\\s*$"            # Empty lines
     - "^Page \\d+$"       # Page numbers
@@ -62,68 +62,61 @@ chunking:
 vector_store:
   provider: "lancedb"
   db_path: "./data/vector"
-  
+
   # Index type: "flat" (exact) or "ivfflat" (approximate, faster)
   index_type: "ivfflat"
-  
+
   # =========================================================================
-  # DISTANCE METRIC - CRITICAL SETTING
+  # DISTANCE METRIC — CRITICAL SETTING
   # =========================================================================
   # Must be "cosine" for text embeddings.
-  # LanceDB defaults to L2 which gives incorrect similarity scores!
+  # LanceDB defaults to L2 which produces incorrect similarity scores.
   distance_metric: "cosine"
-  
-  # L2 normalization for numerical stability
+
+  # L2 normalisation for numerical stability
   normalize_embeddings: true
-  
+
   # Retrieval parameters
   top_k_vectors: 10
   similarity_threshold: 0.3    # Minimum similarity [0.0, 1.0]
-  overfetch_factor: 3          # ANN candidates = top_k * overfetch_factor; filtered by threshold
-  graph_text_max_chars: 500    # Max characters stored in graph node (full text in vector store)
+  overfetch_factor: 3          # ANN candidates = top_k * overfetch_factor
+  graph_text_max_chars: 500    # Max characters stored in graph node
 
 # ============================================================================
 # KNOWLEDGE GRAPH
 # ============================================================================
 graph:
   enabled: true
-  
+
   # =========================================================================
   # BACKEND SELECTION
   # =========================================================================
-  # Options:
-  #   "kuzu"     - KuzuDB (recommended): Native Cypher, 10-100x faster
-  #   "networkx" - NetworkX (fallback): Pure Python, GraphML persistence
-  #
-  # KuzuDB requires: pip install kuzu
-  # NetworkX requires: pip install networkx
-  #
-  # If selected backend is unavailable, system will auto-fallback to other.
+  # Only "kuzu" is supported in v4.0.0.
+  # NetworkX fallback was removed — KuzuDB is required.
+  # Install: pip install kuzu
   # =========================================================================
   backend: "kuzu"
-  
-  # Database path
-  # KuzuDB: Directory (e.g., "./data/graph")
-  # NetworkX: File (e.g., "./data/graph/graph.graphml")
+
+  # Database path (KuzuDB: directory)
   graph_path: "./data/graph"
-  
+
   # Graph traversal settings
   max_hops: 2                    # Maximum path length for traversal
   top_k_entities: 5              # Number of graph results
   expand_context: true           # Include surrounding chunks (KuzuDB only)
-  
-  # Entity extraction method
+
+  # Entity extraction method during ingestion
   # "keyword" - Simple keyword-based (fast, basic)
   # "spacy"   - spaCy NER (requires: pip install spacy)
   # "gliner"  - GLiNER zero-shot NER (requires: pip install gliner)
   entity_extraction_method: "keyword"
-  
+
   # Relationship types stored in graph
   relation_types:
-    - "from_source"     # Chunk -> Document
-    - "next_chunk"      # Chunk -> Chunk (sequential)
-    - "mentions"        # Chunk -> Entity
-    - "related_to"      # Entity -> Entity
+    - "from_source"     # Chunk → Document
+    - "next_chunk"      # Chunk → Chunk (sequential)
+    - "mentions"        # Chunk → Entity
+    - "related_to"      # Entity → Entity
 
 # ============================================================================
 # RETRIEVAL AUGMENTED GENERATION (RAG)
@@ -138,9 +131,9 @@ rag:
   #   "hybrid" - Weighted combination (recommended)
   # =========================================================================
   retrieval_mode: "hybrid"
-  
+
   # =========================================================================
-  # HYBRID WEIGHTS - Ablation Study Configuration
+  # HYBRID WEIGHTS — Ablation Study Configuration
   # =========================================================================
   # Experiment 1: Vector-only  → vector_weight=1.0, graph_weight=0.0
   # Experiment 2: Graph-only   → vector_weight=0.0, graph_weight=1.0
@@ -153,10 +146,10 @@ rag:
 
   # RRF Fusion Parameter
   # Note: rrf_k here is consumed by HybridRetriever (data layer) for its own
-  # internal fusion pass.  The Navigator (logic layer) reads navigator.rrf_k
-  # separately for its RRF fusion over sub-query result lists.  Both keys
-  # default to 60 (Cormack et al., 2009) but serve different components and
-  # must be maintained independently.
+  # internal fusion pass. The Navigator (logic layer) reads navigator.rrf_k
+  # separately for its RRF fusion over sub-query result lists. Both default
+  # to 60 (Cormack et al., 2009) but serve different components and must be
+  # maintained independently.
   rrf_k: 60                    # Reciprocal Rank Fusion constant (standard: 60)
   cross_source_boost: 1.2      # Boost for chunks appearing in both retrieval paths
 
@@ -165,42 +158,42 @@ rag:
   query_expansion_enabled: false
 
 # ============================================================================
-# LLM CONFIGURATION (for Artifact B - Logic Layer)
+# LLM CONFIGURATION (Artifact B — Logic Layer)
 # ============================================================================
 llm:
-  # Active model — override with --model flag on CLI
-  model_name: "qwen2:1.5b"   # TEST 2026-04-15: phi3 times out on CPU; qwen2:1.5b expected ~10-20s
+  # Active model — must be pulled via: ollama pull <model_name>
+  model_name: "qwen2:1.5b"   # qwen2:1.5b: ~10-20s per query on CPU (safest for 60s timeout)
 
   base_url: "http://localhost:11434"
-  temperature: 0.1    # Low for factual responses
-  max_tokens: 200     # Ausreichend für vollständige Antworten
-  timeout: 60         # Ollama API Timeout in Sekunden
-                      # Modellwahl entscheidet ob 60s reicht — siehe available_models.
-                      # phi3 (3.8B): grenzwertig (~45-80s), gemma2:2b: sicher (~20-35s),
-                      # qwen2:1.5b: sehr sicher (~10-20s).
+  temperature: 0.0    # 0.0 = fully deterministic — required for reproducible thesis evaluation
+  max_tokens: 200
+  timeout: 60         # Ollama API timeout in seconds
+                      # Model latency on CPU: qwen2:1.5b ~10-20s, gemma2:2b ~20-35s,
+                      # llama3.2:3b ~35-55s, phi3 ~45-80s (risky at 60s).
 
-  # Context Budget für Verifier (S_V)
+  # Context budget for Verifier (S_V)
   #
-  # Der Navigator filtert 10 → max. 8 Chunks (beste nach Relevanz).
-  # Der Verifier nimmt daraus nur max_docs Chunks und kürzt jeden auf
-  # max_chars_per_doc Zeichen — das ist die eigentliche Kontextreduktion.
+  # After Navigator filtering, at most max_docs chunks are forwarded to S_V.
+  # Each chunk is truncated to max_chars_per_doc characters.
+  # The assembled context is then capped at max_context_chars as a safety net.
   #
-  # Warum 3 Docs à 300 chars (= 900 chars total)?
-  #   - Navigator hat bereits die relevantesten Chunks ausgewählt
-  #   - 300 chars (~75 Wörter) enthält den entscheidenden Fakt für HotpotQA
-  #   - 200 chars/doc (alte Einstellung) war zu wenig → Fakt oft abgeschnitten
-  #   - 900 chars Gesamtkontext ≈ 225 Tokens Input → phi3 sicher in <55s
-  #   - Prompt-Overhead (~150 chars) → ~1050 chars Gesamtinput ans LLM
-  max_context_chars: 900    # Gesamtbudget (Sicherheitsnetz)
-  max_docs: 3               # Navigator wählt vor, Verifier nimmt Top-3
-  max_chars_per_doc: 500    # ~125 words per chunk — increased from 300 to reduce key-sentence loss
+  # Theoretical max: max_docs(5) × max_chars_per_doc(500) = 2500 chars
+  # Safety cap:      max_context_chars = 900 chars (~225 tokens input to LLM)
+  # Prompt overhead: ~150 chars → ~1050 chars total input
+  #
+  # The safety cap keeps edge CPU latency predictable regardless of chunk length.
+  # max_docs was raised from 3 to 5 (2026-04-23) to prevent bridge-chunk
+  # truncation on multi-hop HotpotQA questions.
+  max_context_chars: 900    # Safety cap (overrides theoretical max)
+  max_docs: 5               # Max chunks forwarded to Verifier after Navigator filtering
+  max_chars_per_doc: 500    # ~125 words per chunk
 
 # ============================================================================
 # NAVIGATOR (S_N) — Pre-Generative Filtering
 # ============================================================================
 navigator:
   # Relevance Filter: keep chunks with score >= factor × max_rrf_score
-  relevance_threshold_factor: 0.85  # raised from 0.6 — score compression 0.74–0.80 made 0.6 keep everything
+  relevance_threshold_factor: 0.85
 
   # Redundancy Filter: Jaccard similarity threshold for deduplication
   redundancy_threshold: 0.8
@@ -240,7 +233,7 @@ planner:
   # Maximum number of entities to extract per query
   max_entities: 10
 
-  # Enable bridge entity detection (for multi-hop)
+  # Enable bridge entity detection (for multi-hop queries)
   enable_bridge_detection: true
 
   # Parse temporal constraints from queries
@@ -268,56 +261,53 @@ planner:
   # ENTITY DENSITY THRESHOLDS (Phase 3 of classify())
   # Queries with more than these counts receive a multi-hop score boost.
   # ---------------------------------------------------------------------------
-  entity_density_threshold: 2    # named entity count threshold
-  noun_density_threshold: 4      # noun/proper-noun count threshold
+  entity_density_threshold: 2    # Named entity count threshold
+  noun_density_threshold: 4      # Noun/proper-noun count threshold
 
   # Confidence assigned to entities found via regex fallback (not SpaCy NER)
   regex_entity_confidence: 0.75
 
 # ============================================================================
-# AVAILABLE MODELS (für Multi-Modell-Evaluation und Ablation)
-# Hier zentral pflegen — nirgendwo im Code hardcoded.
-# Alle Modelle müssen via `ollama pull <name>` installiert sein.
+# AVAILABLE MODELS (for multi-model evaluation and ablation)
+# All models must be installed via: ollama pull <name>
 # ============================================================================
 available_models:
-  # ── Thesis-Vergleichsmodelle (Accuracy-vs-Latency Tradeoff auf Edge-CPU) ──────
-  # Alle 4 Modelle decken die SLM-Bandbreite 1.5B–3.8B ab.
-  # install: ollama pull <name>
+  # Thesis comparison models — accuracy vs. latency on edge CPU (1.5B–3.8B)
 
   - name: "qwen2:1.5b"
-    description: "Qwen 2 1.5B — schnellstes Modell, sehr sicher in 60s"
+    description: "Qwen 2 1.5B — fastest model, reliably under 60s"
     params_b: 1.5
     quantization: "Q4_K_M"
-    expected_latency_s: 10   # ~10-20s für 500 Tokens auf CPU
-    60s_safe: true
+    expected_latency_s: 10
+    safe_60s: true
 
   - name: "gemma2:2b"
-    description: "Gemma 2 2B — gutes Qualitäts-/Speed-Verhältnis, Google"
+    description: "Gemma 2 2B — good quality/speed ratio (Google)"
     params_b: 2.0
     quantization: "Q4_K_M"
-    expected_latency_s: 25   # ~20-35s für 500 Tokens auf CPU
-    60s_safe: true
+    expected_latency_s: 25
+    safe_60s: true
 
   - name: "llama3.2:3b"
-    description: "Llama 3.2 3B — Meta-Referenz für 3B-Klasse, knapp"
+    description: "Llama 3.2 3B — Meta reference for the 3B class"
     params_b: 3.0
     quantization: "Q4_K_M"
-    expected_latency_s: 45   # ~35-55s für 500 Tokens auf CPU
-    60s_safe: true           # meist, bei kleinem Kontext (800 chars)
+    expected_latency_s: 45
+    safe_60s: true
 
   - name: "phi3"
-    description: "Phi-3 Mini 3.8B — Microsoft Edge-Flaggschiff, grenzwertig bei 60s"
+    description: "Phi-3 Mini 3.8B — Microsoft edge flagship, borderline at 60s"
     params_b: 3.8
     quantization: "Q4_K_M"
-    expected_latency_s: 55   # ~45-80s für 500 Tokens auf CPU — bei 800 chars meist ok
-    60s_safe: false          # bei größerem Kontext riskant
+    expected_latency_s: 55
+    safe_60s: false
 
 # ============================================================================
 # AGENTIC CONTROLLER (Artifact B)
 # ============================================================================
 agent:
-  # Maximum verification iterations in self-correction loop
-  # 1 = kein Self-Correction (Baseline), 2 = Thesis-Default (1 Korrektur-Runde)
+  # Maximum self-correction iterations in the Verifier loop
+  # 1 = no self-correction (baseline), 2 = thesis default (1 correction round)
   max_verification_iterations: 2
 
   # Enable/disable individual pipeline stages (ablation flags)
@@ -362,21 +352,21 @@ logging:
 performance:
   # Embedding batch size (higher = faster ingestion, more memory)
   batch_size: 64
-  
+
   # Number of worker threads for parallel processing
   num_workers: 2
-  
+
   # Compute device: "cpu" or "cuda" (if available)
   device: "cpu"
-  
+
   # Enable embedding cache (SQLite-based)
   cache_embeddings: true
-  
+
   # Maximum cache size in MB
   max_cache_size_mb: 512
 
 # ============================================================================
-# BENCHMARK CONFIGURATION (for Thesis Evaluation)
+# BENCHMARK CONFIGURATION (for thesis evaluation)
 # ============================================================================
 benchmark:
   # Available datasets for evaluation
@@ -384,10 +374,10 @@ benchmark:
     - "hotpotqa"
     - "2wikimultihop"
     - "strategyqa"
-  
+
   # Default number of samples per dataset
   default_samples: 500
-  
+
   # Ablation study configurations
   ablation_configs:
     - name: "vector_only"
@@ -403,7 +393,6 @@ benchmark:
       vector_weight: 0.5
       graph_weight: 0.5
 
-
 # ============================================================================
 # VERIFIER (S_V) — Pre-Validation and Self-Correction
 # ============================================================================
@@ -414,7 +403,7 @@ verifier:
   # installed — the NLI model (~270 MB) is downloaded on first use.
   # ---------------------------------------------------------------------------
   enable_entity_path_validation: true
-  enable_contradiction_detection: false   # Disabled by default (NLI download)
+  enable_contradiction_detection: false   # Disabled by default (NLI download required)
   enable_credibility_scoring: true
 
   # NLI contradiction detection model and parameters.
@@ -457,40 +446,40 @@ verifier:
 # INGESTION CONFIGURATION
 # ============================================================================
 ingestion:
-  # Verfügbare Strategien: sentence | sentence_spacy | semantic | fixed | recursive
+  # Available strategies: sentence | sentence_spacy | semantic | fixed | recursive
   chunking_strategy: "sentence_spacy"
 
-  # Sentence-Strategie
+  # Sentence strategy (thesis default: 3 sentences per chunk, 1 overlap)
   sentences_per_chunk: 3
-  sentence_overlap: 1       # Überlappende Sätze (nur sentence_spacy)
+  sentence_overlap: 1
 
-  # Fixed/Recursive/Semantic-Strategie
+  # Fixed/Recursive/Semantic strategy
   chunk_size: 1024
   chunk_overlap: 128
   min_chunk_size: 50
 
-  # Semantic-Strategie
+  # Semantic strategy
   min_lexical_diversity: 0.3
   min_information_density: 2.0
 
-  # Fixed Chunking: Wortgrenzen-Heuristik
-  # Brich am letzten Leerzeichen, wenn es in den letzten (1 - factor) * chunk_size Zeichen liegt.
-  # 0.8 = brich am Wort, sofern das Leerzeichen im letzten 20% des Chunks liegt.
+  # Fixed chunking: word-boundary heuristic
+  # Break at last space if it falls within the last (1 - factor) * chunk_size chars.
+  # 0.8 = break at word boundary when space is within the last 20% of the chunk.
   word_boundary_factor: 0.8
 
   # Maximum character length per sentence-based chunk (SpacySentenceChunker)
   max_chunk_chars: 2000
 
-  # SpaCy-spezifisch
+  # SpaCy-specific settings
   spacy_model: "en_core_web_sm"
   entity_aware_chunking: false
 
-  # Quality Filter thresholds (AutomaticQualityFilter — semantic chunking only)
+  # Quality filter thresholds (AutomaticQualityFilter — semantic chunking only)
   quality_filter:
     min_length: 100   # Minimum characters per chunk
     min_words: 15     # Minimum word count per chunk
 
-  # Metadata & Entity Extraction
+  # Metadata and entity extraction during ingestion
   extract_entities: true
   add_source_metadata: true
 
@@ -531,7 +520,7 @@ entity_extraction:
     max_output_length: 256       # generation length cap
     num_beams: 5                 # beam search width
 
-  # Entity Caching (in-memory LRU + SQLite persistent store)
+  # Entity caching (in-memory LRU + SQLite persistent store)
   caching:
     enabled: true
     cache_path: "./data/entity_cache.db"

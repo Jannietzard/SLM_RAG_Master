@@ -1,60 +1,61 @@
 """
-Ablation Study Module - Wissenschaftliche Evaluation für Masterarbeit
+Ablation Study Module — Systematic Evaluation for Master's Thesis
 
-Masterthesis: "Enhancing Reasoning Fidelity in Quantized SLMs on Edge"
+Thesis: "Enhancing Reasoning Fidelity in Quantized SLMs on Edge"
 
 ===============================================================================
 OVERVIEW
 ===============================================================================
 
-Dieses Modul führt systematische Ablationsstudien durch mit:
+This module runs systematic ablation studies over the hybrid retrieval
+configurations described in thesis Chapter 4.
 
-1. KLARE FORTSCHRITTSANZEIGE
-   - Aktueller Stand (x/y Fragen, z/n Configs)
-   - Geschätzte Restzeit (ETA)
-   - Live-Updates pro Frage
+1. PROGRESS DISPLAY
+   - Current position (x/y questions, z/n configurations)
+   - Estimated time remaining (ETA)
+   - Live per-question updates
 
-2. DETAILLIERTE METRIKEN
-   - Pro Frage: EM, F1, Retrieval-Count, Latenz
-   - Pro Iteration im Agentic Loop: Claims verified/violated
-   - Aggregiert: Mean, Std, Min, Max
+2. DETAILED METRICS
+   - Per question: EM, F1, retrieval count, latency
+   - Per agentic loop iteration: claims verified / violated
+   - Aggregated: mean, std, min, max
 
-3. WISSENSCHAFTLICHE OUTPUTS
-   - JSON mit allen Rohdaten
-   - CSV für statistische Analyse
-   - Markdown-Report für Thesis
-   - Latex-Tabellen (optional)
+3. SCIENTIFIC OUTPUTS
+   - JSON with all raw data
+   - CSV for statistical analysis
+   - Markdown report for thesis
+   - LaTeX tables (optional)
 
-4. REPRODUZIERBARKEIT
-   - Seed-basierte Sampling
-   - Vollständige Config-Dokumentation
-   - Timestamps und Versionen
+4. REPRODUCIBILITY
+   - Seed-based sampling (random + numpy + torch)
+   - Full configuration logging with timestamps
+   - requirements_frozen.txt pins all dependency versions
 
 ===============================================================================
 USAGE
 ===============================================================================
 
-# Als eigenständiges Skript:
-python ablation_study.py --samples 10 --datasets strategyqa
+    # As a standalone script:
+    python ablation_study.py --samples 10 --datasets strategyqa
 
-# Von benchmark_datasets.py:
-from ablation_study import AblationStudy
-study = AblationStudy(config)
-results = study.run(datasets, samples=10)
+    # From benchmark_datasets.py:
+    from ablation_study import AblationStudy
+    study = AblationStudy(config)
+    results = study.run(datasets, samples=10)
 
 ===============================================================================
 OUTPUT STRUCTURE
 ===============================================================================
 
-results/
-├── ablation_20260126_003000/
-│   ├── config.json              # Vollständige Konfiguration
-│   ├── raw_results.json         # Alle Rohdaten
-│   ├── summary.csv              # Aggregierte Ergebnisse
-│   ├── per_question.csv         # Ergebnisse pro Frage
-│   ├── iteration_analysis.csv   # Agentic Loop Analyse
-│   ├── report.md                # Markdown-Report
-│   └── latex_tables.tex         # LaTeX für Thesis
+    results/
+    ├── ablation_<timestamp>/
+    │   ├── config.json              # Full configuration snapshot
+    │   ├── raw_results.json         # All raw data
+    │   ├── summary.csv              # Aggregated results
+    │   ├── per_question.csv         # Per-question results
+    │   ├── iteration_analysis.csv   # Agentic loop analysis
+    │   ├── report.md                # Markdown report
+    │   └── latex_tables.tex         # LaTeX tables for thesis
 
 ===============================================================================
 """
@@ -72,6 +73,9 @@ from typing import List, Dict, Any, Optional, Tuple
 from collections import defaultdict
 import statistics
 
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from src.evaluations.metrics import normalize_answer, compute_exact_match, compute_f1
+
 # Suppress noisy warnings
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -80,8 +84,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 try:
     import unified_planning as up
     up.shortcuts.get_environment().credits_stream = None
-except:
-    pass
+except (ImportError, AttributeError):
+    pass   # unified_planning is an optional dependency
 
 
 # =============================================================================
@@ -90,7 +94,7 @@ except:
 
 @dataclass
 class AblationConfig:
-    """Konfiguration für Ablationsstudie."""
+    """Configuration for the ablation study (thesis Chapter 4)."""
     # Study Settings
     name: str = "hybrid_retrieval_ablation"
     seed: int = 42
@@ -117,31 +121,31 @@ class AblationConfig:
 
 @dataclass
 class QuestionResult:
-    """Ergebnis für eine einzelne Frage."""
+    """Per-question evaluation result."""
     question_id: str
     question: str
     gold_answer: str
     predicted_answer: str
-    
-    # Metriken
+
+    # Metrics
     exact_match: bool
     f1_score: float
-    
-    # Retrieval Info
+
+    # Retrieval info
     retrieval_count: int
     vector_results: int
     graph_results: int
-    
+
     # Timing
     total_time_ms: float
     retrieval_time_ms: float
     llm_time_ms: float
-    
-    # Agentic Loop Details
+
+    # Agentic loop details
     iterations_used: int
     iteration_details: List[Dict] = field(default_factory=list)
     all_verified: bool = False
-    
+
     # Metadata
     dataset: str = ""
     config_name: str = ""
@@ -150,32 +154,32 @@ class QuestionResult:
 
 @dataclass
 class ConfigurationResult:
-    """Aggregierte Ergebnisse für eine Konfiguration."""
+    """Aggregated results for one ablation configuration."""
     config_name: str
     vector_weight: float
     graph_weight: float
     dataset: str
-    
-    # Sample Info
+
+    # Sample info
     n_questions: int
-    n_success: int  # Fragen ohne Fehler
-    
-    # Aggregierte Metriken
+    n_success: int  # Questions without errors
+
+    # Aggregated metrics
     exact_match_mean: float
     exact_match_std: float
     f1_mean: float
     f1_std: float
-    
+
     # Timing
     avg_time_ms: float
     min_time_ms: float
     max_time_ms: float
-    
-    # Agentic Loop Stats
+
+    # Agentic loop stats
     avg_iterations: float
-    verification_rate: float  # % der Antworten vollständig verifiziert
-    
-    # Raw Results (für detaillierte Analyse)
+    verification_rate: float  # Fraction of answers fully verified
+
+    # Raw results (for detailed analysis)
     question_results: List[QuestionResult] = field(default_factory=list)
 
 
@@ -184,7 +188,7 @@ class ConfigurationResult:
 # =============================================================================
 
 class ProgressTracker:
-    """Übersichtliche Fortschrittsanzeige."""
+    """Live progress display for long-running ablation runs."""
     
     def __init__(self, total_questions: int, total_configs: int):
         self.total_questions = total_questions
@@ -195,7 +199,7 @@ class ProgressTracker:
         self.question_times = []
         
     def start_config(self, config_name: str, config_num: int):
-        """Neue Konfiguration starten."""
+        """Start a new ablation configuration."""
         self.current_config = config_num
         self.current_question = 0
         self.config_start_time = time.time()
@@ -205,7 +209,7 @@ class ProgressTracker:
         print(f"{'='*70}")
     
     def update(self, question_num: int, question_id: str, result: Optional[QuestionResult] = None):
-        """Update Fortschritt für eine Frage."""
+        """Update progress for a single question."""
         self.current_question = question_num
         elapsed = time.time() - self.start_time
         
@@ -244,7 +248,7 @@ class ProgressTracker:
         print(f"\r{status}", end="", flush=True)
     
     def finish_config(self, result: ConfigurationResult):
-        """Konfiguration abgeschlossen."""
+        """Mark a configuration as complete and print its summary."""
         print()  # New line after progress bar
         print(f"  ────────────────────────────────────────────────────────")
         print(f"  Results: EM={result.exact_match_mean*100:.1f}% | F1={result.f1_mean:.3f} | "
@@ -252,7 +256,7 @@ class ProgressTracker:
         print(f"  Verification Rate: {result.verification_rate*100:.1f}%")
     
     def finish_study(self, total_time: float):
-        """Studie abgeschlossen."""
+        """Mark the full study as complete and print total runtime."""
         print(f"\n{'='*70}")
         print(f"  ABLATION STUDY COMPLETE")
         print(f"  Total Time: {timedelta(seconds=int(total_time))}")
@@ -260,64 +264,18 @@ class ProgressTracker:
 
 
 # =============================================================================
-# METRICS CALCULATION
-# =============================================================================
-
-def normalize_answer(s: str) -> str:
-    """Normalisiere Antwort für Vergleich."""
-    import re
-    import string
-    
-    def remove_articles(text):
-        return re.sub(r'\b(a|an|the)\b', ' ', text)
-    
-    def white_space_fix(text):
-        return ' '.join(text.split())
-    
-    def remove_punc(text):
-        exclude = set(string.punctuation)
-        return ''.join(ch for ch in text if ch not in exclude)
-    
-    def lower(text):
-        return text.lower()
-    
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
-
-
-def compute_exact_match(prediction: str, ground_truth: str) -> bool:
-    """Berechne Exact Match."""
-    return normalize_answer(prediction) == normalize_answer(ground_truth)
-
-
-def compute_f1(prediction: str, ground_truth: str) -> float:
-    """Berechne F1 Score (Token-Level)."""
-    pred_tokens = normalize_answer(prediction).split()
-    gold_tokens = normalize_answer(ground_truth).split()
-    
-    if not pred_tokens or not gold_tokens:
-        return float(pred_tokens == gold_tokens)
-    
-    common = set(pred_tokens) & set(gold_tokens)
-    
-    if not common:
-        return 0.0
-    
-    precision = len(common) / len(pred_tokens)
-    recall = len(common) / len(gold_tokens)
-    
-    return 2 * precision * recall / (precision + recall)
-
-
-# =============================================================================
 # ABLATION STUDY CLASS
 # =============================================================================
+# Metrics (normalize_answer, compute_exact_match, compute_f1) are imported
+# from src.evaluations.metrics — the canonical implementation shared with
+# evaluate_hotpotqa.py to guarantee identical numbers across all reported tables.
 
 class AblationStudy:
     """
-    Wissenschaftliche Ablationsstudie für Hybrid Retrieval.
-    
-    Führt systematische Evaluation durch und generiert
-    publikationsreife Ergebnisse.
+    Systematic ablation study for hybrid retrieval (thesis Chapter 4).
+
+    Runs all ablation configurations and produces publication-ready outputs:
+    JSON raw data, CSV summaries, Markdown report, and LaTeX tables.
     """
     
     def __init__(
@@ -329,8 +287,8 @@ class AblationStudy:
         Initialize Ablation Study.
         
         Args:
-            config: AblationConfig für Studie
-            pipeline_config: Config für RAG Pipeline (settings.yaml)
+            config:          AblationConfig for this study run.
+            pipeline_config: RAG pipeline configuration (mirrors settings.yaml).
         """
         self.config = config or AblationConfig()
         self.pipeline_config = pipeline_config or {}
@@ -347,14 +305,14 @@ class AblationStudy:
         self.logger.info(f"AblationStudy initialized. Results: {self.run_dir}")
     
     def _create_run_directory(self) -> Path:
-        """Erstelle eindeutiges Verzeichnis für diesen Run."""
+        """Create a timestamped output directory for this run."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir = self.config.results_dir / f"ablation_{timestamp}"
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
     
     def _save_config(self):
-        """Speichere Konfiguration für Reproduzierbarkeit."""
+        """Save the study configuration for reproducibility."""
         config_data = {
             "ablation_config": asdict(self.config),
             "pipeline_config": self.pipeline_config,
@@ -375,15 +333,16 @@ class AblationStudy:
         pipeline_factory = None,  # Function to create pipeline
     ) -> Dict[str, Dict[str, ConfigurationResult]]:
         """
-        Führe Ablationsstudie durch.
-        
+        Run the complete ablation study.
+
         Args:
-            datasets: Dict mit {name: (questions, articles)}
-            samples_per_dataset: Anzahl Fragen pro Dataset
-            pipeline_factory: Factory-Funktion für Pipeline
-            
+            datasets:            Mapping of {name: (questions_list, articles_list)}.
+            samples_per_dataset: Number of questions evaluated per dataset.
+            pipeline_factory:    Callable(vector_weight, graph_weight, dataset_name)
+                                 returning a pipeline with a .query(question) method.
+
         Returns:
-            Nested Dict: {dataset: {config: ConfigurationResult}}
+            Nested dict {dataset_name: {config_name: ConfigurationResult}}.
         """
         self._save_config()
         
@@ -413,9 +372,16 @@ class AblationStudy:
             print(f"  DATASET: {dataset_name.upper()}")
             print(f"{'─'*70}")
             
-            # Sample questions
+            # Sample questions — seed all RNG sources for full reproducibility
             import random
+            import numpy as np
             random.seed(self.config.seed)
+            np.random.seed(self.config.seed)
+            try:
+                import torch
+                torch.manual_seed(self.config.seed)
+            except ImportError:
+                pass
             sampled_questions = random.sample(
                 questions, 
                 min(samples_per_dataset, len(questions))
@@ -514,7 +480,7 @@ class AblationStudy:
         config_name: str,
         dataset_name: str,
     ) -> QuestionResult:
-        """Evaluiere eine einzelne Frage."""
+        """Evaluate a single question against the pipeline and compute EM/F1."""
         
         start_time = time.time()
         
@@ -594,7 +560,7 @@ class AblationStudy:
         graph_weight: float,
         dataset: str,
     ) -> ConfigurationResult:
-        """Aggregiere Ergebnisse für eine Konfiguration."""
+        """Aggregate per-question results into a ConfigurationResult summary."""
         
         if not question_results:
             return ConfigurationResult(
@@ -645,7 +611,7 @@ class AblationStudy:
         )
     
     def _save_intermediate_results(self):
-        """Speichere Zwischenergebnisse."""
+        """Persist intermediate results after each configuration completes."""
         # Convert to serializable format
         data = {}
         for dataset, configs in self.results.items():
@@ -667,7 +633,7 @@ class AblationStudy:
             json.dump(data, f, indent=2)
     
     def _generate_outputs(self):
-        """Generiere alle Output-Dateien."""
+        """Generate all output files: raw JSON, CSV summaries, Markdown report, LaTeX tables."""
         self._save_raw_results()
         self._save_summary_csv()
         self._save_per_question_csv()
@@ -680,7 +646,7 @@ class AblationStudy:
         print(f"\n  Results saved to: {self.run_dir}")
     
     def _save_raw_results(self):
-        """Speichere alle Rohdaten als JSON."""
+        """Serialize all raw QuestionResult objects to JSON."""
         data = {}
         for dataset, configs in self.results.items():
             data[dataset] = {}
@@ -694,7 +660,7 @@ class AblationStudy:
             json.dump(data, f, indent=2, default=str)
     
     def _save_summary_csv(self):
-        """Speichere aggregierte Ergebnisse als CSV."""
+        """Write per-configuration aggregated metrics to a CSV file."""
         rows = []
         for dataset, configs in self.results.items():
             for config_name, result in configs.items():
@@ -722,7 +688,7 @@ class AblationStudy:
                 writer.writerows(rows)
     
     def _save_per_question_csv(self):
-        """Speichere Ergebnisse pro Frage."""
+        """Write per-question results to a CSV file."""
         rows = []
         for dataset, configs in self.results.items():
             for config_name, result in configs.items():
@@ -747,7 +713,7 @@ class AblationStudy:
                 writer.writerows(rows)
     
     def _save_iteration_analysis(self):
-        """Analysiere Agentic Loop Iterationen."""
+        """Write per-iteration self-correction analysis to a CSV file."""
         rows = []
         for dataset, configs in self.results.items():
             for config_name, result in configs.items():
@@ -771,7 +737,7 @@ class AblationStudy:
                 writer.writerows(rows)
     
     def _generate_markdown_report(self):
-        """Generiere Markdown-Report für Thesis."""
+        """Generate a Markdown summary report for the thesis appendix."""
         report = []
         report.append("# Ablation Study Results\n")
         report.append(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -805,7 +771,7 @@ class AblationStudy:
             f.write("".join(report))
     
     def _generate_latex_tables(self):
-        """Generiere LaTeX-Tabellen für Thesis."""
+        """Generate LaTeX table source for the thesis results chapter."""
         latex = []
         latex.append("% Ablation Study Results - Auto-generated\n")
         latex.append("% Include with: \\input{latex_tables.tex}\n\n")

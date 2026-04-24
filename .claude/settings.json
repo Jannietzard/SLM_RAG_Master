@@ -36,7 +36,24 @@
       "Bash(python -X utf8 -m pytest test_system/ src/ --ignore=test_system/test_gliner_quality.py -q)",
       "Bash(python -X utf8 -m pytest test_system/ src/ --ignore=test_system/test_gliner_quality.py --ignore=test_system/test_gliner.py -q)",
       "Read(//c/Users/JANNIE~1/AppData/Local/Temp/claude/c--Users-Jan-Nietzard-Documents-FOM-FOM-Masterarbeit-Masterarbeit-Edge-Entwicklungfolder/b5bea62f-1e58-422a-a597-1780c2bd07a0/tasks/**)",
-      "Bash(python -X utf8 -m pytest test_system/ src/ --ignore=test_system/test_gliner_quality.py --ignore=src/evaluations/ -q)"
+      "Bash(python -X utf8 -m pytest test_system/ src/ --ignore=test_system/test_gliner_quality.py --ignore=src/evaluations/ -q)",
+      "Bash(grep -n \"^\\\\s*[A-Z_]*\\\\s*=\\\\s*[0-9.]*\\\\s*$\" \"/c/Users/Jan Nietzard/Documents/FOM/FOM Masterarbeit/Masterarbeit Edge/Entwicklungfolder/src/data_layer/embeddings.py\")",
+      "Bash(python -X utf8 -m pytest test_system/ src/ --ignore=test_system/test_gliner_quality.py --ignore=src/evaluations/ --co -q)",
+      "Bash(python -m pip freeze)",
+      "Bash(python -X utf8 -m pytest test_system/test_logic_layer.py::TestNavigator::test_jaccard_similarity_identical_texts test_system/test_logic_layer.py::TestNavigator::test_jaccard_similarity_different_texts -v)",
+      "Bash(python -X utf8 -m pytest src/ test_system/ --ignore=src/evaluations/test_rag_quality.py -q)",
+      "Bash(python -X utf8 -m pytest test_system/test_missing_coverage.py -v)",
+      "Bash(python -X utf8 -m pytest test_system/test_missing_coverage.py::test_planner_disabled_returns_answer -v)",
+      "Bash(python -X utf8 -m pytest test_system/test_missing_coverage.py -v --tb=short)",
+      "Bash(python -X utf8 -m pytest src/data_layer/test_data_layer.py src/logic_layer/test_logic_layer.py test_system/test_chunking.py test_system/test_embeddings.py test_system/test_missing_coverage.py -v --tb=short)",
+      "Bash(python -X utf8 -m pytest test_system/test_data_layer.py test_system/test_logic_layer.py test_system/test_chunking.py test_system/test_embeddings.py test_system/test_missing_coverage.py -v --tb=short)",
+      "Bash(python -X utf8 -m pytest test_system/test_thesis_matrix.py -v --tb=short)",
+      "Bash(python -X utf8 -c \"from src.data_layer.chunking import SpacySentenceChunker; c = SpacySentenceChunker\\(sentences_per_chunk=3, sentence_overlap=1\\); chunks = c.chunk_text\\('Albert Einstein was born in Ulm in 1879.', source_doc='test.txt'\\); print\\(len\\(chunks\\), chunks\\)\")",
+      "Bash(python -X utf8 -c ' *)",
+      "Bash(python -X utf8 -m pytest test_system/test_thesis_matrix.py::test_navigator_empty_sub_queries_returns_empty test_system/test_thesis_matrix.py::test_pipeline_all_timing_fields_non_negative test_system/test_thesis_matrix.py::test_config_top_k_change_propagates_to_result_count -v --tb=long)",
+      "Bash(python -X utf8 -m pytest test_system/test_thesis_matrix.py::test_config_top_k_change_propagates_to_result_count -v --tb=short)",
+      "Bash(python -X utf8 -m pytest test_system/test_data_layer.py::TestHybridRetriever::test_retrieval_modes test_system/test_data_layer.py::TestFullPipeline::test_ingestion_to_retrieval --tb=short)",
+      "Bash(python -X utf8 -m pytest test_system/test_data_layer.py::TestHybridRetriever::test_retrieval_modes test_system/test_data_layer.py::TestFullPipeline::test_ingestion_to_retrieval -v --tb=short)"
     ]
   }
 }

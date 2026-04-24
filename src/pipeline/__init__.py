@@ -28,7 +28,7 @@ from .ingestion_pipeline import (
 )
 
 __version__ = "4.0.0"
-__author__ = "Jan Nietzard"
+__author__ = "Edge-RAG Research Project"
 
 __all__ = [
     # Agent Pipeline

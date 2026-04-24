@@ -20,18 +20,25 @@ Usage:
 import argparse
 import json
 import logging
+import random
 import sys
 import time
-import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 
+import numpy as np
 import yaml
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.evaluations.metrics import compute_exact_match, compute_f1
+
+# Seed all RNG sources for fully reproducible evaluation runs.
+random.seed(42)
+np.random.seed(42)
 
 
 # ============================================================================
@@ -48,70 +55,6 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
     logging.getLogger("src.data_layer").setLevel(logging.WARNING)
     logging.getLogger("src.logic_layer").setLevel(logging.WARNING)
     return logging.getLogger(__name__)
-
-
-# ============================================================================
-# METRICS
-# ============================================================================
-
-def normalize_answer(text: str) -> str:
-    """Normalize answer for comparison."""
-    # Lowercase
-    text = text.lower()
-    # Remove articles
-    text = re.sub(r'\b(a|an|the)\b', ' ', text)
-    # Remove punctuation
-    text = re.sub(r'[^\w\s]', '', text)
-    # Remove extra whitespace
-    text = ' '.join(text.split())
-    return text.strip()
-
-
-def compute_exact_match(prediction: str, gold: str) -> bool:
-    """Compute Exact Match (EM) score.
-
-    Accepts the prediction if:
-    1. The normalized strings are identical, OR
-    2. The gold answer appears as a whole-word span inside the prediction
-       (word-boundary anchored to avoid substring false positives like
-       "no" matching "cannot").
-    """
-    pred_norm = normalize_answer(prediction)
-    gold_norm = normalize_answer(gold)
-
-    if pred_norm == gold_norm:
-        return True
-
-    # Whole-word containment check (word-boundary anchored)
-    if re.search(r'\b' + re.escape(gold_norm) + r'\b', pred_norm):
-        return True
-
-    return False
-
-
-def compute_f1(prediction: str, gold: str) -> float:
-    """Compute token-level F1 score."""
-    pred_tokens = normalize_answer(prediction).split()
-    gold_tokens = normalize_answer(gold).split()
-    
-    if not pred_tokens or not gold_tokens:
-        return 0.0
-    
-    common = set(pred_tokens) & set(gold_tokens)
-    
-    if not common:
-        return 0.0
-    
-    # Count occurrences for proper F1
-    num_common = sum(min(pred_tokens.count(w), gold_tokens.count(w)) for w in common)
-    
-    precision = num_common / len(pred_tokens)
-    recall = num_common / len(gold_tokens)
-    
-    if precision + recall == 0:
-        return 0.0
-    
-    return 2 * precision * recall / (precision + recall)
 
 
 # ============================================================================

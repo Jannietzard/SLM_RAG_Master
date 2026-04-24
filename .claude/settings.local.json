@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -X utf8 -c ' *)",
+      "Bash(python -X utf8 -m pytest test_system/test_thesis_matrix_ext.py -v --tb=short)",
+      "Bash(python -X utf8 -m pytest test_system/test_pipeline.py::TestIngestionPipeline::test_ingest_returns_metrics_with_timing -v --tb=short)"
+    ]
+  }
+}

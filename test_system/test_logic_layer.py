@@ -569,15 +569,15 @@ class TestNavigator:
             "Higher-scored chunk must survive deduplication"
         )
 
-    def test_jaccard_similarity_identical_texts(self, navigator) -> None:
+    def test_jaccard_similarity_identical_texts(self) -> None:
         """Identical texts → Jaccard similarity = 1.0."""
-        sim = navigator._jaccard_similarity("hello world", "hello world")
-        assert sim == 1.0
+        from src.utils import jaccard_similarity
+        assert jaccard_similarity("hello world", "hello world") == 1.0
 
-    def test_jaccard_similarity_different_texts(self, navigator) -> None:
+    def test_jaccard_similarity_different_texts(self) -> None:
         """Completely different texts → Jaccard similarity < 0.5."""
-        sim = navigator._jaccard_similarity("hello world", "goodbye universe")
-        assert sim < 0.5
+        from src.utils import jaccard_similarity
+        assert jaccard_similarity("hello world", "goodbye universe") < 0.5
 
     def test_rrf_fusion_deduplicates_and_boosts(self, navigator) -> None:
         """A chunk appearing in two sub-queries receives a cross-source boost.
