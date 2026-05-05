@@ -763,17 +763,26 @@ The Navigator executes the retrieval plan produced by S_P and returns a filtered
 ```python
 @dataclass
 class ControllerConfig:
-    retrieval_mode: str = "hybrid"
-    vector_top_k: int = 20
-    graph_top_k: int = 10
-    max_hops: int = 2
-    rrf_k: int = 60
-    cross_source_boost: float = 1.2
+    # LLM Settings — emergency fallbacks; live values from settings.yaml
+    model_name: str = "qwen2:1.5b"            # settings.yaml: llm.model_name
+    base_url: str = "http://localhost:11434"
+    temperature: float = 0.0                   # 0.0 = fully deterministic
 
-    enable_pre_filtering: bool = True
-    relevance_threshold_factor: float = 0.85   # Raised from 0.6; see Section 12.16
+    # Pipeline Settings
+    max_verification_iterations: int = 2       # settings.yaml: agent.max_verification_iterations
+
+    # Navigator Settings (pre-generative filtering, thesis section 3.3)
+    relevance_threshold_factor: float = 0.85   # Raised from 0.6; see §12.16
     redundancy_threshold: float = 0.8
-    enable_contradiction_filter: bool = True
+    max_context_chunks: int = 10
+    rrf_k: int = 60                            # Cormack et al. (2009). SIGIR.
+    top_k_per_subquery: int = 10
+    max_chars_per_doc: int = 500
+    corroboration_source_weight: float = 0.1
+    corroboration_query_weight: float = 0.05
+    contradiction_overlap_threshold: float = 0.3
+    contradiction_ratio_threshold: float = 2.0
+    contradiction_min_value: float = 10.0
 ```
 
 #### 4.2.2 NavigatorResult
@@ -1755,87 +1764,84 @@ The Jaccard redundancy threshold of 0.8 is conservative: two chunks sharing 80 %
 
 ---
 
-## 12. Änderungen & Alternativen
+## 12. Changes & Design Decisions
 
-Dieser Abschnitt dokumentiert signifikante Änderungen gegenüber früheren Versionen, verworfene Ansätze und die Begründung für getroffene Entscheidungen. Er dient als Entscheidungsprotokoll für die Masterarbeit.
-
----
-
-### 12.1 LLM-Konfiguration: max_tokens und Context-Budget
-
-**Problem:** In der initialen Konfiguration war `max_tokens: 50` gesetzt. Das führte dazu, dass Antworten des phi3-Modells mitten im Satz abgeschnitten wurden, da HotpotQA-Antworten häufig 10–30 Tokens benötigen, aber der Kontext-Aufbau (CoT-Reasoning) des Modells mehr Token-Budget erforderte.
-
-**Symptom:** Ablation mit 10 Samples (2026-03-31) zeigte EM=20% für alle drei Konfigurationen (vector_only, hybrid, graph_only) — identische Ergebnisse trotz unterschiedlicher Retrieval-Methoden. Ursache: Alle Antworten wurden truncated, bevor sie die Gold-Antwort enthielten.
-
-**Lösung:** `max_tokens: 200` (Faktor 4 Erhöhung). Zusätzlich wurden drei neue Context-Budget-Parameter eingeführt, die die Menge an Text steuern die dem LLM übergeben wird:
-- `max_context_chars: 2400` — Verhindert Out-of-Context-Fehler bei phi3 (4k Context Window)
-- `max_docs: 6` — Mehr Chunks erhöhen die Chance, beide Supporting Facts zu treffen (HotpotQA braucht 2)
-- `max_chars_per_doc: 400` — Balanciert Breite (mehr Docs) vs. Tiefe (mehr Text pro Doc)
-
-**Verworfene Alternative:** `max_tokens: 500` — getestet, führt zu längeren Antworten mit Halluzinationen ("According to the context, the answer is X, however it should be noted that..."). phi3 neigt bei mehr Token-Budget zu redundantem Output.
+This section documents significant changes from earlier versions, discarded approaches, and the rationale for decisions made. It serves as a decision log for the thesis.
 
 ---
 
-### 12.2 Entfernung des äußeren Pipeline-Retry-Loops
+### 12.1 LLM Configuration: max_tokens and Context Budget
 
-**Problem:** In einer früheren Version enthielt `AgentPipeline.process()` einen äußeren Loop der `verifier.generate_and_verify()` bis zu `max_verification_iterations` mal aufrief. Dieser Loop wurde unter der Annahme eingebaut, dass Wiederholungen mit identischem Input zu besseren Antworten führen.
+**Problem:** The initial configuration set `max_tokens: 50`. This caused model responses to be truncated mid-sentence, as HotpotQA answers typically require 10–30 tokens, but the model's context-building (chain-of-thought reasoning) demanded a larger token budget.
 
-**Erkenntnis:** Ein LLM mit identischem Prompt und `temperature=0.1` (fast-deterministisch) produziert bei jeder Iteration nahezu identische Outputs. Der äußere Loop war damit faktisch eine teure No-Op-Operation (mehrfache LLM-Calls ohne inhaltliche Verbesserung).
+**Symptom:** Ablation with 10 samples (2026-03-31) showed EM=20% for all three configurations (vector_only, hybrid, graph_only) — identical results despite different retrieval methods. Root cause: all answers were truncated before they could include the gold answer.
 
-**Lösung (2026-03-31):** Äußerer Loop entfernt. `AgentPipeline.process()` ruft `generate_and_verify()` jetzt genau einmal auf. Der echte Self-Correction-Mechanismus ist der innere Loop im Verifier, der bei jeder Iteration **konkrete Verletzungen als Feedback** übergibt (CORRECTION_PROMPT mit spezifischen `violations`). Das ist der tatsächliche Thesis-Beitrag.
+**Fix:** `max_tokens: 200` (4× increase). Three additional context-budget parameters were introduced to control the amount of text passed to the LLM:
+- `max_context_chars: 2400` — Prevents out-of-context errors on small models with a 4k context window
+- `max_docs: 6` — More chunks increase the chance of retrieving both supporting facts (HotpotQA requires 2)
+- `max_chars_per_doc: 400` — Balances breadth (more docs) vs. depth (more text per doc)
 
-**Konfigurationskonsolidierung:** `max_verification_iterations` wird ausschließlich in `settings.yaml` unter `agent:` konfiguriert und von `_verifier_config_from_cfg()` gelesen. Es gibt keine weitere Stelle im Code wo dieser Wert festgelegt wird.
-
----
-
-### 12.3 Graph-Visualisierung: pyvis → matplotlib
-
-**Problem:** Das ursprüngliche `test_system/graph_3d.py` verwendete pyvis mit `LIMIT 200` für MENTIONS und `LIMIT 100` für RELATED_TO. Bei 66.585 MENTIONS und 14.445 RELATED_TO-Kanten im HotpotQA-Graph entsprach das 0,3% der Daten — der Graph sah leer und unstrukturiert aus.
-
-**Lösung:** Komplette Neuentwicklung mit matplotlib + networkx:
-- Lädt bis zu 2000 RELATED_TO-Kanten, filtert Hub-Entitäten (Pronomen, generische Terme)
-- Wählt Top-N Entitäten nach Verbindungsgrad aus (konfigurierbares `--top N`)
-- Speichert direkt als PNG (dpi=200, für Thesis dpi=300)
-- Erzeugt optional weiterhin interaktives pyvis-HTML
-
-**Erkenntnisse durch Analyse:**
-- Keyword-Regex-Extraktion funktioniert gut (Hub-Kontamination: 0%)
-- Graph Answer Coverage: 33% vs. Vector: 40% — Graph hat echten Mehrwert
-- GLiNER Answer Coverage: 13% — schlechter als einfaches Keyword-Regex. Kein Re-Ingest erforderlich.
+**Discarded alternative:** `max_tokens: 500` — tested; produced longer responses with hallucinations ("According to the context, the answer is X, however it should be noted that..."). Small models tend toward redundant output when given a larger token budget.
 
 ---
 
-### 12.4 Graph-Qualität: REBEL-Relation-Extraktion
+### 12.2 Removal of the Outer Pipeline Retry Loop
 
-**Befund:** REBEL (`Babelscape/rebel-large`) extrahiert hauptsächlich Wikipedia-Infobox-Style-Relationen:
-`publication_date`, `country`, `date_of_birth`, `genre`, `performer`
+**Problem:** An earlier version of `AgentPipeline.process()` contained an outer loop that called `verifier.generate_and_verify()` up to `max_verification_iterations` times. This loop was introduced under the assumption that repeating the call with identical input would yield better answers.
 
-Diese Relationstypen sind für HotpotQA-Bridge-Fragen weitgehend nutzlos. HotpotQA benötigt narrative Relationen wie `directed_by`, `portrayed_by`, `held_position`.
+**Finding:** An LLM with an identical prompt and `temperature=0.1` (near-deterministic) produces nearly identical outputs on every iteration. The outer loop was therefore a costly no-op — multiple LLM calls with no content improvement.
 
-**Kennzahlen HotpotQA-Graph:**
+**Fix (2026-03-31):** Outer loop removed. `AgentPipeline.process()` now calls `generate_and_verify()` exactly once. The actual self-correction mechanism is the inner loop inside the Verifier, which at each iteration passes **concrete violations as feedback** (CORRECTION_PROMPT with specific `violations`). This is the core thesis contribution.
 
-*Stand 2026-04-01 (threshold=0.15):*
-- 9.412 DocumentChunks, 36.996 unique Entities, 74.741 MENTIONS, 17.221 RELATED_TO
-- Hub-Entitäten: "American" (898 Chunks), "He" (737), "United States" (699), "She" (283)
-
-*Stand 2026-04-02 (threshold=0.5, Re-Ingestion):*
-- 9.412 DocumentChunks, 23.858 unique Entities, 50.096 MENTIONS, 15.766 RELATED_TO
-- Hub-Kontamination deutlich reduziert (10% vs. zuvor hoch)
-
-**Entscheidung für die Masterarbeit:** Keine Re-Ingestion mit anderem RE-Modell (Zeitaufwand GPU > 1h, unsicherer Gewinn). Stattdessen:
-1. Graph-Limitierung als dokumentierte Limitation in der Thesis
-2. Union-Coverage (60%) als Argument für Hybrid-Ansatz: Graph findet 3 Fragen die Vector verfehlt
-3. Der Mehrwert des Graphs liegt in MENTIONS (66.585 Kanten), nicht in RELATED_TO
+**Configuration consolidation:** `max_verification_iterations` is configured exclusively in `settings.yaml` under `agent:` and read by `_verifier_config_from_cfg()`. There is no other location in the code where this value is set.
 
 ---
 
-### 12.5 Benchmark-Stichprobengröße
+### 12.3 Graph Visualisation: pyvis → matplotlib
 
-**Problem:** Erste Ablation mit nur 10 Samples lieferte statistisch bedeutungslose Ergebnisse (EM=20% für alle Configs — könnte Zufall sein, N zu klein für Konfidenzintervalle).
+**Problem:** The original `test_system/graph_3d.py` used pyvis with `LIMIT 200` for MENTIONS and `LIMIT 100` for RELATED_TO edges. With 66,585 MENTIONS and 14,445 RELATED_TO edges in the HotpotQA graph, this represented 0.3% of the data — the visualisation appeared sparse and structureless.
 
-**Mindestanforderung für Masterarbeit:** N≥50 für erste orientierendem Ergebnisse, N≥200 für belastbare Konfidenzintervalle (95% CI ≈ ±7pp bei N=200, ±14pp bei N=50).
+**Fix:** Complete rewrite using matplotlib + networkx:
+- Loads up to 2,000 RELATED_TO edges; filters hub entities (pronouns, generic terms)
+- Selects the top-N entities by degree (configurable via `--top N`)
+- Saves directly as PNG (dpi=200; use dpi=300 for thesis figures)
+- Optionally still generates interactive pyvis HTML
 
-**Empfohlene Konfiguration für finale Thesis-Ergebnisse:**
+**Findings from the analysis:**
+- Keyword-regex extraction performs well (hub contamination: 0%)
+- Graph answer coverage: 33% vs. vector: 40% — the graph provides genuine added value
+- GLiNER answer coverage: 13% — worse than simple keyword-regex. No re-ingestion required.
+
+---
+
+### 12.4 Graph Quality: REBEL Relation Extraction
+
+**Finding:** REBEL (`Babelscape/rebel-large`) extracts primarily Wikipedia infobox-style relations: `publication_date`, `country`, `date_of_birth`, `genre`, `performer`. These relation types are largely useless for HotpotQA bridge questions, which require narrative relations such as `directed_by`, `portrayed_by`, `held_position`.
+
+**HotpotQA graph metrics:**
+
+*As of 2026-04-01 (threshold=0.15):*
+- 9,412 DocumentChunks, 36,996 unique entities, 74,741 MENTIONS, 17,221 RELATED_TO
+- Hub entities: "American" (898 chunks), "He" (737), "United States" (699), "She" (283)
+
+*As of 2026-04-02 (threshold=0.5, re-ingestion):*
+- 9,412 DocumentChunks, 23,858 unique entities, 50,096 MENTIONS, 15,766 RELATED_TO
+- Hub contamination significantly reduced (10% vs. previously high)
+
+**Thesis decision:** No re-ingestion with an alternative RE model (GPU effort > 1h, uncertain gain). Instead:
+1. The graph limitation is documented as a known limitation in the thesis
+2. Union coverage (60%) serves as an argument for the hybrid approach: the graph retrieves 3 questions that vector misses
+3. The graph's value lies in MENTIONS (66,585 edges), not in RELATED_TO
+
+---
+
+### 12.5 Benchmark Sample Size
+
+**Problem:** The initial ablation with only 10 samples produced statistically meaningless results (EM=20% for all configurations — could be chance; N too small for confidence intervals).
+
+**Minimum requirement for the thesis:** N≥50 for preliminary orientation; N≥200 for reliable confidence intervals (95% CI ≈ ±7pp at N=200, ±14pp at N=50).
+
+**Recommended configuration for final thesis results:**
 ```bash
 python benchmark_datasets.py ablation --dataset hotpotqa --samples 200
 ```
@@ -1844,81 +1850,79 @@ python benchmark_datasets.py ablation --dataset hotpotqa --samples 200
 
 ### 12.6 Entity Confidence Threshold: 0.15 → 0.5 (Re-Ingestion 2026-04-02)
 
-**Problem:** Bei `ner_confidence_threshold=0.15` dominierten generische Tokens den Graphen:
-- "American" (898 Chunks), "He" (737), "United States" (699), "She" (283)
-Diese Entitäten wurden als Hub-Nodes mit hunderten MENTIONS-Kanten im Graphen gespeichert. Bei Graph-Traversal wurden sie als "matched entity" zurückgegeben, obwohl sie keinen semantischen Mehrwert liefern.
+**Problem:** With `ner_confidence_threshold=0.15`, generic tokens dominated the graph: "American" (898 chunks), "He" (737), "United States" (699), "She" (283). These entities were stored as hub nodes with hundreds of MENTIONS edges. During graph traversal, they were returned as "matched entities" despite providing no semantic value.
 
-**Lösung:** `entity_confidence_threshold=0.5` in `local_importingestion.py`. Der Filter wird beim Import angewendet (nicht bei der Extraktion), sodass `extraction_results.json` unverändert bleibt und bei Bedarf mit anderem Threshold neu importiert werden kann.
+**Fix:** `entity_confidence_threshold=0.5` in `local_importingestion.py`. The filter is applied at import time (not at extraction time), so `extraction_results.json` remains unchanged and can be re-imported with a different threshold if needed.
 
-**Datenvorfall:** Der erste `--clear`-Lauf verwendete `shutil.rmtree(base_path)` und löschte `data/hotpotqa/` vollständig (inkl. `chunks_export.json`, `questions.json`). `extraction_results.json` überlebte nur weil es im IDE geöffnet war. Behoben: `--clear` löscht jetzt nur `vector_db/` und `knowledge_graph/`, niemals Source-JSON-Dateien.
+**Data incident:** The first `--clear` run used `shutil.rmtree(base_path)` and deleted `data/hotpotqa/` entirely (including `chunks_export.json`, `questions.json`). `extraction_results.json` survived only because it was open in the IDE. Fixed: `--clear` now deletes only `vector_db/` and `knowledge_graph/`, never source JSON files.
 
-**Ergebnis:** 36.996 → 23.858 unique Entities (−35%), 74.741 → 50.096 MENTIONS (−33%).
+**Result:** 36,996 → 23,858 unique entities (−35%), 74,741 → 50,096 MENTIONS (−33%).
 
 ---
 
-### 12.7 GLiNER Query-Zeit-Konsistenz (2026-04-02)
+### 12.7 GLiNER Query-Time Consistency (2026-04-02)
 
-**Problem:** `ImprovedQueryEntityExtractor` erhielt `gliner_model=None` weil `StorageConfig(enable_entity_extraction=False)` der Default ist. Folge: Jede Query lief mit SpaCy-Fallback statt GLiNER — obwohl GLiNER installiert und der Graph mit GLiNER gebaut ist.
+**Problem:** `ImprovedQueryEntityExtractor` received `gliner_model=None` because `StorageConfig(enable_entity_extraction=False)` is the default. Consequence: every query ran with the SpaCy fallback instead of GLiNER — even though GLiNER is installed and the graph was built with GLiNER.
 
-**Symptom:** SpaCy extrahierte `"Were Scott Derrickson"` (Verb + Name) statt `"Scott Derrickson"`. Außerdem: SpaCy-Entity-Types (`PERSON`, `ORG`, `GPE`) stimmen nicht mit Graph-Entity-Types (`person`, `film`, `city`) überein → Name-Mismatch bei Graph-Lookup.
+**Symptom:** SpaCy extracted `"Were Scott Derrickson"` (verb + name) instead of `"Scott Derrickson"`. Additionally, SpaCy entity types (`PERSON`, `ORG`, `GPE`) did not match the graph entity types (`person`, `film`, `city`) — causing name mismatches in graph lookups.
 
-**Lösung:**
-1. `_get_gliner_model()` — Modul-Level-Cache, lädt `gliner_small-v2.1` einmal pro Prozess
-2. `_load_gliner()` nutzt Cache statt `GLiNER.from_pretrained()` direkt aufzurufen
-3. Entity Types in `ImprovedQueryEntityExtractor` auf Ingestion-Types angeglichen: `["person", "organization", "city", "country", "film", "movie", "work of art", "event"]`
-4. Default-Threshold: `0.5 → 0.2` (Queries kurz → niedrigere GLiNER-Scores als bei langen Chunk-Texten)
-5. `diagnose.py` Layer 3: Regex-Extraktion durch `ImprovedQueryEntityExtractor` ersetzt
+**Fix:**
+1. `_get_gliner_model()` — module-level cache; loads `gliner_small-v2.1` once per process
+2. `_load_gliner()` uses the cache instead of calling `GLiNER.from_pretrained()` directly
+3. Entity types in `ImprovedQueryEntityExtractor` aligned with ingestion types: `["person", "organization", "city", "country", "film", "movie", "work of art", "event"]`
+4. Default threshold: `0.5 → 0.2` (queries are short → lower GLiNER scores than for long chunk texts)
+5. `diagnose.py` Layer 3: regex extraction replaced by `ImprovedQueryEntityExtractor`
 
-**Performance-Hinweis:** GLiNER cold start: ~7.5s, cached: <1ms. Beim ersten Aufruf pro Prozess einmalige Verzögerung.
+**Performance note:** GLiNER cold start: ~7.5s, cached: <1ms. One-time delay on the first call per process.
 
 ---
 
-### 12.8 Fallback-Sichtbarkeit: ⚠ FALLBACK AKTIV Warnings
+### 12.8 Fallback Visibility: ⚠ FALLBACK ACTIVE Warnings
 
-**Motivation:** Fallbacks sind immer Symptome — sie bedeuten, dass die primäre Implementierung nicht funktioniert. Stille Fallbacks verbergen Fehler.
+**Motivation:** Fallbacks are always symptoms — they indicate that the primary implementation is not working. Silent fallbacks hide errors.
 
-**Implementierung (2026-04-02):** Alle bekannten Fallback-Pfade emittieren jetzt `logger.warning("⚠ FALLBACK AKTIV: ...")`:
+**Implementation (2026-04-02):** All known fallback paths now emit `logger.warning("⚠ FALLBACK ACTIVE: ...")`:
 
-| Datei | Fallback-Pfad |
+| File | Fallback path |
 |---|---|
-| `hybrid_retriever.py` | SpaCy/Regex statt GLiNER für Query-Entities |
-| `entity_extraction.py` | SpaCy/Regex statt GLiNER für Batch-Extraction |
+| `hybrid_retriever.py` | SpaCy/regex instead of GLiNER for query entities |
+| `entity_extraction.py` | SpaCy/regex instead of GLiNER for batch extraction |
 | `ingestion_pipeline.py` | MockEntityExtractor / MockEmbeddingGenerator (use_mocks=True) |
-| `verifier.py` | Heuristische Widerspruchserkennung statt NLI |
-| `navigator.py` | Relativer Import-Fallback |
-| `chunking.py` | LangChain nicht installiert |
+| `verifier.py` | Heuristic contradiction detection instead of NLI |
+| `navigator.py` | Relative import fallback |
+| `chunking.py` | LangChain not installed |
 
 ---
 
-### 12.9 Bekannte Limitierungen: Entity Name Disambiguation
+### 12.9 Known Limitations: Entity Name Disambiguation
 
-**Befund (2026-04-02):** Das System versagt bei Fragen wo die Query eine Entität als Kurzname verwendet, der Graph sie aber unter dem vollständigen Namen gespeichert hat.
+**Finding (2026-04-02):** The system fails on queries where the query uses a short form of an entity name, but the graph stores it under the full name.
 
-**Konkretes Beispiel:**
+**Concrete example:**
 - Query: "Were Scott Derrickson and **Ed Wood** of the same nationality?"
-- GLiNER extrahiert: `"Ed Wood"` → Graph-Lookup findet Entity "Ed Wood" → FILM-Artikel (1994 Tim-Burton-Film)
-- Korrekte Chunk 7: `"Edward Davis Wood Jr. was an American filmmaker"` → hängt an Entity `"Edward Davis Wood Jr."` → wird **nicht** gefunden
+- GLiNER extracts: `"Ed Wood"` → graph lookup finds entity "Ed Wood" → FILM article (1994 Tim Burton film)
+- Correct Chunk 7: `"Edward Davis Wood Jr. was an American filmmaker"` → attached to entity `"Edward Davis Wood Jr."` → **not found**
 
-**Ursache:** KuzuDB-Graph-Lookup ist **exaktes String-Matching**. Keine Alias-Auflösung, keine Coreference.
+**Cause:** KuzuDB graph lookup uses **exact string matching**. No alias resolution, no coreference.
 
-**Mögliche Lösungen (für Thesis-Ausblick):**
+**Possible solutions (for thesis outlook):**
 
-| Ansatz | Aufwand | Wirkung |
+| Approach | Effort | Effect |
 |---|---|---|
-| Entity-Linking (z.B. BLINK, REL) | hoch | Normalisiert Entitäten auf Wikidata-IDs |
-| Alias-Tabelle bei Ingestion | mittel | `"Ed Wood"` ↔ `"Edward Davis Wood Jr."` als Alias-Node |
-| Fuzzy Graph-Lookup | niedrig | Levenshtein-Abstand bei Graph-Suche erlauben |
-| Sub-Query-Reformulierung | niedrig | "What is the nationality of Ed Wood?" statt "Were Ed Wood of same nationality?" |
+| Entity linking (e.g. BLINK, REL) | High | Normalises entities to Wikidata IDs |
+| Alias table at ingestion | Medium | `"Ed Wood"` ↔ `"Edward Davis Wood Jr."` as alias node |
+| Fuzzy graph lookup | Low | Allow Levenshtein distance in graph search |
+| Sub-query reformulation | Low | "What is the nationality of Ed Wood?" instead of "Were Ed Wood of same nationality?" |
 
-Für die Masterarbeit wird diese Limitierung als dokumentierte Known Issue behandelt. Sie ist in der Union-Coverage-Metrik sichtbar und motiviert den Hybrid-Ansatz.
+For the thesis, this limitation is treated as a documented known issue. It is visible in the union-coverage metric and motivates the hybrid approach.
 
 ---
 
-### 12.10 Planner Sub-Query Rewriting für Comparison-Queries (2026-04-02)
+### 12.10 Planner Sub-Query Rewriting for Comparison Queries (2026-04-02)
 
-**Problem:** Comparison-Queries wie `"Were Scott Derrickson and Ed Wood of the same nationality?"` erzeugen ohne Rewriting Sub-Queries wie `"Were Scott Derrickson of the same nationality as Ed Wood?"`. Diese komplex formulierten Sub-Queries haben geringe Vektor-Ähnlichkeit zu Fakten-Chunks.
+**Problem:** Comparison queries such as `"Were Scott Derrickson and Ed Wood of the same nationality?"` produce, without rewriting, sub-queries like `"Were Scott Derrickson of the same nationality as Ed Wood?"`. These complex formulations have low vector similarity to factual chunks.
 
-**Lösung:** `_ATTR_MAP` mit 8 Regex-Patterns in `src/logic_layer/planner.py` `_decompose_comparison()`:
+**Fix:** `_ATTR_MAP` with 8 regex patterns in `src/logic_layer/planner.py` `_decompose_comparison()`:
 
 | Pattern | Template |
 |---|---|
@@ -1931,28 +1935,28 @@ Für die Masterarbeit wird diese Limitierung als dokumentierte Known Issue behan
 | `same religion` | `"What is the religion of {entity}?"` |
 | `born in the same` | `"Where was {entity} born?"` |
 
-**Ergebnis:** `"Were Scott Derrickson and Ed Wood of the same nationality?"` erzeugt jetzt:
-1. `"What is the nationality of Scott Derrickson?"` → direkter Treffer ✓
-2. `"What is the nationality of Ed Wood?"` → kein Treffer (Disambiguierungs-Problem 12.9)
-3. Original-Query als Kontext-Fallback
+**Result:** `"Were Scott Derrickson and Ed Wood of the same nationality?"` now produces:
+1. `"What is the nationality of Scott Derrickson?"` → direct match ✓
+2. `"What is the nationality of Ed Wood?"` → no match (disambiguation issue 12.9)
+3. Original query as context fallback
 
 ---
 
 ### 12.11 Navigator Entity-Mention Filter (2026-04-02)
 
-**Problem:** Für Sub-Queries wie `"What is the nationality of Ed Wood?"` hat `nomic-embed-text` hohe Ähnlichkeit zu beliebigen Nationalitäts-Artikeln. Beispiel: `"British people, or Britons..."` Score 0.798, relevanter Ed-Wood-Chunk nur 0.649 — unterhalb aller Ergebnisse.
+**Problem:** For sub-queries such as `"What is the nationality of Ed Wood?"`, `nomic-embed-text` assigns high similarity to arbitrary nationality articles. Example: `"British people, or Britons..."` scores 0.798, while the relevant Ed Wood chunk scores only 0.649 — below all other results.
 
-**Lösung:** `_entity_mention_filter()` als Filter 5 in `_navigate()` der `Navigator`-Klasse (`src/logic_layer/navigator.py`):
+**Fix:** `_entity_mention_filter()` as Filter 5 in `_navigate()` of the `Navigator` class (`src/logic_layer/navigator.py`):
 
-- Multi-Word Entities (z.B. `"Scott Derrickson"`): prüfe vollständige Phrase **oder** einzelne Tokens ≥5 Zeichen als ganze Wörter (`\bscott\b`, `\bderrickson\b`)
-- Single-Token Entities: nur prüfen wenn ≥5 Zeichen (vermeidet False Positives durch `"Were"`, `"Wood"`)
-- **Safety-Fallback:** wenn alle Chunks gefiltert werden → behalte alle (kein leerer Kontext)
+- Multi-word entities (e.g. `"Scott Derrickson"`): check for the full phrase **or** individual tokens ≥5 characters as whole words (`\bscott\b`, `\bderrickson\b`)
+- Single-token entities: checked only if ≥5 characters (avoids false positives from stopwords like `"Were"` or `"Wood"`)
+- **Safety fallback:** if all chunks are filtered → retain all (no empty context)
 
-**Ergebnis (Frage 0):**
-- `"British people"` → entfernt ✓ (kein "Scott", "Derrickson")
-- `"The Oku people"` → entfernt ✓ (kein Match, vorher durch "Were"-Entity falsch behalten)
-- `"Tyler Bates"` → behalten ✓ (enthält "Scott" im vollen Chunk-Text, da Tyler Bates mit Scott Derrickson zusammenarbeitete)
-- 20 raw → 5 relevante Chunks (vorher 6 mit 2 irrelevanten)
+**Result (question 0):**
+- `"British people"` → removed ✓ (no "Scott", "Derrickson")
+- `"The Oku people"` → removed ✓ (no match; previously retained due to "Were" false positive)
+- `"Tyler Bates"` → retained ✓ (contains "Scott" in the full chunk text, as Tyler Bates collaborated with Scott Derrickson)
+- 20 raw → 5 relevant chunks (previously 6 with 2 irrelevant)
 
 ---
 
@@ -2136,6 +2140,130 @@ def jaccard_similarity(text1: str, text2: str) -> float:
 
 ---
 
+### 12.21 Test Suite Audit II — Gap-Filling Invariants (2026-04-30)
+
+**Motivation:** A second 12-step test health audit (2026-04-30) identified five structural gaps in the test suite where correctness invariants were not asserted: embeddings vector-space consistency (T-B), GLiNER compound-span extraction (T-C), AgentPipeline FIFO cache eviction (T-D), ingestion metadata isolation (T-E), and Verifier factual grounding (T-A).
+
+**Changes:**
+
+| ID | File | Class added | Invariant covered |
+|---|---|---|---|
+| T-A | `test_verifier_semantic.py` | `TestVerifierFactualCorrectness` | Wrong entity in answer → violated claim or LOW confidence |
+| T-B | `test_embeddings.py` | `TestEmbedQueryDocumentsConsistency` | `embed_query` / `embed_documents` same dimension + cosine ≥ 0.99 for identical text |
+| T-C | `test_gliner_boundary.py` | `TestGLiNERSpanBoundary` | Multi-token spans ("Eiffel Tower", "New York City") extracted as one entity |
+| T-D | `test_pipeline.py` | `TestAgentPipelineFIFOCache` | FIFO eviction: oldest entry removed when `_cache_max_size` exceeded |
+| T-E | `test_pipeline.py` | `TestIngestionMetadataIsolation` | `source_doc` metadata does not leak across `_chunk_document()` calls |
+
+**R1 compliance:** All five new test classes use zero or ≤2 ML inference calls (T-C respects `EDGE_RAG_N_SAMPLES=2`). T-A, T-B, T-D, T-E are pure unit tests with no model calls.
+
+**Additional R-1 (nightly):** `TestEmbeddingSemanticQuality` added to `test_embeddings.py` with `@pytest.mark.nightly @pytest.mark.llm` — tests ordinal ranking of similar vs. dissimilar text pairs via live `nomic-embed-text`, documenting the score-compression limitation (§4.4) quantitatively.
+
+**Additional R-2 (nightly):** `TestGLiNERRecall.test_recall_by_entity_type` added to `test_gliner_boundary.py` — emits `UserWarning` for entity types with recall < 0.5, surfacing the per-type weaknesses documented in §12.6.
+
+---
+
+### 12.22 Keyword Entity Fallback with Dual Injection (2026-05-04)
+
+**Motivation:** `nomic-embed-text` score compression causes ANN retrieval to fail for specific entity-named chunks when the query contains multiple genus-level entity names. In practice, for the query "Are both Dictyosperma and Huernia described as a genus?" the Dictyosperma chunk ranked at ANN position #71–80 (score ≈ 0.68 vs. Fokienia ≈ 0.84 at position #1) and never entered the top-10 ANN results. KuzuDB also had no "Dictyosperma" entity node because GLiNER's entity-type list (`person`, `organization`, …) does not include plant genera. The chunk was therefore completely invisible to both retrieval paths.
+
+**Root cause chain:**
+1. nomic-embed-text score compression → Dictyosperma chunk at ANN rank #71 (not in top-10)
+2. GLiNER entity-type list excludes plant genera → 0 KuzuDB nodes for "Dictyosperma" → 0 graph results
+3. Without any retrieval hit, the Navigator Relevance Filter (threshold = 0.85 × max_score) rejects the chunk even after entity-mention check
+
+**Solution — `_keyword_entity_search()` with dual injection** in `src/data_layer/hybrid_retriever.py`:
+
+1. **O(N) pandas keyword scan:** On first call, load the full LanceDB table into a pandas DataFrame (`_keyword_df_cache`). For each query entity (≥ 4 chars), case-insensitively scan the `text` column and collect matching chunks.
+2. **Dual injection:** Each keyword-matched chunk is injected into BOTH `vector_results` (with synthetic `similarity=0.76`) AND `graph_results` (with `hops=0`). This ensures the RRF cross-source boost applies, yielding a combined score of ~0.050 — above the relevance threshold of ~0.043.
+3. **Single-path injection would fail:** A chunk present only in `graph_results` yields a single-path RRF score ≈ 0.016, below the threshold. Both paths are required.
+
+**RRF arithmetic for dual-injected chunk:**
+- Vector path: rank 10/10 → `1/(60+10) ≈ 0.0143`; graph path: rank 1/1 → `1/(60+1) ≈ 0.0164`
+- Cross-source boost: `1.2 / 61 ≈ 0.0197`; total ≈ `0.0143 + 0.0164 + 0.0197 = 0.050`
+- Relevance threshold ≈ `0.85 × 0.059 ≈ 0.050` → dual-injected chunk is retained
+
+**Scope guard:** The scan only runs when `entity_names` is non-empty and the LanceDB table is accessible. A `_keyword_df_cache` attribute avoids repeated full-table scans within a single pipeline call.
+
+**Trade-off:** O(N) pandas scan is acceptable for the thesis corpus (≤ 10,000 chunks). For production scale (millions of chunks), a full-text inverted index (e.g., LanceDB FTS or Tantivy) would replace this approach.
+
+---
+
+### 12.23 Navigator Entity Hints Propagation Fix (2026-05-04)
+
+**Motivation:** `navigator.navigate()` accepted an `entity_names` parameter, but diagnostic tooling called `navigate(plan, sub_queries)` without supplying it. Without explicit hints, the HybridRetriever ran GLiNER independently on each sub-query. For sub-query 2 ("Are both Huernia described as a genus?"), GLiNER extracted only "Huernia" — so the keyword entity fallback (§12.22) never searched for "Dictyosperma" in that sub-query's retrieval call. Dictyosperma appeared in sub-query 1's results only, giving it a Navigator-level RRF score of ≈ 0.016 — below the relevance threshold of 0.029.
+
+**Fix:** When `entity_names` is `None` (not supplied by caller), `navigate()` now falls back to `retrieval_plan.entities` to build the entity hints list:
+
+```python
+if entity_names is not None:
+    hints = entity_names
+elif retrieval_plan is not None and getattr(retrieval_plan, "entities", None):
+    hints = [e.text for e in retrieval_plan.entities if getattr(e, "text", None)]
+else:
+    hints = None
+```
+
+This guarantees all sub-queries share the full entity list from the Planner, so keyword searches run for all entities across all sub-queries regardless of which entity appears in the sub-query text.
+
+**Effect:** With both §12.22 and this fix, `diagnose.py --idx 27` retrieves 10 raw → **2** filtered chunks (Huernia + Dictyosperma), and the pipeline answers "Yes." (gold: "yes").
+
+---
+
+### 12.25 Contradiction Filter: Raised `contradiction_min_value` from 10 → 100 (2026-05-04)
+
+**Problem:** The pre-generative contradiction filter in `navigator.py` compares numbers across chunk pairs to detect factual conflicts. The number extraction regex (`\b\d{4}\b|\b\d+(?:\.\d+)?\b`) captures all integers, including day-of-month values (e.g., `18` from "born **18** November 1963"). With `contradiction_min_value=10`, the filter required only that both numbers exceed 10. This meant the pair `(18, 1992)` — a birth-day from one chunk and a year from another — triggered with a ratio of 110×, incorrectly evicting valid answer chunks.
+
+**Root cause:** The filter was designed to detect genuine fact conflicts like "has 200 employees" vs. "has 2000 employees". Day-of-month values (1–31) and month numbers (1–12) are date components, not independent factual claim slots, and must not drive contradiction logic.
+
+**Fix:** `contradiction_min_value` raised from `10.0` to `100.0` in `config/settings.yaml` and the `ControllerConfig` dataclass default. Values < 100 (days, months, small counts) are excluded from the ratio comparison. Year-scale numbers (≥ 100) and count-scale statistics (population, budget, staff count) are unaffected.
+
+**Effect:** Answer chunks in biographical articles (which routinely contain both day-of-month and year values) are no longer incorrectly evicted. The Peter Schmeichel bio chunk (containing the IFFHS award fact) now survives all pre-generative filters.
+
+**Verification:** New smoke-test case in `navigator.py` (`if __name__ == "__main__"`) verifies that the pair `(18, 1992)` does **not** trigger (false-positive guard) while the pair `(200, 2000)` on a shared-topic pair **does** trigger (correct contradiction).
+
+---
+
+### 12.26 Planner Pattern E: Relational Anchor Bridge Decomposition (2026-05-04)
+
+**Problem:** Bridge questions with the structure "What [fact] about the [role] of [Entity]?" were classified as `MULTI_HOP` but produced only a single sub-query (the verbatim original). The existing split patterns split at `that/which/who` or `of the`, neither of which matches "of Kasper Schmeichel" (a proper noun, not the article "the"). With one sub-query, retrieval is anchored entirely to the surface entity (e.g., Kasper Schmeichel), and the bridge entity's article (Peter Schmeichel) may not rank high enough to survive filtering.
+
+**Examples of the failure class:**
+- "What was the **father of** Kasper Schmeichel voted to be?" → bridge = Peter Schmeichel
+- "Where did the **wife of** John Lennon grow up?" → bridge = Yoko Ono
+- "What award did the **founder of** Apple win?" → bridge = Steve Jobs
+
+**Fix:** Added Pattern E to `PlanGenerator._decompose_multi_hop()` in `planner.py`. When all existing split patterns fail (`len(parts) == 1`) and the query matches `the [role] of [Entity]` (using a fixed vocabulary of ~25 role nouns via class constant `_RELATIONAL_ANCHOR_ROLES`), two sub-queries are generated:
+- **Hop 0 (bridge):** `"Who is the {role} of {anchor entity}?"` — causes the Navigator to retrieve the anchor's article, which names the bridge entity, and to run keyword entity search for the anchor, surfacing the bridge's own article via cross-mention
+- **Hop 1 (final):** The original query — direct retrieval for the downstream fact
+
+Pattern E only fires as a fallback after Patterns C and D are checked, preserving existing decomposition paths.
+
+**Effect:** For relational bridge questions, the Navigator now runs two sub-queries. The bridge resolution sub-query (hop 0) retrieves the anchor entity's article (containing the bridge entity name) and, via keyword entity fallback, may also surface the bridge entity's own article. Both appear in the RRF fusion pool with cross-query boosts.
+
+---
+
+### 12.27 Verifier Question-Relevance Context Reordering (2026-05-04)
+
+**Problem:** Small LLMs (qwen2:1.5b, 1.5B parameters) exhibit a strong position bias: they preferentially extract the first plausible entity or fact they encounter in the context prompt. In multi-hop questions the final answer chunk often has a lower RRF rank than distractor chunks (those containing the bridge entity name), so the answer appears late in the formatted context and the LLM outputs the bridge entity rather than the requested fact.
+
+**Root cause observed (idx=24):** Query "What was the father of Kasper Schmeichel voted to be by the IFFHS in 1992?" Peter Schmeichel biographical chunk (containing "voted the IFFHS World's Best Goalkeeper in 1992") had RRF score 0.0152 — ranked last after Kasper Schmeichel chunks. LLM saw "Peter Schmeichel" first and answered "Peter Schmeichel." instead of "World's Best Goalkeeper."
+
+**Fix:** Added `Verifier._reorder_by_question_relevance(query, context)` called immediately before `_format_context`. The method:
+1. Tokenises the query with `re.findall(r"\b\w{4,}\b", ...)` and removes a fixed stopword set (`_QR_STOPWORDS`)
+2. Scores each chunk by counting how many query content tokens appear in the chunk text (case-insensitive substring match)
+3. Stable-sorts descending — chunks most lexically aligned with the query float to the top; equal-score chunks retain their original RRF order
+
+**Properties:**
+- Zero-cost when context has ≤1 chunk
+- Falls back to original order when query produces no content tokens (all stopwords)
+- Does not alter ranking semantics — RRF scores are preserved and available for downstream processing; only the display order to the LLM is changed
+
+**Effect:** The chunk "Peter Schmeichel was voted the IFFHS World's Best Goalkeeper in 1992" scores 4 query-word hits (schmeichel, voted, iffhs, 1992) and now appears first in the formatted context. The LLM reads the answer evidence before distractors.
+
+**Tests:** `TestQuestionRelevanceReorder` in `test_system/test_verifier_semantic.py` (5 tests).
+
+---
+
 *End of Technical Architecture Documentation*
 
 ---
@@ -2170,3 +2298,6 @@ def jaccard_similarity(text1: str, text2: str) -> float:
 | 3.3.0 | 2026-04-02 | Threshold 0.15→0.5 (re-ingestion); GLiNER query consistency fix; fallback warnings; entity disambiguation documented |
 | 3.4.0 | 2026-04-02 | Planner sub-query rewriting (12.10); Navigator entity-mention filter (12.11); Verifier `or`-bug fix (12.12) |
 | 4.0.0 | 2026-04-11 | Data layer reviews (12.13); entity_hints parameter (12.14); storage fuzzy matching (12.15); threshold 0.6→0.85 (12.16); comparison noise sub-query removed (12.17); iterative multi-hop implemented (12.18); diagnose_ingestion.py added (12.19); all dataclass field names corrected; AgenticController documented (§5.3); repository structure updated |
+| 4.1.0 | 2026-05-04 | Keyword entity fallback + dual injection (12.22); Navigator entity hints propagation fix (12.23); test_data_layer.py: 74→90 tests; total CI suite: 501 passed |
+| 4.2.0 | 2026-05-04 | Contradiction filter min_value 10→100 (12.25); Planner Pattern E relational-anchor bridge (12.26); own-doc chunk alias annotation (12.24) |
+| 4.3.0 | 2026-05-04 | Verifier question-relevance context reordering (12.27); test_verifier_semantic.py: 36→39 tests; total CI suite: 500 passed |

@@ -684,7 +684,7 @@ class PreGenerationValidator:
         # ── Check 3: Source Credibility Scoring ───────────────────────────────
         if self.config.enable_credibility_scoring:
             credibility_scores = self._compute_credibility(
-                result.filtered_context, context
+                result.filtered_context, context, entities=entities
             )
             result.credibility_scores = credibility_scores
             high_cred = [
@@ -897,6 +897,7 @@ class PreGenerationValidator:
         self,
         filtered_context: List[str],
         original_context: List[str],
+        entities: Optional[List[str]] = None,
     ) -> List[float]:
         """
         Compute credibility scores for each chunk in ``filtered_context``.
@@ -910,20 +911,47 @@ class PreGenerationValidator:
            does not forward retrieval-source metadata (known limitation).
            The provenance weight is applied uniformly at the
            ``credibility_provenance_baseline`` level (0.5).
+
+        ``entities`` adds token-level cross-reference matching: if a word
+        (≥4 chars) from an entity name appears in both this chunk and another
+        chunk, that counts as a cross-reference even when the full entity name
+        is absent as a substring.  This handles surface-form mismatches such
+        as 'Terrence "Uncle Terry" Richardson' which does not contain the
+        substring 'Terry Richardson' but does contain 'Terry' and 'Richardson'.
         """
+        # Pre-compute entity name tokens for token-level cross-reference.
+        entity_tokens_lower: List[str] = []
+        if entities:
+            seen_tokens: set = set()
+            for name in entities:
+                for tok in name.split():
+                    tok_l = tok.lower()
+                    if len(tok_l) >= 4 and tok_l not in seen_tokens:
+                        entity_tokens_lower.append(tok_l)
+                        seen_tokens.add(tok_l)
+
         scores: List[float] = []
         for chunk in filtered_context:
             cred = SourceCredibility(text=chunk)
             key_phrases = self._extract_key_phrases(chunk)
+            chunk_lower = chunk.lower()
 
-            # Cross-reference: any other chunk that shares a key phrase.
+            # Cross-reference: any other chunk that shares a key phrase OR
+            # shares an entity name token with this chunk.
             for other in original_context:
                 if other != chunk:
                     other_lower = other.lower()
-                    for phrase in key_phrases:
-                        if phrase.lower() in other_lower:
+                    phrase_matched = any(
+                        phrase.lower() in other_lower for phrase in key_phrases
+                    )
+                    if phrase_matched:
+                        cred.cross_references += 1
+                    elif entity_tokens_lower:
+                        # Token-level fallback: entity word present in both chunks.
+                        chunk_has = any(t in chunk_lower for t in entity_tokens_lower)
+                        other_has = any(t in other_lower for t in entity_tokens_lower)
+                        if chunk_has and other_has:
                             cred.cross_references += 1
-                            break
 
             # Entity-frequency signal.
             if SPACY_AVAILABLE and NLP:
@@ -1116,6 +1144,58 @@ Please provide a partial answer based on the available evidence, clearly indicat
             latency_ms = (time.time() - start) * 1000
             logger.error("LLM request failed: %s", exc)
             return "[Error: %s]" % str(exc)[:100], latency_ms
+
+    # ── Context Relevance Reordering ──────────────────────────────────────────
+
+    # Content words to exclude from question-keyword scoring.
+    # These appear in almost every question and carry no discriminative signal.
+    _QR_STOPWORDS: frozenset = frozenset({
+        "what", "who", "where", "when", "which", "whom", "whose", "that",
+        "this", "these", "those", "have", "been", "from", "with", "their",
+        "they", "were", "there", "about", "also", "into", "more", "some",
+        "does", "will", "would", "could", "should", "than", "then", "them",
+    })
+
+    def _reorder_by_question_relevance(
+        self,
+        query: str,
+        context: List[str],
+    ) -> List[str]:
+        """
+        Stable-sort context chunks so those sharing more content words with the
+        query appear first in the LLM prompt.
+
+        Rationale (§12.27): small LLMs tend to latch onto the first plausible
+        entity in the context. For multi-hop questions the answer chunk often
+        has a lower Navigator RRF score than distractor chunks (because RRF
+        rewards broad entity overlap, not question-specific term overlap).
+        By positioning the most answer-relevant chunk first, the LLM is
+        exposed to the fact it needs before encountering distractors.
+
+        Algorithm (O(n × |query_tokens|)):
+        1. Tokenise the query into lowercase content words (≥ 4 chars,
+           not in _QR_STOPWORDS).
+        2. Count how many query tokens occur anywhere in each chunk
+           (case-insensitive substring match).
+        3. Stable-sort descending by count — ties preserve original order
+           (Navigator RRF order), so the change is a no-op when all chunks
+           are equally relevant.
+        """
+        if len(context) <= 1:
+            return context
+
+        query_tokens = {
+            t for t in re.findall(r"\b\w{4,}\b", query.lower())
+            if t not in self._QR_STOPWORDS
+        }
+        if not query_tokens:
+            return context
+
+        def _score(chunk: str) -> int:
+            chunk_lower = chunk.lower()
+            return sum(1 for t in query_tokens if t in chunk_lower)
+
+        return sorted(context, key=_score, reverse=True)
 
     # ── Context Formatting ────────────────────────────────────────────────────
 
@@ -1343,6 +1423,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
             len(working_context),
             len(context),
         )
+        working_context = self._reorder_by_question_relevance(query, working_context)
         formatted_context = self._format_context(working_context)
 
         best_answer: Optional[str] = None

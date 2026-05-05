@@ -26,6 +26,7 @@ Review History:
     Next Review:    After changes to entity extraction or storage schema
 """
 
+import os
 import sys
 import shutil
 import tempfile
@@ -45,9 +46,15 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Synthetic corpus — HotpotQA bridge-question style
+#
+# R1 compliance: N_DOCS defaults to 2 so that CI runs GLiNER + REBEL on
+# only 2 documents.  Set EDGE_RAG_N_SAMPLES=4 (and use -m nightly) to run
+# the full 4-document suite.
 # ---------------------------------------------------------------------------
 
-DOCS = [
+N_DOCS: int = int(os.getenv("EDGE_RAG_N_SAMPLES", "2"))
+
+_ALL_DOCS = [
     Document(
         page_content=(
             "Scott Derrickson is an American filmmaker. "
@@ -98,8 +105,26 @@ DOCS = [
     ),
 ]
 
-# Expected bridge entities: entity → chunks that must both mention it.
-BRIDGE_EXPECTATIONS = [
+# DOCS is the slice actually ingested in this test run (controlled by N_DOCS).
+DOCS = _ALL_DOCS[:N_DOCS]
+
+# Per-doc expected persons — used to restrict person assertions to ingested docs.
+_EXPECTED_PERSONS_BY_CHUNK: dict[str, str] = {
+    "c1": "Scott Derrickson",
+    "c2": "Ed Wood",
+    "c3": "Tom Hanks",
+    "c4": "Gustave Eiffel",
+}
+_EXPECTED_PERSONS: list[str] = [
+    _EXPECTED_PERSONS_BY_CHUNK[doc.metadata["chunk_id"]]
+    for doc in DOCS
+    if doc.metadata["chunk_id"] in _EXPECTED_PERSONS_BY_CHUNK
+]
+
+# Only retain bridge cases whose expected chunks are all within DOCS.
+_INGESTED_CHUNK_IDS: set[str] = {doc.metadata["chunk_id"] for doc in DOCS}
+
+_ALL_BRIDGE_EXPECTATIONS = [
     {
         "question": "Both Scott Derrickson and Ed Wood are _ filmmakers.",
         "bridge_entity": "American",
@@ -115,6 +140,11 @@ BRIDGE_EXPECTATIONS = [
         "bridge_entity": "Steven Spielberg",
         "expected_chunk_ids": {"c3"},
     },
+]
+
+BRIDGE_EXPECTATIONS = [
+    case for case in _ALL_BRIDGE_EXPECTATIONS
+    if case["expected_chunk_ids"].issubset(_INGESTED_CHUNK_IDS)
 ]
 
 
@@ -189,12 +219,15 @@ class TestEntityNodes:
         assert count > 0, "No Entity nodes found — GLiNER extraction may have failed"
 
     def test_expected_persons_extracted(self, store: HybridStore) -> None:
-        """Named persons must be detected by GLiNER and stored as Entity nodes."""
+        """Named persons must be detected by GLiNER and stored as Entity nodes.
+
+        Only checks persons from the docs that were actually ingested (N_DOCS).
+        """
         res = _conn(store).execute(
             "MATCH (e:Entity) RETURN e.name"
         )
         names = {row[0] for row in res}
-        for expected in ("Scott Derrickson", "Ed Wood", "Tom Hanks", "Gustave Eiffel"):
+        for expected in _EXPECTED_PERSONS:
             assert expected in names, (
                 f"Expected entity '{expected}' not found in graph. "
                 f"Found: {sorted(names)}"

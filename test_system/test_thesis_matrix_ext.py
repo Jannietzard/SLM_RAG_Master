@@ -297,6 +297,70 @@ def test_ablation_planner_disabled_returns_answer():
 # ERROR PATH — Ollama unreachable
 # =============================================================================
 
+# =============================================================================
+# DATA LAYER — RRF Fusion: cross-source boost ordering (T-04)
+# =============================================================================
+
+def test_dual_source_chunk_outranks_single_source_chunk():
+    """
+    A chunk appearing in BOTH vector and graph result lists must have a higher
+    RRF score than a chunk that appears only in the vector list — even when the
+    single-source chunk ranks first in its list.
+
+    This tests the cross_source_boost invariant that is the key architectural
+    contribution of the RRF fusion design (thesis section 3.2.3):
+        dual-source score   = 1/(k+1) + 1/(k+1) + boost/(k+1)
+        single-source score = 1/(k+1)
+    With boost=1.2, dual-source always > single-source for equal ranks.
+    """
+    from src.data_layer.hybrid_retriever import RRFFusion
+
+    # c1 appears only in vector (rank 1 — highest possible single-source score)
+    # c2 appears in both vector (rank 2) and graph (rank 1) → receives boost
+    vector_results = [
+        {
+            "document_id": "c1",
+            "text": "Single-source chunk at rank 1.",
+            "similarity": 0.95,
+            "metadata": {"source_file": "a.txt"},
+            "position": 0,
+        },
+        {
+            "document_id": "c2",
+            "text": "Dual-source chunk at rank 2.",
+            "similarity": 0.85,
+            "metadata": {"source_file": "a.txt"},
+            "position": 1,
+        },
+    ]
+    graph_results = [
+        {
+            "chunk_id": "c2",
+            "text": "Dual-source chunk at rank 2.",
+            "hops": 1,
+            "source_file": "a.txt",
+            "matched_entity": "Einstein",
+            "position": 0,
+        },
+    ]
+
+    fusion = RRFFusion(k=60, cross_source_boost=1.2)
+    fused = fusion.fuse(vector_results, graph_results, final_top_k=5)
+
+    fused_by_id = {r.chunk_id: r for r in fused}
+    assert "c1" in fused_by_id, "c1 must be present in fused results"
+    assert "c2" in fused_by_id, "c2 must be present in fused results"
+
+    assert fused_by_id["c2"].rrf_score > fused_by_id["c1"].rrf_score, (
+        f"Dual-source c2 ({fused_by_id['c2'].rrf_score:.6f}) must outrank "
+        f"single-source c1 ({fused_by_id['c1'].rrf_score:.6f}) "
+        f"despite c1 ranking higher in the vector list."
+    )
+    assert fused_by_id["c2"].retrieval_method == "hybrid", (
+        "Chunk found in both sources must have retrieval_method='hybrid'"
+    )
+
+
 def test_ollama_unreachable_raises_connection_error():
     """
     When Ollama is not running, constructing BatchedOllamaEmbeddings must

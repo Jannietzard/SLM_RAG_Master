@@ -15,9 +15,15 @@ Usage:
 Flags:
     --idx N           Frage N aus data/hotpotqa/questions.json (default: 0)
     --question TEXT   Eigene Freitextfrage statt questions.json
+    --gold TEXT       Gold-Antwort (optional; wird automatisch aus questions.json gelesen)
     --skip-llm        Verifier überspringen (Retrieval-Debugging ohne LLM-Wartezeit)
     --trace-calls     sys.settrace: zeigt JEDEN Funktionsaufruf in src/ mit Dateiname
     --no-color        Farbloses Output (für Pipe/Dateiausgabe)
+
+Gold-Tracking:
+    Wenn --gold gesetzt ist (oder automatisch aus questions.json), prüft das Tool
+    nach JEDEM Filter-Schritt, ob die Gold-Antwort noch in einem der verbleibenden
+    Chunks enthalten ist. Bei "✗ GOLD VERLOREN" ist der vorige Schritt der Täter.
 """
 
 import argparse
@@ -34,6 +40,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # ─── Farben ─────────────────────────────────────────────────────────────────
 USE_COLOR = True
 
+# ─── Gold-Antwort für Stage-Tracking ─────────────────────────────────────────
+# Wird in main() gesetzt und von allen Patch-Funktionen über Closure gelesen.
+_GOLD_ANSWER: str = ""
+_HOP_COUNTER: list = [0]   # mutable container für Hop-Zähler in Closures
+
 def _c(code: str, text: str) -> str:
     return f"{code}{text}\033[0m" if USE_COLOR else text
 
@@ -45,6 +56,43 @@ def bold(t):    return _c("\033[1m", t)
 def dim(t):     return _c("\033[2m", t)
 def magenta(t): return _c("\033[95m", t)
 def blue(t):    return _c("\033[94m", t)
+
+
+# ─── Gold-Answer-Tracking ────────────────────────────────────────────────────
+
+def _gold_words(gold: str) -> list:
+    """Wichtige Wörter aus der Gold-Antwort (≥4 Zeichen, kein Stoppwort)."""
+    _stops = {"that", "this", "with", "from", "have", "been", "were", "will", "would"}
+    return [w for w in gold.lower().split() if len(w) >= 4 and w not in _stops]
+
+
+def _gold_check_texts(texts, stage: str, gold: str = "") -> None:
+    """
+    Gibt aus, ob die Gold-Antwort noch in mindestens einem der übergebenen Texte vorkommt.
+    texts: Liste von str ODER Liste von dicts mit "text"-Key.
+    """
+    if not gold:
+        gold = _GOLD_ANSWER
+    if not gold or gold in ("?", "(unbekannt)"):
+        return
+    words = _gold_words(gold)
+    if not words:
+        return
+    hits = []
+    for i, item in enumerate(texts):
+        t = (item if isinstance(item, str) else item.get("text", "")).lower()
+        if all(w in t for w in words):
+            hits.append(i + 1)
+    bar = "  " + "·" * 60
+    if hits:
+        extra = f" (+ {len(hits)-1} weitere)" if len(hits) > 1 else ""
+        print(f"{bar}")
+        print(f"  {green(bold('✓ GOLD'))}  «{gold}»  →  Chunk #{hits[0]}{extra}  [{stage}]")
+        print(f"{bar}")
+    else:
+        print(f"{bar}")
+        print(f"  {red(bold('✗ GOLD VERLOREN'))}  «{gold}»  nicht mehr in verbleibenden Chunks  [{stage}]")
+        print(f"{bar}")
 
 
 # ─── Ausgabe-Hilfsfunktionen ─────────────────────────────────────────────────
@@ -310,13 +358,21 @@ def patch_navigator(navigator) -> None:
                 src   = r.get("source_count", "?")
                 qc    = r.get("query_count", "?")
                 txt   = r["text"][:120].replace("\n", " ")
+                # Mark chunks that contain the gold answer
+                gold_marker = ""
+                if _GOLD_ANSWER and _gold_words(_GOLD_ANSWER):
+                    words = _gold_words(_GOLD_ANSWER)
+                    if all(w in txt.lower() for w in words):
+                        gold_marker = f"  {green('← GOLD')}"
                 print(f"    {bold(f'#{i+1}')}"
                       f"  {green(f'rrf={score:.4f}')}"
-                      f"  {dim(f'src_count={src} query_count={qc}')}")
+                      f"  {dim(f'src_count={src} query_count={qc}')}"
+                      f"{gold_marker}")
                 for line in wrap(txt, 86):
                     print(f"      {dim(line)}")
             if len(fused) > 8:
                 print(f"    {dim(f'… {len(fused)-8} weitere Chunks')}")
+            _gold_check_texts(fused, "nach RRF-Fusion")
             return fused
         return _rrf
 
@@ -324,8 +380,6 @@ def patch_navigator(navigator) -> None:
     def _wrap_relevance(original):
         def _filt(results):
             before = len(results)
-            # Compute threshold before calling original so we can reference it
-            # in the removed-chunk display below.
             threshold = 0.0
             if results:
                 max_score = max(r["rrf_score"] for r in results)
@@ -333,7 +387,6 @@ def patch_navigator(navigator) -> None:
             filtered = original(results)
             after = len(filtered)
             removed = before - after
-            # Section header first, threshold info second.
             subsection(f"Filter 1 — Relevanz  ({before} → {after}"
                        + (f", {red(str(removed) + ' entfernt')})" if removed else ")"))
             if results:
@@ -347,6 +400,7 @@ def patch_navigator(navigator) -> None:
                                       f"rrf={r['rrf_score']:.4f} < {threshold:.4f}")
             else:
                 print(f"    {dim('(alle Chunks über Schwelle — kein Filtering)')}")
+            _gold_check_texts(filtered, "nach Relevanz-Filter")
             return filtered
         return _filt
 
@@ -367,6 +421,7 @@ def patch_navigator(navigator) -> None:
                         removed_block(i, r["text"], "Jaccard-Duplikat")
             if not removed:
                 print(f"    {dim('(keine Duplikate)')}")
+            _gold_check_texts(filtered, "nach Redundanz-Filter")
             return filtered
         return _filt
 
@@ -379,6 +434,7 @@ def patch_navigator(navigator) -> None:
             removed = before - after
             subsection(f"Filter 3 — Widerspruch  overlap>={navigator.config.contradiction_overlap_threshold}"
                        f"  ratio>={navigator.config.contradiction_ratio_threshold}"
+                       f"  min_value>={navigator.config.contradiction_min_value}"
                        f"  ({before} → {after}"
                        + (f", {red(str(removed) + ' entfernt')})" if removed else ")"))
             if removed:
@@ -388,6 +444,7 @@ def patch_navigator(navigator) -> None:
                         removed_block(i, r["text"], "Numerischer Widerspruch")
             if not removed:
                 print(f"    {dim('(keine Widersprüche)')}")
+            _gold_check_texts(filtered, "nach Widerspruchs-Filter")
             return filtered
         return _filt
 
@@ -407,6 +464,7 @@ def patch_navigator(navigator) -> None:
                         removed_block(i, r["text"], "Entity-Set ist Teilmenge")
             if not removed:
                 print(f"    {dim('(keine Teilmengen)')}")
+            _gold_check_texts(filtered, "nach Entity-Overlap-Filter")
             return filtered
         return _filt
 
@@ -466,6 +524,7 @@ def patch_navigator(navigator) -> None:
                 print(f"    {bold('Verbleibende Chunks:')}")
                 for i, r in enumerate(filtered):
                     chunk_block(i, r["text"], r.get("rrf_score"))
+            _gold_check_texts(filtered, "nach Entity-Mention-Filter")
             return filtered
         return _filt
 
@@ -485,6 +544,7 @@ def patch_navigator(navigator) -> None:
                 new_len  = len(r["text"])
                 trunc = f"gekürzt {orig_len}→{new_len}" if orig_len != new_len else "unverändert"
                 chunk_block(i, r["text"], r.get("rrf_score"), extra=trunc)
+            _gold_check_texts(shrunk, "nach Context-Shrinkage")
             return shrunk
         return _filt
 
@@ -500,7 +560,9 @@ def patch_navigator(navigator) -> None:
     orig_navigate = navigator.navigate
 
     def _nav_wrapper(retrieval_plan, sub_queries, entity_names=None):
-        section("S_N — NAVIGATOR")
+        _HOP_COUNTER[0] += 1
+        hop_label = f"Hop {_HOP_COUNTER[0]}" if _HOP_COUNTER[0] > 1 else "Single-Pass"
+        section(f"S_N — NAVIGATOR  [{hop_label}]")
         field("Sub-Queries", len(sub_queries))
         for i, sq in enumerate(sub_queries, 1):
             print(f"    {bold(str(i) + '.')} {sq}")
@@ -537,6 +599,9 @@ def patch_navigator(navigator) -> None:
 
         if result.metadata.get("retrieval_errors"):
             print(f"    {red('Retrieval-Fehler:')} {result.metadata['retrieval_errors']}")
+
+        # Gold-Check auf finales Navigator-Ergebnis
+        _gold_check_texts(result.filtered_context, f"Navigator-Ergebnis [{hop_label}]")
         return result
 
     navigator.navigate = _nav_wrapper
@@ -547,6 +612,33 @@ def patch_navigator(navigator) -> None:
 # =============================================================================
 
 def patch_verifier(verifier) -> None:
+
+    # ── _reorder_by_question_relevance ────────────────────────────────────────
+    orig_reorder = verifier._reorder_by_question_relevance
+
+    def _reorder_wrapper(query, context):
+        reordered = orig_reorder(query, context)
+        subsection(f"_reorder_by_question_relevance()  {len(context)} Chunks")
+        if reordered != context:
+            print(f"    {bold('Reihenfolge geändert')} — LLM sieht Chunks in dieser Reihenfolge:")
+        else:
+            print(f"    {dim('(Reihenfolge unverändert)')}")
+        for i, c in enumerate(reordered):
+            orig_pos = context.index(c) + 1 if c in context else "?"
+            gold_marker = ""
+            if _GOLD_ANSWER:
+                words = _gold_words(_GOLD_ANSWER)
+                if words and all(w in c.lower() for w in words):
+                    gold_marker = f"  {green('← GOLD ✓')}"
+            pos_change = f"  {dim(f'(war #{orig_pos})')}" if orig_pos != i + 1 else ""
+            print(f"    {bold(f'#{i+1}')}{pos_change}{gold_marker}")
+            preview = c[:120].replace("\n", " ")
+            for line in wrap(preview, 86):
+                print(f"      {dim(line)}")
+        _gold_check_texts(reordered, "nach Reorder (LLM-Eingang)")
+        return reordered
+
+    verifier._reorder_by_question_relevance = _reorder_wrapper
 
     # ── _format_context ───────────────────────────────────────────────────────
     orig_format = verifier._format_context
@@ -672,6 +764,40 @@ def load_question(idx: int) -> dict:
     return questions[idx]
 
 
+# =============================================================================
+# CONTROLLER HOOK — Bridge-Entity-Extraktion sichtbar machen
+# =============================================================================
+
+def patch_controller_bridge(controller) -> None:
+    """
+    Patcht AgenticController._extract_bridge_entities so dass jede Erkennung
+    von Bridge-Entities im Output erscheint. Das zeigt ob der iterative Multi-Hop
+    tatsächlich läuft und welche Entities er entdeckt.
+    """
+    from src.logic_layer.controller import AgenticController as _AC
+    orig_extract = _AC._extract_bridge_entities  # raw function via class
+
+    def _wrapped_extract(chunks, exclude):
+        result = orig_extract(chunks, exclude)
+        bar = "  " + "·" * 60
+        print(f"\n{bar}")
+        if result:
+            print(f"  {green(bold('⚡ BRIDGE ENTITIES ENTDECKT:'))}  "
+                  + "  ".join(bold(e) for e in result))
+            print(f"  {dim(f'(aus {len(chunks)} Chunk(s), exclude={exclude})')}")
+        else:
+            print(f"  {yellow(bold('⚠ KEINE BRIDGE ENTITIES GEFUNDEN'))}  "
+                  f"{dim(f'(exclude={exclude}, Chunks: {len(chunks)})')}")
+            if chunks:
+                preview = chunks[0][:120].replace("\n", " ")
+                print(f"  {dim(f'Chunk-Preview: {preview}')}")
+        print(f"{bar}\n")
+        return result
+
+    # Instanz-Dict-Patch: Python sucht zuerst in self.__dict__ → überschreibt Klassen-staticmethod
+    controller._extract_bridge_entities = _wrapped_extract
+
+
 def build_pipeline(cfg: dict):
     import yaml
     from src.data_layer.embeddings import BatchedOllamaEmbeddings
@@ -728,13 +854,15 @@ def build_pipeline(cfg: dict):
 # =============================================================================
 
 def main():
-    global USE_COLOR
+    global USE_COLOR, _GOLD_ANSWER
 
     parser = argparse.ArgumentParser(
         description="Vollständiger Pipeline-Trace mit Output jeder Funktion"
     )
     parser.add_argument("--idx",         type=int,  default=0)
     parser.add_argument("--question",    type=str,  default=None)
+    parser.add_argument("--gold",        type=str,  default=None,
+                        help="Gold-Antwort für Stage-Tracking (wird sonst aus questions.json gelesen)")
     parser.add_argument("--skip-llm",    action="store_true")
     parser.add_argument("--trace-calls", action="store_true",
                         help="sys.settrace: zeigt jeden src/-Funktionsaufruf")
@@ -746,12 +874,17 @@ def main():
 
     # ── Frage laden ──────────────────────────────────────────────────────────
     if args.question:
-        q_text, gold, q_type = args.question, "(unbekannt)", "custom"
+        q_text = args.question
+        gold   = args.gold or "(unbekannt)"
+        q_type = "custom"
     else:
         q = load_question(args.idx)
         q_text = q["question"]
-        gold   = q.get("answer", "?")
+        gold   = args.gold or q.get("answer", "?")
         q_type = q.get("question_type", "?")
+
+    # Gold-Antwort global setzen (alle Patch-Hooks lesen daraus)
+    _GOLD_ANSWER = gold
 
     # ── Config laden ─────────────────────────────────────────────────────────
     import yaml
@@ -784,6 +917,7 @@ def main():
     patch_planner(planner)
     patch_retriever(retriever)
     patch_navigator(controller.navigator)
+    patch_controller_bridge(controller)
 
     if not args.skip_llm:
         patch_verifier(verifier)
@@ -794,7 +928,15 @@ def main():
             field("Kontext-Chunks", len(context))
             if context:
                 for i, c in enumerate(context):
+                    gold_marker = ""
+                    if _GOLD_ANSWER:
+                        words = _gold_words(_GOLD_ANSWER)
+                        if words and all(w in c.lower() for w in words):
+                            gold_marker = f"  {green('← GOLD ✓')}"
                     chunk_block(i, c)
+                    if gold_marker:
+                        print(f"    {green(f'  ← GOLD «{_GOLD_ANSWER}» IN DIESEM CHUNK')}")
+                _gold_check_texts(context, "Verifier-Eingang (skip-llm)")
             else:
                 print(f"    {red('⚠ KEIN KONTEXT — Navigator hat 0 Chunks geliefert!')}")
                 print(f"    {yellow('  → Mögliche Ursachen: Retrieval-Fehler, Entity-Mention-Filter zu aggressiv')}")

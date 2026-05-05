@@ -694,22 +694,22 @@ class TestNavigator:
     def test_contradiction_filter_removes_lower_scored_chunk(self, navigator) -> None:
         """Lower-scored chunk with a contradictory number is removed.
 
-        Setup: two chunks discuss the same topic (8/10 word overlap) but cite
-        conflicting numeric values (50 vs 200 → ratio 4.0 > threshold 2.0;
-        min value 50 > threshold 10).  The chunk with the lower rrf_score (0.5)
+        Setup: two chunks discuss the same topic (high word overlap) but cite
+        conflicting numeric values (200 vs 2000 → ratio 10× > threshold 2.0;
+        both values ≥ min_value=100).  The chunk with the lower rrf_score (0.5)
         must be removed; the higher-scored chunk (0.9) must survive.
 
-        This test exercises the ``any()`` comprehension fix that replaced a
-        nested ``break`` (which only exited the inner for-n2 loop, wasting CPU
-        after the first contradicting pair was found).
+        Note: contradiction_min_value was raised from 10 → 100 (§12.25) to
+        prevent day-of-month values (1–31) from creating false contradictions
+        with year-scale numbers. Test data uses values ≥ 100 on both sides.
         """
         results = [
             {
-                "text": "The scientist was born 50 years after the event.",
+                "text": "The company was founded in 1900 and employs 200 staff.",
                 "rrf_score": 0.9,
             },
             {
-                "text": "The scientist was born 200 years after the event.",
+                "text": "The company was founded in 1900 and employs 2000 staff.",
                 "rrf_score": 0.5,
             },
         ]

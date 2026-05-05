@@ -218,6 +218,46 @@ class TestVectorStore:
         assert store._distance_to_similarity(1.0) == 0.0
         assert store._distance_to_similarity(0.5) == pytest.approx(0.5)
 
+    def test_vector_search_results_ordered_by_similarity(
+        self, temp_dir: Path, mock_embeddings
+    ) -> None:
+        """vector_search must return results in descending similarity order.
+
+        This is the core retrieval invariant: the most relevant chunk must
+        appear first so that top_k slicing is meaningful.  A regression here
+        would silently degrade answer quality without any obvious error.
+        """
+        from src.data_layer.storage import VectorStoreAdapter
+
+        db_path = temp_dir / "vector_order_test"
+        store = VectorStoreAdapter(db_path=db_path, embedding_dim=768)
+
+        docs = [
+            Document(
+                page_content="Einstein developed the theory of relativity.",
+                metadata={"chunk_id": "ord_c1", "source_file": "phys.txt"},
+            ),
+            Document(
+                page_content="The quick brown fox jumps over the lazy dog.",
+                metadata={"chunk_id": "ord_c2", "source_file": "misc.txt"},
+            ),
+            Document(
+                page_content="Special relativity was published in 1905.",
+                metadata={"chunk_id": "ord_c3", "source_file": "phys.txt"},
+            ),
+        ]
+        store.add_documents_with_embeddings(docs, mock_embeddings)
+
+        query_emb = mock_embeddings.embed_query("relativity")
+        results = store.vector_search(query_emb, top_k=3, threshold=0.0)
+
+        assert len(results) >= 2, "Expected at least two results"
+        similarities = [r["similarity"] for r in results]
+        assert similarities == sorted(similarities, reverse=True), (
+            "vector_search results must be sorted in descending similarity order. "
+            f"Got: {similarities}"
+        )
+
 
 class TestKuzuGraphStore:
     """Tests for the KuzuDB Knowledge Graph store."""
@@ -335,6 +375,45 @@ class TestKuzuGraphStore:
         stats = store.get_statistics()
         assert "document_chunks" in stats
         assert stats["document_chunks"] >= 2
+
+    def test_multihop_finds_connected_chunk(self, temp_dir: Path) -> None:
+        """find_chunks_by_entity_multihop must return a chunk linked via RELATED_TO.
+
+        Graph structure:
+            c_mh1 --MENTIONS--> Entity("Einstein")
+                                    --RELATED_TO--> Entity("Curie")
+                                                        <--MENTIONS-- c_mh2
+
+        A query for "Einstein" must return both c_mh1 (hop 0, direct mention)
+        and c_mh2 (hop 2, via the Einstein→Curie RELATED_TO edge).
+        This is the core multi-hop retrieval invariant (thesis section 2.4).
+        """
+        from src.data_layer.storage import KuzuGraphStore
+
+        db_path = temp_dir / "graph_multihop_t05"
+        store = KuzuGraphStore(db_path)
+
+        # Insert two document chunks
+        store.add_document_chunk("mh_c1", "Einstein developed relativity.", 1, 0, "physics.txt")
+        store.add_document_chunk("mh_c2", "Curie discovered radium.", 1, 1, "bio.txt")
+
+        # Insert Entity nodes and edges using the public API
+        store.add_entity("e_einstein", "Einstein", entity_type="person", confidence=0.95)
+        store.add_entity("e_curie", "Curie", entity_type="person", confidence=0.95)
+        store.add_mentions_relation("mh_c1", "e_einstein")
+        store.add_mentions_relation("mh_c2", "e_curie")
+        store.add_related_to_relation("e_einstein", "e_curie", relation_type="colleague")
+
+        # Query for "Einstein" — must reach c_mh2 via the RELATED_TO bridge
+        results = store.find_chunks_by_entity_multihop("Einstein", max_results=10)
+        chunk_ids = {r["chunk_id"] for r in results}
+
+        assert "mh_c1" in chunk_ids, (
+            "Direct-mention chunk mh_c1 must be found for entity 'Einstein'"
+        )
+        assert "mh_c2" in chunk_ids, (
+            "1-hop related chunk mh_c2 must be found via Einstein→Curie RELATED_TO edge"
+        )
 
 
 class TestHybridStore:
@@ -1050,23 +1129,26 @@ class TestHybridRetriever:
         ]
         store.add_documents(docs)
 
-        for mode in [RetrievalMode.VECTOR, RetrievalMode.GRAPH, RetrievalMode.HYBRID]:
-            retrieval_config = RetrievalConfig(
-                mode=mode,
-                vector_top_k=5,
-                graph_top_k=3,
-                # threshold=0.0 avoids mock-embedding score variability
-                similarity_threshold=0.0,
-            )
+        try:
+            for mode in [RetrievalMode.VECTOR, RetrievalMode.GRAPH, RetrievalMode.HYBRID]:
+                retrieval_config = RetrievalConfig(
+                    mode=mode,
+                    vector_top_k=5,
+                    graph_top_k=3,
+                    # threshold=0.0 avoids mock-embedding score variability
+                    similarity_threshold=0.0,
+                )
 
-            retriever = HybridRetriever(
-                config=retrieval_config,
-                hybrid_store=store,
-                embeddings=mock_embeddings,
-            )
+                retriever = HybridRetriever(
+                    config=retrieval_config,
+                    hybrid_store=store,
+                    embeddings=mock_embeddings,
+                )
 
-            results, metrics = retriever.retrieve("test query")
-            assert isinstance(results, list)
+                results, metrics = retriever.retrieve("test query")
+                assert isinstance(results, list)
+        finally:
+            store.close()
 
 
 # ============================================================================
@@ -1131,17 +1213,20 @@ class TestFullPipeline:
             embeddings=mock_embeddings,
         )
 
-        results, metrics = retriever.retrieve("Who developed relativity?")
+        try:
+            results, metrics = retriever.retrieve("Who developed relativity?")
 
-        # With deterministic mock embeddings and threshold=0.0, ingestion of
-        # 5 texts must produce at least one retrievable result.
-        assert len(results) > 0, (
-            "Expected at least one result; check ingestion pipeline and retrieval config."
-        )
-        assert all(hasattr(r, "chunk_id") for r in results)
-        assert all(hasattr(r, "text") for r in results)
-        assert all(hasattr(r, "rrf_score") for r in results)
-        assert all(r.rrf_score >= 0.0 for r in results)
+            # With deterministic mock embeddings and threshold=0.0, ingestion of
+            # 5 texts must produce at least one retrievable result.
+            assert len(results) > 0, (
+                "Expected at least one result; check ingestion pipeline and retrieval config."
+            )
+            assert all(hasattr(r, "chunk_id") for r in results)
+            assert all(hasattr(r, "text") for r in results)
+            assert all(hasattr(r, "rrf_score") for r in results)
+            assert all(r.rrf_score >= 0.0 for r in results)
+        finally:
+            store.close()
 
     def test_thesis_compliance(self) -> None:
         """Verify that ExtractionConfig and SentenceChunkingConfig match thesis specifications.

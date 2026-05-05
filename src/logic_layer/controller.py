@@ -354,25 +354,69 @@ class AgenticController:
         """
         Extract candidate bridge entity names from retrieved text chunks.
 
-        Simple heuristic: capitalized multi-word phrases (2+ tokens) that are
-        not already in the known entity list.  Used by iterative multi-hop to
-        discover the bridge entity name from step-N results before step-N+1.
+        Two-pass heuristic (§12.28):
 
-        Args:
-            chunks: Filtered context chunks from a bridge retrieval step.
-            exclude: Entity strings already known (from S_P extraction).
+        Pass 1 — Surname-anchor search (higher precision):
+          For each known entity (e.g. "Kasper Schmeichel"), look for its
+          surname-length token ("Schmeichel", ≥6 chars) in ALL provided chunks
+          using a unicode-aware pattern that allows an optional middle name
+          between the first name and the surname.  This recovers names like
+          "Peter Schmeichel" even when the stored text has the full form
+          "Peter Bolesław Schmeichel" (the ł character breaks the ASCII-only
+          _PROPER_NOUN_RE).  The constructed full name (first + surname) is
+          preferred as the bridge entity.
 
-        Returns:
-            Up to 3 candidate bridge entity strings.
+        Pass 2 — General proper-noun fallback (higher recall):
+          Falls back to _PROPER_NOUN_RE over all chunks if Pass 1 yields no
+          results.  Still caps at 3 candidates.
 
-        Note: The Title-Case regex captures sequences of 2+ "Xx Yy" tokens only.
-        ALL-CAPS entities (NATO, FBI) and names with lowercase prepositions
-        (Tower of London) are missed — known recall trade-off for a zero-weight
-        heuristic that avoids loading a second NER model at inference time.
+        Previously this only looked at filtered_context[:2], which meant the
+        bridge entity (typically in a later chunk) was never found.
         """
+        # Unicode-aware optional-middle-name pattern for surname anchoring.
+        # Captures "[FirstName] [OptionalMiddle] [Surname]" where Surname is
+        # supplied explicitly.  [^\s]+ matches any non-whitespace (handles
+        # special characters like ł, ñ, é).
+        _SURNAME_ANCHOR = re.compile(
+            r"\b([A-Z][^\s]{1,})\s+(?:[A-Z][^\s]+\s+)?({surname})\b"
+        )
+
         exclude_lower = {e.lower() for e in exclude}
-        seen: set[str] = set()
+        seen: set = set()
         candidates: List[str] = []
+
+        # ── Pass 1: surname-anchor search ────────────────────────────────────
+        for known in exclude:
+            tokens = known.split()
+            # Use only long tokens (≥6 chars) as surname anchors to avoid
+            # matching common first names ("Peter" = 5, but "Schmeichel" = 10).
+            surnames = [t for t in tokens if len(t) >= 6]
+            for surname in surnames:
+                pat = re.compile(
+                    r"\b([A-Z][^\s,.()\[\]]{1,})\s+(?:[A-Z][^\s,.()\[\]]+\s+)?"
+                    + re.escape(surname)
+                    + r"\b",
+                    re.UNICODE,
+                )
+                for chunk in chunks:
+                    for m in pat.finditer(chunk):
+                        first = m.group(1)
+                        full = f"{first} {surname}"
+                        full_lower = full.lower()
+                        if (
+                            full_lower not in exclude_lower
+                            and full_lower not in seen
+                            and len(full) > 4
+                            # reject noise tokens (articles, punct residue)
+                            and first not in {"The", "A", "An", "This", "In", "Of"}
+                        ):
+                            seen.add(full_lower)
+                            candidates.append(full)
+
+        if candidates:
+            return candidates[:3]
+
+        # ── Pass 2: general proper-noun fallback ──────────────────────────────
         for chunk in chunks:
             for m in _PROPER_NOUN_RE.finditer(chunk):
                 phrase = m.group(1)
@@ -464,10 +508,12 @@ class AgenticController:
                     accumulated_context.append(chunk)
                     seen_filtered.add(chunk)
 
-            # After a bridge step: discover the bridge entity name
+            # After a bridge step: discover the bridge entity name.
+            # All filtered chunks are used (not just first 2) so that bridge
+            # entities in lower-ranked chunks are not missed.
             if is_bridge and nav_result.filtered_context:
                 bridge_entities = self._extract_bridge_entities(
-                    nav_result.filtered_context[:2],
+                    nav_result.filtered_context,
                     exclude=current_hints,
                 )
                 if bridge_entities:

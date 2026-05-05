@@ -226,7 +226,21 @@ class Navigator:
         # Entity hints from S_P passed to retriever so GLiNER is not re-run
         # on short sub-query fragments (e.g. "What is the nationality of Ed Wood?")
         # where it frequently fails to recognise the entity name.
-        hints = entity_names if entity_names else None
+        #
+        # Priority: explicit entity_names arg > plan.entities > None (GLiNER re-runs).
+        # Using plan entities as hints ensures all sub-queries share the same full
+        # entity set, so the keyword entity fallback in HybridRetriever can inject
+        # entity-specific chunks into every sub-query result list.  Without this,
+        # sub-queries that don't mention a target entity (e.g. "Are both Huernia
+        # described as a genus?" for query entity "Dictyosperma") produce no
+        # keyword hit for that entity, lowering its cross-query RRF score below the
+        # Relevance Filter threshold.
+        if entity_names is not None:
+            hints = entity_names
+        elif retrieval_plan is not None and getattr(retrieval_plan, "entities", None):
+            hints = [e.text for e in retrieval_plan.entities if getattr(e, "text", None)]
+        else:
+            hints = None
 
         for sub_query in sub_queries:
             try:
@@ -683,13 +697,28 @@ class Navigator:
         # Pre-compile one regex per qualifying token to avoid per-chunk compilation.
         # Each entry is (phrase_lower, token_patterns) where token_patterns is a
         # list of compiled regexes for individual long tokens.
+        #
+        # §12.28: Fallback token threshold raised from ≥5 → ≥8 chars for multi-word
+        # entities.  Short first-name tokens (e.g. "Kasper" = 6 chars) match
+        # unrelated articles ("Kasper Barfoed", "Kasper Williams") and let false-positive
+        # chunks through.  Raising to ≥8 keeps distinctive surnames ("Schmeichel" = 10)
+        # while excluding common first names from the fallback path.
+        _SINGLE_TOKEN_MIN = 5   # unchanged: single-token entity minimum
+        _FALLBACK_TOKEN_MIN = 8  # raised: per-token fallback for multi-word entities
+
         compiled: List[Any] = []
         for name in entity_names:
             tokens = name.split()
-            token_patterns = [
-                re.compile(r"\b" + re.escape(t.lower()) + r"\b")
-                for t in tokens if len(t) >= 5
-            ]
+            if len(tokens) >= 2:
+                token_patterns = [
+                    re.compile(r"\b" + re.escape(t.lower()) + r"\b")
+                    for t in tokens if len(t) >= _FALLBACK_TOKEN_MIN
+                ]
+            else:
+                token_patterns = [
+                    re.compile(r"\b" + re.escape(t.lower()) + r"\b")
+                    for t in tokens if len(t) >= _SINGLE_TOKEN_MIN
+                ]
             compiled.append((name.lower(), tokens, token_patterns))
 
         def mentions_any(text: str) -> bool:
@@ -699,7 +728,9 @@ class Navigator:
                     # Multi-word entity: try full phrase first
                     if name_lower in text_lower:
                         return True
-                    # Fallback: any individual long token as whole word
+                    # Fallback: any individual long token (≥8 chars) as whole word.
+                    # Threshold ≥8 excludes common first names while retaining
+                    # distinctive surnames.
                     for pat in token_patterns:
                         if pat.search(text_lower):
                             return True
@@ -858,16 +889,31 @@ if __name__ == "__main__":
     for c in nav_result.filtered_context:
         print(f"    · {c[:80]}")
 
-    # ── Test 3: _contradiction_filter both-loops exit ─────────────────────
-    print("\n--- _contradiction_filter any()-based exit ---")
+    # ── Test 3: _contradiction_filter ────────────────────────────────────────
+    print("\n--- _contradiction_filter ---")
+    # True contradiction: same topic, employee count differs by 10× (200 vs 2000).
+    # Both values ≥ 100 (min_value threshold), so the filter fires correctly.
     dummy_results = [
-        {"text": "John was born in 1940 in New York.", "rrf_score": 0.9},
-        {"text": "John was born in 1985 in New York.", "rrf_score": 0.5},
+        {"text": "The company was founded in 1900 and has 200 employees.", "rrf_score": 0.9},
+        {"text": "The company was founded in 1900 and has 2000 employees.", "rrf_score": 0.5},
     ]
     filtered = nav._contradiction_filter(dummy_results)
     assert len(filtered) == 1, f"Expected 1, got {len(filtered)}"
     assert filtered[0]["rrf_score"] == 0.9, "Higher-scored chunk should be retained"
     print("  ✓ Contradiction filter correctly removes lower-scored contradicting chunk")
+
+    # False-positive guard: day-of-month (18) vs year (1992).
+    # Before §12.25 (min_value=100), the pair (18, 1992) triggered at 110× ratio.
+    # After the fix, 18 < 100 is excluded from the comparison → no false eviction.
+    dummy_no_contradiction = [
+        {"text": "Peter was born on 18 November 1963 in Copenhagen.", "rrf_score": 0.9},
+        {"text": "Denmark won the 1992 European Championship.", "rrf_score": 0.7},
+    ]
+    not_filtered = nav._contradiction_filter(dummy_no_contradiction)
+    assert len(not_filtered) == 2, (
+        f"Expected 2 (no false positive on day-of-month vs year), got {len(not_filtered)}"
+    )
+    print("  ✓ False-positive guard: day-of-month (18) vs year (1992) does not trigger")
 
     print("\n" + "=" * 70)
     print("All smoke tests passed.")

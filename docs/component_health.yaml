@@ -1,0 +1,156 @@
+---
+meta:
+  audit_date: "2026-05-04"
+  audit_profile: "CI + Nightly"
+  total_ci_tests: 508
+  total_tests_all: 515
+  framework: "F1-F6 functional correctness"
+  r1_constraint: "max 2 ML-model inference samples per test run (CI)"
+  note: "501 after Audit III (2026-05-04); +14 from v4.1.0 additions (keyword fallback tests + multihop test). 7 deselected in CI (nightly/llm)."
+
+components:
+  - name: config_loader
+    status: robust
+    error_class_coverage: {F1: true, F2: true, F3: true, F4: true, F5: true, F6: true}
+    test_files: [test_system/test_config_robustness.py, test_system/test_logic_layer.py]
+    r1_compliant: true
+
+  - name: hybrid_retrieval
+    status: robust
+    error_class_coverage: {F1: true, F2: true, F3: true, F4: true, F5: true, F6: true}
+    test_files: [test_system/test_data_layer.py]
+    r1_compliant: true
+
+  - name: planner_SP
+    status: robust
+    error_class_coverage: {F1: true, F2: true, F3: true, F4: true, F5: true, F6: true}
+    test_files: [test_system/test_planner_semantic.py, test_system/test_logic_layer.py]
+    r1_compliant: true
+
+  - name: navigator_SN
+    status: robust
+    error_class_coverage: {F1: true, F2: true, F3: true, F4: true, F5: true, F6: true}
+    test_files: [test_system/test_navigator_semantic.py, test_system/test_logic_layer.py]
+    r1_compliant: true
+
+  - name: entity_extraction_gliner
+    status: stable
+    error_class_coverage: {F1: true, F2: true, F3: true, F4: true, F5: false, F6: false}
+    gaps: ["F5: no isolation test between sequential extract() calls", "F6: no resource-release test"]
+    test_files: [test_system/test_gliner_boundary.py]
+    r1_compliant: true
+    r1_note: "TestGLiNERRobustness uses mocked model (0 real calls); TestGLiNERBoundary uses N_SAMPLES=2"
+
+  - name: embeddings
+    status: stable
+    error_class_coverage: {F1: false, F2: true, F3: true, F4: true, F5: false, F6: false}
+    gaps: ["F1: no test for embed_documents([None]) or embed_query(None)", "F5: no cross-instance isolation test", "F6: no SQLite connection leak test"]
+    test_files: [test_system/test_embeddings.py]
+    r1_compliant: true
+    r1_note: "TestEmbedQueryDocumentsConsistency mocks _embed_batch; TestEmbeddingSemanticQuality is nightly-gated (2 real calls)"
+
+  - name: chunking
+    status: stable
+    error_class_coverage: {F1: false, F2: false, F3: true, F4: true, F5: true, F6: false}
+    gaps: ["F1: no test for chunk_text(None) or chunk_text('')", "F2: no test for SpaCy model unavailable mid-run", "F6: SpaCy model reference counting not tested"]
+    test_files: [test_system/test_chunking.py]
+    r1_compliant: true
+
+  - name: storage_lancedb
+    status: stable
+    error_class_coverage: {F1: false, F2: false, F3: true, F4: true, F5: true, F6: false}
+    gaps: ["F1: no crash test for add_documents([])", "F2: no test for LanceDB disk-full scenario", "F6: no explicit connection-close test"]
+    test_files: [test_system/test_data_layer.py]
+    r1_compliant: true
+
+  - name: storage_kuzudb
+    status: stable
+    error_class_coverage: {F1: false, F2: false, F3: true, F4: true, F5: true, F6: false}
+    gaps: ["F1: no crash test for malformed entity data", "F2: no test for duplicate node insert", "F6: no explicit close test"]
+    test_files: [test_system/test_data_layer.py]
+    r1_compliant: true
+
+  - name: verifier_SV
+    status: stable
+    error_class_coverage: {F1: true, F2: true, F3: true, F4: true, F5: true, F6: false}
+    gaps: ["F6: no test that LLM connection is not held open between calls"]
+    evidence:
+      - "TestLLMErrorPaths.test_llm_timeout_returns_fallback_not_exception (F2)"
+      - "TestLLMErrorPaths.test_llm_empty_string_does_not_substitute_fallback (F2)"
+      - "TestVerifierFactualCorrectness.test_answer_with_entity_absent (F4/T-A)"
+      - "TestVerifierStatelessness.test_second_call_does_not_inherit_first_call_context (F5)"
+      - "TestFactory.test_none_query_does_not_crash (F1)"
+    test_files: [test_system/test_verifier_semantic.py]
+    r1_compliant: true
+
+  - name: ingestion_pipeline
+    status: stable
+    error_class_coverage: {F1: false, F2: false, F3: true, F4: true, F5: true, F6: false}
+    gaps: ["F1: no crash test for ingest(None) or missing doc_id", "F2: no test for storage.add_documents() raising on duplicate SHA-256", "F6: no LanceDB handle release test"]
+    evidence:
+      - "TestIngestionMetadataIsolation.test_two_documents_have_distinct_source_doc_values (F5/T-E)"
+      - "TestIngestionMetadataIsolation.test_chunk_ids_globally_unique_across_two_documents (F4/T-E)"
+    test_files: [test_system/test_pipeline.py, test_system/test_data_layer.py]
+    r1_compliant: true
+
+  - name: query_pipeline
+    status: stable
+    error_class_coverage: {F1: true, F2: false, F3: true, F4: true, F5: true, F6: false}
+    gaps: ["F2: no test for Planner raising mid-pipeline with graceful fallback", "F6: no resource-release test"]
+    evidence:
+      - "TestAgentPipelineFIFOCache.test_fifo_eviction_removes_oldest_entry (F4/T-D)"
+      - "TestQueryPipelineStatelessness.test_empty_query_does_not_raise (F1)"
+      - "TestQueryPipelineStatelessness.test_second_query_not_served_from_first_query_cache (F5)"
+    test_files: [test_system/test_pipeline.py]
+    r1_compliant: true
+
+action_list:
+  - {id: 1, priority: DONE, effort: XS, file: "test_system/test_gliner_boundary.py", title: "Fix R1: mark TestGLiNERSpanBoundary @nightly"}
+  - {id: 2, priority: DONE, effort: XS, file: "test_system/test_gliner_boundary.py", title: "Fix R1: cap test_recall_by_entity_type to N_SAMPLES"}
+  - {id: 3, priority: DONE, effort: XS, file: "test_system/test_embeddings.py", title: "Fix R1: reduce TestEmbeddingSemanticQuality to 2 texts"}
+  - {id: 4, priority: DONE, effort: S, file: "test_system/test_gliner_boundary.py", title: "Add TestGLiNERRobustness (F1+F2 for GLiNER extractor)"}
+  - {id: 5, priority: DONE, effort: S, file: "test_system/test_embeddings.py", title: "Add TestEmbedderErrorHandling (ConnectionError, HTTP 500)"}
+  - {id: 6, priority: DONE, effort: S, file: "test_system/test_verifier_semantic.py", title: "Add TestVerifierStatelessness (F5 gap)"}
+  - {id: 7, priority: DONE, effort: S, file: "test_system/test_pipeline.py", title: "Add TestQueryPipelineStatelessness + process('') crash"}
+  - {id: 8, priority: DONE, effort: S, file: "test_system/test_config_robustness.py", title: "Add TestConfigFileLoading (malformed YAML, missing file)"}
+  - {id: 9, priority: DONE, effort: M, file: "test_system/test_chunking.py", title: "Add TestChunkerProperty (Hypothesis — activates on install)"}
+  - {id: 10, priority: DONE, effort: XS, file: "pytest.ini", title: "Write nightly profile addopts comment"}
+  - {id: 11, priority: DONE, effort: S, file: "docs/", title: "Materialise component_health_matrix.md + component_health.yaml"}
+
+changes_since_last_run:
+  date: "2026-05-04"
+  additions:
+    - "GLiNER offline fix: HF_HUB_OFFLINE retry in hybrid_retriever.py + entity_extraction.py"
+    - "embeddings.py: ConnectionError wrapped as RuntimeError in _embed_batch"
+    - "Action 1: TestGLiNERSpanBoundary marked @nightly (R1 fix)"
+    - "Action 2: test_recall_by_entity_type capped to _ALL_GOLD[:N_SAMPLES] (R1 fix)"
+    - "Action 3: TestEmbeddingSemanticQuality reduced to 2 API calls (R1 fix)"
+    - "Action 4: TestGLiNERRobustness (5 tests, mocked, 0 real GLiNER calls)"
+    - "Action 5: TestEmbedderErrorHandling (2 tests: ConnectionError, HTTP 500)"
+    - "Action 6: TestVerifierStatelessness (2 tests, F5 coverage)"
+    - "Action 7: TestQueryPipelineStatelessness (3 tests, F1+F5 coverage)"
+    - "Action 8: TestConfigFileLoading (2 tests, F1+F2 coverage)"
+    - "Action 9: TestChunkerProperty (2 tests, Hypothesis, activates on pip install hypothesis)"
+    - "Action 10: pytest.ini nightly profile comment added"
+    - "Action 11: docs/component_health_matrix.md + docs/component_health.yaml created"
+  total_tests_before: 487
+  total_tests_after: 501
+  delta: +15
+  r1_violations_resolved: 3
+  new_r1_violations_introduced: 0
+
+v4_1_0_changes:
+  date: "2026-05-04"
+  additions:
+    - "hybrid_retriever.py: _keyword_entity_search() + dual injection (§12.22) — keyword entity fallback for nomic-embed-text score compression"
+    - "navigator.py: entity hints propagation fix — falls back to retrieval_plan.entities when entity_names=None (§12.23)"
+    - "storage.py: KuzuGraphStore.close() + HybridStore.close() methods (F6 gap)"
+    - "test_data_layer.py: test_vector_search_results_ordered_by_similarity (F4)"
+    - "test_data_layer.py: test_multihop_finds_connected_chunk (F4 multi-hop contract)"
+    - "TECHNICAL_ARCHITECTURE.md: §12.22 + §12.23 added; version bumped to 4.1.0"
+    - "diagnose.py --idx 27: 10 raw → 2 filtered chunks (Dictyosperma + Huernia); LLM answers 'Yes.' (gold: yes)"
+  total_tests_before: 501
+  total_tests_after: 515
+  delta: +14
+  r1_violations_resolved: 0
+  new_r1_violations_introduced: 0

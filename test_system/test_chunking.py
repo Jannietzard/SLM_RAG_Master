@@ -278,6 +278,39 @@ class TestSpacySentenceChunker:
             assert len(chunk.chunk_id) == 20
             assert all(c in "0123456789abcdef" for c in chunk.chunk_id)
 
+    def test_chunk_id_uses_hashlib_sha256_not_python_hash(self):
+        """Chunk ID must match the SHA-256 formula, ruling out Python's hash().
+
+        Python's built-in hash() is PYTHONHASHSEED-randomised: the same text
+        produces different values across process restarts.  Using it for chunk
+        IDs would make IDs non-deterministic across re-ingestion runs, breaking
+        stable KuzuDB node references.
+
+        This test reconstructs the expected ID from the documented formula
+            SHA-256(source_doc:chunk_index:text[:50])[:20]
+        and asserts it matches the generated ID.  The test would fail if the
+        implementation were ever changed to use hash().
+        """
+        import hashlib
+        from src.data_layer.chunking import create_sentence_chunker
+
+        chunker = create_sentence_chunker(sentences_per_chunk=3, sentence_overlap=1)
+        chunks = chunker.chunk_text(EINSTEIN_TEXT, source_doc="einstein.txt")
+
+        assert len(chunks) >= 1, "Need at least one chunk to verify ID formula"
+        first_chunk = chunks[0]
+
+        # chunk_index=0 is the position of the first chunk in the output list.
+        content = "einstein.txt:0:%s" % first_chunk.text[:50]
+        expected_id = hashlib.sha256(content.encode()).hexdigest()[:20]
+
+        assert first_chunk.chunk_id == expected_id, (
+            "chunk_id does not match SHA-256('einstein.txt:0:text[:50]').\n"
+            "Expected: %s, got: %s.\n"
+            "If Python's hash() were used instead, this value would vary "
+            "across process runs (PYTHONHASHSEED-sensitive)." % (expected_id, first_chunk.chunk_id)
+        )
+
     def test_none_input_returns_empty(self):
         from src.data_layer.chunking import create_sentence_chunker
 
@@ -386,3 +419,59 @@ class TestThesisCompliance:
         assert cfg.sentence_overlap == 1, "Thesis §2.2: 1-sentence overlap"
         assert cfg.min_chunk_chars == 50
         assert cfg.spacy_model == "en_core_web_sm"
+
+
+# ── TestChunkerProperty (Action #9) ───────────────────────────────────────────
+# Requires: pip install hypothesis
+# Class is defined only when hypothesis is available; silently absent otherwise.
+
+try:
+    from hypothesis import given as _hyp_given, settings as _hyp_settings
+    import hypothesis.strategies as _hyp_st
+
+    @pytest.mark.slow
+    class TestChunkerProperty:
+        """Property-based tests for SpacySentenceChunker invariants (Action #9).
+
+        Uses Hypothesis to generate arbitrary text inputs and verify that the
+        chunker satisfies its core invariants regardless of input content.
+
+        Install with: pip install hypothesis
+        Run with:     pytest test_system/test_chunking.py -m slow -v
+        """
+
+        _TEXT_STRATEGY = _hyp_st.text(
+            min_size=20,
+            max_size=2000,
+            alphabet=_hyp_st.characters(
+                whitelist_categories=("L", "N", "P", "Z"),
+                whitelist_characters="\n .,!?",
+            ),
+        )
+
+        @_hyp_settings(max_examples=50, deadline=5000)
+        @_hyp_given(_TEXT_STRATEGY)
+        def test_all_chunks_nonempty(self, text):
+            """Every chunk produced by the chunker must be non-empty."""
+            from src.data_layer.chunking import SpacySentenceChunker, SentenceChunkingConfig
+            chunker = SpacySentenceChunker(SentenceChunkingConfig())
+            chunks = chunker.chunk_text(text)
+            for chunk in chunks:
+                assert len(chunk.get("text", "").strip()) > 0, (
+                    f"Empty chunk found for input: {text!r:.80}"
+                )
+
+        @_hyp_settings(max_examples=50, deadline=5000)
+        @_hyp_given(_TEXT_STRATEGY)
+        def test_chunk_ids_unique(self, text):
+            """Chunk IDs must be globally unique within a single chunking call."""
+            from src.data_layer.chunking import SpacySentenceChunker, SentenceChunkingConfig
+            chunker = SpacySentenceChunker(SentenceChunkingConfig())
+            chunks = chunker.chunk_text(text)
+            ids = [c.get("chunk_id", "") for c in chunks]
+            assert len(ids) == len(set(ids)), (
+                f"Duplicate chunk IDs: {[x for x in ids if ids.count(x) > 1]}"
+            )
+
+except ImportError:
+    pass  # hypothesis not installed — TestChunkerProperty not defined

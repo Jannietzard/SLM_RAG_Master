@@ -1,0 +1,88 @@
+{
+  "_comment": "Gold-standard NER annotations for 10 HotpotQA-style sentences. Used by test_gliner_boundary.py for recall evaluation. Entity types use lowercase GLiNER labels (see config/settings.yaml entity_extraction.gliner.entity_types).",
+  "_version": "1.0.0",
+  "_created": "2026-04-25",
+  "sentences": [
+    {
+      "id": 1,
+      "text": "Albert Einstein was born in Ulm, Germany in 1879.",
+      "entities": [
+        {"name": "Albert Einstein", "type": "person", "start": 0, "end": 15},
+        {"name": "Ulm", "type": "city", "start": 27, "end": 30},
+        {"name": "Germany", "type": "country", "start": 32, "end": 39}
+      ]
+    },
+    {
+      "id": 2,
+      "text": "Marie Curie discovered radium and polonium.",
+      "entities": [
+        {"name": "Marie Curie", "type": "person", "start": 0, "end": 11}
+      ]
+    },
+    {
+      "id": 3,
+      "text": "Scott Derrickson directed Doctor Strange for Marvel Studios.",
+      "entities": [
+        {"name": "Scott Derrickson", "type": "person", "start": 0, "end": 16},
+        {"name": "Doctor Strange", "type": "film", "start": 25, "end": 39},
+        {"name": "Marvel Studios", "type": "organization", "start": 44, "end": 58}
+      ]
+    },
+    {
+      "id": 4,
+      "text": "The Eiffel Tower stands in Paris, France.",
+      "entities": [
+        {"name": "Eiffel Tower", "type": "landmark", "start": 4, "end": 16},
+        {"name": "Paris", "type": "city", "start": 27, "end": 32},
+        {"name": "France", "type": "country", "start": 34, "end": 40}
+      ]
+    },
+    {
+      "id": 5,
+      "text": "Isaac Newton formulated the laws of motion at Cambridge University.",
+      "entities": [
+        {"name": "Isaac Newton", "type": "person", "start": 0, "end": 12},
+        {"name": "Cambridge University", "type": "organization", "start": 46, "end": 66}
+      ]
+    },
+    {
+      "id": 6,
+      "text": "Tom Hanks starred in Forrest Gump directed by Robert Zemeckis.",
+      "entities": [
+        {"name": "Tom Hanks", "type": "person", "start": 0, "end": 9},
+        {"name": "Forrest Gump", "type": "film", "start": 21, "end": 33},
+        {"name": "Robert Zemeckis", "type": "person", "start": 46, "end": 61}
+      ]
+    },
+    {
+      "id": 7,
+      "text": "Stephen Hawking worked at the University of Cambridge.",
+      "entities": [
+        {"name": "Stephen Hawking", "type": "person", "start": 0, "end": 15},
+        {"name": "University of Cambridge", "type": "organization", "start": 30, "end": 53}
+      ]
+    },
+    {
+      "id": 8,
+      "text": "Nikola Tesla invented the alternating current motor.",
+      "entities": [
+        {"name": "Nikola Tesla", "type": "person", "start": 0, "end": 12}
+      ]
+    },
+    {
+      "id": 9,
+      "text": "The Berlin Wall fell in November 1989.",
+      "entities": [
+        {"name": "Berlin Wall", "type": "landmark", "start": 4, "end": 15}
+      ]
+    },
+    {
+      "id": 10,
+      "text": "Charles Darwin published On the Origin of Species in 1859.",
+      "entities": [
+        {"name": "Charles Darwin", "type": "person", "start": 0, "end": 14},
+        {"name": "On the Origin of Species", "type": "work of art", "start": 25, "end": 49}
+      ]
+    }
+  ]
+}

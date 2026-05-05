@@ -981,6 +981,11 @@ class PlanGenerator:
          "What country is {entity} from?"),
         (re.compile(r'\bsame\s+(?:religion|faith|belief)\b', re.IGNORECASE),
          "What is the religion of {entity}?"),
+        # "Who is older/younger, X or Y?" → "When was X born?" so ANN matches
+        # Wikipedia bio intros ("X (born 14 August 1965) is a …") rather than the
+        # comparative question phrasing. §12.24 (2026-05-04).
+        (re.compile(r'\b(older|younger)\b', re.IGNORECASE),
+         "When was {entity} born?"),
     )
 
     # ── Pattern C: "for a/an/the [category] [description]" ──────────────────────
@@ -994,6 +999,24 @@ class PlanGenerator:
     _FOR_CAT = re.compile(
         r'\bfor (?:a|an|the)\s+(?P<cat>' + _CATEGORY_WORDS + r')\b'
         r'(?P<desc>.{5,}?)(?:\?|$)',
+        re.IGNORECASE,
+    )
+
+    # ── Pattern E: "the [role] of [Entity]" — relational anchor bridge ──────────
+    # Handles: "What was the father of X voted to be?", "Where was the wife of Y born?"
+    # When none of the split patterns match, this detects a role-relation that
+    # implicitly names a bridge entity (e.g., "the father of Kasper Schmeichel"
+    # → Peter Schmeichel). Two sub-queries are generated:
+    #   hop 0 (bridge): "Who is the {role} of {anchor entity}?"  — resolves bridge
+    #   hop 1 (final):  original query                           — answers the fact
+    # The bridge sub-query causes the Navigator to retrieve the anchor entity's
+    # article, which names the bridge, increasing the chance that the bridge
+    # entity's own article surfaces via keyword entity fallback and RRF fusion.
+    _RELATIONAL_ANCHOR_ROLES = re.compile(
+        r'\bthe\s+(father|mother|son|daughter|wife|husband|brother|sister|'
+        r'uncle|aunt|grandfather|grandmother|nephew|niece|cousin|'
+        r'director|founder|creator|author|composer|inventor|'
+        r'president|chairman|owner|captain|coach|manager)\s+of\b',
         re.IGNORECASE,
     )
 
@@ -1276,6 +1299,45 @@ class PlanGenerator:
                 ]
                 logger.debug(
                     "_decompose_multi_hop: Pattern D role-bridge → %r", bridge_q[:60]
+                )
+                return hop_sequence, [bridge_q, query]
+
+        # ── Pattern E: "the [role] of [Entity]" — relational anchor bridge ──────
+        # Only fires when all split patterns failed (len(parts) == 1).
+        # See class-level _RELATIONAL_ANCHOR_ROLES for full rationale.
+        if len(parts) <= 1 and entities:
+            em = self._RELATIONAL_ANCHOR_ROLES.search(query)
+            if em:
+                role = em.group(1).lower()
+                # Use the first proper named entity as the anchor (the entity
+                # whose article will name the bridge). Prefer PERSON/ORG/GPE
+                # over DATE entities, which are not article subjects.
+                _ANCHOR_LABELS = frozenset({
+                    "PERSON", "ORG", "GPE", "LOC", "WORK_OF_ART", "EVENT", "FAC",
+                })
+                anchor = next(
+                    (e.text for e in entities if e.label in _ANCHOR_LABELS),
+                    entities[0].text,
+                )
+                bridge_q = f"Who is the {role} of {anchor}?"
+                hop_sequence = [
+                    HopStep(
+                        step_id=0,
+                        sub_query=bridge_q,
+                        target_entities=[anchor],
+                        depends_on=[],
+                        is_bridge=True,
+                    ),
+                    HopStep(
+                        step_id=1,
+                        sub_query=query,
+                        target_entities=[e.text for e in entities],
+                        depends_on=[0],
+                        is_bridge=False,
+                    ),
+                ]
+                logger.debug(
+                    "_decompose_multi_hop: Pattern E relational-anchor → %r", bridge_q[:60]
                 )
                 return hop_sequence, [bridge_q, query]
 

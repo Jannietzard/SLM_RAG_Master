@@ -3,7 +3,23 @@
     "allow": [
       "Bash(python -X utf8 -c ' *)",
       "Bash(python -X utf8 -m pytest test_system/test_thesis_matrix_ext.py -v --tb=short)",
-      "Bash(python -X utf8 -m pytest test_system/test_pipeline.py::TestIngestionPipeline::test_ingest_returns_metrics_with_timing -v --tb=short)"
+      "Bash(python -X utf8 -m pytest test_system/test_pipeline.py::TestIngestionPipeline::test_ingest_returns_metrics_with_timing -v --tb=short)",
+      "Bash(python -X utf8 -m pytest src/ test_system/ --ignore=src/evaluations/test_rag_quality.py --ignore=test_system/test_graph_inspect.py -q --tb=short)",
+      "Bash(python -X utf8 -m pytest test_system/test_data_layer.py test_system/test_config_robustness.py test_system/test_thesis_matrix_ext.py test_system/test_verifier_semantic.py test_system/test_chunking.py test_system/test_planner_semantic.py -x --tb=short -q)",
+      "Bash(python -X utf8 -m pytest test_system/test_data_layer.py test_system/test_config_robustness.py test_system/test_thesis_matrix_ext.py test_system/test_verifier_semantic.py test_system/test_chunking.py test_system/test_planner_semantic.py --tb=short -q)",
+      "Bash(python -X utf8 -m pytest test_system/test_data_layer.py test_system/test_config_robustness.py test_system/test_thesis_matrix_ext.py test_system/test_verifier_semantic.py test_system/test_chunking.py test_system/test_planner_semantic.py -v)",
+      "Bash(python -X utf8 -m pytest test_system/test_pipeline.py test_system/test_navigator_semantic.py test_system/test_logic_layer.py -v)",
+      "Bash(python -X utf8 -m pytest test_system/ --ignore=test_system/test_graph_inspect.py --ignore=test_system/test_gliner_boundary.py -v)",
+      "Bash(python -X utf8 -m pytest test_system/test_config_robustness.py -v)",
+      "Bash(python -X utf8 -m pytest test_system/test_gliner_boundary.py -v)",
+      "Bash(python -X utf8 -m pytest test_system/ --ignore=test_system/test_graph_inspect.py -v)",
+      "Bash(python -X utf8 -m pytest test_system/test_embeddings.py test_system/test_gliner_boundary.py test_system/test_verifier_semantic.py test_system/test_pipeline.py -x --tb=short -q)",
+      "Bash(python -X utf8 -m pytest test_system/ --ignore=test_system/test_graph_inspect.py -x --tb=short -q)",
+      "Bash(python -X utf8 -m pytest test_system/ --ignore=test_system/test_graph_inspect.py -q)",
+      "Bash(python -X utf8 -m pytest test_system/ --ignore=test_system/test_graph_inspect.py)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\Jan Nietzard\\.claude\\projects\\c--Users-Jan-Nietzard-Documents-FOM-FOM-Masterarbeit-Masterarbeit-Edge-Entwicklungfolder\\memory"
     ]
   }
 }

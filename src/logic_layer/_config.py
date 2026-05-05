@@ -69,7 +69,7 @@ class ControllerConfig:
     corroboration_query_weight: float = 0.05  # settings.yaml: navigator.corroboration_query_weight
     contradiction_overlap_threshold: float = 0.3   # settings.yaml: navigator.contradiction_overlap_threshold
     contradiction_ratio_threshold: float = 2.0     # settings.yaml: navigator.contradiction_ratio_threshold
-    contradiction_min_value: float = 10.0          # settings.yaml: navigator.contradiction_min_value
+    contradiction_min_value: float = 100.0         # settings.yaml: navigator.contradiction_min_value
 
     def __post_init__(self) -> None:
         import warnings as _warnings

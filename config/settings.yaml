@@ -50,11 +50,6 @@ chunking:
     detect_structure: true
     quality_filter: true
 
-  # Content patterns to filter out during ingestion
-  filter_patterns:
-    - "^\\s*$"            # Empty lines
-    - "^Page \\d+$"       # Page numbers
-    - "^\\d+$"            # Standalone numbers
 
 # ============================================================================
 # VECTOR STORE (LanceDB)
@@ -62,9 +57,6 @@ chunking:
 vector_store:
   provider: "lancedb"
   db_path: "./data/vector"
-
-  # Index type: "flat" (exact) or "ivfflat" (approximate, faster)
-  index_type: "ivfflat"
 
   # =========================================================================
   # DISTANCE METRIC — CRITICAL SETTING
@@ -168,8 +160,9 @@ llm:
   temperature: 0.0    # 0.0 = fully deterministic — required for reproducible thesis evaluation
   max_tokens: 200
   timeout: 60         # Ollama API timeout in seconds
-                      # Model latency on CPU: qwen2:1.5b ~10-20s, gemma2:2b ~20-35s,
-                      # llama3.2:3b ~35-55s, phi3 ~45-80s (risky at 60s).
+                      # Comparison model latency on CPU (ablation study):
+                      # qwen2:1.5b ~10-20s, gemma2:2b ~20-35s,
+                      # llama3.2:3b ~35-55s, phi3 ~45-80s (ablation model, borderline at 60s).
 
   # Context budget for Verifier (S_V)
   #
@@ -178,13 +171,17 @@ llm:
   # The assembled context is then capped at max_context_chars as a safety net.
   #
   # Theoretical max: max_docs(5) × max_chars_per_doc(500) = 2500 chars
-  # Safety cap:      max_context_chars = 900 chars (~225 tokens input to LLM)
-  # Prompt overhead: ~150 chars → ~1050 chars total input
+  # Safety cap:      max_context_chars = 2500 chars (~625 tokens input to LLM)
+  # Prompt overhead: ~150 chars → ~2650 chars total input
   #
-  # The safety cap keeps edge CPU latency predictable regardless of chunk length.
+  # Raised from 900 → 2500 (2026-05-04): comparison queries need ≥2 birth-date
+  # facts in context across up to 5 chunks. At 900, a single 500-char chunk
+  # filled the budget; at 1800, 4 chunks × ~450 chars still left no room for
+  # the entity's own-article chunk at position 5 (see §12.24).
+  # 2500 chars ≈ 625 tokens; still well within qwen2:1.5b's 4k context window.
   # max_docs was raised from 3 to 5 (2026-04-23) to prevent bridge-chunk
   # truncation on multi-hop HotpotQA questions.
-  max_context_chars: 900    # Safety cap (overrides theoretical max)
+  max_context_chars: 2500   # Safety cap (overrides theoretical max)
   max_docs: 5               # Max chunks forwarded to Verifier after Navigator filtering
   max_chars_per_doc: 500    # ~125 words per chunk
 
@@ -219,9 +216,16 @@ navigator:
   # Two chunks are flagged as contradictory when:
   #   word_overlap > overlap_threshold AND
   #   max(n1,n2)/min(n1,n2) > ratio_threshold AND min(n1,n2) > min_value
+  #
+  # min_value raised from 10 → 100 (§12.25, 2026-05-04):
+  # Biographical text routinely contains day-of-month values (1–31) alongside
+  # year values. With min_value=10, the pair (18, 1992) — "born 18 November"
+  # paired with a 1992 year from another chunk — yields ratio 110× > 2.0 and
+  # incorrectly evicts the answer chunk. Values < 100 (days, months, small
+  # counts) are not factual claim slots and must not drive contradiction logic.
   contradiction_overlap_threshold: 0.3
   contradiction_ratio_threshold: 2.0
-  contradiction_min_value: 10.0
+  contradiction_min_value: 100.0
 
 # ============================================================================
 # PLANNER (S_P) — Query Analysis and Plan Generation

@@ -78,6 +78,7 @@ Review History:
 """
 
 import logging
+import os
 import re
 import threading
 import time
@@ -145,6 +146,37 @@ def _get_gliner_model(model_name: str = "urchade/gliner_small-v2.1"):
                         " -> SpaCy/Regex extraction will be used for query entities.",
                         e,
                     )
+                except Exception as _net_err:
+                    # transformers ≥ 4.45 calls huggingface_hub.model_info() in
+                    # _patch_mistral_regex for every from_pretrained call, even
+                    # when the model is already cached locally.  In offline /
+                    # air-gapped environments this raises httpx.ConnectError or
+                    # httpcore.ConnectError.  Retry with HF_HUB_OFFLINE=1 so
+                    # the local HuggingFace cache is used without any network
+                    # request.
+                    logger.warning(
+                        "GLiNER online load raised %s (%s); retrying offline.",
+                        type(_net_err).__name__, _net_err,
+                    )
+                    _prev_hf = os.environ.get("HF_HUB_OFFLINE")
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                    try:
+                        from gliner import GLiNER
+                        _GLINER_MODEL_CACHE = GLiNER.from_pretrained(model_name)
+                        logger.info(
+                            "GLiNER model loaded from local cache: %s", model_name
+                        )
+                    except (ImportError, OSError, RuntimeError, Exception) as e2:
+                        logger.warning(
+                            "FALLBACK ACTIVE: GLiNER offline load also failed (%s)"
+                            " -> SpaCy/Regex extraction will be used.",
+                            e2,
+                        )
+                    finally:
+                        if _prev_hf is None:
+                            os.environ.pop("HF_HUB_OFFLINE", None)
+                        else:
+                            os.environ["HF_HUB_OFFLINE"] = _prev_hf
     return _GLINER_MODEL_CACHE
 
 
@@ -698,6 +730,49 @@ class HybridRetriever:
                     logger.warning("Graph retrieval failed: %s", e)
                     graph_results = []
 
+            # Keyword entity fallback: compensates for nomic-embed-text score
+            # compression where domain-similar texts (e.g. all botanical genus
+            # descriptions) cluster together and the target entity chunk ranks
+            # outside the ANN top-K even when it literally contains the query
+            # entity name.
+            #
+            # Dual injection into both vector_results AND graph_results grants
+            # the chunk the RRF cross-source boost, pushing total score to
+            # ~0.050 — above the Navigator Relevance Filter threshold of
+            # 0.85 × max_rrf (~0.043 when the top chunk has both vector+graph).
+            if query_entities:
+                try:
+                    keyword_results = self._keyword_entity_search(query_entities, top_k)
+                    existing_vector_ids = {r["document_id"] for r in vector_results}
+                    existing_graph_ids = {r.get("chunk_id") for r in graph_results}
+                    for kr in keyword_results:
+                        chunk_id = kr["chunk_id"]
+                        if chunk_id not in existing_vector_ids:
+                            # Own-article chunks (source_file == entity name) get a
+                            # higher synthetic similarity so they out-rank mere-mention
+                            # chunks in RRF. "Terrence 'Uncle Terry' Richardson" would
+                            # otherwise rank below Amanda Lepore (which mentions TR but
+                            # is unrelated), pushing the bio chunk past max_docs. §12.24
+                            src_title = (
+                                kr.get("source_file", "")
+                                .lower()
+                                .replace("hotpotqa_", "")
+                            )
+                            entity_lower = kr.get("matched_entity", "").lower()
+                            sim = 0.95 if src_title == entity_lower else 0.76
+                            vector_results.append({
+                                "document_id": chunk_id,
+                                "text": kr["text"],
+                                "similarity": sim,
+                                "metadata": {"source_file": kr["source_file"]},
+                            })
+                            existing_vector_ids.add(chunk_id)
+                        if chunk_id not in existing_graph_ids:
+                            graph_results.append(kr)
+                            existing_graph_ids.add(chunk_id)
+                except Exception as _kw_err:
+                    logger.debug("Keyword entity search failed: %s", _kw_err)
+
         graph_time = (time.time() - graph_start) * 1000
 
         # 4. Fusion
@@ -747,6 +822,107 @@ class HybridRetriever:
         else:
             embedding = self.embeddings.embed_documents([query])[0]
         return np.array(embedding, dtype=np.float32)
+
+    def _keyword_entity_search(
+        self,
+        entity_names: List[str],
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Verbatim keyword search across the full LanceDB table.
+
+        For each entity name, returns chunks whose text contains the name
+        as a substring (case-insensitive).  Results are returned in graph
+        result format so they can be merged into the graph_results list and
+        receive RRF scores via the standard fuse() call.
+
+        The DataFrame scan is O(N) over all stored chunks.  For the thesis
+        scale (< 50 k chunks) this runs in < 5 ms.  The pandas DataFrame is
+        cached on the first call so subsequent queries within the same
+        retriever instance pay no repeated scan overhead.
+
+        NOTE: The cache is intentionally NOT invalidated on add_documents()
+        calls.  This retriever instance is created once and used for queries
+        only; re-ingestion creates a new store and a new retriever instance.
+        """
+        import json as _json
+
+        vector_store = getattr(self.store, "vector_store", None)
+        if vector_store is None or getattr(vector_store, "table", None) is None:
+            return []
+
+        if not hasattr(self, "_keyword_df_cache"):
+            try:
+                self._keyword_df_cache = vector_store.table.to_pandas()
+            except Exception as _e:
+                logger.debug("Keyword search cache build failed: %s", _e)
+                return []
+
+        df = self._keyword_df_cache
+        results: List[Dict[str, Any]] = []
+        seen: set = set()
+
+        import pandas as _pd
+
+        for name in entity_names:
+            if len(name) < 4:
+                continue
+            try:
+                name_lower = name.lower()
+
+                # Own-document match: source_file == "hotpotqa_{name}" (case-insensitive).
+                # This is UNCONDITIONAL — the entity's own Wikipedia article is always
+                # included first, even when the article text uses a different surface form
+                # (e.g. 'Terrence "Uncle Terry" Richardson' does not contain the substring
+                # "Terry Richardson", so a pure text-contains search would miss chunk 173).
+                if "source_file" in df.columns:
+                    src_titles = (
+                        df["source_file"]
+                        .str.lower()
+                        .str.replace(r"^hotpotqa_", "", regex=True)
+                    )
+                    own_mask = src_titles == name_lower
+                else:
+                    own_mask = _pd.Series(False, index=df.index)
+
+                # Text-substring match: entity name appears verbatim in chunk text.
+                text_mask = df["text"].str.contains(name, na=False, case=False)
+
+                # Combine: own-doc chunks first (always), then text-mention chunks
+                # from OTHER articles. De-duplicate via index.
+                own_rows  = df[own_mask]
+                text_rows = df[text_mask & ~own_mask]
+                matched   = _pd.concat([own_rows, text_rows])
+
+                own_ids = set(str(r["document_id"]) for _, r in own_rows.iterrows())
+
+                for _, row in matched.head(top_k).iterrows():
+                    doc_id = str(row["document_id"])
+                    if doc_id in seen:
+                        continue
+                    seen.add(doc_id)
+                    try:
+                        metadata = _json.loads(row.get("metadata", "{}"))
+                    except Exception:
+                        metadata = {}
+                    text = str(row["text"])
+                    # For own-doc chunks where the canonical name doesn't appear
+                    # verbatim in the text (e.g. 'Terrence "Uncle Terry" Richardson'
+                    # for query entity 'Terry Richardson'), prepend an alias label so
+                    # the LLM can resolve the surface-form mismatch. §12.24
+                    if doc_id in own_ids and name.lower() not in text.lower():
+                        text = f"[About: {name}] {text}"
+                    results.append({
+                        "chunk_id": doc_id,
+                        "text": text,
+                        "source_file": row.get("source_file", metadata.get("source_file", "unknown")),
+                        "matched_entity": name,
+                        "hops": 0,
+                    })
+            except Exception as _e:
+                logger.debug("Keyword search for %r failed: %s", name, _e)
+
+        return results[:top_k]
 
     def _vector_only_results(
         self,

@@ -584,9 +584,13 @@ class BatchedOllamaEmbeddings(Embeddings):
                 f"Ollama API timeout after {self.timeout}s. "
                 f"Consider reducing batch_size or increasing timeout."
             )
+        except requests.exceptions.ConnectionError as e:
+            raise RuntimeError(
+                f"Ollama not reachable at {self.base_url} (connection refused). "
+                f"Ensure Ollama is running: {e}"
+            ) from e
         except requests.exceptions.RequestException as e:
-            logger.error("Batch embedding failed (network/API error): %s", e)
-            raise
+            raise RuntimeError(f"Embedding API error: {e}") from e
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """

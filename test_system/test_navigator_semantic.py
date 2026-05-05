@@ -39,7 +39,7 @@ def cfg():
         corroboration_query_weight=0.05,
         contradiction_overlap_threshold=0.3,
         contradiction_ratio_threshold=2.0,
-        contradiction_min_value=10.0,
+        contradiction_min_value=100.0,
     )
 
 
@@ -211,13 +211,33 @@ class TestContradictionFilter:
         assert len(filtered) == 1
 
     def test_small_numbers_not_flagged_as_contradiction(self, nav):
-        """Numbers below min_value=10 are ignored to avoid false positives."""
+        """Numbers below min_value=100 are ignored to avoid false positives.
+
+        §12.25: contradiction_min_value raised from 10 → 100 to prevent
+        day-of-month values (1–31) from triggering false contradictions.
+        """
         results = [
             {"text": "The team won 3 to 1.", "rrf_score": 0.9},
             {"text": "The team won 3 to 1 in overtime.", "rrf_score": 0.7},
         ]
         filtered = nav._contradiction_filter(results)
         assert len(filtered) == 2
+
+    def test_day_of_month_vs_year_not_a_contradiction(self, nav):
+        """Day-of-month (e.g. 18) paired with a year (1992) must NOT trigger.
+
+        Before §12.25, the pair (18, 1992) → ratio 110× exceeded the threshold
+        and incorrectly evicted biographical chunks containing birth dates.
+        With min_value=100, 18 < 100 is excluded from the ratio comparison.
+        """
+        results = [
+            {"text": "Peter was born on 18 November 1963 in Copenhagen.", "rrf_score": 0.9},
+            {"text": "Denmark won the 1992 European Championship.", "rrf_score": 0.7},
+        ]
+        filtered = nav._contradiction_filter(results)
+        assert len(filtered) == 2, (
+            "Day-of-month (18) vs year (1992) must not evict biographical chunks"
+        )
 
 
 # ---------------------------------------------------------------------------

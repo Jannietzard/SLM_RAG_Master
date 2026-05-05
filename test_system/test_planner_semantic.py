@@ -20,7 +20,7 @@ from src.logic_layer.planner import (
 )
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def planner():
     return create_planner()  # auto-loads config/settings.yaml
 

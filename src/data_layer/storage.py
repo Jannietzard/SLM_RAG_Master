@@ -501,6 +501,28 @@ class KuzuGraphStore:
         self._init_schema()
         logger.info("KuzuGraphStore initialised: %s", kuzu_file)
 
+    def close(self) -> None:
+        """Release the KuzuDB connection and database handle.
+
+        Explicitly deleting the connection before the database is required
+        because KuzuDB's C++ bindings use reference counting internally; if
+        the Connection is still alive when the Database is deleted, the OS
+        file lock is not released promptly, causing the next test that opens
+        a new KuzuDB in the same process to see a stale lock.
+        """
+        try:
+            if getattr(self, "conn", None) is not None:
+                del self.conn
+                self.conn = None  # type: ignore[assignment]
+        except Exception:
+            pass
+        try:
+            if getattr(self, "db", None) is not None:
+                del self.db
+                self.db = None  # type: ignore[assignment]
+        except Exception:
+            pass
+
     def _init_schema(self) -> None:
         """
         Create node and relationship tables if they do not yet exist.
@@ -1282,6 +1304,17 @@ class HybridStore:
             self.entity_pipeline = self._init_entity_pipeline(config)
 
         logger.info("HybridStore initialised: dim=%d", embedding_dim)
+
+    def close(self) -> None:
+        """Release all underlying store connections.
+
+        Delegates to KuzuGraphStore.close() so that KuzuDB's C++ file lock
+        is released promptly rather than waiting for garbage collection.
+        Call this at the end of test teardown or when the store is no longer
+        needed to prevent lock-related flicker in the test suite.
+        """
+        if hasattr(self, "graph_store") and self.graph_store is not None:
+            self.graph_store.close()
 
     def _init_entity_pipeline(self, config: StorageConfig) -> "Optional[EntityExtractionPipeline]":
         """

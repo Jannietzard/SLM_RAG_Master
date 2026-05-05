@@ -59,6 +59,7 @@ Review History:
 import logging
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from pathlib import Path
@@ -586,6 +587,30 @@ class GLiNERExtractor:
                 "Failed to load GLiNER model '%s': %s", self.config.gliner_model, e
             )
             self.model = None
+        except Exception as _net_err:
+            # transformers ≥ 4.45 calls huggingface_hub.model_info() even for
+            # cached models; raises httpx.ConnectError in offline environments.
+            # Retry with HF_HUB_OFFLINE=1 to load from local cache.
+            logger.warning(
+                "GLiNER online load raised %s; retrying offline.",
+                type(_net_err).__name__,
+            )
+            _prev_hf = os.environ.get("HF_HUB_OFFLINE")
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            try:
+                self.model = GLiNER.from_pretrained(self.config.gliner_model)
+                logger.info("GLiNER model loaded from local cache")
+            except Exception as e2:
+                logger.error(
+                    "GLiNER offline load failed for '%s': %s",
+                    self.config.gliner_model, e2,
+                )
+                self.model = None
+            finally:
+                if _prev_hf is None:
+                    os.environ.pop("HF_HUB_OFFLINE", None)
+                else:
+                    os.environ["HF_HUB_OFFLINE"] = _prev_hf
 
     def _load_spacy(self) -> Optional[Any]:
         """Load SpaCy model once; return None on failure."""
