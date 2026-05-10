@@ -1,10 +1,8 @@
-# Technical Architecture Documentation
+# Technical Architecture
 
 **Project:** Enhancing Reasoning Fidelity in Quantized Small Language Models on Edge Devices via Hybrid Retrieval-Augmented Generation
 **Author:** Jan Nietzard
 **Institution:** FOM Hochschule, Master of Science
-**Version:** 4.0.0
-**Last Updated:** 2026-04-23
 
 ---
 
@@ -22,37 +20,37 @@
    - 4.1 [Planner Agent (S_P)](#41-planner-agent-s_p)
    - 4.2 [Navigator Agent (S_N)](#42-navigator-agent-s_n)
    - 4.3 [Verifier Agent (S_V)](#43-verifier-agent-s_v)
+   - 4.4 [Agentic Controller](#44-agentic-controller)
 5. [Pipeline Layer](#5-pipeline-layer)
    - 5.1 [Agent Pipeline](#51-agent-pipeline)
    - 5.2 [Ingestion Pipeline](#52-ingestion-pipeline)
 6. [Configuration System](#6-configuration-system)
-7. [Benchmark & Evaluation Framework](#7-benchmark--evaluation-framework)
+7. [Evaluation Framework — Artifact C](#7-evaluation-framework--artifact-c)
 8. [Technology Stack](#8-technology-stack)
 9. [Data Flows](#9-data-flows)
-   - 9.1 [Ingestion Flow](#91-ingestion-flow)
-   - 9.2 [Query Processing Flow](#92-query-processing-flow)
 10. [Performance Characteristics](#10-performance-characteristics)
-11. [Design Decisions & Trade-offs](#11-design-decisions--trade-offs)
-12. [Änderungen & Alternativen](#12-änderungen--alternativen)
+11. [Non-Functional Requirements](#11-non-functional-requirements)
+12. [Design Decisions & Trade-offs](#12-design-decisions--trade-offs)
 
 ---
 
 ## 1. System Overview
 
-This system implements a hybrid Retrieval-Augmented Generation (RAG) architecture optimised for edge deployment on resource-constrained hardware. The central research hypothesis is that combining dense vector retrieval with structured knowledge graph traversal, mediated by a three-agent reasoning pipeline, increases answer fidelity compared to either retrieval modality alone—particularly for multi-hop reasoning tasks.
+This system implements a hybrid Retrieval-Augmented Generation (RAG) architecture optimised for edge deployment on resource-constrained hardware. The central research hypothesis is that combining dense vector retrieval, sparse term-frequency retrieval, and structured knowledge graph traversal — mediated by a three-agent reasoning pipeline — increases answer fidelity over any single modality, particularly for multi-hop reasoning tasks.
 
 The architecture is organised into three independently testable artifact layers:
 
-| Artifact | Layer | Description |
+| Artifact | Layer | Responsibility |
 |---|---|---|
-| **A** | Data Layer | Dual-index storage, batched embeddings, hybrid retrieval with Reciprocal Rank Fusion |
-| **B** | Logic Layer | Agentic reasoning pipeline: Planner → Navigator → Verifier |
-| **C** | Evaluation | Multi-dataset benchmarking, ablation study, quality diagnostics |
+| **A** | Data Layer | Dual-index storage (vectors + graph), batched embeddings, hybrid retrieval with Reciprocal Rank Fusion (RRF), BM25 sparse retrieval, optional cross-encoder reranking |
+| **B** | Logic Layer | Three-agent reasoning pipeline: Planner → Navigator → Verifier, with optional iterative multi-hop bridge resolution |
+| **C** | Evaluation | Multi-dataset benchmarking (HotpotQA, 2WikiMultiHopQA, StrategyQA), ablation runner, diagnostic tooling |
 
-**Key constraints (Edge deployment):**
-- All databases are *embedded* (no server process required): LanceDB for vectors, KuzuDB for graphs.
-- All language models are served locally via Ollama (no cloud API dependency).
-- The system must operate within the memory budget of a modern edge device (< 16 GB RAM).
+**Edge-deployment constraints:**
+- All databases are *embedded* (no server process): LanceDB for vectors, KuzuDB for the property graph, SQLite for the embedding cache.
+- All language models are served locally via Ollama; no cloud API dependency.
+- The system is designed to operate within < 16 GB of host RAM.
+- Generation runs on CPU-only hardware using 4-bit GGUF quantisation (llama.cpp backend).
 
 ---
 
@@ -61,125 +59,124 @@ The architecture is organised into three independently testable artifact layers:
 ```
 Entwicklungfolder/
 │
-├── src/                            # All production source code
-│   ├── data_layer/                 # Artifact A: Storage & Retrieval
-│   │   ├── __init__.py             # Package exports
-│   │   ├── embeddings.py           # BatchedOllamaEmbeddings + cache
+├── src/                            # Production source code
+│   ├── data_layer/                 # Artifact A: storage, retrieval, ingestion
+│   │   ├── __init__.py             # Public exports
+│   │   ├── embeddings.py           # BatchedOllamaEmbeddings + SQLite cache
 │   │   ├── chunking.py             # SpacySentenceChunker, SemanticChunker
 │   │   ├── entity_extraction.py    # GLiNER NER + REBEL RE pipeline
+│   │   ├── entity_types.py         # Canonical label maps (single source of truth)
 │   │   ├── storage.py              # HybridStore, VectorStoreAdapter, KuzuGraphStore
-│   │   ├── hybrid_retriever.py     # HybridRetriever, RRFFusion, PreGenerativeFilter
-│   │   ├── ingestion.py            # DocumentIngestionPipeline
-│   │   ├── test_data_layer.py      # Pytest test suite (33 tests)
+│   │   ├── hybrid_retriever.py     # HybridRetriever, RRFFusion, BM25, query NER
+│   │   ├── ingestion.py            # DocumentIngestionPipeline (data-layer side)
 │   │   └── conftest.py             # Adds project root to sys.path
 │   │
-│   ├── logic_layer/                # Artifact B: Agentic Reasoning
-│   │   ├── __init__.py             # 34 public exports
-│   │   ├── planner.py              # S_P: Query analysis & plan generation
-│   │   ├── navigator.py            # S_N: Retrieval orchestration
-│   │   ├── verifier.py             # S_V: Pre-validation & generation
-│   │   ├── controller.py           # AgenticController: LangGraph state machine
-│   │   ├── test_logic_layer.py
+│   ├── logic_layer/                # Artifact B: agentic reasoning
+│   │   ├── __init__.py             # Public exports
+│   │   ├── _config.py              # ControllerConfig (shared dataclass)
+│   │   ├── _settings.py            # YAML loader + shared regex constants
+│   │   ├── planner.py              # S_P: query analysis & plan generation
+│   │   ├── navigator.py            # S_N: hybrid orchestration + filter chain
+│   │   ├── verifier.py             # S_V: pre-validation, generation, self-correction
+│   │   ├── controller.py           # AgenticController: LangGraph or sequential fallback
 │   │   └── conftest.py
 │   │
-│   ├── pipeline/                   # Orchestration Layer
-│   │   ├── agent_pipeline.py       # AgentPipeline: S_P → S_N → S_V
+│   ├── pipeline/                   # Orchestration layer
+│   │   ├── __init__.py
+│   │   ├── agent_pipeline.py       # AgentPipeline: thin S_P → S_N → S_V chain
 │   │   ├── ingestion_pipeline.py   # End-to-end ingestion workflow
-│   │   ├── test_pipeline.py        # Pytest test suite (54 tests)
 │   │   └── conftest.py
 │   │
-│   └── evaluations/                # Artifact C: Thesis Evaluation
-│       ├── ablation_study.py       # Ablation study runner
-│       ├── evaluate_hotpotqa.py    # HotpotQA-specific evaluator
-│       ├── test_rag_quality.py     # RAG quality diagnostics
-│       └── ollama_performance_diagnostic.py
+│   ├── evaluations/                # Artifact C: thesis evaluation
+│   │   ├── __init__.py
+│   │   ├── metrics.py              # Canonical EM / F1 (HotpotQA-compatible)
+│   │   ├── evaluate_hotpotqa.py    # HotpotQA benchmark runner
+│   │   ├── ablation_study.py       # Ablation runner (configurable matrix)
+│   │   ├── ollama_performance_diagnostic.py
+│   │   └── test_rag_quality.py     # Standalone retrieval-quality probe
+│   │
+│   └── utils.py                    # Shared utilities (jaccard_similarity)
 │
 ├── config/
-│   └── settings.yaml               # Unified configuration (single source of truth)
+│   └── settings.yaml               # Single source of truth for all parameters
+│
+├── prompts/                        # External prompt templates (review/audit)
 │
 ├── data/                           # Runtime data (gitignored)
 │   ├── hotpotqa/
-│   │   ├── vector/                 # LanceDB vector store (directory)
-│   │   ├── graph/                  # KuzuDB graph database (directory)
-│   │   │   └── extraction_results.json  # GLiNER+REBEL extraction output (Colab)
-│   │   ├── chunks_export.json      # All chunks with text + metadata (Phase 1 output)
-│   │   ├── questions.json          # Benchmark questions with supporting_facts
-│   │   └── articles_info.json
+│   │   ├── vector/                 # LanceDB directory
+│   │   ├── graph/                  # KuzuDB directory
+│   │   ├── chunks_export.json      # Phase-1 chunking output
+│   │   ├── extraction_results.json # Phase-2 extraction output (Colab GPU)
+│   │   └── questions.json
 │   ├── 2wikimultihop/              # (same structure)
 │   └── strategyqa/                 # (same structure)
 │
 ├── cache/                          # SQLite embedding caches (gitignored)
-│   ├── hotpotqa_embeddings.db
-│   └── embeddings.db
-│
-├── evaluation_results/             # JSON ablation results
+├── evaluation_results/             # JSON ablation outputs
 ├── logs/                           # Structured log output
-├── benchmark_datasets.py           # CLI entry point for all experiments
-├── diagnose.py                     # Layer-by-layer diagnostic (graph quality, vector scores)
-├── diagnose_verbose.py             # Trace-mode diagnostic with per-call timing
-├── diagnose_ingestion.py           # Ingestion consistency checker (chunks→LanceDB→KuzuDB→rank)
-├── local_importingestion.py        # Phase 3 import: chunks_export.json + extraction_results.json → stores
-├── test_system/
-│   ├── graph_3d.py                 # Graph visualisation: matplotlib PNG + pyvis HTML
-│   ├── graph_inspect.py            # Graph schema and statistics inspector
-│   ├── test_chunking.py            # 29 chunking unit tests
-│   ├── test_embeddings.py          # 34 embedding unit tests
-│   ├── test_ner_quality.py         # NER quality evaluation (20-sentence gold set)
-│   └── graph_preview.html          # Generated interactive visualisation (gitignored)
-└── requirements.txt
+│
+├── benchmark_datasets.py           # CLI entry point: ingest / evaluate / ablation
+├── diagnose.py                     # Layer-by-layer pipeline diagnostic
+├── diagnose_verbose.py             # Trace-mode diagnostic with gold tracking
+├── diagnose_ingestion.py           # Ingestion consistency checker
+├── local_importingestion.py        # Phase-3 import: chunks + extraction → stores
+│
+├── test_system/                    # Test suite + visualisation tooling
+│   ├── conftest.py                 # Pytest fixtures, sys.path setup
+│   ├── fixtures/                   # Gold NER and similar reference data
+│   ├── test_*.py                   # Active test modules (see §11.4)
+│   ├── diagnose_*.py               # GLiNER / SpaCy / NER diagnostics
+│   ├── graph_inspect.py            # KuzuDB schema/statistics inspector
+│   └── graph_3d.py                 # matplotlib + pyvis graph visualisation
+│
+├── pytest.ini                      # CI markers: slow, nightly, llm, integration
+├── requirements.txt                # Range constraints
+├── requirements_frozen.txt         # Pinned reproducibility set
+└── REPRODUCE.md                    # Reproduction protocol
 ```
-
-**Total source code:** ~35 Python files, approximately 18,000 lines of production code (excluding tests and generated data).
 
 **Decoupled ingestion architecture (3-phase):**
 
-| Phase | Tool | Description |
+| Phase | Tool | Output |
 |---|---|---|
-| Phase 1 | `benchmark_datasets.py ingest` | Chunk articles → `chunks_export.json` |
-| Phase 2 | Google Colab (GPU) | GLiNER + REBEL extraction → `extraction_results.json` |
-| Phase 3 | `local_importingestion.py` | Import Phase 1+2 outputs → LanceDB + KuzuDB |
+| 1 | `benchmark_datasets.py ingest` | `chunks_export.json` (chunks + metadata) |
+| 2 | Google Colab (GPU) | `extraction_results.json` (GLiNER + REBEL output) |
+| 3 | `local_importingestion.py` | LanceDB + KuzuDB populated from Phase-1 and Phase-2 outputs |
+
+This decoupling allows GPU-bound entity extraction to run separately from CPU-only ingestion on the edge target.
 
 ---
 
 ## 3. Data Layer — Artifact A
 
-The data layer encapsulates all operations related to document processing, embedding, indexing, and retrieval. It is designed to be stateless with respect to any particular query—all state is persisted to disk.
+The data layer encapsulates all operations on documents, embeddings, indices, and retrieval. It is stateless with respect to any particular query; persistent state lives entirely on disk.
 
 ### 3.1 Embedding Module
 
-**File:** `src/data_layer/embeddings.py`
+**File:** [src/data_layer/embeddings.py](src/data_layer/embeddings.py)
 
 #### 3.1.1 Architecture
 
-The embedding module wraps the Ollama HTTP API for local model inference and provides two performance optimisations critical for edge deployment: *batched inference* and *content-addressable persistent caching*.
+The module wraps the Ollama HTTP API and adds two performance-critical primitives: *batched inference* and *content-addressable persistent caching*.
 
-**`EmbeddingCache`** — SQLite-backed persistent cache.
+**`EmbeddingCache`** — SQLite-backed (WAL mode) persistent cache:
 
 ```
-Schema:
-  embeddings (
-    text_hash     TEXT PRIMARY KEY,   -- SHA-256(text.encode('utf-8'))
-    text_content  TEXT NOT NULL,      -- Original text (for debugging)
-    embedding     BLOB NOT NULL,      -- JSON-serialised float list
-    model_name    TEXT NOT NULL,      -- Model identifier
-    access_count  INTEGER DEFAULT 0,
-    created_at    TIMESTAMP
-  )
-  INDEX: idx_model_hash ON (model_name, text_hash)
+embeddings (
+  text_hash     TEXT PRIMARY KEY,   -- SHA-256(text.encode('utf-8'))
+  text_content  TEXT NOT NULL,
+  embedding     BLOB NOT NULL,      -- JSON-serialised float list
+  model_name    TEXT NOT NULL,
+  access_count  INTEGER DEFAULT 0,
+  created_at    TIMESTAMP
+)
+INDEX idx_model_hash ON (model_name, text_hash)
 ```
 
-Cache lookup is O(1) due to the SHA-256 primary key. Duplicate texts in a batch are deduplicated at the hash level, so the cache guarantees that identical strings are never embedded twice—even across separate process invocations.
+Lookup is O(1) on the SHA-256 primary key. Identical input strings are deduplicated at hash level, guaranteeing single embedding per unique text — even across separate process invocations. The schema is keyed by `(model_name, text_hash)`, so changing the embedding model invalidates cached vectors automatically.
 
-**`EmbeddingMetrics`** (dataclass) — Tracks operational statistics:
-
-| Field | Type | Description |
-|---|---|---|
-| `total_texts` | `int` | Cumulative texts processed |
-| `cache_hits` | `int` | Texts served from cache |
-| `cache_misses` | `int` | Texts requiring API call |
-| `batch_count` | `int` | Number of HTTP requests |
-| `total_time_ms` | `float` | Wall-clock time |
-| `cache_hit_rate` | `float` (property) | `hits / total` |
+**`EmbeddingMetrics`** (dataclass) tracks `total_texts`, `cache_hits`, `cache_misses`, `batch_count`, and `total_time_ms`; the `cache_hit_rate` property is derived.
 
 **`BatchedOllamaEmbeddings`** — LangChain `Embeddings`-compatible interface:
 
@@ -187,104 +184,67 @@ Cache lookup is O(1) due to the SHA-256 primary key. Duplicate texts in a batch 
 class BatchedOllamaEmbeddings(Embeddings):
     def __init__(
         self,
-        model_name: str = "nomic-embed-text",   # Ollama model
+        model_name: str = "nomic-embed-text",
         base_url: str = "http://localhost:11434",
-        batch_size: int = 32,                   # Texts per HTTP request
+        batch_size: int = 64,
         cache_path: Path = Path("./cache/embeddings.db"),
         device: str = "cpu",
         timeout: int = 60,
-    )
+    ): ...
 
-    def embed_documents(self, texts: List[str]) -> List[List[float]]
-    def embed_query(self, text: str) -> List[float]
-    def get_metrics(self) -> Dict[str, Any]
-    def clear_cache(self) -> None
+    def embed_documents(self, texts: List[str]) -> List[List[float]]: ...
+    def embed_query(self, text: str) -> List[float]: ...
+    def get_metrics(self) -> Dict[str, Any]: ...
+    def clear_cache(self) -> None: ...
 ```
 
 #### 3.1.2 Batching Algorithm
 
 ```
 Input:  texts[0..N-1]
-Output: embeddings[0..N-1]
-
-1. CACHE LOOKUP (batch SQL query):
-   hash_to_idxs = {}
-   for i, t in enumerate(texts):
-       h = SHA256(t)
-       hash_to_idxs[h].append(i)      # preserves duplicates
-
-   cache_hits = SQL: SELECT text_hash, embedding
-                     WHERE model_name = ? AND text_hash IN (hashes)
-
-2. IDENTIFY MISSES:
-   miss_texts = [texts[i] for i not in cache_results]
-
-3. BATCH API CALLS:
-   for batch in chunks(miss_texts, batch_size):
-       vectors = POST /api/embeddings {model, texts: batch}
-       cache.put(batch, vectors)
-
-4. ASSEMBLE RESULT:
-   for i in range(N):
-       result[i] = cache_result[i] OR api_result[i]
+1. CACHE LOOKUP (single SQL query):
+     hashes = [SHA256(t) for t in texts]
+     hits   = SELECT text_hash, embedding FROM embeddings
+              WHERE model_name = ? AND text_hash IN (hashes)
+2. IDENTIFY MISSES.
+3. BATCH API CALLS in chunks of `batch_size`.
+4. WRITE-BACK to cache, then assemble results in original order.
 ```
 
-**Performance characteristics:**
-- Batching reduces HTTP overhead by ~30× for typical workloads.
-- Persistent caching yields ~500× speedup on repeated ingestion runs.
-- SHA-256 collision probability: 2⁻²⁵⁶ — negligible for any practical corpus size.
+The factory `create_embeddings(cfg)` constructs the client from a `settings.yaml` dict.
 
 ---
 
 ### 3.2 Document Chunking
 
-**File:** `src/data_layer/chunking.py`
+**File:** [src/data_layer/chunking.py](src/data_layer/chunking.py)
 
-Two chunking strategies are implemented. The primary strategy for the thesis benchmarks is the *SpaCy Sentence Chunker* (Section 2.2 of the thesis).
+Two strategies are implemented; the thesis benchmarks use the SpaCy sentence chunker.
 
 #### 3.2.1 SpacySentenceChunker
 
-Implements a sliding window over SpaCy sentence boundaries.
+Sliding window over SpaCy sentence boundaries:
 
 ```python
 class SpacySentenceChunker:
     def __init__(
         self,
-        sentences_per_chunk: int = 3,    # Window size
-        sentence_overlap: int = 1,        # Overlap between consecutive windows
+        sentences_per_chunk: int = 3,
+        sentence_overlap: int = 1,
         min_chunk_chars: int = 50,
         spacy_model: str = "en_core_web_sm",
-    )
-    def chunk_text(self, text: str, source_doc: str = "") -> List[SentenceChunk]
+    ): ...
+    def chunk_text(self, text: str, source_doc: str = "") -> List[SentenceChunk]: ...
+    def chunk_document(self, document: Document) -> List[Document]: ...
 ```
 
-**`SentenceChunk`** output dataclass:
+The output `SentenceChunk` carries `text`, `sentence_count`, `position`, `start_char`, `end_char`, and `source_doc`. With the default `sentences_per_chunk=3` and `sentence_overlap=1`, evidence spanning a sentence boundary is represented in at least one chunk without full-chunk duplication. Chunk IDs are deterministic SHA-256 hashes of `source_doc:position:text[:50]` — re-ingestion of the same source produces identical IDs and is therefore idempotent.
 
-| Field | Type | Description |
-|---|---|---|
-| `text` | `str` | Concatenated sentences |
-| `sentence_count` | `int` | Number of sentences in chunk |
-| `position` | `int` | Chunk index within document |
-| `start_char` | `int` | Character offset (start) |
-| `end_char` | `int` | Character offset (end) |
-| `source_doc` | `str` | Originating document title |
-
-**Windowing scheme** (sentences_per_chunk=3, overlap=1):
-
-```
-Sentences:  [S0, S1, S2, S3, S4, S5, ...]
-Chunk 0:    [S0, S1, S2]
-Chunk 1:        [S2, S3, S4]
-Chunk 2:            [S4, S5, S6]
-```
-
-This ensures that reasoning evidence spanning a sentence boundary is represented in at least one chunk without duplication of full chunks.
-
-**SpaCy model caching:** The model is loaded once per process via a module-level `SpacyModelCache` singleton to avoid repeated 200–300 ms model load times across multiple chunker instantiations.
+A module-level `SpacyModelCache` singleton avoids repeated 200–300 ms model load times when multiple chunker instances are created.
 
 #### 3.2.2 SemanticChunker
 
-Structure-aware chunking using TF-IDF importance scoring and header/section detection.
+Structure-aware chunking using TF-IDF importance scoring and header detection:
 
 ```python
 class SemanticChunker:
@@ -296,95 +256,83 @@ class SemanticChunker:
         max_chunk_size: int = 1000,
         detect_structure: bool = True,
         quality_filter: bool = True,
-    )
+    ): ...
 ```
 
-The `AutomaticQualityFilter` component removes low-information chunks based on:
-- **Lexical Diversity (TTR):** type-token ratio < 0.3 → rejected.
-- **Information Density:** Shannon entropy < 2.0 bits → rejected.
-
-This strategy is recommended for long-form technical documents (PDFs, research papers). For the thesis benchmark (HotpotQA short passages), `sentence_spacy` is preferred.
+The `AutomaticQualityFilter` rejects chunks with type-token ratio < 0.3 or Shannon entropy < 2.0 bits. This strategy is intended for long-form technical documents; on short HotpotQA passages, the sentence chunker is preferred.
 
 ---
 
 ### 3.3 Entity Extraction
 
-**File:** `src/data_layer/entity_extraction.py`
+**File:** [src/data_layer/entity_extraction.py](src/data_layer/entity_extraction.py)
 
-Entity extraction populates the knowledge graph with named entities and their relations, enabling the graph-based retrieval path.
+Entity extraction populates the knowledge graph with named entities and their relations, enabling the graph retrieval path.
 
-#### 3.3.1 Named Entity Recognition (NER)
+#### 3.3.1 Named Entity Recognition
 
-**Model:** GLiNER (`urchade/gliner_small-v2.1`) — a zero-shot span-based NER model that requires no task-specific fine-tuning.
+**Model:** GLiNER (`urchade/gliner_small-v2.1`) — zero-shot span-based NER, no task-specific fine-tuning required.
 
-**`ExtractionConfig`** (relevant fields):
+**`ExtractionConfig`** key fields:
 
 ```python
 @dataclass
 class ExtractionConfig:
     gliner_model: str = "urchade/gliner_small-v2.1"
     entity_types: List[str] = [
-        # Lowercase natural-language labels — better zero-shot performance with GLiNER
+        # Lowercase natural-language labels yield better zero-shot performance.
         "person", "organization", "city", "country", "state",
         "location", "film", "movie", "album", "work of art",
         "landmark", "event", "award",
     ]
-    ner_confidence_threshold: float = 0.15  # Recall-optimised for HotpotQA
+    ner_confidence_threshold: float = 0.15   # Recall-optimised for HotpotQA
     ner_batch_size: int = 16
     rebel_max_input_length: int = 256
     rebel_max_output_length: int = 256
-    rebel_num_beams: int = 3
+    rebel_num_beams: int = 5
     device: str = "cpu"
 ```
 
-> **Change history:** Prior to 2026-04-01, `ner_confidence_threshold=0.15` and entity types were UPPERCASE (`PERSON`, `ORGANIZATION`, etc.), causing hub contamination ("American" 898 chunks, "He" 737). From 2026-04-02: threshold raised to 0.5, lowercase types — unique entities reduced from 36,996 → 23,858 (−35%). Subsequently revised to `0.15` again for recall (Section 12.6): the entity types and normalisation now prevent noise better than the threshold alone.
+**`ExtractedEntity`** carries `entity_id` (24-character SHA-256 hex), `name` (normalised surface form), `entity_type` (one of the canonical 13), `confidence`, `mention_span`, and `source_chunk_id`. The serialised key for the type field is `"entity_type"` (not `"type"`).
 
-**`ExtractedEntity`** (output dataclass):
+A fallback chain ensures availability: GLiNER → SpaCy NER → regex. Each fallback hop emits `logger.warning("FALLBACK ACTIVE: …")` so silent degradations are observable in production logs.
 
-| Field | Type | Description |
-|---|---|---|
-| `entity_id` | `str` | SHA-256 24-char hex ID |
-| `name` | `str` | Surface form (normalised) |
-| `entity_type` | `str` | One of 13 entity types |
-| `confidence` | `float` | GLiNER span score |
-| `mention_span` | `Tuple[int, int]` | Character offsets |
-| `source_chunk_id` | `str` | Parent chunk |
+#### 3.3.2 Relation Extraction
 
-> **Note on `to_dict()`:** The serialised key is `"entity_type"` (not `"type"`). Entity IDs were migrated from UUID (12-char MD5) to SHA-256 24-char hex in April 2026 — existing KuzuDB stores built before this change use the old format and require re-ingestion.
+**Model:** REBEL (`Babelscape/rebel-large`) — seq2seq generator that emits `(subject, relation, object)` triples directly from text. RE is applied *conditionally*: only to chunks containing ≥ 2 extracted entities, reducing compute by ~60–70 % on Wikipedia-style corpora.
 
-#### 3.3.2 Relation Extraction (RE)
+**`ExtractedRelation`** carries `subject_entity`, `relation_type`, `object_entity`, `confidence`, and `source_chunk_ids`. Serialised keys mirror the field names.
 
-**Model:** REBEL (`Babelscape/rebel-large`) — a seq2seq model that generates triples (subject, relation, object) directly from text.
-
-RE is applied *conditionally*: only to chunks with ≥ 2 extracted entities. This reduces unnecessary compute by approximately 70 % on typical corpora.
-
-**`ExtractedRelation`** (output dataclass):
-
-| Field | Type | Description |
-|---|---|---|
-| `subject_entity` | `str` | Entity name |
-| `relation_type` | `str` | Wikidata property label |
-| `object_entity` | `str` | Entity name |
-| `confidence` | `float` | REBEL generation score |
-| `source_chunk_ids` | `List[str]` | Provenance |
-
-> **Note on `to_dict()`:** Serialised keys are `"subject_entity"`, `"relation_type"`, `"object_entity"` (not `"subject"`, `"relation"`, `"object"`). REBEL's `extract_batch` was renamed `extract_sequential` to reflect the seq2seq model's limitation.
-
-**`EntityExtractionPipeline`** — main interface:
+#### 3.3.3 Pipeline Interface
 
 ```python
 class EntityExtractionPipeline:
-    def __init__(self, config: ExtractionConfig)
-    def extract(self, chunks: List[DocumentChunk]) -> List[ChunkExtractionResult]
+    def __init__(self, config: ExtractionConfig): ...
+    def extract_chunk(self, text: str) -> ChunkExtractionResult: ...
+    def extract_batch(self, texts: List[str]) -> List[ChunkExtractionResult]: ...
 ```
+
+A two-tier `EntityCache` (in-memory LRU + SQLite persistent store) keys cached results on `(text_hash, model_name)` so a model change automatically invalidates entries.
+
+#### 3.3.4 Canonical Label Maps
+
+**File:** [src/data_layer/entity_types.py](src/data_layer/entity_types.py) — single source of truth for label normalisation.
+
+| Map | Direction |
+|---|---|
+| `GLINER_LABEL_MAP` | lowercase GLiNER label → canonical type |
+| `SPACY_LABEL_MAP` | uppercase SpaCy NER label → canonical type (preserves `GPE`) |
+| `SPACY_LABEL_MAP_FLAT` | uppercase SpaCy NER label → canonical type (flattens `GPE → LOCATION`) |
+
+Both ingestion-time and query-time entity normalisation route through `normalize_entity_name()` and these maps, ensuring identical canonicalisation across the two phases.
 
 ---
 
 ### 3.4 Storage Layer
 
-**File:** `src/data_layer/storage.py`
+**File:** [src/data_layer/storage.py](src/data_layer/storage.py)
 
-The storage layer provides a *unified interface* (`HybridStore`) over two physically separate indices: a LanceDB vector store and a KuzuDB property graph. Both are embedded databases requiring no server process.
+The storage layer provides a unified `HybridStore` façade over two physically separate indices: a LanceDB vector store and a KuzuDB property graph. Both are embedded; no server process is required.
 
 #### 3.4.1 StorageConfig
 
@@ -397,231 +345,150 @@ class StorageConfig:
     similarity_threshold: float = 0.3
     normalize_embeddings: bool = True
     distance_metric: str = "cosine"      # MUST be "cosine" for text embeddings
-    graph_backend: str = "kuzu"          # "kuzu" | "networkx"
+    graph_backend: str = "kuzu"          # "kuzu" only in current build
     enable_entity_extraction: bool = False
 ```
 
-> **Note on distance metric:** LanceDB defaults to L2 (Euclidean) distance. For normalised text embeddings, cosine distance is required. Using L2 on normalised vectors yields systematically lower similarity scores and degrades retrieval quality. The `distance_metric` field explicitly overrides the LanceDB default.
+LanceDB defaults to L2 distance; on normalised text embeddings this yields systematically lower similarity scores than cosine. The `distance_metric` field explicitly overrides the LanceDB default — a precondition for retrieval correctness.
 
 #### 3.4.2 VectorStoreAdapter
 
-Wraps LanceDB with a simplified interface and handles the distance-to-similarity conversion.
-
 ```python
 class VectorStoreAdapter:
-    def __init__(self, db_path: Path, embedding_dim: int, distance_metric: str = "cosine")
-
-    def add_documents(self, documents: List[Document]) -> None
+    def __init__(self, db_path: Path, embedding_dim: int, distance_metric: str = "cosine"): ...
+    def add_documents(self, documents: List[Document]) -> None: ...
     def vector_search(
-        self,
-        query_embedding: List[float],
-        top_k: int = 10,
-        threshold: float = 0.0,
-    ) -> List[Dict[str, Any]]
-    def _distance_to_similarity(self, distance: float) -> float
+        self, query_embedding: List[float], top_k: int = 10, threshold: float = 0.0,
+    ) -> List[Dict[str, Any]]: ...
 ```
 
-**Return schema** of `vector_search()`:
+`vector_search()` returns dicts with the schema:
 
 ```python
 {
-    "document_id": str,           # Unique chunk identifier
-    "text": str,                  # Chunk text content
-    "similarity": float,          # Cosine similarity ∈ [0, 1]
-    "metadata": {
-        "source_file": str,
-        "chunk_index": int,
-        "page_number": int,
-        ...
-    }
+    "document_id": str,
+    "text": str,
+    "similarity": float,        # ∈ [0, 1] after distance→similarity conversion
+    "metadata": {"source_file": str, "chunk_index": int, "page_number": int, ...},
 }
 ```
 
 #### 3.4.3 KuzuGraphStore
 
-Wraps KuzuDB with a domain-specific graph schema for document knowledge representation.
+Wraps KuzuDB with a domain-specific schema:
 
-**Node types:**
+| Node | Key properties |
+|---|---|
+| `DocumentChunk` | `chunk_id`, `text`, `page_number`, `chunk_index`, `source_file` |
+| `SourceDocument` | `doc_id`, `filename`, `total_pages` |
+| `Entity` | `entity_id`, `name`, `entity_type`, `confidence` |
 
-| Node Type | Key Properties | Description |
-|---|---|---|
-| `DocumentChunk` | `chunk_id`, `text`, `page_number`, `chunk_index` | Atomic retrieval unit |
-| `SourceDocument` | `doc_id`, `filename`, `total_pages` | Document provenance |
-| `Entity` | `entity_id`, `name`, `entity_type` | Named entity |
+| Edge | Source → Target |
+|---|---|
+| `FROM_SOURCE` | `DocumentChunk → SourceDocument` |
+| `NEXT_CHUNK` | `DocumentChunk → DocumentChunk` (sequential adjacency) |
+| `MENTIONS` | `DocumentChunk → Entity` |
+| `RELATED_TO` | `Entity → Entity` (with `relation_type`, `confidence`) |
 
-**Edge types (relations):**
-
-| Edge Type | Source → Target | Description |
-|---|---|---|
-| `FROM_SOURCE` | `DocumentChunk → SourceDocument` | Document provenance |
-| `NEXT_CHUNK` | `DocumentChunk → DocumentChunk` | Sequential adjacency |
-| `MENTIONS` | `DocumentChunk → Entity` | Entity occurrence |
-| `RELATED_TO` | `Entity → Entity` | Semantic relation |
-
-**Key methods:**
-
-```python
-class KuzuGraphStore:
-    def __init__(self, db_path: Path)
-    def add_document_chunk(self, chunk_id, text, page_number, chunk_index, source_file) -> None
-    def add_source_document(self, doc_id, filename, total_pages) -> None
-    def add_entity(self, entity_id, name, entity_type, chunk_id) -> None
-    def add_next_chunk_relation(self, from_chunk_id, to_chunk_id) -> None
-    def graph_traversal(self, start_chunk_id, max_hops=2) -> Dict[str, Any]
-    def get_statistics(self) -> Dict[str, int]
-```
-
-**Return schema** of `graph_search()` (via `HybridStore`):
-
-```python
-{
-    "chunk_id": str,
-    "text": str,
-    "source_file": str,
-    "matched_entity": str,     # Entity that triggered this result
-    "hops": int,               # Graph distance from query entity
-}
-```
+Public methods include `add_chunk_node`, `add_entity_node`, `add_relation`, `find_chunks_by_entity_multihop(entity_name, max_hops)`, and `get_statistics`. The multi-hop helper applies a lightweight name-variant heuristic: for two-token names whose first token is ≤ 3 characters (e.g., `"Ed Wood"`), it also queries the surname; for any name, it tries individual tokens of length ≥ 4. Full alias resolution (e.g., `"Ed Wood"` ↔ `"Edward Davis Wood Jr."`) requires an entity-linking system and is documented as a known limitation (§12.3).
 
 #### 3.4.4 HybridStore
 
-The `HybridStore` class is the single public interface consumed by all higher layers.
+The unified façade consumed by all higher layers:
 
 ```python
 class HybridStore:
-    def __init__(self, config: StorageConfig, embeddings: BatchedOllamaEmbeddings)
-
-    def add_documents(self, documents: List[Document]) -> None
-    def vector_search(
-        self, query_embedding, top_k, threshold
-    ) -> List[Dict]
-    def graph_search(
-        self, entities: List[str], max_hops: int, top_k: int
-    ) -> List[Dict]
-    def save(self) -> None
+    def __init__(self, config: StorageConfig, embeddings: BatchedOllamaEmbeddings): ...
+    def add_documents(self, documents: List[Document]) -> None: ...
+    def vector_search(self, query_embedding, top_k, threshold) -> List[Dict]: ...
+    def graph_search(self, entities: List[str], max_hops: int, top_k: int) -> List[Dict]: ...
+    def close(self) -> None: ...
     @property
-    def vector_store(self) -> VectorStoreAdapter
+    def vector_store(self) -> VectorStoreAdapter: ...
     @property
-    def graph_store(self) -> KuzuGraphStore
+    def graph_store(self) -> KuzuGraphStore: ...
 ```
+
+`graph_search()` results carry `chunk_id`, `text`, `source_file`, `matched_entity` (the entity that triggered the result), and `hops` (graph distance). `close()` releases both database handles cleanly — important for long-running batch evaluations.
 
 ---
 
 ### 3.5 Hybrid Retriever
 
-**File:** `src/data_layer/hybrid_retriever.py`
+**File:** [src/data_layer/hybrid_retriever.py](src/data_layer/hybrid_retriever.py)
 
-The hybrid retriever combines results from both retrieval modalities using Reciprocal Rank Fusion (RRF), followed by a pre-generative filtering stage.
+The hybrid retriever combines three retrieval modalities — dense vector ANN, BM25 sparse, and graph traversal — using Reciprocal Rank Fusion (RRF). The Navigator is the primary consumer.
 
 #### 3.5.1 RetrievalConfig
 
 ```python
 @dataclass
 class RetrievalConfig:
-    mode: RetrievalMode = RetrievalMode.HYBRID   # VECTOR | GRAPH | HYBRID
-    vector_top_k: int = 20          # canonical name (not top_k_vector)
-    graph_top_k: int = 10           # canonical name (not top_k_graph)
-    vector_weight: float = 0.7      # used to disable modality (weight=0); NOT an RRF coefficient
-    graph_weight: float = 0.3       # used to disable modality (weight=0); NOT an RRF coefficient
+    mode: RetrievalMode = RetrievalMode.HYBRID    # VECTOR | GRAPH | HYBRID
+    vector_top_k: int = 20
+    graph_top_k: int = 10
     similarity_threshold: float = 0.3
-    rrf_k: int = 60                 # RRF smoothing constant (Cormack et al., 2009)
-    cross_source_boost: float = 1.2 # Bonus for dual-indexed results
+    rrf_k: int = 60                               # Cormack et al. (2009)
+    cross_source_boost: float = 1.2               # Bonus for multi-lane chunks
     final_top_k: int = 10
-    query_ner_confidence: float = 0.15       # Read from settings.yaml
-    query_entity_types: List[str] = field(default_factory=list)  # Read from settings.yaml
+    enable_bm25: bool = True
+    bm25_top_k: int = 20
+    query_ner_confidence: float = 0.15
+    query_entity_types: List[str] = field(default_factory=list)
     gliner_model_name: str = "urchade/gliner_small-v2.1"
 ```
 
-#### 3.5.2 Reciprocal Rank Fusion (RRFFusion)
+Modality ablation is performed by switching `mode` to `VECTOR` or `GRAPH`; weighted-fusion knobs are intentionally absent because RRF is rank-based and requires no scalar weighting.
 
-RRF is a parameter-robust rank aggregation method (Cormack et al., 2009). It assigns each document a score based on its rank position in each result list, rather than on raw similarity scores.
+#### 3.5.2 Reciprocal Rank Fusion
 
-**Formal definition:**
+`RRFFusion` implements the Cormack et al. (2009) formulation, extended for three retrieval lanes:
 
 ```
-RRF(d) = Σ_{r ∈ {vector, graph}} 1 / (k + rank_r(d))
-       + BONUS(d)
+RRF(d) = Σ_{r ∈ {vector, graph, bm25}} 1 / (k + rank_r(d))  +  BONUS(d)
 
-where:
-  k      = smoothing constant (default: 60)
-  rank_r = position of document d in result list r (1-indexed)
-  BONUS  = cross_source_boost / (k + 1)   if d appears in both lists
-         = 0                               otherwise
+k     = 60  (standard, parameter-robust)
+rank_r = position of d in result list r (1-indexed)
+BONUS = cross_source_boost / (k + 1)  per pair of lanes containing d
+      = 0  otherwise
 ```
 
-**Properties of the boost formulation:**
-- The boost is *additive*, not multiplicative, to preserve interpretable score ranges.
-- The magnitude `cross_source_boost / (k + 1)` is calibrated to equal one additional rank-1 vote, independent of k.
-- Documents appearing in only one list still receive a valid RRF score.
+The boost is *additive* (preserving interpretable score ranges) and calibrated to equal one additional rank-1 vote independently of `k`. A chunk surfacing in multiple lanes receives at most one cross-source bonus per pair of lanes that match.
 
 ```python
 class RRFFusion:
-    def __init__(self, k: int = 60, cross_source_boost: float = 1.2)
+    def __init__(self, k: int = 60, cross_source_boost: float = 1.2): ...
     def fuse(
         self,
-        vector_results: List[Dict],   # from VectorStoreAdapter.vector_search()
-        graph_results: List[Dict],    # from HybridStore.graph_search()
+        vector_results: List[Dict],
+        graph_results: List[Dict],
         final_top_k: int = 10,
-    ) -> List[RetrievalResult]
+        bm25_results: Optional[List[Dict]] = None,
+    ) -> List[RetrievalResult]: ...
 ```
 
-**`RetrievalResult`** (output dataclass):
+`RetrievalResult` (output dataclass) carries `chunk_id`, `text`, `source_doc`, `position`, `rrf_score`, the per-lane scores and ranks (`vector_score/rank`, `graph_score/rank`, `bm25_score/rank`), `retrieval_method` (`"vector" | "graph" | "bm25" | "hybrid"`), `hop_distance`, and `matched_entities`.
 
-| Field | Type | Description |
-|---|---|---|
-| `chunk_id` | `str` | Document identifier |
-| `text` | `str` | Retrieved text |
-| `source_doc` | `str` | Source document title |
-| `position` | `int` | Chunk index |
-| `rrf_score` | `float` | Final RRF score |
-| `vector_score` | `Optional[float]` | Cosine similarity (if available) |
-| `vector_rank` | `Optional[int]` | Rank in vector list |
-| `graph_score` | `Optional[float]` | Derived from hop distance: `1/(hops+1)` |
-| `graph_rank` | `Optional[int]` | Rank in graph list |
-| `retrieval_method` | `str` | `"vector"` \| `"graph"` \| `"hybrid"` |
-| `hop_distance` | `Optional[int]` | Graph distance from query entity |
-| `matched_entities` | `List[str]` | Graph-matched entity names |
+#### 3.5.3 BM25 Sparse Retrieval
 
-#### 3.5.3 PreGenerativeFilter
-
-Reduces hallucination risk by filtering the fused result set before passing context to the LLM.
-
-```python
-class PreGenerativeFilter:
-    def filter(self, results: List[RetrievalResult]) -> List[RetrievalResult]
-```
-
-Six sequential filter stages:
-
-1. **Relevance filter** — Removes results below `relevance_threshold_factor × max_score` (default factor: 0.85). Score compression in nomic-embed-text (all pairs score 0.74–0.80) means this threshold must be calibrated carefully — too low keeps all chunks, too high removes everything. The factor `0.85 × max` keeps only results close to the top score.
-
-2. **Redundancy filter** — Deduplicates by Jaccard similarity on token sets. Two results are considered redundant if `|A ∩ B| / |A ∪ B| > redundancy_threshold` (default: 0.8). Preserves topically similar but informationally complementary chunks.
-
-3. **Contradiction filter** — Applies a lightweight NLI classifier to detect conflicting factual claims. Conflicted pairs are resolved by retaining the higher-scoring result.
-
-4. **Entity-overlap filter** — Retains only chunks that share at least one named entity with the query entity set. Reduces noise from topically adjacent but factually irrelevant chunks.
-
-5. **Entity-mention filter** (`_entity_mention_filter` in `navigator.py`) — Checks that each chunk's *text* contains at least one query entity as a literal mention. Multi-word entities (e.g. `"Scott Derrickson"`) match if the full phrase appears OR individual tokens ≥ 5 characters appear as whole words (`\b...\b`). Single-token entities are only checked if length ≥ 5 (avoids false positives from short stopwords like `"Were"` or `"Wood"`). **Safety fallback:** if all chunks are filtered, all are returned (context is never empty).
-
-6. **Context-shrinkage guard** — Ensures the final context set does not drop below a minimum size threshold. Prevents edge cases where aggressive upstream filters produce an empty context window.
+BM25 (`rank_bm25`) is the third RRF lane. The index is built lazily from a cached pandas DataFrame of the LanceDB table on the first query (no extra disk scan). BM25 scores are normalised to `[0, 1]` for clean RRF integration. Because BM25 operates on raw term-frequency statistics, it is unaffected by the *score compression* exhibited by `nomic-embed-text` (where most text-pair similarities cluster in the 0.74–0.78 band). Exact-match queries (award names, titles, identifiers) that embed poorly therefore surface reliably via BM25.
 
 #### 3.5.4 ImprovedQueryEntityExtractor
 
-Extrahiert Entitäten aus der Query konsistent mit der Ingestion-Zeit-Extraktion.
+Extracts entities from queries consistently with ingestion-time extraction:
 
 ```python
 class ImprovedQueryEntityExtractor:
-    def __init__(self, gliner_model=None, spacy_model: str = "en_core_web_sm")
-    def extract(self, query: str, confidence_threshold: float = 0.2) -> List[str]
+    def __init__(self, gliner_model=None, spacy_model: str = "en_core_web_sm"): ...
+    def extract(self, query: str, confidence_threshold: float = 0.2) -> List[str]: ...
 ```
 
-**Wichtige Designentscheidungen (Stand 2026-04-02):**
-- Lädt `gliner_small-v2.1` **eigenständig** via `_get_gliner_model()` wenn kein Modell übergeben wird (Prozess-Level-Cache)
-- Verwendet **identische Entity Types wie Ingestion**: `["person", "organization", "city", "country", "film", "movie", "work of art", "event"]`
-- **Threshold 0.2** (nicht 0.5): Queries sind kurze Sätze → GLiNER-Scores systematisch niedriger als bei langen Chunk-Texten
-- **Modul-Level-Cache** `_GLINER_MODEL_CACHE`: Modell wird pro Prozess nur einmal geladen (7.5s cold start, danach <1ms)
-
-> **Kritisches Problem bis 2026-04-02:** `StorageConfig(enable_entity_extraction=False)` ist der Default. `ImprovedQueryEntityExtractor` bekam dadurch `gliner_model=None` und fiel auf SpaCy zurück — obwohl GLiNER installiert ist. Symptom: `"Were Scott Derrickson"` statt `"Scott Derrickson"` als extrahierte Entität. Behoben durch eigenständiges Laden in `_load_gliner()`. Siehe Abschnitt 12.7.
+Design properties:
+- Loads `gliner_small-v2.1` independently via `_get_gliner_model()` (process-level cache with double-checked locking) when no model is supplied.
+- Uses the **same entity types as ingestion** to guarantee consistent normalisation.
+- Default threshold is **0.2** rather than 0.5: queries are short, so GLiNER scores are systematically lower than on chunk-length text.
+- A module-level cache (`_GLINER_MODEL_CACHE`) keeps the cold-start cost (~7.5 s) to once per process; thereafter calls return in < 1 ms.
+- Handles offline / air-gapped environments by retrying with `HF_HUB_OFFLINE=1` if the initial load fails on a network call.
 
 #### 3.5.5 HybridRetriever
 
@@ -632,34 +499,26 @@ class HybridRetriever:
         config: RetrievalConfig,
         hybrid_store: HybridStore,
         embeddings: BatchedOllamaEmbeddings,
-    )
+    ): ...
     def retrieve(
         self,
         query: str,
         top_k: Optional[int] = None,
-        entity_hints: Optional[List[str]] = None,   # Pre-extracted entities (bypass GLiNER)
-    ) -> Tuple[List[RetrievalResult], RetrievalMetrics]
+        entity_hints: Optional[List[str]] = None,
+    ) -> Tuple[List[RetrievalResult], RetrievalMetrics]: ...
 ```
 
-> **`entity_hints` parameter:** When provided, the retriever uses these entity names directly for graph search instead of running GLiNER on the sub-query. This is critical for iterative multi-hop retrieval (Section 12.18), where bridge entities are discovered at runtime and passed to the next hop. Without this, GLiNER fails on short sub-query fragments (3–5 words) that lack context for reliable NER.
+The `entity_hints` parameter is essential for iterative multi-hop retrieval: when supplied, the retriever uses the provided entity names directly for graph search, bypassing GLiNER on short sub-query fragments where NER is unreliable. Bridge entities discovered at runtime by the controller are passed through this parameter to subsequent hops.
 
-**`RetrievalMetrics`** (output dataclass):
+`RetrievalMetrics` carries `total_time_ms`, `vector_time_ms`, `graph_time_ms`, `n_vector_results`, `n_graph_results`, `n_final_results`, and `retrieval_mode`.
 
-| Field | Type | Description |
-|---|---|---|
-| `total_time_ms` | `float` | End-to-end retrieval latency |
-| `vector_time_ms` | `float` | Vector search latency |
-| `graph_time_ms` | `float` | Graph traversal latency |
-| `n_vector_results` | `int` | Results before fusion |
-| `n_graph_results` | `int` | Results before fusion |
-| `n_final_results` | `int` | Results after filter |
-| `retrieval_mode` | `str` | Active mode |
+> **Filter ownership.** Pre-generative filtering is a **Logic Layer** concern owned by the Navigator (§4.2). The data layer is intentionally filter-free: it returns ranked candidates, not curated context.
 
 ---
 
 ## 4. Logic Layer — Artifact B
 
-The logic layer implements a three-agent reasoning pipeline. Each agent is independently instantiable and testable. The agents communicate via typed dataclass contracts.
+The logic layer implements a three-agent reasoning pipeline. Each agent is independently instantiable and testable. Agents communicate via typed dataclass contracts.
 
 ```
 Query ──► S_P (Planner) ──► RetrievalPlan
@@ -676,113 +535,124 @@ Query ──► S_P (Planner) ──► RetrievalPlan
 
 ### 4.1 Planner Agent (S_P)
 
-**File:** `src/logic_layer/planner.py`
+**File:** [src/logic_layer/planner.py](src/logic_layer/planner.py)
 
-The Planner analyses the incoming query and produces a structured `RetrievalPlan` that directs subsequent retrieval.
+The Planner analyses the incoming query and produces a structured `RetrievalPlan`. Classification is rule-based (SpaCy `Matcher` over dependency parses + NER), keeping latency below 10 ms.
 
 #### 4.1.1 Query Classification
 
-Six query types are distinguished:
-
-| Type | Description | Typical Indicator |
+| Type | Description | Indicator example |
 |---|---|---|
-| `SINGLE_HOP` | Direct fact lookup | Simple subject-predicate-object |
-| `MULTI_HOP` | Bridge entity required | "Who was the director of X and where was he born?" |
-| `COMPARISON` | Compare two entities | "Which is larger: X or Y?" |
-| `TEMPORAL` | Time-constrained | "When did…", "Before/after…" |
-| `AGGREGATE` | Set operations | "How many…", "All countries that…" |
+| `SINGLE_HOP` | Direct fact lookup | Simple subject–predicate–object |
+| `MULTI_HOP` | Bridge entity required | "Who directed X and where was he born?" |
+| `COMPARISON` | Comparison of two entities | "Which is larger: X or Y?" |
+| `TEMPORAL` | Time-constrained reasoning | "When did…", "Before/after…" |
+| `AGGREGATE` | Set/count operations | "How many…", "All countries that…" |
 | `INTERSECTION` | Common attributes | "What do X and Y have in common?" |
-
-Classification is performed using a rule-based SpaCy pipeline (dependency parsing + named entity recognition) without an LLM call, keeping latency below 10 ms.
 
 #### 4.1.2 RetrievalPlan
 
 ```python
 @dataclass
 class RetrievalPlan:
-    original_query: str              # The unmodified input query
+    original_query: str
     query_type: QueryType
-    strategy: RetrievalStrategy      # VECTOR_ONLY | GRAPH_ONLY | HYBRID
+    strategy: RetrievalStrategy        # VECTOR_ONLY | GRAPH_ONLY | HYBRID
     confidence: float
-
-    entities: List[EntityInfo]       # Named entities extracted from query (SpaCy)
-    hop_sequence: List[HopStep]      # Decomposed sub-queries for multi-hop
-    sub_queries: List[str]           # Flat list of sub-query strings
-
+    entities: List[EntityInfo]         # SpaCy-extracted entities
+    hop_sequence: List[HopStep]
+    sub_queries: List[str]
     temporal_constraints: Dict[str, Any]
     comparison_pairs: List[Tuple[str, str]]
     estimated_hops: int = 1
     metadata: Dict[str, Any] = field(default_factory=dict)
-    cached_answer: Optional[str] = None   # For early-exit short-circuit
+    cached_answer: Optional[str] = None   # Early-exit short-circuit
 ```
 
-**`EntityInfo`** (dataclass):
+`EntityInfo` carries `text`, `label`, `confidence`, character offsets, and an `is_bridge` flag. `HopStep` carries `step_id`, `sub_query`, `target_entities`, `depends_on` (other `step_id`s that must complete first), and `is_bridge`.
 
-| Field | Type | Description |
-|---|---|---|
-| `text` | `str` | Surface form of the entity |
-| `label` | `str` | SpaCy NER label (e.g. `PERSON`, `ORG`) |
-| `confidence` | `float` | Detection confidence |
-| `start_char` | `int` | Start character offset in query |
-| `end_char` | `int` | End character offset in query |
-| `is_bridge` | `bool` | Multi-hop indicator |
+#### 4.1.3 Sub-Query Decomposition
 
-**`HopStep`** (dataclass — for multi-hop decomposition):
+The `_decompose_comparison()` rewrites comparison queries into per-entity factual sub-queries via a fixed regex map (`_ATTR_MAP`):
 
-| Field | Type | Description |
-|---|---|---|
-| `step_id` | `int` | Step index (0-based) |
-| `sub_query` | `str` | Decomposed sub-question |
-| `target_entities` | `List[str]` | Entity names targeted in this hop |
-| `depends_on` | `List[int]` | `step_id`s that must complete before this step |
-| `is_bridge` | `bool` | Whether this step retrieves a bridge entity |
+| Pattern | Template |
+|---|---|
+| `same nationality` | `"What is the nationality of {entity}?"` |
+| `same birthplace` | `"Where was {entity} born?"` |
+| `same profession` | `"What is the profession of {entity}?"` |
+| `same genre` | `"What genre is {entity}?"` |
+| `same age` | `"When was {entity} born?"` |
+| `same country` | `"What country is {entity} from?"` |
+| `same religion` | `"What is the religion of {entity}?"` |
+| `born in the same` | `"Where was {entity} born?"` |
 
-#### 4.1.3 Strategy Selection
+Multi-hop decomposition follows pattern matchers C, D, and E:
+- **Pattern C** detects `"for a/an/the [film|movie|show|…]"` constructions.
+- **Pattern D** detects `"[role] with [qualifier] co-wrote/directed/…"` constructions where the bridge is a work, not a person.
+- **Pattern E** is a relational-anchor fallback: when no other split matches, `the [role] of [Entity]` is decomposed into a bridge sub-query (`"Who is the {role} of {anchor}?"`) followed by the original query as the final hop. The role vocabulary is the class constant `_RELATIONAL_ANCHOR_ROLES` (~25 nouns).
+
+#### 4.1.4 Strategy Selection
 
 ```
-if query_type == MULTI_HOP or entities.any(is_bridge=True):
+if query_type == MULTI_HOP or any(entity.is_bridge for entity in entities):
     strategy = HYBRID
-elif query_type in {SINGLE_HOP, COMPARISON} and entities.count >= 2:
+elif query_type in {SINGLE_HOP, COMPARISON} and len(entities) >= 2:
     strategy = HYBRID
-elif graph_search not available:
+elif graph not available:
     strategy = VECTOR_ONLY
 else:
-    strategy = HYBRID   # default
+    strategy = HYBRID
 ```
+
+> **Known limitation.** SpaCy's `en_core_web_sm` is loaded at module import time using a hard-coded default. The `PlannerConfig.spacy_model` setting (read after import) cannot override this. The active default matches `settings.yaml`, so the limitation has no current effect; a deferred lazy-load refactor would lift it.
 
 ---
 
 ### 4.2 Navigator Agent (S_N)
 
-**File:** `src/logic_layer/navigator.py`
+**File:** [src/logic_layer/navigator.py](src/logic_layer/navigator.py)
 
-The Navigator executes the retrieval plan produced by S_P and returns a filtered context window for S_V.
+The Navigator executes the plan produced by S_P, performs RRF fusion across sub-query result lists, and applies the pre-generative filter chain that produces the context window for S_V.
 
 #### 4.2.1 ControllerConfig
+
+`ControllerConfig` (defined in [_config.py](src/logic_layer/_config.py)) is the shared configuration dataclass that backs both the Navigator and the AgenticController:
 
 ```python
 @dataclass
 class ControllerConfig:
-    # LLM Settings — emergency fallbacks; live values from settings.yaml
-    model_name: str = "qwen2:1.5b"            # settings.yaml: llm.model_name
+    # LLM settings (emergency fallbacks; live values from settings.yaml)
+    model_name: str = "qwen2:1.5b"
     base_url: str = "http://localhost:11434"
-    temperature: float = 0.0                   # 0.0 = fully deterministic
+    temperature: float = 0.0
 
-    # Pipeline Settings
-    max_verification_iterations: int = 2       # settings.yaml: agent.max_verification_iterations
+    # Pipeline
+    max_verification_iterations: int = 1   # 1 = no self-correction (default)
 
-    # Navigator Settings (pre-generative filtering, thesis section 3.3)
-    relevance_threshold_factor: float = 0.85   # Raised from 0.6; see §12.16
+    # Navigator: pre-generative filtering
+    relevance_threshold_factor: float = 0.6
     redundancy_threshold: float = 0.8
-    max_context_chunks: int = 10
-    rrf_k: int = 60                            # Cormack et al. (2009). SIGIR.
-    top_k_per_subquery: int = 10
-    max_chars_per_doc: int = 500
+    max_context_chunks: int = 8
+    rrf_k: int = 60
+    top_k_per_subquery: int = 20
+    max_chars_per_doc: int = 800
+
+    # Cross-source corroboration weights (RRF fusion)
     corroboration_source_weight: float = 0.1
     corroboration_query_weight: float = 0.05
+
+    # Numeric contradiction filter
     contradiction_overlap_threshold: float = 0.3
     contradiction_ratio_threshold: float = 2.0
-    contradiction_min_value: float = 10.0
+    contradiction_min_value: float = 100.0
+
+    # Stage 2.5 cross-encoder reranker
+    enable_reranker: bool = True
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    reranker_top_k: int = 10
+
+    @classmethod
+    def from_yaml(cls, config: Dict[str, Any]) -> "ControllerConfig": ...
 ```
 
 #### 4.2.2 NavigatorResult
@@ -790,159 +660,282 @@ class ControllerConfig:
 ```python
 @dataclass
 class NavigatorResult:
-    query: str
-    filtered_context: List[str]              # Filtered chunk texts
-    retrieval_metadata: Dict[str, Any]       # Per-chunk metadata
-    retrieval_metrics: RetrievalMetrics      # Timing & counts
+    filtered_context: List[str]      # Aligned with `scores`
+    raw_context: List[str]           # Pre-filter chunks from RRF fusion
+    scores: List[float]
+    metadata: Dict[str, Any]         # Per-filter counts, provenance
 ```
 
-> `filtered_context` is the key field consumed by `benchmark_datasets.py` to measure *retrieval coverage*: a query is "covered" if `len(filtered_context) > 0`.
+`filtered_context` is the field consumed by `benchmark_datasets.py` to compute *retrieval coverage*: a query is "covered" iff `len(filtered_context) > 0`.
 
 #### 4.2.3 Retrieval Execution
 
 ```
-Input:  RetrievalPlan
-Output: NavigatorResult
-
-SIMPLE (no bridge dependencies):
+SIMPLE PATH (no bridge dependencies):
   For each sub_query in plan.hop_sequence:
-    a. embed(sub_query) → query_embedding
-    b. vector_search(query_embedding, top_k=20)          ~8–12ms
-    c. if strategy ∈ {GRAPH, HYBRID}:
-          entities = entity_hints or extract_entities(sub_query)  ~3–5ms
-          graph_search(entities, max_hops=2)                      ~1–30ms
-  → RRF fusion → PreGenerativeFilter → top-K chunks
+    a. embed(sub_query) → q_emb
+    b. vector_search(q_emb, top_k=20)
+    c. bm25_search(sub_query, top_k=20)            (if enabled)
+    d. graph_search(entity_hints, max_hops=2)
+  → RRF fusion across sub-queries → filter chain → top-K chunks
 
-ITERATIVE (bridge dependencies detected, see Section 12.18):
+ITERATIVE PATH (any HopStep.depends_on is non-empty):
   Sort hop_sequence by step_id
-  current_hints = plan.entities (SpaCy-extracted)
-  accumulated_context = []
+  current_hints      = plan.entities
+  accumulated_chunks = []
 
   for step in sorted_hops:
     sub_results = retrieve(step.sub_query, entity_hints=current_hints)
-    accumulated_context += deduplicate(sub_results)
+    accumulated_chunks += deduplicate(sub_results)
 
     if step.is_bridge:
-      bridge_entities = _extract_bridge_entities(sub_results, exclude=query_tokens)
-      if bridge_entities:
-        current_hints = current_hints ∪ bridge_entities  (up to 3 new entities)
+      bridge = _extract_bridge_entities(sub_results, exclude=query_tokens)
+      current_hints = current_hints ∪ bridge      # capped at 3 new entities
 
-  → PreGenerativeFilter(accumulated_context) → top-K chunks
+  → filter chain on accumulated_chunks → top-K chunks
 ```
 
-The iterative path activates when any `HopStep.depends_on` is non-empty. It resolves the *hidden bridge entity problem*: the answer to hop 0 becomes the graph search key for hop 1, enabling retrieval of the answer document even when the bridge entity was unknown at query time.
+The iterative path resolves the *hidden bridge entity problem*: the answer to hop 0 becomes the graph-search key for hop 1, enabling retrieval of an answer document even when the bridge entity was unknown at query time.
+
+#### 4.2.4 Pre-Generative Filter Chain
+
+After RRF fusion, the Navigator runs **six sequential filters**, with an **optional Stage 2.5 cross-encoder reranker** between fusion and Stage 1:
+
+| Stage | Filter | Mechanism |
+|---|---|---|
+| **2.5** | Cross-encoder reranker (optional) | `cross-encoder/ms-marco-MiniLM-L-6-v2` re-scores top-K fused chunks by `(query, chunk)` relevance. Lazy-loaded; ~22 MB; ~30 ms per pair on CPU. Toggle via `navigator.enable_reranker`. |
+| **1** | Relevance filter | Keep chunks with `rrf_score ≥ relevance_threshold_factor × max_score`. Default factor `0.6` is calibrated for `nomic-embed-text` score compression. |
+| **2** | Redundancy filter | Drop pairs with Jaccard token-set similarity > `redundancy_threshold` (default `0.8`). |
+| **3** | Contradiction filter | Numeric heuristic: chunks with high word overlap (`> 0.3`) but strongly differing numeric values (`max/min > 2.0`, both `≥ 100`) are flagged; the lower-RRF chunk is dropped. The `min_value=100` floor prevents day-of-month vs. year false positives. |
+| **4** | Entity-overlap pruning | Drop chunks whose entity set is a strict subset of a higher-ranked chunk's entity set (original contribution). |
+| **5** | Entity-mention filter | Each surviving chunk must literally contain at least one query entity. Multi-word entities match on the full phrase OR on individual tokens of length ≥ 8 characters; single-token entities require length ≥ 5. **Safety fallback:** if the filter would empty the context, all chunks are returned unmodified. |
+| **6** | Context shrinkage | Per-chunk truncation to `max_chars_per_doc` (default 800) with sentence-boundary awareness. |
+
+The filter chain is pure Python and adds < 6 ms to retrieval latency in typical operation. Each filter logs its before/after chunk count for traceability.
 
 ---
 
 ### 4.3 Verifier Agent (S_V)
 
-**File:** `src/logic_layer/verifier.py`
+**File:** [src/logic_layer/verifier.py](src/logic_layer/verifier.py)
 
-The Verifier receives the filtered context window and is responsible for generating a factually grounded answer and verifying its consistency.
+The Verifier consumes the filtered context window, generates a grounded answer, and optionally self-corrects.
 
 #### 4.3.1 VerifierConfig
+
+All values are loaded from `config/settings.yaml` via `_verifier_config_from_cfg()` in `agent_pipeline.py`. Class-level defaults are emergency fallbacks only.
 
 ```python
 @dataclass
 class VerifierConfig:
     model_name: str = "qwen2:1.5b"
     base_url: str = "http://localhost:11434"
-    temperature: float = 0.1
-    max_tokens: int = 200            # Increased from 50; prevents answer truncation
-    max_iterations: int = 2          # Initial generation + 1 correction round
-    max_context_chars: int = 2400    # Total chars fed to LLM (~600 tokens)
-    max_docs: int = 6                # Maximum number of context documents
-    max_chars_per_doc: int = 500     # Characters per individual document (raised from 400)
+    temperature: float = 0.0
+    max_tokens: int = 200
+    max_iterations: int = 1            # 1 = single generation, no self-correction loop
+    max_context_chars: int = 3500
+    max_docs: int = 5
+    max_chars_per_doc: int = 800
+    # Pre-validation
+    enable_entity_path_validation: bool = True
+    enable_credibility_scoring: bool = True
+    entity_coverage_threshold: float = 0.34
+    # Credibility weights (must sum to 1.0)
+    credibility_weight_cross_ref: float = 0.4
+    credibility_weight_entity_freq: float = 0.3
+    credibility_weight_provenance: float = 0.3
 ```
-
-> **Wichtig:** Alle `VerifierConfig`-Werte werden durch `_verifier_config_from_cfg()` in `agent_pipeline.py` aus `config/settings.yaml` gelesen. Die Klassen-Defaults sind Fallback-Werte und sollten nie direkt im Code überschrieben werden.
 
 #### 4.3.2 ValidationStatus
 
 ```python
 class ValidationStatus(Enum):
-    VALID = "valid"               # Context is sufficient
-    AMBIGUOUS = "ambiguous"       # Partial evidence
-    CONFLICTED = "conflicted"     # Contradictory evidence
-    INSUFFICIENT = "insufficient" # No evidence found
+    VALID = "valid"
+    AMBIGUOUS = "ambiguous"
+    CONFLICTED = "conflicted"
+    INSUFFICIENT = "insufficient"
 ```
 
-#### 4.3.3 Self-Correction Loop
+#### 4.3.3 Pre-Generation Validation
 
-Der Self-Correction-Loop befindet sich **vollständig innerhalb von `Verifier.generate_and_verify()`** und ist der wissenschaftliche Kernbeitrag von Artifact B.
+Three checks run before generation:
+
+1. **Entity-Path Validation.** Verifies that the retrieved chunks cover the query entities. With a KuzuDB graph store available, `find_chunks_by_entity_multihop()` is used; otherwise the check falls back to substring matching. The required coverage fraction is `entity_coverage_threshold` (default 0.34) — for 3-entity bridge queries, 1/3 lets the gold chunk pass on the first hop while the bridge entity is still unknown.
+2. **Contradiction Detection.** A numeric-divergence heuristic over consecutive chunk pairs (O(n)) is the offline default. The NLI-based check (Reimers & Gurevych 2019 cross-encoder) is disabled by default to honour the edge constraint (~270 MB model download).
+3. **Source Credibility Scoring.** Weighted combination of `cross_ref_score` (0.4), `entity_freq_score` (0.3), and `provenance_score` (0.3). The provenance signal is currently always derived from a baseline because the Navigator does not forward retrieval-source metadata to S_V — a documented limitation.
+
+#### 4.3.4 Question-Relevance Reordering
+
+Before formatting the prompt, `Verifier._reorder_by_question_relevance(query, context)` stable-sorts context chunks by query content-word overlap (substring count of tokens of length ≥ 4 after stopword filtering). This counters the position bias of small LLMs (qwen2:1.5b strongly favours the first plausible entity it sees) and ensures the most lexically aligned chunk appears first. RRF scores are preserved; only the LLM display order is changed.
+
+#### 4.3.5 Generation and Self-Correction Loop
 
 ```
-# Verifier.generate_and_verify(query, context)
-
 pre_validate(context) → PreValidationResult
-
 if status == INSUFFICIENT:
-    return fallback_answer("I cannot determine the answer from the provided context.")
+    return fallback("I cannot determine the answer from the provided context.")
 
-# Schritt 1: Initiale Antwortgenerierung
 context_str = build_context(context, max_chars=max_context_chars,
                             max_docs=max_docs, max_chars_per_doc=max_chars_per_doc)
-answer = call_llm(GENERATION_PROMPT, query, context_str)   # qwen2:1.5b via Ollama
+answer = call_llm(GENERATION_PROMPT, query, context_str)
 
-# Schritt 2: Bis zu (max_iterations - 1) Korrektur-Runden
-# Bei max_iterations=2: maximal 1 Korrektur-Runde
+# With max_iterations=1 (default) the loop body never runs; raise to ≥ 2
+# for the self-correction ablation comparison.
 for iteration in range(1, max_iterations):
-    is_valid, violations = verify(query, answer, context)  # NLI consistency check
+    is_valid, violations = verify_claims(query, answer, context)
     if is_valid:
         break
-    # Korrektur-Prompt enthält konkrete Verletzungen als Feedback
     answer = call_llm(CORRECTION_PROMPT, query, context_str, violations)
 
 return VerificationResult(answer, confidence, iterations_used)
 ```
 
-> **Architekturentscheidung (2026-03-31):** Ein früherer äußerer Wiederholungs-Loop in `AgentPipeline.process()` wurde entfernt. Dieser rief `generate_and_verify()` mehrfach mit identischem Input auf, was keine echte Selbstkorrektur darstellte. Die Selbstkorrektur findet ausschließlich im inneren Loop des Verifiers statt, der bei jeder Iteration konkrete Verletzungen als Feedback übergibt (CORRECTION_PROMPT).
+The correction prompt embeds concrete claim-level violations as feedback (Madaan et al. 2023, *Self-Refine*). On a 1.5 B-parameter SLM the second pass tends to inject hallucinations rather than correct them, so the default is a single pass; the loop is opt-in for ablation.
 
-**`VerificationResult`** (output dataclass):
+#### 4.3.6 VerificationResult
 
-| Field | Type | Description |
+```python
+@dataclass
+class VerificationResult:
+    answer: str
+    confidence: ConfidenceLevel        # HIGH | MEDIUM | LOW
+    iterations: int
+    sources: List[str]
+    self_corrections: int
+```
+
+`ConfidenceLevel` is derived from the verified-claim ratio (`≥ 0.8 → HIGH`, `≥ 0.5 → MEDIUM`, otherwise `LOW`).
+
+---
+
+### 4.4 Agentic Controller
+
+**File:** [src/logic_layer/controller.py](src/logic_layer/controller.py)
+
+`AgenticController` orchestrates the S_P → S_N → S_V chain as a state machine. It supports two execution modes:
+
+- **LangGraph mode** — `StateGraph` workflow used when `langgraph` is importable.
+- **Sequential fallback** — `_run_simple_pipeline`, always available; used for the thesis evaluation.
+
+Both modes produce an identical `AgentState` result. LangGraph is therefore an optional dependency.
+
+#### 4.4.1 AgentState
+
+```python
+class AgentState(TypedDict):
+    # Input
+    query: str
+    # Planner output
+    retrieval_plan: NotRequired[Optional[Dict[str, Any]]]
+    sub_queries: List[str]
+    entities: List[str]
+    query_type: str
+    # Navigator output
+    raw_context: List[str]
+    context: List[str]
+    retrieval_scores: List[float]
+    retrieval_metadata: Dict[str, Any]
+    # Verifier output
+    answer: str
+    iterations: int
+    verified_claims: List[str]
+    violated_claims: List[str]
+    all_verified: bool
+    pre_validation: NotRequired[Optional[Dict[str, Any]]]
+    # Metadata
+    total_time_ms: float
+    errors: List[str]
+    stage_timings: Dict[str, float]
+```
+
+#### 4.4.2 State Machine
+
+```
+START
+  ▼
+_planner_node()    → populates RetrievalPlan in state
+  ▼
+_navigator_node()  → inspects hop_sequence for bridge dependencies
+  │                  ├─ has_bridge_deps=False → _simple_navigate()
+  │                  └─ has_bridge_deps=True  → _iterative_navigator_node()
+  ▼
+_verifier_node()   → calls Verifier with accumulated context
+  ▼
+END
+```
+
+#### 4.4.3 Iterative Navigator Node
+
+Activates when any `HopStep.depends_on` is non-empty:
+
+1. Sort hops by `step_id`.
+2. Execute hops in dependency order via `Navigator.navigate_step(step.sub_query, entity_hints=current_hints)`.
+3. After each `is_bridge=True` step, call `_extract_bridge_entities(results, exclude=query_tokens)` and append the discovered entities to `current_hints` (capped at 3 per step).
+4. After all hops, run the pre-generative filter chain on the accumulated context.
+
+#### 4.4.4 Bridge Entity Extraction
+
+`_extract_bridge_entities(chunks, exclude)`:
+- **Pass 1 (surname-anchor):** for each known entity (e.g., `"Kasper Schmeichel"`), extract surname tokens of length ≥ 6 (`"Schmeichel"`) and run a Unicode-aware regex `[FirstName] [OptionalMiddle]? [Surname]` over all chunks — recovers names containing diacritics that would otherwise break ASCII-only patterns. Candidates whose first token contains `:` are rejected (filters out `[About: …]` annotation artifacts).
+- **Pass 2 (general):** capitalised multi-word phrases (`\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b`), excluding tokens already in the original query.
+- Returns up to 3 candidates ranked by frequency in the retrieved chunks.
+- **Fallback:** if extraction yields nothing, the original `entity_hints` are retained unchanged.
+
+#### 4.4.5 Safety Constraints
+
+| Constraint | Value | Reason |
 |---|---|---|
-| `answer` | `str` | Final generated answer |
-| `confidence` | `ConfidenceLevel` | `HIGH` \| `MEDIUM` \| `LOW` |
-| `iterations` | `int` | Self-correction iterations used |
-| `sources` | `List[str]` | Source document references |
-| `self_corrections` | `int` | Number of corrections applied |
+| Maximum iterative hops | 3 | Bounds graph fan-out and total latency |
+| Bridge entities added per step | 3 | Prevents combinatorial explosion in graph search |
+| Empty-bridge fallback | retain prior hints | Graceful degradation to single-hop behaviour |
 
 ---
 
 ## 5. Pipeline Layer
 
-The pipeline layer contains two orchestration implementations: the original `AgentPipeline` (simple sequential chain) and the newer `AgenticController` (LangGraph state machine with iterative multi-hop support). Both expose a compatible `process(query)` interface.
+The pipeline layer provides two orchestrators with compatible `process(query)` interfaces: `AgentPipeline` (a thin sequential chain used by the benchmark and ingestion CLIs) and `AgenticController` (the LangGraph state machine, §4.4). Either is acceptable as the production entry point; `AgentPipeline` is the simpler choice when iterative multi-hop is not required.
 
 ### 5.1 Agent Pipeline
 
-**File:** `src/pipeline/agent_pipeline.py`
+**File:** [src/pipeline/agent_pipeline.py](src/pipeline/agent_pipeline.py)
 
-`AgentPipeline` is the top-level orchestrator that chains S_P → S_N → S_V and exposes a single `process()` method.
+`AgentPipeline` chains S_P → S_N → S_V and exposes a single `process()` method.
 
-#### 5.1.1 PipelineResult
+#### 5.1.1 AgentPipelineConfig
+
+```python
+@dataclass
+class AgentPipelineConfig:
+    enable_planner: bool = True            # ablation toggle
+    enable_verifier: bool = True           # ablation toggle
+    enable_caching: bool = True
+    cache_max_size: int = 1000             # FIFO eviction
+
+    @classmethod
+    def from_yaml(cls, config: Dict[str, Any]) -> "AgentPipelineConfig": ...
+```
+
+#### 5.1.2 PipelineResult
 
 ```python
 @dataclass
 class PipelineResult:
     answer: str
-    confidence: str                    # "high" | "medium" | "low"
+    confidence: str                        # "high" | "medium" | "low"
     query: str
     planner_result: Dict[str, Any]
-    navigator_result: Dict[str, Any]   # contains "filtered_context" key
+    navigator_result: Dict[str, Any]       # contains "filtered_context"
     verifier_result: Dict[str, Any]
     planner_time_ms: float
     navigator_time_ms: float
     verifier_time_ms: float
     total_time_ms: float
-    early_exit_used: bool = False
     cached_result: bool = False
-
-    def to_dict(self) -> Dict[str, Any]
-    def to_json(self, indent: int = 2) -> str
+    def to_dict(self) -> Dict[str, Any]: ...
+    def to_json(self, indent: int = 2) -> str: ...
 ```
 
-#### 5.1.2 AgentPipeline
+#### 5.1.3 AgentPipeline
 
 ```python
 class AgentPipeline:
@@ -953,210 +946,191 @@ class AgentPipeline:
         verifier: Optional[Verifier] = None,
         hybrid_retriever: Optional[HybridStore] = None,
         graph_store: Optional[KuzuGraphStore] = None,
-        enable_early_exit: bool = True,
         enable_caching: bool = True,
         cache_max_size: int = 1000,
         config: Optional[Dict] = None,
-    )
-
-    def process(self, query: str) -> PipelineResult
-    def get_stats(self) -> Dict[str, Any]
-    def clear_cache(self) -> None
+    ): ...
+    def process(self, query: str) -> PipelineResult: ...
+    def get_stats(self) -> Dict[str, Any]: ...
+    def clear_cache(self) -> None: ...
 ```
 
-**Optimisations:**
-
-| Feature | Mechanism | Effect |
+| Optimisation | Mechanism | Effect |
 |---|---|---|
-| Early Exit | Detects trivial queries with confidence > 0.95 | Skips S_N and S_V |
-| Result Cache | LRU cache (size=1000) keyed on query string | Zero-cost repeated queries |
-| Lazy Init | Agents are instantiated on first `process()` call | Reduced startup time |
+| Result cache | SHA-256-keyed FIFO cache (size 1000) on the normalised query string | Zero-cost repeated queries during evaluation |
+| Lazy initialisation | Agents are constructed on first `process()` call | Reduced startup time |
 
-> **Architekturhinweis:** `AgentPipeline.process()` ruft `verifier.generate_and_verify()` **genau einmal** auf. Es gibt keinen äußeren Wiederholungs-Loop auf Pipeline-Ebene. Der Self-Correction-Mechanismus (Thesis-Beitrag) findet ausschließlich **innerhalb des Verifiers** statt. `max_verification_iterations` in `settings.yaml` steuert die Anzahl der Korrektur-Runden *im Verifier*, nicht die Anzahl der Pipeline-Durchläufe.
+`AgentPipeline.process()` calls `verifier.generate_and_verify()` **exactly once**; there is no outer pipeline-level retry loop. The self-correction mechanism is the inner loop inside the Verifier (§4.3.5), controlled by `agent.max_verification_iterations` in `settings.yaml`.
 
-**Factory function:**
+#### 5.1.4 Factory
 
 ```python
 def create_full_pipeline(
     hybrid_retriever: HybridStore,
     graph_store: KuzuGraphStore,
     config: Dict,
-) -> AgentPipeline
+) -> AgentPipeline: ...
 ```
 
-This is the primary entry point for external consumers (e.g., `benchmark_datasets.py`).
-
----
-
-### 5.3 AgenticController
-
-**File:** `src/logic_layer/controller.py`
-
-The `AgenticController` is a LangGraph-based state machine that replaces the linear `AgentPipeline` for production use. It models the S_P → S_N → S_V chain as a directed graph of nodes with typed state transitions.
-
-#### 5.3.1 State Machine
-
-```
-START
-  │
-  ▼
-_planner_node()          → Calls Planner; populates RetrievalPlan in state
-  │
-  ▼
-_navigator_node()         → Inspects hop_sequence for bridge dependencies
-  │                          ├─ has_bridge_deps=False → _simple_navigate()
-  │                          └─ has_bridge_deps=True  → _iterative_navigator_node()
-  ▼
-_verifier_node()          → Calls Verifier with accumulated context
-  │
-  ▼
-END
-```
-
-#### 5.3.2 Iterative Navigator
-
-`_iterative_navigator_node(state, hop_sequence, entity_names, plan_dict, start_time)`:
-
-```python
-# Step 1: Sort hops by step_id
-sorted_hops = sorted(hop_sequence, key=lambda h: h.get("step_id", 0))
-
-# Step 2: Execute hops in dependency order
-for step in sorted_hops:
-    results = navigator.navigate_step(step.sub_query, entity_hints=current_hints)
-    accumulated_context += deduplicate(results)   # by chunk_id
-
-    # Step 3: After bridge hop, extract new entities
-    if step.is_bridge:
-        bridge_entities = _extract_bridge_entities(results, exclude=query_tokens)
-        current_hints.extend(bridge_entities)     # max 3 new entities
-
-# Step 4: Apply pre-generative filter to accumulated context
-final_context = navigator.filter(accumulated_context)
-```
-
-#### 5.3.3 Bridge Entity Extraction
-
-`_extract_bridge_entities(chunks, exclude)` — static method:
-- Regex: capitalized multi-word phrases (`\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b`)
-- Excludes: tokens already in the original query
-- Returns up to 3 candidates (prioritised by frequency in retrieved chunks)
-- **Fallback:** if extraction yields nothing, original `entity_hints` are retained unchanged
-
-#### 5.3.4 Safety Constraints
-
-| Constraint | Value | Reason |
-|---|---|---|
-| Max iterative hops | 3 | Prevents unbounded loops |
-| Bridge entity limit | 3 per step | Prevents graph search fan-out |
-| Fallback on empty bridge | retain prior hints | Graceful degradation to single-hop behaviour |
+This is the primary entry point used by `benchmark_datasets.py`.
 
 ---
 
 ### 5.2 Ingestion Pipeline
 
-**File:** `src/pipeline/ingestion_pipeline.py`
+**File:** [src/pipeline/ingestion_pipeline.py](src/pipeline/ingestion_pipeline.py)
 
-Provides an end-to-end workflow from raw documents to a fully indexed `HybridStore`. Used both by `benchmark_datasets.py` and directly.
-
-**Pipeline stages:**
+End-to-end workflow from raw documents to a fully indexed `HybridStore`.
 
 ```
 Documents (paths)
      │
-     ▼ DocumentLoadingPipeline
+     ▼ DocumentLoader
      │   - Multi-format: TXT, JSON, JSONL, MD, PDF
      │   - Streaming iterator (memory-efficient)
      ▼
 Documents (loaded)
      │
-     ▼ ChunkingPipeline
-     │   - SpacySentenceChunker (primary)
-     │   - Fallback: fixed-size chunker
+     ▼ Chunking (SpacySentenceChunker primary; fixed-size fallback)
      ▼
 Chunks
      │
      ▼ EntityExtractionPipeline (optional)
-     │   - GLiNER NER
-     │   - REBEL RE (conditional on ≥2 entities)
+     │   - GLiNER NER → REBEL RE (conditional on ≥ 2 entities)
      ▼
 Chunks + Entities
      │
-     ▼ EmbeddingPipeline
-     │   - BatchedOllamaEmbeddings
-     │   - Cache-aware, batch_size=32
+     ▼ EmbeddingPipeline (BatchedOllamaEmbeddings, batch_size = 32–64)
      ▼
 Chunks + Embeddings
      │
-     ▼ HybridStoragePipeline
+     ▼ HybridStorage
          - VectorStoreAdapter.add_documents()
-         - KuzuGraphStore.add_document_chunk() × N
-         - KuzuGraphStore.add_entity() × M
-         - KuzuGraphStore.add_next_chunk_relation() × (N-1)
+         - KuzuGraphStore.add_chunk_node × N
+         - KuzuGraphStore.add_entity_node × M
+         - KuzuGraphStore.add_relation × R
 ```
+
+```python
+class IngestionPipeline:
+    def __init__(self, config: IngestionConfig): ...
+    def ingest(self, source_path: str) -> IngestionMetrics: ...
+    def ingest_texts(self, texts: List[str], metadatas: List[Dict]) -> IngestionMetrics: ...
+
+def create_ingestion_pipeline(config: Dict[str, Any], use_mocks: bool = False) -> IngestionPipeline: ...
+```
+
+`IngestionMetrics` carries `chunks_added`, `entities_added`, `relations_added`, and `total_time_ms`.
 
 ---
 
 ## 6. Configuration System
 
-**File:** `config/settings.yaml`
+**File:** [config/settings.yaml](config/settings.yaml)
 
-All configurable parameters are centralised in a single YAML file, which acts as the *single source of truth* for all experiments. This is essential for reproducibility.
+All configurable parameters live in a single YAML file, the *single source of truth*. Every Python module reads it via `src/logic_layer/_settings.py` or directly via `yaml.safe_load()`; no values are hard-coded in production code paths.
 
 ```yaml
-# ── EMBEDDING MODEL ────────────────────────────────────────────────────────
 embeddings:
-  model_name: "nomic-embed-text"    # 768-dimensional dense embedding model
+  model_name: "nomic-embed-text"
   base_url: "http://localhost:11434"
   embedding_dim: 768
+  cache_path: "./cache/embeddings.db"
 
-# ── VECTOR STORE ───────────────────────────────────────────────────────────
 vector_store:
   provider: "lancedb"
-  db_path: "./data/vector_db"
-  index_type: "ivfflat"             # Approximate nearest-neighbour index
-  distance_metric: "cosine"         # Required for text embeddings
+  db_path: "./data/vector"
+  distance_metric: "cosine"          # MUST be "cosine" for text embeddings
   normalize_embeddings: true
-  vector_top_k: 10
+  top_k_vectors: 20
   similarity_threshold: 0.3
+  overfetch_factor: 3
+  graph_text_max_chars: 500
 
-# ── KNOWLEDGE GRAPH ────────────────────────────────────────────────────────
 graph:
-  backend: "kuzu"                   # Primary: KuzuDB (Cypher-native)
-  graph_path: "./data/{dataset}/graph"  # Per-dataset KuzuDB directory
+  enabled: true
+  backend: "kuzu"                    # only "kuzu" supported
+  graph_path: "./data/graph"
   max_hops: 2
-  top_k_entities: 5
-  entity_extraction_method: "keyword"   # keyword | spacy | gliner
+  top_k_entities: 10
+  expand_context: true
+  entity_extraction_method: "keyword"  # keyword | spacy | gliner (query-time)
+  relation_types: ["from_source", "next_chunk", "mentions", "related_to"]
 
-# ── RETRIEVAL & RAG ────────────────────────────────────────────────────────
 rag:
-  retrieval_mode: "hybrid"          # vector | graph | hybrid
-  vector_weight: 0.7                # Ablation parameter
-  graph_weight: 0.3                 # Ablation parameter
+  retrieval_mode: "hybrid"           # vector | graph | hybrid
+  rrf_k: 60
+  cross_source_boost: 1.2
+  enable_bm25: true
+  bm25_top_k: 20
 
-# ── LANGUAGE MODEL (LLM) ───────────────────────────────────────────────────
 llm:
   model_name: "qwen2:1.5b"
   base_url: "http://localhost:11434"
-  temperature: 0.1
-  max_tokens: 200              # Erhöht von 50 auf 200; verhindert Antwort-Truncation
-  max_context_chars: 2400      # Total chars for LLM context (~600 tokens)
-  max_docs: 6                  # Maximum context documents
-  max_chars_per_doc: 500       # Characters per document (raised from 400 to reduce key-sentence loss)
+  temperature: 0.0                   # fully deterministic for reproducible thesis runs
+  max_tokens: 200
+  timeout: 60
+  max_context_chars: 3500
+  max_docs: 5
+  max_chars_per_doc: 800
 
-# ── AGENTIC CONTROLLER ─────────────────────────────────────────────────────
+navigator:
+  relevance_threshold_factor: 0.6
+  redundancy_threshold: 0.8
+  max_context_chunks: 8
+  rrf_k: 60
+  top_k_per_subquery: 20
+  corroboration_source_weight: 0.1
+  corroboration_query_weight: 0.05
+  enable_reranker: true
+  reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  reranker_top_k: 10
+  contradiction_overlap_threshold: 0.3
+  contradiction_ratio_threshold: 2.0
+  contradiction_min_value: 100.0
+
+planner:
+  min_entity_confidence: 0.7
+  max_entities: 10
+  enable_bridge_detection: true
+  enable_temporal_parsing: true
+  classifier_spacy_weight: 1.5
+  classifier_entity_boost: 0.5
+  classifier_confidence_base: 0.6
+  classifier_confidence_scale: 0.15
+  classifier_confidence_cap: 0.95
+  classifier_fallback_confidence: 0.8
+  entity_density_threshold: 2
+  noun_density_threshold: 4
+  regex_entity_confidence: 0.75
+
 agent:
-  max_verification_iterations: 2   # 1 initial answer + 1 correction round
-  enable_verification: true
-  relevance_threshold_factor: 0.85  # PreGenerativeFilter: keep within 15% of top score
-  redundancy_threshold: 0.8         # Jaccard dedup threshold
+  max_verification_iterations: 1     # 1 = no self-correction (default)
+  enable_planner: true
+  enable_verifier: true
+  enable_caching: true
+  cache_max_size: 1000
 
-# ── ENTITY EXTRACTION ──────────────────────────────────────────────────────
+verifier:
+  enable_entity_path_validation: true
+  enable_credibility_scoring: true
+  entity_coverage_threshold: 0.34
+  min_credibility_score: 0.5
+  credibility_weight_cross_ref: 0.4
+  credibility_weight_entity_freq: 0.3
+  credibility_weight_provenance: 0.3
+  credibility_cross_ref_max: 3.0
+  credibility_provenance_baseline: 0.5
+  spacy_max_chars: 500
+  confidence_high_threshold: 0.8
+  confidence_medium_threshold: 0.5
+  min_claim_chars: 15
+  max_entities_to_verify: 5
+  max_key_phrases: 10
+
 entity_extraction:
   gliner:
     model_name: "urchade/gliner_small-v2.1"
-    confidence_threshold: 0.15          # Recall-optimised for HotpotQA
-    query_ner_confidence: 0.15          # Query-time threshold (same model, shorter text)
     entity_types:
       - person
       - organization
@@ -1171,12 +1145,20 @@ entity_extraction:
       - landmark
       - event
       - award
+    confidence_threshold: 0.15       # recall-optimised for HotpotQA
+    batch_size: 16
   rebel:
+    model_name: "Babelscape/rebel-large"
+    confidence_threshold: 0.5        # uniform sentinel — REBEL emits no per-triplet score
+    min_entities_for_re: 2
     max_input_length: 256
     max_output_length: 256
-    num_beams: 3
+    num_beams: 5
+  caching:
+    enabled: true
+    cache_path: "./data/entity_cache.db"
+    lru_cache_size: 10000
 
-# ── INGESTION ──────────────────────────────────────────────────────────────
 ingestion:
   chunking_strategy: "sentence_spacy"
   sentences_per_chunk: 3
@@ -1185,283 +1167,134 @@ ingestion:
   extract_entities: true
   add_source_metadata: true
 
-# ── BENCHMARK ──────────────────────────────────────────────────────────────
-benchmark:
-  datasets: ["hotpotqa", "2wikimultihop", "strategyqa"]
-  default_samples: 500
-  ablation_configs:
-    - {name: "vector_only",   vector_weight: 1.0, graph_weight: 0.0}
-    - {name: "graph_only",    vector_weight: 0.0, graph_weight: 1.0}
-    - {name: "hybrid_70_30",  vector_weight: 0.7, graph_weight: 0.3}
-    - {name: "hybrid_50_50",  vector_weight: 0.5, graph_weight: 0.5}
+available_models:
+  - { name: "qwen2:1.5b",  params_b: 1.5, expected_latency_s: 10, safe_60s: true }
+  - { name: "gemma2:2b",   params_b: 2.0, expected_latency_s: 25, safe_60s: true }
+  - { name: "llama3.2:3b", params_b: 3.0, expected_latency_s: 45, safe_60s: true }
+  - { name: "phi3",        params_b: 3.8, expected_latency_s: 55, safe_60s: false }
+  - { name: "qwen3:4b",    params_b: 4.0, expected_latency_s: 35, safe_60s: true }
+
+paths:    { root: "./", data: "./data", documents: "./data/documents",
+            vector_db: "./data/vector", graph_db: "./data/graph",
+            logs: "./logs", cache: "./cache" }
+
+logging:  { level: "INFO", format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            file: "./logs/edge_rag.log" }
+
+performance:
+  batch_size: 64
+  num_workers: 2
+  device: "cpu"
+  cache_embeddings: true
+  max_cache_size_mb: 512
 ```
 
-**Configuration loading** is handled by `benchmark_datasets.load_config_file()` and `ingestion.load_ingestion_config()`. Both functions accept the YAML path and fall back to sensible defaults if the file is absent, ensuring graceful degradation.
+Configuration loading is handled by `_load_settings()` (which logs a `WARNING` on missing keys but returns a usable dict for graceful degradation) and by the `from_yaml()` classmethods on `ControllerConfig`, `VerifierConfig`, and `AgentPipelineConfig`. All three contain dataclass-level defaults that match the values above; production code constructs them via `from_yaml()` so that `settings.yaml` is the unique source of truth.
 
 ---
 
-## 6.x Evaluation Layer — Artifact C
+## 7. Evaluation Framework — Artifact C
 
-**Package:** `src/evaluations/`
+**Package:** [src/evaluations/](src/evaluations/) and [benchmark_datasets.py](benchmark_datasets.py)
 
-The evaluation layer (Artifact C) provides the shared metric functions and experiment runners used across all thesis experiments.
-
-### 6.x.1 Module Overview
-
-| Module | Purpose |
-|---|---|
-| `metrics.py` | Canonical EM and F1 implementations shared by all evaluators |
-| `evaluate_hotpotqa.py` | End-to-end HotpotQA benchmark runner |
-| `ablation_study.py` | Configurable ablation study (vector/graph weights, verifier on/off) |
-| `ollama_performance_diagnostic.py` | Embedding-dimension and LLM latency diagnostics |
-
-### 6.x.2 Metric Functions (`metrics.py`)
-
-All three functions are the single canonical implementation imported via `src.evaluations`:
-
-- **`normalize_answer(s)`** — lowercase, strip articles, punctuation, and whitespace; following the official HotpotQA evaluation script.
-- **`compute_exact_match(pred, gold)`** — normalised string equality with word-boundary substring fallback (handles cases where the gold answer is a proper subset of the predicted span).
-- **`compute_f1(pred, gold)`** — token-level F1 matching the official HotpotQA evaluator (precision × recall harmonic mean over unigram bag-of-words overlap).
-
-### 6.x.3 Ablation Study (`ablation_study.py`)
-
-`AblationStudy.run()` accepts a `pipeline_factory` callable and a list of `(name, vector_weight, graph_weight)` configurations. For each configuration it:
-1. Instantiates a fresh pipeline via `pipeline_factory`.
-2. Evaluates `samples_per_dataset` questions.
-3. Aggregates per-question EM/F1 into a `ConfigurationResult`.
-4. Optionally saves raw JSON, CSV summaries, Markdown report, and LaTeX tables.
-
-Random seed `42` is set at module import (`random.seed(42)`, `numpy.random.seed(42)`) to ensure reproducible question sampling across runs.
-
----
-
-## 7. Benchmark & Evaluation Framework
-
-**File:** `benchmark_datasets.py`
-
-The evaluation framework implements the full experimental pipeline for the thesis ablation study. Datasets are isolated in separate vector stores and graph databases to prevent cross-dataset data leakage—a critical requirement for scientific validity.
+The evaluation layer provides the shared metric functions, dataset loaders, and experiment runners for the thesis evaluation. Datasets are isolated in separate vector stores and graph databases (per-dataset directory under `./data/`) to prevent cross-dataset leakage.
 
 ### 7.1 Supported Datasets
 
-| Dataset | Task Type | Split | Source |
+| Dataset | Task | Split | Source |
 |---|---|---|---|
-| **HotpotQA** | Multi-hop QA (2 documents) | validation (distractor) | `hotpot_qa` on HuggingFace |
+| **HotpotQA** | Multi-hop QA (2 documents) | validation (distractor) | `hotpot_qa` (HuggingFace) |
 | **2WikiMultiHopQA** | Multi-hop QA (2 Wikipedia articles) | validation | `framolfese/2WikiMultihopQA` |
-| **StrategyQA** | Boolean (yes/no) implicit reasoning | train | `ChilleD/StrategyQA` |
+| **StrategyQA** | Boolean implicit-reasoning QA | train | `ChilleD/StrategyQA` |
 
-### 7.2 Data Structures
+### 7.2 Metric Functions
 
-**`TestQuestion`** (dataclass):
+**File:** [src/evaluations/metrics.py](src/evaluations/metrics.py) — canonical implementations consumed by every evaluator.
 
-| Field | Type | Description |
-|---|---|---|
-| `id` | `str` | Dataset-specific ID |
-| `question` | `str` | Natural language question |
-| `answer` | `str` | Gold standard answer |
-| `dataset` | `str` | Source dataset name |
-| `question_type` | `str` | e.g., `"bridge"`, `"comparison"` |
-| `level` | `str` | Difficulty level |
-| `supporting_facts` | `List` | (title, sentence_id) pairs |
+- **`normalize_answer(text)`** — lowercase, strip articles (`a`, `an`, `the`), remove punctuation, collapse whitespace. Matches the official HotpotQA normaliser.
+- **`compute_exact_match(pred, gold)`** — normalised string equality OR word-boundary substring fallback (handles cases where the gold answer is a strict subset of the predicted span).
+- **`compute_f1(pred, gold)`** — token-level F1 over multiset (occurrence-counted, not set) intersection of tokens; precision × recall harmonic mean.
 
-**`EvalResult`** (dataclass):
-
-| Field | Type | Description |
-|---|---|---|
-| `question_id` | `str` | |
-| `predicted_answer` | `str` | System output |
-| `gold_answer` | `str` | Ground truth |
-| `exact_match` | `bool` | Normalised string equality |
-| `f1_score` | `float` | Token-level F1 |
-| `retrieval_count` | `int` | `len(navigator_result["filtered_context"])` |
-| `time_ms` | `float` | End-to-end latency |
-
-**`ConfigResult`** (aggregated per configuration):
-
-| Field | Type | Description |
-|---|---|---|
-| `exact_match` | `float` | EM rate |
-| `f1_score` | `float` | Mean F1 |
-| `coverage` | `float` | Fraction of queries with ≥1 retrieved chunk |
-| `avg_time_ms` | `float` | Mean latency per query |
-| `by_type` | `Dict` | Breakdown per question type |
-
-### 7.3 Evaluation Metrics
-
-**Exact Match (EM):**
 ```
-EM = 1  if  normalize(prediction) == normalize(gold)
-        or  normalize(gold) ∈ normalize(prediction)   [substring match]
-     0  otherwise
+EM = 1 if normalize(pred) == normalize(gold)
+        OR normalize(gold) ∈ normalize(pred)
+     0 otherwise
 
-normalize(text):
-  1. Lowercase
-  2. Remove articles (a, an, the)
-  3. Remove punctuation
-  4. Collapse whitespace
+common  = multiset_intersection(pred_tokens, gold_tokens)
+prec    = |common| / |pred_tokens|
+rec     = |common| / |gold_tokens|
+F1      = 2 * prec * rec / (prec + rec)
 ```
 
-**Token-level F1:**
-```
-common_tokens = multiset_intersection(pred_tokens, gold_tokens)
-precision = |common| / |pred_tokens|
-recall    = |common| / |gold_tokens|
-F1        = 2 * precision * recall / (precision + recall)
+### 7.3 HotpotQA Evaluator
+
+**File:** [src/evaluations/evaluate_hotpotqa.py](src/evaluations/evaluate_hotpotqa.py)
+
+```python
+class HotpotQAEvaluator:
+    def evaluate(self, n_samples: int) -> EvalSummary: ...
+    def run_comparison(self, mode_list: List[str]) -> Dict[str, EvalSummary]: ...
 ```
 
-This metric is consistent with the official HotpotQA evaluation script.
+`EvalResult` carries `question_id`, `question`, `gold_answer`, `predicted_answer`, `exact_match`, `f1_score`, `total_time_ms`. `EvalSummary` aggregates `exact_match_rate`, `avg_f1`, `avg_time_ms`, plus per-type and per-level breakdowns.
 
-### 7.4 CLI Interface
+### 7.4 Ablation Study
+
+**File:** [src/evaluations/ablation_study.py](src/evaluations/ablation_study.py)
+
+```python
+class AblationStudy:
+    def run(self, datasets: List[str], samples: int) -> Dict[str, Dict[str, float]]: ...
+```
+
+For each configuration the runner instantiates a fresh pipeline via the supplied `pipeline_factory`, evaluates `samples_per_dataset` questions, aggregates per-question EM/F1, and emits `config.json`, `raw_results.json`, `summary.csv`, `per_question.csv`, `report.md`, and `latex_tables.tex`. Random seed `42` is set at module import (`random.seed`, `numpy.random.seed`) for reproducible question sampling.
+
+### 7.5 CLI Interface
+
+The top-level driver is `benchmark_datasets.py`:
 
 ```bash
-# Ingest dataset (run once)
-python benchmark_datasets.py ingest \
-  --dataset hotpotqa \
-  --samples 500 \
-  --chunk-sentences 3 \
-  --chunk-overlap 1
+# Ingest one dataset (Phase 1: chunking only)
+python benchmark_datasets.py ingest --dataset hotpotqa --samples 500 \
+       --chunk-sentences 3 --chunk-overlap 1
 
-# Nur Chunks ingestieren, ohne Embeddings neu zu berechnen (schneller bei Re-Ingest)
-python benchmark_datasets.py ingest \
-  --dataset hotpotqa \
-  --samples 500 \
-  --chunks-only
+# Ingest chunks only (skip embedding; faster on re-ingest)
+python benchmark_datasets.py ingest --dataset hotpotqa --samples 500 --chunks-only
 
-# Single configuration evaluation
-python benchmark_datasets.py evaluate \
-  --dataset hotpotqa \
-  --samples 100 \
-  --model qwen2:1.5b \
-  --vector-weight 0.7 \
-  --graph-weight 0.3
+# Single-configuration evaluation
+python benchmark_datasets.py evaluate --dataset hotpotqa --samples 100 \
+       --model qwen2:1.5b --mode hybrid
 
-# Evaluation mit deaktivierten Komponenten (Ablation der Pipeline-Stufen)
-python benchmark_datasets.py evaluate \
-  --dataset hotpotqa \
-  --samples 100 \
-  --no-planner \     # S_P deaktiviert
-  --no-verifier \    # S_V deaktiviert
-  --iterations 1     # Keine Selbstkorrektur
+# Component ablation (toggle individual stages)
+python benchmark_datasets.py evaluate --dataset hotpotqa --samples 100 \
+       --no-planner --no-verifier --iterations 1
 
-# Ablation study (alle Gewichtungskombinationen)
-python benchmark_datasets.py ablation \
-  --dataset hotpotqa \
-  --samples 100
+# Full ablation matrix (all retrieval modes)
+python benchmark_datasets.py ablation --dataset hotpotqa --samples 100
 
-# Komponenten-Ablation (Planner, Verifier, Iterationen)
-python benchmark_datasets.py ablation \
-  --dataset hotpotqa \
-  --samples 100 \
-  --component-ablation
+# Component ablation (Planner / Verifier / iteration counts)
+python benchmark_datasets.py ablation --dataset hotpotqa --samples 100 --component-ablation
 
-# Ingestion status check
+# Status / self-test
 python benchmark_datasets.py status
-
-# System self-test (no network required)
 python benchmark_datasets.py test
 ```
 
-Results of the ablation study are persisted to `evaluation_results/ablation_<timestamp>.json`.
+Results are persisted to `evaluation_results/ablation_<timestamp>.json`.
 
-### 7.5 Diagnostic Tools
+### 7.6 Diagnostic Tooling
 
-Three diagnostic scripts are available for investigating retrieval quality, ingestion consistency, and LLM behaviour.
-
-#### `diagnose.py` — Layer-by-layer pipeline diagnostic
-
-```bash
-# Test all pipeline layers for one question
-python -X utf8 diagnose.py --idx 5
-
-# Graph quality analysis (hub contamination, answer coverage)
-python -X utf8 diagnose.py --graph-quality 20
-
-# Vector score analysis for N questions (no LLM required)
-python -X utf8 diagnose.py --multi 50
-
-# Test a specific layer only
-python -X utf8 diagnose.py --layer retrieval
-python -X utf8 diagnose.py --layer verifier --skip-llm
-```
-
-#### `diagnose_verbose.py` — Trace-mode diagnostic with per-call timing
-
-```bash
-# Full trace including retrieval call timings and chunk scores
-python -X utf8 diagnose_verbose.py --idx 11 --trace-calls
-
-# Skip LLM to focus on retrieval only
-python -X utf8 diagnose_verbose.py --idx 12 --skip-llm
-```
-
-#### `diagnose_ingestion.py` — Ingestion consistency checker
-
-Traces each question's supporting articles through the full ingestion pipeline: `chunks_export.json` → LanceDB → KuzuDB → retrieval rank.
-
-```bash
-# Check ingestion consistency for specific question indices
-python -X utf8 diagnose_ingestion.py --indices 11,12
-
-# Check a range with vector rank included (requires Ollama)
-python -X utf8 diagnose_ingestion.py --indices 0-19 --vector
-
-# Different dataset
-python -X utf8 diagnose_ingestion.py --indices 0-9 --dataset 2wikimultihop
-```
-
-**Output per question:**
-1. Answer-bearing chunks (chunks whose text contains the gold answer)
-2. Supporting-fact article presence in each store (chunks_export → LanceDB → KuzuDB)
-3. Retrieval rank per query entity (graph and vector)
-4. Crowd-out analysis: how many competing sources contain the same entity
-
-**Graph-Quality Output (--graph-quality N)** zeigt pro Frage:
-
-| Spalte | Bedeutung |
+| Tool | Purpose |
 |---|---|
-| `KW-H` | Anzahl Graph-Chunks per Keyword-Extraktion |
-| `Top-Entity` | Welche Entität tatsächlich gematcht hat |
-| `Hub` | `HUB` wenn generische/Pronomen-Entität gematcht hat |
-| `GrAns` | ✓ wenn Gold-Antwort in Graph-Chunks vorkommt |
-| `VecH` | Anzahl Vector-Chunks |
-| `VecAns` | ✓ wenn Gold-Antwort in Vector-Chunks vorkommt |
+| [diagnose.py](diagnose.py) | Layer-by-layer pipeline diagnostic for a single question; supports `--layer`, `--skip-llm`, `--graph-quality`, `--multi`. |
+| [diagnose_verbose.py](diagnose_verbose.py) | Trace-mode diagnostic with monkey-patched filter hooks; tracks per-stage gold-answer survival. |
+| [diagnose_ingestion.py](diagnose_ingestion.py) | Source-to-rank trace per question across `chunks_export.json` → LanceDB → KuzuDB → retrieval rank. |
+| [src/evaluations/ollama_performance_diagnostic.py](src/evaluations/ollama_performance_diagnostic.py) | Embedding-dimension and Ollama endpoint health checks. |
+| [src/evaluations/test_rag_quality.py](src/evaluations/test_rag_quality.py) | Standalone retrieval-quality probe (config verification, threshold sweep). |
+| [test_system/graph_inspect.py](test_system/graph_inspect.py) | KuzuDB schema and statistics inspector. |
+| [test_system/graph_3d.py](test_system/graph_3d.py) | matplotlib + pyvis knowledge-graph visualisation. |
 
-**Empirische Ergebnisse:**
-
-*Stand 2026-04-01 (threshold=0.15, UPPERCASE types, 15 Fragen):*
-
-| Metrik | Wert |
-|---|---|
-| Hub-Kontamination (Keyword-Regex) | 0% |
-| Graph Answer Coverage | 33% (5/15) |
-| Vector Answer Coverage | 40% (6/15) |
-| Union Coverage (Graph ODER Vector) | 60% (9/15) |
-| GLiNER Answer Coverage | 13% (2/15) — schlechter als Keyword-Regex |
-
-*Stand 2026-04-02 (threshold=0.5, lowercase types, Re-Ingestion, 10 Fragen):*
-
-| Metrik | Wert | vs. vorher |
-|---|---|---|
-| Hub-Kontamination | 10% | ↓ besser |
-| Graph Answer Coverage | 20% (2/10) | ↓ schlechter (aber N zu klein) |
-| Vector Answer Coverage | 50% (5/10) | ↑ besser |
-| Unique Entities | 23.858 | −35% (von 36.996) |
-| MENTIONS | 50.096 | −33% (von 74.741) |
-
-> **Interpretation:** Der Rückgang der Graph Answer Coverage ist auf (a) zu kleine Stichprobe (N=10 vs. N=15) und (b) Entity-Name-Disambiguation-Problem zurückzuführen (Chunk 7 "Edward Davis Wood Jr." nicht via "Ed Wood"-Query erreichbar). Statistisch nicht vergleichbar. Für belastbaren Vergleich: `python diagnose.py --graph-quality 50`.
-
-Der Graph fügt für ≥3 Fragen exklusiven Mehrwert hinzu (GrAns=✓, VecAns=✗), was die Hybrid-Hypothese stützt.
-
-**Graph-Visualisierung** (`test_system/graph_3d.py`):
-
-```bash
-# PNG für Thesis generieren (Hub-Entities gefiltert)
-python test_system/graph_3d.py --top 80 --no-html
-
-# Mit interaktiver HTML-Ansicht (pyvis)
-python test_system/graph_3d.py --top 80
-```
-
-Erzeugt `test_system/graph_preview.png` mit matplotlib (dpi=200). Für Druckqualität: `dpi=300` setzen.
+All diagnostic CLIs require `python -X utf8` on Windows to render Unicode correctly.
 
 ---
 
@@ -1469,47 +1302,44 @@ Erzeugt `test_system/graph_preview.png` mit matplotlib (dpi=200). Für Druckqual
 
 ### 8.1 Core Dependencies
 
-| Package | Version | Role |
+| Package | Constraint | Role |
 |---|---|---|
-| `lancedb` | ≥ 0.6.0 | Embedded vector database (columnar, Arrow-based) |
-| `kuzu` | ≥ 0.3.0 | Embedded property graph database (native Cypher) |
-| `networkx` | ≥ 3.2.0 | Fallback graph backend (pure Python) |
-| `spacy` | ≥ 3.5.0 | NLP pipeline: tokenisation, POS tagging, NER, dependency parsing |
-| `gliner` | ≥ 0.2.0 | Zero-shot named entity recognition |
-| `transformers` | ≥ 4.30.0 | REBEL relation extraction model |
-| `numpy` | ≥ 1.24.0 | Numerical operations |
-| `scikit-learn` | ≥ 1.3.0 | TF-IDF scoring, quality metrics |
-| `pydantic` | ≥ 2.5.0 | Data validation and serialisation |
-| `pyyaml` | ≥ 6.0.1 | Configuration file parsing |
-| `langchain` | ≥ 0.3.0 | NLP orchestration primitives (Document schema) |
-| `datasets` | ≥ 2.14.0 | HuggingFace dataset loading (HotpotQA etc.) |
-| `requests` | ≥ 2.31.0 | Ollama HTTP API client |
-| `pyarrow` | ≥ 12.0.0 | Columnar data format (LanceDB dependency) |
+| `lancedb` | ≥ 0.6 | Embedded vector store (Apache Arrow, IVF-Flat ANN) |
+| `kuzu` | ≥ 0.3 | Embedded property graph (native Cypher) |
+| `spacy` | ≥ 3.5 | Tokenisation, POS tagging, NER, dependency parsing |
+| `gliner` | ≥ 0.2 | Zero-shot NER |
+| `transformers` | ≥ 4.30 | REBEL relation extraction |
+| `rank_bm25` | ≥ 0.2.2 | BM25 sparse retrieval (third RRF lane) |
+| `sentence-transformers` | ≥ 2.2 | Cross-encoder reranker (`ms-marco-MiniLM-L-6-v2`) |
+| `numpy` | ≥ 1.24 | Numerical operations |
+| `scikit-learn` | ≥ 1.3 | TF-IDF, quality metrics |
+| `pydantic` | ≥ 2.5 | Data validation |
+| `pyyaml` | ≥ 6.0 | Configuration parsing |
+| `langchain` | 0.3.x | `Document` schema and `Embeddings` interface |
+| `langgraph` | ≥ 1.0 (optional) | State-machine orchestration in `AgenticController` |
+| `datasets` | ≥ 2.14 | HuggingFace dataset loading |
+| `requests` | ≥ 2.31 | Ollama HTTP client |
+| `pyarrow` | ≥ 12.0 | LanceDB columnar layer |
 | `sqlite3` | stdlib | Embedding cache persistence |
+
+`requirements_frozen.txt` pins every transitive dependency for thesis reproducibility.
 
 ### 8.2 External Services (Local)
 
 | Service | Model | Purpose |
 |---|---|---|
 | Ollama | `nomic-embed-text` | 768-dim dense text embeddings |
-| Ollama | `qwen2:1.5b` | Answer generation (1.5B parameters) |
-| SpaCy | `en_core_web_sm` | Query parsing in Planner and Navigator |
+| Ollama | `qwen2:1.5b` | Answer generation (1.5 B params, 4-bit GGUF) |
+| Ollama (alternates) | `gemma2:2b`, `llama3.2:3b`, `phi3`, `qwen3:4b` | Ablation comparison models |
+| SpaCy | `en_core_web_sm` | Query parsing in S_P; sentence segmentation in chunking |
 
-Both Ollama models run entirely on CPU and require no GPU. `qwen2:1.5b` is loaded as a 4-bit GGUF quantisation via llama.cpp (Ollama backend), fitting within a 2 GB memory budget.
+All models run on CPU. `qwen2:1.5b` fits within ~2 GB memory; the full system stays under the 16 GB RAM constraint.
 
-### 8.3 Design Rationale: Database Selection
+### 8.3 Database Selection Rationale
 
-**LanceDB** was selected over alternatives (FAISS, ChromaDB, Qdrant) because:
-- Embedded architecture: no server, no Docker, no network latency.
-- Native Apache Arrow columnar format: zero-copy reads, efficient batch operations.
-- IVF-Flat index: approximate nearest-neighbour with configurable recall/speed trade-off.
-- Built-in metadata filtering in a single SQL-like query.
+**LanceDB** was selected over FAISS, ChromaDB, and Qdrant for: embedded architecture (no server, no Docker), native Apache Arrow columnar format (zero-copy reads), IVF-Flat ANN with configurable recall/speed trade-off, and built-in metadata filtering in a single SQL-like query.
 
-**KuzuDB** was selected over NetworkX because:
-- Native Cypher query language: expressive multi-hop path queries.
-- Persistent on-disk storage: graph survives process restarts.
-- Measured 10–100× faster traversal than NetworkX for graphs with >100 nodes (verified during migration benchmarks, April 2026).
-- Embedded: no server process required.
+**KuzuDB** was selected over NetworkX for: native Cypher (expressive multi-hop path queries), persistent on-disk storage, and 10–100× faster traversal than NetworkX for graphs with > 100 nodes (verified during migration benchmarks). It is embedded — no server process required.
 
 ---
 
@@ -1518,14 +1348,13 @@ Both Ollama models run entirely on CPU and require no GPU. `qwen2:1.5b` is loade
 ### 9.1 Ingestion Flow
 
 ```
- Raw Articles (HotpotQA context documents)
+ Raw articles (HotpotQA context documents)
         │
         ▼  HotpotQALoader.load(n_samples=500)
   ┌─────────────────────────────────────────┐
   │  DATASET LOADING                        │
   │  - HuggingFace `datasets` library       │
-  │  - HotpotQA: distractor split (valid)  │
-  │  - Extract: articles + questions        │
+  │  - Distractor split (validation)        │
   │  - Deduplicate articles by title        │
   │  → ~2,000–4,000 unique articles         │
   └─────────────────────────────────────────┘
@@ -1534,770 +1363,266 @@ Both Ollama models run entirely on CPU and require no GPU. `qwen2:1.5b` is loade
   ┌─────────────────────────────────────────┐
   │  CHUNKING (SpacySentenceChunker)        │
   │  - sentences_per_chunk = 3              │
-  │  - sentence_overlap = 1                 │
-  │  - min_chunk_chars = 50                 │
+  │  - sentence_overlap   = 1               │
+  │  - min_chunk_chars    = 50              │
   │  → ~5,000–15,000 Document chunks        │
-  │  Metadata per chunk:                    │
-  │    chunk_id, source_file,               │
-  │    article_title, dataset,              │
-  │    sentence_count, position             │
+  │  Metadata per chunk: chunk_id,          │
+  │  source_file, article_title, dataset,   │
+  │  sentence_count, position               │
   └─────────────────────────────────────────┘
         │
-        ▼  run_ingestion()
+        ▼
   ┌─────────────────────────────────────────┐
-  │  EMBEDDING GENERATION                   │
+  │  EMBEDDING                              │
   │  BatchedOllamaEmbeddings:               │
-  │  - Check SQLite cache (batch lookup)    │
-  │  - API call for cache misses (32/batch) │
-  │  - Store new embeddings to cache        │
+  │  - Single batched cache lookup          │
+  │  - API call for misses (32–64/batch)    │
+  │  - Write-back to cache                  │
   │  - nomic-embed-text → 768-dim vectors   │
   └─────────────────────────────────────────┘
         │
         ▼  HybridStore.add_documents()
   ┌─────────────────────────────────────────┐
   │  DUAL-INDEX STORAGE                     │
-  │                                         │
-  │  ① LanceDB (VectorStoreAdapter)         │
-  │     - Cosine distance metric            │
-  │     - Normalised vectors                │
-  │     - IVF-Flat index (auto-built)       │
-  │     - Per-document metadata stored      │
-  │                                         │
-  │  ② KuzuDB (KuzuGraphStore)              │
-  │     - Node: DocumentChunk               │
-  │     - Node: SourceDocument              │
-  │     - Edge: FROM_SOURCE (chunk→doc)     │
-  │     - Edge: NEXT_CHUNK (chunk→chunk)    │
+  │  ① LanceDB (cosine, normalised, IVF)    │
+  │  ② KuzuDB (DocumentChunk, Entity,       │
+  │     SourceDocument; FROM_SOURCE,        │
+  │     NEXT_CHUNK, MENTIONS, RELATED_TO)   │
   └─────────────────────────────────────────┘
         │
         ▼
-  Persisted to ./data/hotpotqa/
-    vector/                 (LanceDB directory)
-    graph/                  (KuzuDB directory)
-      extraction_results.json  (Colab Phase 2 output — unchanged by Phase 3)
-    chunks_export.json      (Phase 1 output — source of truth for chunks)
-    questions.json          (500 test questions with supporting_facts)
+  Persisted to ./data/<dataset>/{vector,graph}/
 ```
 
 ### 9.2 Query Processing Flow
 
 ```
- User Query: "Where was the director of [Film X] born?"
+ User query: "Where was the director of [Film X] born?"
         │
         ▼  AgentPipeline.process(query)
   ┌─────────────────────────────────────────────────────────┐
-  │  S_P: PLANNER                             ~5–10ms       │
-  │                                                         │
+  │  S_P: PLANNER                             ~5–10 ms      │
   │  1. SpaCy parse(query)                                  │
-  │     → entities: ["Film X"]                              │
-  │     → query_type: MULTI_HOP                             │
-  │     → bridge_entity detected                            │
-  │                                                         │
-  │  2. Decompose into hop_sequence:                        │
+  │     → entities: ["Film X"], type: MULTI_HOP, bridge ✓   │
+  │  2. Decompose into hop_sequence                         │
   │     hop[0]: "Who is the director of Film X?"            │
   │     hop[1]: "Where was [director] born?"                │
-  │                                                         │
-  │  3. strategy: HYBRID (bridge entity present)            │
-  │                                                         │
-  │  OUTPUT: RetrievalPlan                                  │
+  │  3. strategy: HYBRID                                    │
   └─────────────────────────────────────────────────────────┘
         │
         ▼
   ┌─────────────────────────────────────────────────────────┐
-  │  S_N: NAVIGATOR                           ~30–80ms      │
-  │                                                         │
-  │  For each hop:                                          │
-  │                                                         │
-  │  ┌──────────────────────────────┐                       │
-  │  │  VECTOR SEARCH               │  ~8–12ms              │
-  │  │  1. embed(sub_query)         │                       │
-  │  │  2. LanceDB ANN search       │                       │
-  │  │     top_k = 20               │                       │
-  │  │  → 20 candidate chunks       │                       │
-  │  └──────────────────────────────┘                       │
-  │                                                         │
-  │  ┌──────────────────────────────┐                       │
-  │  │  GRAPH SEARCH                │  ~5–30ms              │
-  │  │  1. extract entities from    │                       │
-  │  │     sub_query                │                       │
-  │  │  2. KuzuDB: find entity nodes│                       │
-  │  │  3. BFS traversal (2 hops)   │                       │
-  │  │  → 10 graph-adjacent chunks  │                       │
-  │  └──────────────────────────────┘                       │
-  │                                                         │
-  │  ┌──────────────────────────────┐                       │
-  │  │  RRF FUSION                  │  ~1ms                 │
-  │  │  RRF(d) = Σ 1/(60 + rank_i) │                       │
-  │  │  + cross-source bonus        │                       │
-  │  │  → 30 merged results         │                       │
-  │  └──────────────────────────────┘                       │
-  │                                                         │
-  │  PreGenerativeFilter:                                   │
-  │    relevance_filter → redundancy_filter                 │
-  │    → 5–10 final context chunks                          │
-  │                                                         │
-  │  OUTPUT: NavigatorResult                                │
-  │    filtered_context: ["chunk_text_1", ..., "chunk_n"]  │
+  │  S_N: NAVIGATOR                          ~120–280 ms    │
+  │  Per hop:                                               │
+  │   - VECTOR  : embed → LanceDB ANN, top-20  ~30–60 ms    │
+  │   - BM25    : term-frequency, top-20       ~5–20 ms     │
+  │   - GRAPH   : KuzuDB BFS up to 2 hops      ~1–30 ms     │
+  │   - RRF FUSION (3 lanes + cross-source)    ~1 ms        │
+  │   - CROSS-ENCODER RERANK (optional)        ~80–150 ms   │
+  │   - 6-stage filter chain                   ~2–6 ms      │
+  │  Output: NavigatorResult.filtered_context (5–8 chunks)  │
   └─────────────────────────────────────────────────────────┘
         │
         ▼
   ┌─────────────────────────────────────────────────────────┐
-  │  S_V: VERIFIER                            ~200–600ms    │
-  │                                                         │
+  │  S_V: VERIFIER                            ~200 ms–60 s  │
   │  1. pre_validate(filtered_context)                      │
-  │     → status: VALID / INSUFFICIENT / CONFLICTED         │
-  │                                                         │
-  │  2. Construct prompt:                                   │
-  │     "Answer the following question based solely on      │
-  │      the provided context. Question: <query>            │
-  │      Context: <chunk_1> ... <chunk_n>                   │
-  │      Answer:"                                           │
-  │                                                         │
-  │  3. POST /api/generate → qwen2:1.5b (Ollama)             │
-  │     temperature: 0.1, max_tokens: 200                   │
-  │     → initial_answer: "[director] was born in [city]"  │
-  │                                                         │
-  │  4. NLI consistency check:                              │
-  │     consistent(answer, context) → True                  │
-  │                                                         │
-  │  5. Confidence scoring → HIGH                           │
-  │                                                         │
-  │  OUTPUT: VerificationResult                             │
+  │  2. _reorder_by_question_relevance(query, context)      │
+  │  3. build_context (max_context_chars=3500, max_docs=5)  │
+  │  4. POST /api/generate → qwen2:1.5b (Ollama)            │
+  │     temperature=0.0, max_tokens=200                     │
+  │  5. claim verification + (optional) self-correction     │
+  │  6. confidence scoring → HIGH | MEDIUM | LOW            │
   └─────────────────────────────────────────────────────────┘
         │
         ▼
-  PipelineResult {
-    answer:            "[city]",
-    confidence:        "high",
-    planner_time_ms:   7,
-    navigator_time_ms: 42,
-    verifier_time_ms:  318,
-    total_time_ms:     367,
-    early_exit_used:   false,
-  }
+  PipelineResult { answer, confidence, per-stage timings,
+                    cached_result }
 ```
 
 ---
 
 ## 10. Performance Characteristics
 
-### 10.1 Ingestion Performance
+### 10.1 Ingestion
 
 | Stage | Latency (per chunk) | Notes |
 |---|---|---|
-| SpaCy chunking | ~0.5 ms | Model loaded once; cached |
-| Embedding (cache miss) | ~30–80 ms | Ollama API call, batched |
-| Embedding (cache hit) | ~0.1 ms | SQLite lookup |
+| SpaCy chunking | ~0.5 ms | Module-level model cache |
+| Embedding (cache miss) | ~30–80 ms | Ollama API, batched |
+| Embedding (cache hit) | ~0.1 ms | SQLite primary-key lookup |
 | LanceDB insert | ~2 ms | Arrow batch append |
 | KuzuDB insert | ~1 ms | Cypher `CREATE` |
-| **Total (cold)** | **~35–85 ms** | Per chunk, first run |
-| **Total (warm)** | **~3–5 ms** | Subsequent runs with cache |
+| **Total cold** | **~35–85 ms** | First run |
+| **Total warm** | **~3–5 ms** | Re-ingestion with cache |
 
-For a HotpotQA subset of 500 questions (~10,000 chunks):
-- Cold ingestion: approximately 10–15 minutes (embedding bottleneck).
-- Warm re-ingestion: approximately 1–2 minutes (cache hit rate ~100%).
+For a HotpotQA subset of 500 questions (~10,000 chunks): cold ~10–15 min (embedding-bound); warm re-ingest ~1–2 min (cache hit rate ~100 %).
 
-### 10.2 Retrieval Performance
+### 10.2 Retrieval
 
 | Component | Latency | Notes |
 |---|---|---|
 | Query embedding | ~30–60 ms | Single vector, often cached |
 | LanceDB ANN search | ~8–15 ms | IVF-Flat, top-20 |
-| KuzuDB graph traversal | ~1–30 ms | 2 hops, varies by graph density |
-| RRF fusion | ~0.5 ms | Pure Python, O(N log N) |
-| PreGenerativeFilter | ~1–3 ms | Jaccard + NLI |
-| **Total retrieval** | **~40–110 ms** | Without LLM generation |
-| LLM generation (qwen2:1.5b) | ~200 ms–62 s | CPU, 4-bit quantised; context size and KV-cache allocation dominate |
-| **End-to-end** | **~250 ms–65 s** | Full pipeline; LLM is the dominant bottleneck on CPU |
+| KuzuDB graph traversal | ~1–30 ms | 2 hops; varies by graph density |
+| BM25 retrieval | ~5–20 ms | `rank_bm25` over cached corpus DataFrame |
+| RRF fusion | ~0.5 ms | Pure Python, O(N log N), 3 lanes |
+| Cross-encoder reranker | ~80–150 ms | Optional; top-K × ~30 ms/pair on CPU |
+| Filter chain | ~2–6 ms | Six sequential stages |
+| **Retrieval subtotal** | **~120–280 ms** | Without LLM generation |
+| LLM generation (qwen2:1.5b) | ~200 ms – 60 s | CPU 4-bit; KV-cache and context dominate |
+| **End-to-end** | **~250 ms – 65 s** | LLM is the bottleneck on CPU |
 
-> **LLM timeout note:** Ollama allocates the full KV-cache context window regardless of prompt length. On CPU, `qwen2:1.5b` runs at approximately 8–15 tokens/second. A 2,400-character context (~600 tokens) can produce 60+ second responses. The system applies a 60-second `timeout` to Ollama HTTP calls; exceeding it returns the partial output. In practice, responses for bridge-resolved multi-hop queries with full context fit within 45 seconds.
+> **LLM timeout note.** Ollama allocates the full KV-cache regardless of prompt length. On CPU `qwen2:1.5b` runs at ~8–15 tokens/s; a 3,500-character context (~875 tokens) routinely produces 30–55 s responses. The system enforces a 60 s `timeout` on Ollama HTTP calls; exceeding it returns the partial output.
 
-### 10.3 Embedding Cache Efficiency
+### 10.3 Cache Efficiency
 
 For repeated evaluations on the same dataset:
-- **Cache hit rate** typically exceeds 95 % after the first ingestion run.
-- **Speedup factor**: approximately 300–500× for repeated query embeddings.
-- **Storage overhead**: ~1.5 KB per cached embedding (768 floats × 4 bytes + overhead).
+- Embedding-cache hit rate exceeds 95 % after the first ingestion run.
+- Speed-up factor: ~300–500× for repeated query embeddings.
+- Storage overhead: ~1.5 KB per cached embedding (768 floats × 4 bytes + metadata).
+- Pipeline result-cache (FIFO, 1000 entries) eliminates duplicate end-to-end work for repeated queries during the ablation runs.
 
 ---
 
-## 11. Design Decisions & Trade-offs
+## 11. Non-Functional Requirements
 
-### 11.1 Embedded vs. Client-Server Databases
+### 11.1 Reproducibility
 
-All database components (LanceDB, KuzuDB, SQLite) operate in-process without requiring a server. This is the primary design constraint for edge deployment. The trade-off is reduced horizontal scalability, which is acceptable for the single-node thesis scenario.
+- **Configuration as data.** All tunable parameters live in [config/settings.yaml](config/settings.yaml); no hard-coded values in production code paths.
+- **Deterministic generation.** `llm.temperature = 0.0` is the default; reruns of the evaluation produce identical answers given identical retrieval results.
+- **Pinned dependencies.** `requirements_frozen.txt` records the exact transitive dependency set used for thesis evaluation; `requirements.txt` carries range constraints for general use.
+- **Seeded sampling.** `random.seed(42)` and `numpy.random.seed(42)` are set at `ablation_study` import time.
+- **Idempotent ingestion.** Chunk IDs are deterministic SHA-256 hashes of `source_doc:position:text[:50]`; re-ingestion of the same source yields identical IDs.
+- **Decoupled GPU phase.** Phase 2 entity extraction runs on Colab GPU and emits `extraction_results.json`; the local edge target re-imports this file in Phase 3 without re-running GPU-bound models.
 
-### 11.2 RRF vs. Linear Interpolation
+### 11.2 Error Handling and Observability
 
-An alternative to RRF is linear interpolation: `score = α × vector_score + (1−α) × graph_score`. RRF was preferred because:
-1. It is rank-based, not score-based, making it robust to score scale differences between the two retrieval modalities.
-2. The single hyperparameter `k` is insensitive to small perturbations (Cormack et al., 2009 recommend k=60 as a near-universal default).
-3. It naturally handles the case where a document appears in only one list without requiring score normalisation.
+- **Logger hierarchy.** Every module obtains its logger via `logging.getLogger(__name__)`; the format and level are set in `settings.yaml → logging`.
+- **Narrow exception clauses.** Storage operations catch a defined `_STORAGE_ERRORS` tuple (`OSError`, `IOError`, `RuntimeError`, `ValueError`, `TypeError`, `KeyError`); programming errors (`AttributeError`, `NameError`, `IndexError`) are intentionally not silenced.
+- **Visible fallbacks.** Every fallback path emits `logger.warning("FALLBACK ACTIVE: …")` (GLiNER → SpaCy/regex; LangGraph absent → sequential controller; LangChain absent → minimal `Document` shim; Ollama unreachable → wrapped `RuntimeError`). Silent degradation is treated as a bug.
+- **Timeout discipline.** Ollama HTTP calls carry `timeout=60`; exceeding this returns partial output with a warning rather than blocking the evaluator.
+- **Per-stage timing.** `PipelineResult` and `AgentState` carry per-stage latencies. `RetrievalMetrics` carries lane-level counts. These flow into the ablation report for performance regression detection.
+- **Diagnostic tooling.** `diagnose.py`, `diagnose_verbose.py`, and `diagnose_ingestion.py` are part of the system surface: they monkey-patch Navigator filters to track gold-answer survival per stage. Any change that breaks them is treated as a behavioural change.
 
-The `vector_weight` and `graph_weight` parameters in `settings.yaml` are used exclusively by the ablation study to *disable* one modality (weight=0.0), not as interpolation coefficients for the RRF score itself.
+### 11.3 Scalability
 
-### 11.3 Chunking Strategy Selection
+The system is single-node by design (edge deployment). Within that envelope:
 
-For the thesis benchmark (HotpotQA short passages, 5–15 sentences per article), the SpaCy Sentence Chunker with a 3-sentence window was selected over semantic chunking because:
-- HotpotQA context documents are already short and well-structured.
-- Sentence boundaries are more meaningful than semantic boundaries for Wikipedia-style text.
-- The 3-sentence window corresponds approximately to one coherent factual paragraph.
+- **Horizontal data growth.** LanceDB and KuzuDB scale to millions of records on a single node; the embedding cache scales linearly in disk space (~1.5 KB per record).
+- **Batch throughput.** `BatchedOllamaEmbeddings` scales request count as `ceil(N / batch_size)`; cache hits reduce HTTP traffic by orders of magnitude on re-evaluation.
+- **Filter cost.** The Navigator filter chain is O(N) in the number of fused chunks; with `top_k_per_subquery = 20` and a typical 2-hop plan, N ≤ ~60.
+- **Known bottleneck.** LLM generation on CPU is the dominant latency (~80 % of end-to-end); this is intrinsic to the edge constraint and is the subject of the thesis ablation (model-size vs. accuracy trade-off via `available_models`).
+- **Production-scale gap.** BM25 (`rank_bm25`) is O(N) at query time. For true production scale (millions of chunks), a dedicated FTS index (LanceDB FTS or Tantivy) would be the next step.
+
+### 11.4 Test Coverage
+
+The CI suite is run via `pytest` with `pytest.ini` configuring markers `slow`, `nightly`, `llm`, and `integration` (deselected by default to keep CI under five minutes). Tests requiring a populated KuzuDB (`test_graph_inspect.py`) are skipped in CI.
+
+| File | Tests | Scope |
+|---|---|---|
+| `test_system/test_chunking.py` | 30 | SpaCy chunking correctness |
+| `test_system/test_embeddings.py` | 40 | Batch embeddings, caching, cross-process invariants |
+| `test_system/test_data_layer.py` | ~86 | Storage, retrieval, RRF fusion |
+| `test_system/test_logic_layer.py` | ~106 | Planner, Navigator, Verifier unit tests |
+| `test_system/test_planner_semantic.py` | 27 | Query classification semantics |
+| `test_system/test_navigator_semantic.py` | ~32 | Filter-chain semantics |
+| `test_system/test_verifier_semantic.py` | 39 | Pre-validation, generation, confidence semantics |
+| `test_system/test_pipeline.py` | 74 | End-to-end pipeline (FIFO cache, statelessness) |
+| `test_system/test_thesis_matrix.py` | 9 | Thesis evaluation matrix |
+| `test_system/test_thesis_matrix_ext.py` | 10 | Extended thesis matrix |
+| `test_system/test_missing_coverage.py` | 7 | Coverage-gap probes |
+| `test_system/test_config_robustness.py` | 12 | Config-loader edge cases |
+| `test_system/test_gliner_boundary.py` | 16 | GLiNER span/boundary cases |
+| `test_system/test_graph_inspect.py` | — | Skipped in CI (graph not populated) |
+| **Total CI** | **~496** | All green at the documented configuration |
+
+Five structural invariants are explicitly asserted across the suite: Verifier factual grounding (T-A), embeddings vector-space consistency (T-B), GLiNER compound-span extraction (T-C), `AgentPipeline` FIFO cache eviction (T-D), and ingestion metadata isolation (T-E).
+
+### 11.5 Security and Data Handling
+
+- **Local-only execution.** The system makes outbound HTTP calls only to `localhost:11434` (Ollama). No telemetry, no cloud API.
+- **No credential storage.** No secrets, API keys, or authentication tokens are read or persisted.
+- **Sandboxed inputs.** All ingested text is treated as untrusted: it never reaches an `eval()` or shell. Cypher statements use parameterised arguments (no string concatenation into queries).
+- **Reproducible artefacts.** Generated databases (`./data/<dataset>/{vector,graph}`), caches (`./cache/`), and evaluation outputs (`./evaluation_results/`) are gitignored to prevent accidental check-in of derived data.
+- **Offline operation.** `HF_HUB_OFFLINE=1` retry logic ensures GLiNER loads from the local Hugging Face cache when network calls fail — required for air-gapped edge deployment.
+
+---
+
+## 12. Design Decisions & Trade-offs
+
+### 12.1 Embedded vs. Client-Server Databases
+
+All persistence components (LanceDB, KuzuDB, SQLite) operate in-process. This is the primary edge-deployment constraint. The trade-off is reduced horizontal scalability — acceptable for the single-node thesis scenario.
+
+### 12.2 Reciprocal Rank Fusion vs. Linear Interpolation
+
+RRF was chosen over linear interpolation (`α · vec + (1−α) · graph`) because:
+
+1. It is rank-based, not score-based — robust to the score-distribution differences between dense, sparse, and graph retrieval (notably the score compression of `nomic-embed-text`).
+2. The single hyperparameter `k` is parameter-robust: Cormack et al. (2009) recommend `k = 60` as a near-universal default.
+3. It naturally handles documents present in only one list without score normalisation.
+
+Modality-disable ablation is performed via `rag.retrieval_mode ∈ {vector, graph, hybrid}` rather than scalar weights.
+
+### 12.3 Entity Name Disambiguation
+
+KuzuDB graph lookup uses exact string matching, augmented by the `_name_variants` heuristic (last-name fallback for short first names; individual tokens of length ≥ 4). This resolves common short/full-name mismatches but does not resolve aliases such as `"Ed Wood"` ↔ `"Edward Davis Wood Jr."`. True disambiguation requires an entity-linking system (BLINK, REL); this is documented as a known limitation. The hybrid approach mitigates the impact: queries that fail graph lookup may still succeed via dense or BM25 retrieval.
+
+### 12.4 Chunking Strategy Selection
+
+For HotpotQA's short, well-structured passages (5–15 sentences per article), the SpaCy 3-sentence sliding window was selected over semantic chunking because:
+
+- Wikipedia-style sentence boundaries are more meaningful than TF-IDF importance scores at this granularity.
+- A 3-sentence window approximates one coherent factual paragraph.
 - SpaCy processing is ~10× faster than transformer-based semantic boundary detection.
 
-### 11.4 Graph Depth Constraint
+The semantic chunker is retained for long-form technical documents where structure detection matters.
 
-Maximum graph traversal depth is fixed at 2 hops (`max_hops=2`). Empirical analysis on HotpotQA shows that:
-- 95 % of supporting facts are reachable within 2 hops from any named entity in the question.
+### 12.5 Graph Depth Constraint
+
+`max_hops = 2` is fixed empirically:
+- 95 % of HotpotQA supporting facts are reachable within 2 hops from any named entity in the question.
 - 3-hop traversal increases latency by ~40 ms with marginal recall improvement.
 - HotpotQA is explicitly designed as a 2-hop reasoning benchmark.
 
-### 11.5 Pre-Generative Filtering
+### 12.6 Pre-Generative Filtering Owned by the Logic Layer
 
-Filtering *before* generation (rather than answer-level post-processing) was chosen because:
-- It reduces the token budget passed to the LLM, directly reducing generation latency on CPU.
-- Redundant context causes the LLM to average over duplicate evidence rather than synthesise it.
-- Contradictory context reliably causes factual errors in small models (verified by preliminary experiments with phi3).
+Filtering before generation (rather than answer-level post-processing) was chosen because:
 
-The Jaccard redundancy threshold of 0.8 is conservative: two chunks sharing 80 % of their token vocabulary are treated as duplicates. This avoids accidentally removing topically similar but informationally complementary chunks.
+- It reduces the LLM token budget — a direct latency win on CPU.
+- Redundant context causes small models to average over duplicate evidence rather than synthesise.
+- Contradictory context reliably causes factual errors in models below 3 B parameters.
 
----
+The filter chain lives in the **Navigator (S_N)**, not in the data layer. This places curation under the agent that owns retrieval policy. The Jaccard redundancy threshold of 0.8 is conservative: two chunks must share 80 % of their token vocabulary to be treated as duplicates.
 
----
+### 12.7 Cross-Encoder Reranker as Stage 2.5
 
-## 12. Changes & Design Decisions
+The cross-encoder (`ms-marco-MiniLM-L-6-v2`) is inserted between RRF fusion and the relevance filter rather than as a post-filter step:
 
-This section documents significant changes from earlier versions, discarded approaches, and the rationale for decisions made. It serves as a decision log for the thesis.
+- Reranking before relevance filtering means the relevance threshold is applied to the higher-quality post-rerank scores, not to raw fusion ranks.
+- The 22 MB model and ~30 ms/pair latency are edge-feasible at the typical `reranker_top_k = 10`.
+- Disabling the reranker reverts cleanly to pure RRF order — useful as an ablation comparison.
 
----
+### 12.8 Single-Pass Generation by Default
 
-### 12.1 LLM Configuration: max_tokens and Context Budget
+`agent.max_verification_iterations = 1` means the Verifier generates once and skips the self-correction loop. The Self-Refine paradigm (Madaan et al. 2023) reproduces reliably on GPT-3.5+ but on a 1.5 B-parameter SLM the second pass typically injects hallucinations rather than correcting them. The loop is opt-in (`max_iterations ≥ 2`) for ablation comparison.
 
-**Problem:** The initial configuration set `max_tokens: 50`. This caused model responses to be truncated mid-sentence, as HotpotQA answers typically require 10–30 tokens, but the model's context-building (chain-of-thought reasoning) demanded a larger token budget.
+### 12.9 Question-Relevance Reordering
 
-**Symptom:** Ablation with 10 samples (2026-03-31) showed EM=20% for all three configurations (vector_only, hybrid, graph_only) — identical results despite different retrieval methods. Root cause: all answers were truncated before they could include the gold answer.
+Small LLMs exhibit strong position bias — they preferentially extract the first plausible entity they encounter. The Verifier therefore stable-sorts context chunks by query content-word overlap before formatting the prompt. RRF scores are preserved for downstream processing; only the LLM display order is changed. Empirically, this prevents the LLM from "answering the bridge entity" instead of the requested fact in multi-hop bridge queries.
 
-**Fix:** `max_tokens: 200` (4× increase). Three additional context-budget parameters were introduced to control the amount of text passed to the LLM:
-- `max_context_chars: 2400` — Prevents out-of-context errors on small models with a 4k context window
-- `max_docs: 6` — More chunks increase the chance of retrieving both supporting facts (HotpotQA requires 2)
-- `max_chars_per_doc: 400` — Balances breadth (more docs) vs. depth (more text per doc)
+### 12.10 Iterative Multi-Hop with `entity_hints`
 
-**Discarded alternative:** `max_tokens: 500` — tested; produced longer responses with hallucinations ("According to the context, the answer is X, however it should be noted that..."). Small models tend toward redundant output when given a larger token budget.
+Bridge queries cannot be answered by dispatching all sub-queries simultaneously: the bridge entity is unknown until hop 0 completes. The system:
 
----
+1. Detects bridge dependencies via `HopStep.depends_on`.
+2. Executes hops in dependency order.
+3. After each `is_bridge=True` step, extracts new entities from the retrieved chunks (surname-anchored regex with `[About: …]` artifact rejection).
+4. Passes the extended hint set to subsequent hops via `HybridRetriever.retrieve(..., entity_hints=...)`, bypassing query-time GLiNER on short, low-context sub-query fragments.
 
-### 12.2 Removal of the Outer Pipeline Retry Loop
-
-**Problem:** An earlier version of `AgentPipeline.process()` contained an outer loop that called `verifier.generate_and_verify()` up to `max_verification_iterations` times. This loop was introduced under the assumption that repeating the call with identical input would yield better answers.
-
-**Finding:** An LLM with an identical prompt and `temperature=0.1` (near-deterministic) produces nearly identical outputs on every iteration. The outer loop was therefore a costly no-op — multiple LLM calls with no content improvement.
-
-**Fix (2026-03-31):** Outer loop removed. `AgentPipeline.process()` now calls `generate_and_verify()` exactly once. The actual self-correction mechanism is the inner loop inside the Verifier, which at each iteration passes **concrete violations as feedback** (CORRECTION_PROMPT with specific `violations`). This is the core thesis contribution.
-
-**Configuration consolidation:** `max_verification_iterations` is configured exclusively in `settings.yaml` under `agent:` and read by `_verifier_config_from_cfg()`. There is no other location in the code where this value is set.
+Safety constraints (max 3 iterative hops, max 3 bridge entities per step, retain prior hints on empty extraction) bound the worst-case fan-out.
 
 ---
 
-### 12.3 Graph Visualisation: pyvis → matplotlib
-
-**Problem:** The original `test_system/graph_3d.py` used pyvis with `LIMIT 200` for MENTIONS and `LIMIT 100` for RELATED_TO edges. With 66,585 MENTIONS and 14,445 RELATED_TO edges in the HotpotQA graph, this represented 0.3% of the data — the visualisation appeared sparse and structureless.
-
-**Fix:** Complete rewrite using matplotlib + networkx:
-- Loads up to 2,000 RELATED_TO edges; filters hub entities (pronouns, generic terms)
-- Selects the top-N entities by degree (configurable via `--top N`)
-- Saves directly as PNG (dpi=200; use dpi=300 for thesis figures)
-- Optionally still generates interactive pyvis HTML
-
-**Findings from the analysis:**
-- Keyword-regex extraction performs well (hub contamination: 0%)
-- Graph answer coverage: 33% vs. vector: 40% — the graph provides genuine added value
-- GLiNER answer coverage: 13% — worse than simple keyword-regex. No re-ingestion required.
-
----
-
-### 12.4 Graph Quality: REBEL Relation Extraction
-
-**Finding:** REBEL (`Babelscape/rebel-large`) extracts primarily Wikipedia infobox-style relations: `publication_date`, `country`, `date_of_birth`, `genre`, `performer`. These relation types are largely useless for HotpotQA bridge questions, which require narrative relations such as `directed_by`, `portrayed_by`, `held_position`.
-
-**HotpotQA graph metrics:**
-
-*As of 2026-04-01 (threshold=0.15):*
-- 9,412 DocumentChunks, 36,996 unique entities, 74,741 MENTIONS, 17,221 RELATED_TO
-- Hub entities: "American" (898 chunks), "He" (737), "United States" (699), "She" (283)
-
-*As of 2026-04-02 (threshold=0.5, re-ingestion):*
-- 9,412 DocumentChunks, 23,858 unique entities, 50,096 MENTIONS, 15,766 RELATED_TO
-- Hub contamination significantly reduced (10% vs. previously high)
-
-**Thesis decision:** No re-ingestion with an alternative RE model (GPU effort > 1h, uncertain gain). Instead:
-1. The graph limitation is documented as a known limitation in the thesis
-2. Union coverage (60%) serves as an argument for the hybrid approach: the graph retrieves 3 questions that vector misses
-3. The graph's value lies in MENTIONS (66,585 edges), not in RELATED_TO
-
----
-
-### 12.5 Benchmark Sample Size
-
-**Problem:** The initial ablation with only 10 samples produced statistically meaningless results (EM=20% for all configurations — could be chance; N too small for confidence intervals).
-
-**Minimum requirement for the thesis:** N≥50 for preliminary orientation; N≥200 for reliable confidence intervals (95% CI ≈ ±7pp at N=200, ±14pp at N=50).
-
-**Recommended configuration for final thesis results:**
-```bash
-python benchmark_datasets.py ablation --dataset hotpotqa --samples 200
-```
-
----
-
-### 12.6 Entity Confidence Threshold: 0.15 → 0.5 (Re-Ingestion 2026-04-02)
-
-**Problem:** With `ner_confidence_threshold=0.15`, generic tokens dominated the graph: "American" (898 chunks), "He" (737), "United States" (699), "She" (283). These entities were stored as hub nodes with hundreds of MENTIONS edges. During graph traversal, they were returned as "matched entities" despite providing no semantic value.
-
-**Fix:** `entity_confidence_threshold=0.5` in `local_importingestion.py`. The filter is applied at import time (not at extraction time), so `extraction_results.json` remains unchanged and can be re-imported with a different threshold if needed.
-
-**Data incident:** The first `--clear` run used `shutil.rmtree(base_path)` and deleted `data/hotpotqa/` entirely (including `chunks_export.json`, `questions.json`). `extraction_results.json` survived only because it was open in the IDE. Fixed: `--clear` now deletes only `vector_db/` and `knowledge_graph/`, never source JSON files.
-
-**Result:** 36,996 → 23,858 unique entities (−35%), 74,741 → 50,096 MENTIONS (−33%).
-
----
-
-### 12.7 GLiNER Query-Time Consistency (2026-04-02)
-
-**Problem:** `ImprovedQueryEntityExtractor` received `gliner_model=None` because `StorageConfig(enable_entity_extraction=False)` is the default. Consequence: every query ran with the SpaCy fallback instead of GLiNER — even though GLiNER is installed and the graph was built with GLiNER.
-
-**Symptom:** SpaCy extracted `"Were Scott Derrickson"` (verb + name) instead of `"Scott Derrickson"`. Additionally, SpaCy entity types (`PERSON`, `ORG`, `GPE`) did not match the graph entity types (`person`, `film`, `city`) — causing name mismatches in graph lookups.
-
-**Fix:**
-1. `_get_gliner_model()` — module-level cache; loads `gliner_small-v2.1` once per process
-2. `_load_gliner()` uses the cache instead of calling `GLiNER.from_pretrained()` directly
-3. Entity types in `ImprovedQueryEntityExtractor` aligned with ingestion types: `["person", "organization", "city", "country", "film", "movie", "work of art", "event"]`
-4. Default threshold: `0.5 → 0.2` (queries are short → lower GLiNER scores than for long chunk texts)
-5. `diagnose.py` Layer 3: regex extraction replaced by `ImprovedQueryEntityExtractor`
-
-**Performance note:** GLiNER cold start: ~7.5s, cached: <1ms. One-time delay on the first call per process.
-
----
-
-### 12.8 Fallback Visibility: ⚠ FALLBACK ACTIVE Warnings
-
-**Motivation:** Fallbacks are always symptoms — they indicate that the primary implementation is not working. Silent fallbacks hide errors.
-
-**Implementation (2026-04-02):** All known fallback paths now emit `logger.warning("⚠ FALLBACK ACTIVE: ...")`:
-
-| File | Fallback path |
-|---|---|
-| `hybrid_retriever.py` | SpaCy/regex instead of GLiNER for query entities |
-| `entity_extraction.py` | SpaCy/regex instead of GLiNER for batch extraction |
-| `ingestion_pipeline.py` | MockEntityExtractor / MockEmbeddingGenerator (use_mocks=True) |
-| `verifier.py` | Heuristic contradiction detection instead of NLI |
-| `navigator.py` | Relative import fallback |
-| `chunking.py` | LangChain not installed |
-
----
-
-### 12.9 Known Limitations: Entity Name Disambiguation
-
-**Finding (2026-04-02):** The system fails on queries where the query uses a short form of an entity name, but the graph stores it under the full name.
-
-**Concrete example:**
-- Query: "Were Scott Derrickson and **Ed Wood** of the same nationality?"
-- GLiNER extracts: `"Ed Wood"` → graph lookup finds entity "Ed Wood" → FILM article (1994 Tim Burton film)
-- Correct Chunk 7: `"Edward Davis Wood Jr. was an American filmmaker"` → attached to entity `"Edward Davis Wood Jr."` → **not found**
-
-**Cause:** KuzuDB graph lookup uses **exact string matching**. No alias resolution, no coreference.
-
-**Possible solutions (for thesis outlook):**
-
-| Approach | Effort | Effect |
-|---|---|---|
-| Entity linking (e.g. BLINK, REL) | High | Normalises entities to Wikidata IDs |
-| Alias table at ingestion | Medium | `"Ed Wood"` ↔ `"Edward Davis Wood Jr."` as alias node |
-| Fuzzy graph lookup | Low | Allow Levenshtein distance in graph search |
-| Sub-query reformulation | Low | "What is the nationality of Ed Wood?" instead of "Were Ed Wood of same nationality?" |
-
-For the thesis, this limitation is treated as a documented known issue. It is visible in the union-coverage metric and motivates the hybrid approach.
-
----
-
-### 12.10 Planner Sub-Query Rewriting for Comparison Queries (2026-04-02)
-
-**Problem:** Comparison queries such as `"Were Scott Derrickson and Ed Wood of the same nationality?"` produce, without rewriting, sub-queries like `"Were Scott Derrickson of the same nationality as Ed Wood?"`. These complex formulations have low vector similarity to factual chunks.
-
-**Fix:** `_ATTR_MAP` with 8 regex patterns in `src/logic_layer/planner.py` `_decompose_comparison()`:
-
-| Pattern | Template |
-|---|---|
-| `same nationality` | `"What is the nationality of {entity}?"` |
-| `same birthplace` | `"Where was {entity} born?"` |
-| `same profession` | `"What is the profession of {entity}?"` |
-| `same genre` | `"What genre is {entity}?"` |
-| `same age` | `"When was {entity} born?"` |
-| `same country` | `"What country is {entity} from?"` |
-| `same religion` | `"What is the religion of {entity}?"` |
-| `born in the same` | `"Where was {entity} born?"` |
-
-**Result:** `"Were Scott Derrickson and Ed Wood of the same nationality?"` now produces:
-1. `"What is the nationality of Scott Derrickson?"` → direct match ✓
-2. `"What is the nationality of Ed Wood?"` → no match (disambiguation issue 12.9)
-3. Original query as context fallback
-
----
-
-### 12.11 Navigator Entity-Mention Filter (2026-04-02)
-
-**Problem:** For sub-queries such as `"What is the nationality of Ed Wood?"`, `nomic-embed-text` assigns high similarity to arbitrary nationality articles. Example: `"British people, or Britons..."` scores 0.798, while the relevant Ed Wood chunk scores only 0.649 — below all other results.
-
-**Fix:** `_entity_mention_filter()` as Filter 5 in `_navigate()` of the `Navigator` class (`src/logic_layer/navigator.py`):
-
-- Multi-word entities (e.g. `"Scott Derrickson"`): check for the full phrase **or** individual tokens ≥5 characters as whole words (`\bscott\b`, `\bderrickson\b`)
-- Single-token entities: checked only if ≥5 characters (avoids false positives from stopwords like `"Were"` or `"Wood"`)
-- **Safety fallback:** if all chunks are filtered → retain all (no empty context)
-
-**Result (question 0):**
-- `"British people"` → removed ✓ (no "Scott", "Derrickson")
-- `"The Oku people"` → removed ✓ (no match; previously retained due to "Were" false positive)
-- `"Tyler Bates"` → retained ✓ (contains "Scott" in the full chunk text, as Tyler Bates collaborated with Scott Derrickson)
-- 20 raw → 5 relevant chunks (previously 6 with 2 irrelevant)
-
----
-
-### 12.12 Verifier `best_answer or ...` Bug Fix (2026-04-02)
-
-**Problem:** In `src/logic_layer/verifier.py` the verifier used `best_answer or "[Error:...]"`. Python's `or` returns the fallback when `best_answer` is **falsy** — including empty string `""`. An LLM returning `""` would incorrectly be treated as an error.
-
-**Fix:** `best_answer if best_answer is not None else "[Error: no valid answer generated]"`
-
----
-
-### 12.13 Data Layer Code Reviews (April 2026)
-
-All four data layer modules were comprehensively reviewed and refactored in April 2026. Key changes:
-
-**`entity_extraction.py`:**
-- Entity IDs: MD5 12-char → SHA-256 24-char (`_generate_entity_id` module-level function)
-- `EntityCache`: `get()`/`put()` now require `model_name` param — scoped by `(text_hash, model_name)` to invalidate on model change; `get_batch()` added (1 SQL query vs N round-trips)
-- `ExtractionConfig`: removed `selective_re` (never used); added `rebel_max_input_length`, `rebel_max_output_length`, `rebel_num_beams`, `device`
-- `GLiNERExtractor`: SpaCy NLP loaded once in `__init__` (not per-chunk)
-- `REBELExtractor.extract_batch` → renamed `extract_sequential` (documents model's seq2seq limitation)
-- `ExtractedEntity.to_dict()`: key `"type"` → `"entity_type"`; `ExtractedRelation.to_dict()`: keys renamed to `"subject_entity"`, `"object_entity"`, `"relation_type"`
-- **Re-ingestion required** if entity IDs changed (MD5→SHA-256): existing KuzuDB entries are invalid.
-
-**`chunking.py`:**
-- Removed 316 lines of print()-based test harness
-- UUID chunk IDs → deterministic SHA-256 (`source_doc:position:text[:50]`)
-- Dead code removed; `word_boundary_factor` threaded as parameter
-- `except Exception` narrowed to `(ValueError, RuntimeError, AttributeError)`
-
-**`embeddings.py`:**
-- `embed_documents` Phase 1 now uses `cache.get_batch()` (1 SQL query instead of N individual calls)
-- `embed_query` now increments `metrics.total_texts` (was missing)
-- `print_metrics()` replaced `print()` with `logger.info()`
-- `DEFAULT_BATCH_SIZE` 32→64; all 4 `except Exception` in `EmbeddingCache` → `except sqlite3.Error`
-- `get_batch` now bulk-updates `access_count`; context manager added (`__enter__`/`__exit__`)
-
-**`hybrid_retriever.py`:**
-- `QueryEntityExtractor` class removed (dead code — was immediately overwritten)
-- Key name bugs fixed: `_vector_only_results` uses `document_id`+`metadata.source_file`; `_graph_only_results` uses `source_file`, `hops`, `matched_entity`
-- `threading.Lock` added to `_GLINER_MODEL_CACHE` (double-checked locking)
-- `gliner_model_name` threaded through `RetrievalConfig` → `ImprovedQueryEntityExtractor` → `_get_gliner_model()`
-- Alias params `top_k_vector`/`top_k_graph` removed; canonical names `vector_top_k`/`graph_top_k` used everywhere
-- `top_k or ...` → `top_k if top_k is not None else ...` (falsy-zero bug fixed)
-
----
-
-### 12.14 entity_hints Parameter: GLiNER Re-extraction on Short Sub-Queries (2026-04-11)
-
-**Problem:** In iterative multi-hop retrieval, the second hop's sub-query is a short 3–5 word phrase like `"screenwriter of Evolution"`. GLiNER on such a short fragment produces unreliable or no entity extractions. The graph search then falls back to regex patterns which miss multi-word bridge entities.
-
-**Solution:** `entity_hints: Optional[List[str]]` parameter added to `HybridRetriever.retrieve()`. When provided, the hints are used directly as graph search entity names, bypassing GLiNER. The `Navigator` passes `entity_hints=entity_names` (SpaCy-extracted entities from the full original query) when invoking the retriever, and `AgenticController` extends these with bridge entities discovered during iterative execution.
-
-**Propagation path:**
-```
-AgenticController._iterative_navigator_node()
-  └─► Navigator.navigate_step(sub_query, entity_hints=current_hints)
-        └─► HybridRetriever.retrieve(sub_query, entity_hints=current_hints)
-              └─► HybridStore.graph_search(entity_names=entity_hints)
-```
-
----
-
-### 12.15 Storage Fuzzy Name Matching (`_name_variants`) (2026-04-11)
-
-**Problem:** KuzuDB graph lookup is exact string matching. Queries for `"David Weissman"` find no results if the graph stores `"David N. Weissman"`. Similarly, looking up `"End of Days"` fails if the entity was stored as `"End of Days (film)"`.
-
-**Solution:** `_name_variants(name)` helper in `KuzuGraphStore.find_chunks_by_entity_multihop()`:
-- For 2-token names where the first token is ≤ 3 characters (e.g. `"Ed Wood"`): also tries last-name-only (`"Wood"`)
-- For all names: also tries individual tokens ≥ 4 characters as standalone search terms
-- The loop tries each variant until hop-0 results are found; `entity_name` is updated to the effective variant for hop-2/3 queries
-
-**Limitation:** This is a lightweight heuristic, not a full entity linking solution. It resolves common short-name/full-name mismatches but does not handle aliases (`"Ed Wood"` ↔ `"Edward Davis Wood Jr."`). True disambiguation requires an entity linking system (e.g., BLINK, REL) — documented as Known Issue 12.9.
-
----
-
-### 12.16 Relevance Threshold Factor: 0.6 → 0.85 (2026-04-11)
-
-**Problem:** `nomic-embed-text` exhibits score compression: all text-pair similarities fall in the range 0.739–0.786 regardless of semantic relevance. A threshold factor of `0.6 × max_score` ≈ `0.6 × 0.786` = 0.47 — well below every result — effectively disabled the relevance filter. Every chunk passed through, filling the context window with noise.
-
-**Solution:** `relevance_threshold_factor: 0.6 → 0.85`. This keeps only results within 15% of the top score. For score range [0.74, 0.79], this filters chunks scoring below ~0.67. Combined with the entity-mention filter (12.11), context quality improved measurably.
-
-**Configuration location:** `config/settings.yaml` — `agent.relevance_threshold_factor`. No hardcoding in code.
-
----
-
-### 12.17 Comparison Decomposition: Removed 3rd Sub-Query (2026-04-11)
-
-**Problem:** `_decompose_comparison()` in `planner.py` produced three sub-queries:
-1. `"What is the nationality of Scott Derrickson?"`
-2. `"What is the nationality of Ed Wood?"`
-3. Original query as fallback: `"Were Scott Derrickson and Ed Wood of the same nationality?"`
-
-The third sub-query is a rephrased version of the original question. It embeds as near-identical to the first two and retrieves duplicate chunks, wasting context budget without adding new evidence.
-
-**Solution:** Removed the third sub-query. The comparison decomposition now produces exactly 2 sub-queries (one per entity). If neither entity yields retrievable chunks, the original query is used as the sole sub-query via the existing single-hop fallback path.
-
----
-
-### 12.18 Iterative Multi-hop Implementation (2026-04-11)
-
-**Problem:** `HopStep.depends_on` and `HopStep.is_bridge` were defined in the data structures but never evaluated. All sub-queries in `hop_sequence` were dispatched simultaneously, which defeats the purpose of bridge-entity reasoning: the bridge entity name is unknown until hop 0 completes.
-
-**Concrete failure case (idx=11):** Question: *"Who was the screenwriter of the film 'Evolution', and also wrote the screenplay for the movie in which David Weissman was credited as a producer?"* — The bridge entity is the name of the film David Weissman produced, which must be retrieved first to find the relevant screenwriter.
-
-**Concrete failure case (idx=12):** Question: *"The song 'Oh My God' appears on the soundtrack for which year was the film with Guns N' Roses' contribution released?"* — The bridge is the film title ("End of Days"), not stated in the query.
-
-**Solution:** Three coordinated changes:
-
-1. **Planner (`planner.py`) — Patterns C and D:**
-   - Pattern C: detects `"for a/an/the [film|movie|show|...]"` → HopStep 0 retrieves the bridge film, HopStep 1 retrieves the answer
-   - Pattern D: detects `"[role] with [qualifier] co-wrote/directed/..."` → bridge is the work, not the person
-
-2. **Controller (`controller.py`) — `_iterative_navigator_node()`:**
-   - Sorts hops by `step_id`; executes in order
-   - After each `is_bridge=True` step: calls `_extract_bridge_entities()` on retrieved chunks
-   - Bridge entities are added to `current_hints`; passed as `entity_hints` to subsequent steps
-   - Context accumulated across all steps, deduplicated by `chunk_id`
-
-3. **HybridRetriever / Navigator — `entity_hints` parameter (see 12.14)**
-
-**Routing in `_navigator_node()`:**
-```python
-has_bridge_deps = any(h.get("depends_on") for h in hop_sequence_raw)
-if has_bridge_deps and len(hop_sequence_raw) > 1:
-    return _iterative_navigator_node(state, ...)
-else:
-    return _simple_navigate(state, ...)   # original behaviour
-```
-
-**Verified results:** Both idx=11 and idx=12 now retrieve the correct answer-bearing chunks after the iterative hop resolves the bridge entity.
-
----
-
-### 12.19 Ingestion Diagnostic Tool: `diagnose_ingestion.py` (2026-04-11)
-
-**Motivation:** When retrieval fails for a specific question, the root cause may be at any of three levels: (1) the article was never chunked, (2) the chunk was never indexed in LanceDB or KuzuDB, or (3) the chunk is present but ranked below the top-k cutoff. Previously, this required manually querying each store.
-
-**Tool:** `diagnose_ingestion.py` provides a full trace from source article to retrieval rank for any set of question indices.
-
-**Four diagnostic stages per question:**
-1. Answer-bearing chunks: scans `chunks_export.json` for the gold answer string
-2. Supporting article presence: checks each store (chunks_export → LanceDB → KuzuDB) per supporting fact
-3. Retrieval rank: runs graph and vector search and reports rank of first chunk from the correct source
-4. Crowd-out analysis: shows competing sources per entity (identifies why correct chunk is pushed down)
-
-**Usage:**
-```bash
-python -X utf8 diagnose_ingestion.py --indices 11,12
-python -X utf8 diagnose_ingestion.py --indices 0-19 --vector  # includes vector rank (slow)
-python -X utf8 diagnose_ingestion.py --indices 0-9 --dataset 2wikimultihop
-```
-
-**Confirmed findings (idx=12):** "End of Days" chunk (id=262) present in all three stores; entity "End of Days" returns graph rank #1; "Oh My God" chunk (id=263) contains gold answer ("1999"). Root cause of failure: query entity was "Arnold Schwarzenegger" (crowd-out by other Schwarzenegger films) rather than "End of Days" — resolved by iterative multi-hop (12.18).
-
----
-
-### 12.20 Shared Utility Module: `src/utils.py` (2026-04-24)
-
-**Motivation:** `jaccard_similarity` was independently implemented in both `hybrid_retriever.py` (as a `@staticmethod`) and `navigator.py` (as an instance method). Dual implementations risk silent divergence when one copy is updated.
-
-**Change:** Created `src/utils.py` as the canonical shared utilities module.
-
-```python
-# src/utils.py
-def jaccard_similarity(text1: str, text2: str) -> float:
-    """Word-set Jaccard similarity in [0.0, 1.0]."""
-    words1 = set(text1.lower().split())
-    words2 = set(text2.lower().split())
-    if not words1 or not words2:
-        return 0.0
-    union = len(words1 | words2)
-    return len(words1 & words2) / union if union > 0 else 0.0
-```
-
-**Consumers:**
-- `src/data_layer/hybrid_retriever.py` — deduplication step in RRF fusion
-- `src/logic_layer/navigator.py` — MMR diversity scoring in `_mmr_rerank()`
-
-**Design note:** The function uses word-set overlap (not character n-grams) which is appropriate for multi-hop retrieval deduplication: two retrieval results are considered duplicates when they share the majority of their content words, regardless of minor surface-form variation.
-
----
-
-### 12.21 Test Suite Audit II — Gap-Filling Invariants (2026-04-30)
-
-**Motivation:** A second 12-step test health audit (2026-04-30) identified five structural gaps in the test suite where correctness invariants were not asserted: embeddings vector-space consistency (T-B), GLiNER compound-span extraction (T-C), AgentPipeline FIFO cache eviction (T-D), ingestion metadata isolation (T-E), and Verifier factual grounding (T-A).
-
-**Changes:**
-
-| ID | File | Class added | Invariant covered |
-|---|---|---|---|
-| T-A | `test_verifier_semantic.py` | `TestVerifierFactualCorrectness` | Wrong entity in answer → violated claim or LOW confidence |
-| T-B | `test_embeddings.py` | `TestEmbedQueryDocumentsConsistency` | `embed_query` / `embed_documents` same dimension + cosine ≥ 0.99 for identical text |
-| T-C | `test_gliner_boundary.py` | `TestGLiNERSpanBoundary` | Multi-token spans ("Eiffel Tower", "New York City") extracted as one entity |
-| T-D | `test_pipeline.py` | `TestAgentPipelineFIFOCache` | FIFO eviction: oldest entry removed when `_cache_max_size` exceeded |
-| T-E | `test_pipeline.py` | `TestIngestionMetadataIsolation` | `source_doc` metadata does not leak across `_chunk_document()` calls |
-
-**R1 compliance:** All five new test classes use zero or ≤2 ML inference calls (T-C respects `EDGE_RAG_N_SAMPLES=2`). T-A, T-B, T-D, T-E are pure unit tests with no model calls.
-
-**Additional R-1 (nightly):** `TestEmbeddingSemanticQuality` added to `test_embeddings.py` with `@pytest.mark.nightly @pytest.mark.llm` — tests ordinal ranking of similar vs. dissimilar text pairs via live `nomic-embed-text`, documenting the score-compression limitation (§4.4) quantitatively.
-
-**Additional R-2 (nightly):** `TestGLiNERRecall.test_recall_by_entity_type` added to `test_gliner_boundary.py` — emits `UserWarning` for entity types with recall < 0.5, surfacing the per-type weaknesses documented in §12.6.
-
----
-
-### 12.22 Keyword Entity Fallback with Dual Injection (2026-05-04)
-
-**Motivation:** `nomic-embed-text` score compression causes ANN retrieval to fail for specific entity-named chunks when the query contains multiple genus-level entity names. In practice, for the query "Are both Dictyosperma and Huernia described as a genus?" the Dictyosperma chunk ranked at ANN position #71–80 (score ≈ 0.68 vs. Fokienia ≈ 0.84 at position #1) and never entered the top-10 ANN results. KuzuDB also had no "Dictyosperma" entity node because GLiNER's entity-type list (`person`, `organization`, …) does not include plant genera. The chunk was therefore completely invisible to both retrieval paths.
-
-**Root cause chain:**
-1. nomic-embed-text score compression → Dictyosperma chunk at ANN rank #71 (not in top-10)
-2. GLiNER entity-type list excludes plant genera → 0 KuzuDB nodes for "Dictyosperma" → 0 graph results
-3. Without any retrieval hit, the Navigator Relevance Filter (threshold = 0.85 × max_score) rejects the chunk even after entity-mention check
-
-**Solution — `_keyword_entity_search()` with dual injection** in `src/data_layer/hybrid_retriever.py`:
-
-1. **O(N) pandas keyword scan:** On first call, load the full LanceDB table into a pandas DataFrame (`_keyword_df_cache`). For each query entity (≥ 4 chars), case-insensitively scan the `text` column and collect matching chunks.
-2. **Dual injection:** Each keyword-matched chunk is injected into BOTH `vector_results` (with synthetic `similarity=0.76`) AND `graph_results` (with `hops=0`). This ensures the RRF cross-source boost applies, yielding a combined score of ~0.050 — above the relevance threshold of ~0.043.
-3. **Single-path injection would fail:** A chunk present only in `graph_results` yields a single-path RRF score ≈ 0.016, below the threshold. Both paths are required.
-
-**RRF arithmetic for dual-injected chunk:**
-- Vector path: rank 10/10 → `1/(60+10) ≈ 0.0143`; graph path: rank 1/1 → `1/(60+1) ≈ 0.0164`
-- Cross-source boost: `1.2 / 61 ≈ 0.0197`; total ≈ `0.0143 + 0.0164 + 0.0197 = 0.050`
-- Relevance threshold ≈ `0.85 × 0.059 ≈ 0.050` → dual-injected chunk is retained
-
-**Scope guard:** The scan only runs when `entity_names` is non-empty and the LanceDB table is accessible. A `_keyword_df_cache` attribute avoids repeated full-table scans within a single pipeline call.
-
-**Trade-off:** O(N) pandas scan is acceptable for the thesis corpus (≤ 10,000 chunks). For production scale (millions of chunks), a full-text inverted index (e.g., LanceDB FTS or Tantivy) would replace this approach.
-
----
-
-### 12.23 Navigator Entity Hints Propagation Fix (2026-05-04)
-
-**Motivation:** `navigator.navigate()` accepted an `entity_names` parameter, but diagnostic tooling called `navigate(plan, sub_queries)` without supplying it. Without explicit hints, the HybridRetriever ran GLiNER independently on each sub-query. For sub-query 2 ("Are both Huernia described as a genus?"), GLiNER extracted only "Huernia" — so the keyword entity fallback (§12.22) never searched for "Dictyosperma" in that sub-query's retrieval call. Dictyosperma appeared in sub-query 1's results only, giving it a Navigator-level RRF score of ≈ 0.016 — below the relevance threshold of 0.029.
-
-**Fix:** When `entity_names` is `None` (not supplied by caller), `navigate()` now falls back to `retrieval_plan.entities` to build the entity hints list:
-
-```python
-if entity_names is not None:
-    hints = entity_names
-elif retrieval_plan is not None and getattr(retrieval_plan, "entities", None):
-    hints = [e.text for e in retrieval_plan.entities if getattr(e, "text", None)]
-else:
-    hints = None
-```
-
-This guarantees all sub-queries share the full entity list from the Planner, so keyword searches run for all entities across all sub-queries regardless of which entity appears in the sub-query text.
-
-**Effect:** With both §12.22 and this fix, `diagnose.py --idx 27` retrieves 10 raw → **2** filtered chunks (Huernia + Dictyosperma), and the pipeline answers "Yes." (gold: "yes").
-
----
-
-### 12.25 Contradiction Filter: Raised `contradiction_min_value` from 10 → 100 (2026-05-04)
-
-**Problem:** The pre-generative contradiction filter in `navigator.py` compares numbers across chunk pairs to detect factual conflicts. The number extraction regex (`\b\d{4}\b|\b\d+(?:\.\d+)?\b`) captures all integers, including day-of-month values (e.g., `18` from "born **18** November 1963"). With `contradiction_min_value=10`, the filter required only that both numbers exceed 10. This meant the pair `(18, 1992)` — a birth-day from one chunk and a year from another — triggered with a ratio of 110×, incorrectly evicting valid answer chunks.
-
-**Root cause:** The filter was designed to detect genuine fact conflicts like "has 200 employees" vs. "has 2000 employees". Day-of-month values (1–31) and month numbers (1–12) are date components, not independent factual claim slots, and must not drive contradiction logic.
-
-**Fix:** `contradiction_min_value` raised from `10.0` to `100.0` in `config/settings.yaml` and the `ControllerConfig` dataclass default. Values < 100 (days, months, small counts) are excluded from the ratio comparison. Year-scale numbers (≥ 100) and count-scale statistics (population, budget, staff count) are unaffected.
-
-**Effect:** Answer chunks in biographical articles (which routinely contain both day-of-month and year values) are no longer incorrectly evicted. The Peter Schmeichel bio chunk (containing the IFFHS award fact) now survives all pre-generative filters.
-
-**Verification:** New smoke-test case in `navigator.py` (`if __name__ == "__main__"`) verifies that the pair `(18, 1992)` does **not** trigger (false-positive guard) while the pair `(200, 2000)` on a shared-topic pair **does** trigger (correct contradiction).
-
----
-
-### 12.26 Planner Pattern E: Relational Anchor Bridge Decomposition (2026-05-04)
-
-**Problem:** Bridge questions with the structure "What [fact] about the [role] of [Entity]?" were classified as `MULTI_HOP` but produced only a single sub-query (the verbatim original). The existing split patterns split at `that/which/who` or `of the`, neither of which matches "of Kasper Schmeichel" (a proper noun, not the article "the"). With one sub-query, retrieval is anchored entirely to the surface entity (e.g., Kasper Schmeichel), and the bridge entity's article (Peter Schmeichel) may not rank high enough to survive filtering.
-
-**Examples of the failure class:**
-- "What was the **father of** Kasper Schmeichel voted to be?" → bridge = Peter Schmeichel
-- "Where did the **wife of** John Lennon grow up?" → bridge = Yoko Ono
-- "What award did the **founder of** Apple win?" → bridge = Steve Jobs
-
-**Fix:** Added Pattern E to `PlanGenerator._decompose_multi_hop()` in `planner.py`. When all existing split patterns fail (`len(parts) == 1`) and the query matches `the [role] of [Entity]` (using a fixed vocabulary of ~25 role nouns via class constant `_RELATIONAL_ANCHOR_ROLES`), two sub-queries are generated:
-- **Hop 0 (bridge):** `"Who is the {role} of {anchor entity}?"` — causes the Navigator to retrieve the anchor's article, which names the bridge entity, and to run keyword entity search for the anchor, surfacing the bridge's own article via cross-mention
-- **Hop 1 (final):** The original query — direct retrieval for the downstream fact
-
-Pattern E only fires as a fallback after Patterns C and D are checked, preserving existing decomposition paths.
-
-**Effect:** For relational bridge questions, the Navigator now runs two sub-queries. The bridge resolution sub-query (hop 0) retrieves the anchor entity's article (containing the bridge entity name) and, via keyword entity fallback, may also surface the bridge entity's own article. Both appear in the RRF fusion pool with cross-query boosts.
-
----
-
-### 12.27 Verifier Question-Relevance Context Reordering (2026-05-04)
-
-**Problem:** Small LLMs (qwen2:1.5b, 1.5B parameters) exhibit a strong position bias: they preferentially extract the first plausible entity or fact they encounter in the context prompt. In multi-hop questions the final answer chunk often has a lower RRF rank than distractor chunks (those containing the bridge entity name), so the answer appears late in the formatted context and the LLM outputs the bridge entity rather than the requested fact.
-
-**Root cause observed (idx=24):** Query "What was the father of Kasper Schmeichel voted to be by the IFFHS in 1992?" Peter Schmeichel biographical chunk (containing "voted the IFFHS World's Best Goalkeeper in 1992") had RRF score 0.0152 — ranked last after Kasper Schmeichel chunks. LLM saw "Peter Schmeichel" first and answered "Peter Schmeichel." instead of "World's Best Goalkeeper."
-
-**Fix:** Added `Verifier._reorder_by_question_relevance(query, context)` called immediately before `_format_context`. The method:
-1. Tokenises the query with `re.findall(r"\b\w{4,}\b", ...)` and removes a fixed stopword set (`_QR_STOPWORDS`)
-2. Scores each chunk by counting how many query content tokens appear in the chunk text (case-insensitive substring match)
-3. Stable-sorts descending — chunks most lexically aligned with the query float to the top; equal-score chunks retain their original RRF order
-
-**Properties:**
-- Zero-cost when context has ≤1 chunk
-- Falls back to original order when query produces no content tokens (all stopwords)
-- Does not alter ranking semantics — RRF scores are preserved and available for downstream processing; only the display order to the LLM is changed
-
-**Effect:** The chunk "Peter Schmeichel was voted the IFFHS World's Best Goalkeeper in 1992" scores 4 query-word hits (schmeichel, voted, iffhs, 1992) and now appears first in the formatted context. The LLM reads the answer evidence before distractors.
-
-**Tests:** `TestQuestionRelevanceReorder` in `test_system/test_verifier_semantic.py` (5 tests).
-
----
-
-*End of Technical Architecture Documentation*
-
----
-
-## Test Suite Summary
-
-| File | Tests | Status |
-|---|---|---|
-| `src/data_layer/test_data_layer.py` | 33 | ✓ |
-| `src/logic_layer/test_logic_layer.py` | ~50 | ✓ |
-| `src/pipeline/test_pipeline.py` | 54 | ✓ |
-| `test_system/test_chunking.py` | 29 | ✓ |
-| `test_system/test_embeddings.py` | 34 | ✓ |
-| `test_system/test_missing_coverage.py` | 7 | ✓ |
-| **Total** | **~207** | **✓** |
-
----
-
-**Document Version History**
-
-| Version | Date | Change |
-|---|---|---|
-| 1.0.0 | 2025-12-01 | Initial architecture (NetworkX + FAISS) |
-| 2.0.0 | 2026-01-15 | Migration: LanceDB + KuzuDB |
-| 2.1.0 | 2026-01-25 | Distance metric fix (L2 → cosine) |
-| 3.0.0 | 2026-01-30 | Three-agent pipeline (S_P, S_N, S_V) |
-| 3.1.0 | 2026-02-26 | Comprehensive review; all bugs resolved |
-| 3.1.1 | 2026-03-15 | LLM config: max_tokens=200; new context-budget fields |
-| 3.1.2 | 2026-03-31 | Outer retry loop removed from AgentPipeline; self-correction in Verifier only |
-| 3.1.3 | 2026-03-31 | Graph quality diagnostics (diagnose.py --graph-quality); graph visualisation (graph_3d.py) |
-| 3.2.0 | 2026-04-01 | Full documentation revision; Section 12 (Changes & Alternatives) added |
-| 3.3.0 | 2026-04-02 | Threshold 0.15→0.5 (re-ingestion); GLiNER query consistency fix; fallback warnings; entity disambiguation documented |
-| 3.4.0 | 2026-04-02 | Planner sub-query rewriting (12.10); Navigator entity-mention filter (12.11); Verifier `or`-bug fix (12.12) |
-| 4.0.0 | 2026-04-11 | Data layer reviews (12.13); entity_hints parameter (12.14); storage fuzzy matching (12.15); threshold 0.6→0.85 (12.16); comparison noise sub-query removed (12.17); iterative multi-hop implemented (12.18); diagnose_ingestion.py added (12.19); all dataclass field names corrected; AgenticController documented (§5.3); repository structure updated |
-| 4.1.0 | 2026-05-04 | Keyword entity fallback + dual injection (12.22); Navigator entity hints propagation fix (12.23); test_data_layer.py: 74→90 tests; total CI suite: 501 passed |
-| 4.2.0 | 2026-05-04 | Contradiction filter min_value 10→100 (12.25); Planner Pattern E relational-anchor bridge (12.26); own-doc chunk alias annotation (12.24) |
-| 4.3.0 | 2026-05-04 | Verifier question-relevance context reordering (12.27); test_verifier_semantic.py: 36→39 tests; total CI suite: 500 passed |
+*End of Technical Architecture Documentation.*

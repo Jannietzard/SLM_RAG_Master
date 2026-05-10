@@ -567,32 +567,59 @@ def create_langchain_documents(
     articles: List[Article],
     chunk_sentences: int = 3,
     sentence_overlap: int = 1,
+    apply_coreference: bool = True,
 ) -> List[Document]:
     """
     Convert articles to LangChain Documents using SpacySentenceChunker.
-    
-    NEUE IMPLEMENTIERUNG v4.1.0:
-    - Primär: SpacySentenceChunker (gemäß Masterthesis 2.2)
-    - Fallback: Simple sentence grouping
+
+    Pipeline:
+      1. (optional) Coreference resolution per-article — replaces pronouns
+         with their antecedent noun phrases so GLiNER can later capture the
+         underlying named entity (Phase 2) and the graph captures the right
+         cooccurrence pairs (Phase 3).
+      2. SpacySentenceChunker (3-sentence sliding window) — primary path.
+      3. Simple sentence-grouping fallback if SpaCy is unavailable.
+
+    Coreference is silently skipped when `coreferee` or `en_core_web_md/lg`
+    is not installed — the pipeline keeps working with reduced graph density.
+    Pass apply_coreference=False to disable explicitly (e.g. for ablation).
     """
-    
-    # Methode 1: SpacySentenceChunker (primär)
+
+    # Lazy import — keeps benchmark_datasets.py functional when the data
+    # layer is unavailable for non-ingestion subcommands.
+    coref_resolver = None
+    if apply_coreference:
+        try:
+            from src.data_layer.coreference import resolve_coreferences, is_available
+            if is_available():
+                coref_resolver = resolve_coreferences
+                logger.info("Coreference resolution: ENABLED")
+            else:
+                logger.info("Coreference resolution: SKIPPED (coreferee or md/lg model missing)")
+        except ImportError:
+            logger.info("Coreference resolution: SKIPPED (module not importable)")
+
+    # Method 1: SpacySentenceChunker (primary)
     if CHUNKING_AVAILABLE and SpacySentenceChunker is not None:
         logger.info("Using SpacySentenceChunker (3-sentence window)")
-        
+
         try:
             chunker = create_sentence_chunker(
                 sentences_per_chunk=chunk_sentences,
                 sentence_overlap=sentence_overlap,
                 min_chunk_chars=50,
             )
-            
+
             all_documents = []
             chunk_id = 0
-            
+
             for article in articles:
-                # Chunk this article's text
+                # Apply coreference resolution if available — the chunker
+                # then sees pronoun-resolved text and produces chunks where
+                # GLiNER can re-identify the named entity behind every "He".
                 article_text = article.text
+                if coref_resolver is not None:
+                    article_text = coref_resolver(article_text)
                 chunk_results = chunker.chunk_text(
                     article_text,
                     source_doc=article.title
@@ -1034,6 +1061,7 @@ def cmd_ingest(args, config: Dict, store_manager: StoreManager):
                 articles,
                 chunk_sentences=args.chunk_sentences,
                 sentence_overlap=args.chunk_overlap,
+                apply_coreference=not getattr(args, "no_coreference", False),
             )
             logger.info(f"  Created {len(documents)} document chunks")
 
@@ -1517,7 +1545,11 @@ def main():
     ingest_p.add_argument("--chunk-overlap", type=int, default=1)
     ingest_p.add_argument("--clear", action="store_true")
     ingest_p.add_argument("--chunks-only", action="store_true",
-                          help="Nur Chunks erstellen und als JSON exportieren, keine Ingestion")
+                          help="Only build chunks and export as JSON, no ingestion")
+    ingest_p.add_argument("--no-coreference", action="store_true",
+                          help="Disable per-article coreference resolution. "
+                               "Default: ON (requires coreferee + en_core_web_md/lg, "
+                               "silently skipped if not installed)")
     
     # EVALUATE
     eval_p = subparsers.add_parser("evaluate", help="Evaluate single dataset")

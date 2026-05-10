@@ -156,7 +156,7 @@ def test_vector_search(query: str, embeddings):
             warn("  - similarity_threshold zu hoch (aktuell: "
                  f"{vec_cfg.get('similarity_threshold', 0.3)})")
             warn("  - Embedding-Dimension stimmt nicht")
-            warn("  - LanceDB leer oder korruptes Index")
+            warn("  - LanceDB empty or corrupted index")
 
         return store
 
@@ -221,9 +221,8 @@ def test_hybrid_retriever(query: str, store, embeddings):
     vec_cfg = config.get("vector_store", {})
 
     retrieval_config = RetrievalConfig(
+        # vector_weight / graph_weight were removed in the 2026-05-06 audit.
         mode=RetrievalMode.HYBRID,
-        vector_weight=rag_cfg.get("vector_weight", 0.7),
-        graph_weight=rag_cfg.get("graph_weight", 0.3),
         similarity_threshold=vec_cfg.get("similarity_threshold", 0.3),
     )
 
@@ -478,12 +477,11 @@ def test_full_pipeline(query: str, gold_answer: str, skip_llm: bool,
         )
         store = HybridStore(config=storage_config, embeddings=embeddings)
     else:
-        ok("Store aus früherem Layer wiederverwendet (kein KuzuDB-Lock-Konflikt)")
+        ok("Reused store from earlier layer (avoids KuzuDB lock conflict)")
 
     retrieval_config = RetrievalConfig(
+        # vector_weight / graph_weight were removed in the 2026-05-06 audit.
         mode=RetrievalMode.HYBRID,
-        vector_weight=rag_cfg.get("vector_weight", 0.7),
-        graph_weight=rag_cfg.get("graph_weight", 0.3),
     )
     retriever = HybridRetriever(hybrid_store=store, embeddings=embeddings,
                                 config=retrieval_config)
@@ -752,56 +750,56 @@ def test_graph_quality(n_questions: int):
     hub_all_rate = 100 * hub_contaminated // max(kw_hits, 1)
     hub_any_rate = 100 * any_hub_hit      // max(kw_hits, 1)
     if hub_all_rate >= 50:
-        fail(f"Hub-Kontamination (alle): {hub_contaminated:>3}/{kw_hits} Hits ({hub_all_rate:>3}%) NUR via Hub-Entity")
+        fail(f"Hub contamination (all):  {hub_contaminated:>3}/{kw_hits} hits ({hub_all_rate:>3}%) ONLY via hub entity")
     else:
-        warn(f"Hub-Kontamination (alle): {hub_contaminated:>3}/{kw_hits} Hits ({hub_all_rate:>3}%) NUR via Hub-Entity")
-    warn(f"Hub-Kontamination (mind):{any_hub_hit:>4}/{kw_hits} Hits ({hub_any_rate:>3}%) mit ≥1 Hub-Entity")
+        warn(f"Hub contamination (all):  {hub_contaminated:>3}/{kw_hits} hits ({hub_all_rate:>3}%) ONLY via hub entity")
+    warn(f"Hub contamination (any): {any_hub_hit:>4}/{kw_hits} hits ({hub_any_rate:>3}%) with >=1 hub entity")
 
     # Answer Coverage
     ans_rate = 100 * graph_answer_hits // max(total, 1)
     vec_rate = 100 * vec_answer_hits   // max(total, 1)
     if ans_rate >= 50:
-        ok(f"Graph Answer Coverage:    {graph_answer_hits:>3}/{total} ({ans_rate:>3}%) — Gold in Graph-Chunk")
+        ok(f"Graph answer coverage:    {graph_answer_hits:>3}/{total} ({ans_rate:>3}%) — gold in graph chunk")
     else:
-        fail(f"Graph Answer Coverage:    {graph_answer_hits:>3}/{total} ({ans_rate:>3}%) — Gold in Graph-Chunk")
+        fail(f"Graph answer coverage:    {graph_answer_hits:>3}/{total} ({ans_rate:>3}%) — gold in graph chunk")
     if vec_rate >= 50:
-        ok(f"Vector Answer Coverage:   {vec_answer_hits:>3}/{total} ({vec_rate:>3}%) — Gold in Vector-Chunk")
+        ok(f"Vector answer coverage:   {vec_answer_hits:>3}/{total} ({vec_rate:>3}%) — gold in vector chunk")
     else:
-        warn(f"Vector Answer Coverage:   {vec_answer_hits:>3}/{total} ({vec_rate:>3}%) — Gold in Vector-Chunk")
+        warn(f"Vector answer coverage:   {vec_answer_hits:>3}/{total} ({vec_rate:>3}%) — gold in vector chunk")
 
-    # Effektiver Graph-Mehrwert
+    # Effective graph value-add
     graph_only_answers = sum(
         1 for i in range(n_questions)
-        # Nicht messbar ohne separate Liste, Hinweis im Fazit
+        # Not measurable without a separate list — see summary below.
     )
     print()
-    info("Diagnose:")
+    info("Diagnosis:")
     if hub_all_rate >= 60:
-        fail(f"  PROBLEM: {hub_all_rate}% der Graph-Hits kommen NUR via Hub-Entitäten")
-        fail(f"  → Die '100% Hit-Rate' ist ein False-Positive-Artefakt!")
-        fail(f"  → Keyword findet 'American', 'He', 'United States' in fast jeder Frage")
-        warn(f"  → Graph Answer Coverage ({ans_rate}%) = echter Mehrwert")
-        info(f"  → Das erklärt warum graph_only ≈ vector_only in Ablation")
+        fail(f"  PROBLEM: {hub_all_rate}% of graph hits come ONLY via hub entities")
+        fail(f"  -> The '100% hit rate' is a false-positive artefact!")
+        fail(f"  -> Keyword finds 'American', 'He', 'United States' in almost every question")
+        warn(f"  -> Graph answer coverage ({ans_rate}%) = real value-add")
+        info(f"  -> This explains why graph_only ~ vector_only in the ablation")
         print()
-        info(f"  Lösungsansätze für Masterarbeit:")
-        info(f"  1. Hub-Filter in graph_search: Entitäten mit >200 MENTIONS überspringen")
-        info(f"  2. Min-specificity Score: nur Named Entities mit ≥2 Wörtern oder")
-        info(f"     bekannte Proper Nouns (Kapitalisierung + nicht in HUB_WORDS)")
-        info(f"  3. Als Limitation dokumentieren: Graph-Mehrwert nur bei bridge-type")
-        info(f"     Fragen mit klar benannten Entitäten in der Query messbar")
+        info(f"  Mitigations for the thesis:")
+        info(f"  1. Hub filter in graph_search: skip entities with >200 MENTIONS")
+        info(f"  2. Min-specificity score: only named entities with >=2 words or")
+        info(f"     known proper nouns (capitalised + not in HUB_WORDS)")
+        info(f"  3. Document as a limitation: graph value-add is measurable only on")
+        info(f"     bridge-type questions with clearly named entities in the query")
     elif ans_rate < vec_rate - 10:
-        warn(f"  Graph Coverage ({ans_rate}%) < Vector Coverage ({vec_rate}%) um >10pp")
-        warn(f"  → Graph fügt keinen verlässlichen Mehrwert hinzu")
-        info(f"  → Hybrid-Fusion verwässert ggf. die Vector-Ergebnisse")
+        warn(f"  Graph coverage ({ans_rate}%) < vector coverage ({vec_rate}%) by >10pp")
+        warn(f"  -> Graph adds no reliable value")
+        info(f"  -> Hybrid fusion may dilute the vector results")
     elif ans_rate >= vec_rate:
-        ok(f"  Graph Coverage ({ans_rate}%) ≥ Vector Coverage ({vec_rate}%) → Graph hilft!")
+        ok(f"  Graph coverage ({ans_rate}%) >= vector coverage ({vec_rate}%) -> graph helps!")
     else:
-        info(f"  Gemischtes Bild: Graph={ans_rate}%, Vector={vec_rate}%")
+        info(f"  Mixed picture: graph={ans_rate}%, vector={vec_rate}%")
 
-    # GLiNER Vergleich (wenn verfügbar)
+    # GLiNER comparison (if available)
     if gliner:
         print()
-        info("GLiNER Answer Coverage Vergleich:")
+        info("GLiNER answer coverage comparison:")
         gl_ans_hits = 0
         for i in range(min(n_questions, len(all_qs))):
             sample  = all_qs[i]
@@ -816,13 +814,13 @@ def test_graph_quality(n_questions: int):
                 pass
         gl_ans_rate = 100 * gl_ans_hits // max(n_questions, 1)
         if gl_ans_rate > ans_rate:
-            ok(f"  GLiNER Graph Coverage: {gl_ans_hits}/{n_questions} ({gl_ans_rate}%) — besser als Keyword ({ans_rate}%)")
-            ok(f"  → Re-Ingest mit GLiNER-Extraction würde Graph-Mehrwert verbessern!")
+            ok(f"  GLiNER graph coverage: {gl_ans_hits}/{n_questions} ({gl_ans_rate}%) — better than keyword ({ans_rate}%)")
+            ok(f"  -> Re-ingestion with GLiNER extraction would improve graph value-add")
         else:
-            info(f"  GLiNER Graph Coverage: {gl_ans_hits}/{n_questions} ({gl_ans_rate}%) vs Keyword ({ans_rate}%)")
-            info(f"  → GLiNER bringt keinen messbaren Graph-Coverage-Vorteil")
+            info(f"  GLiNER graph coverage: {gl_ans_hits}/{n_questions} ({gl_ans_rate}%) vs keyword ({ans_rate}%)")
+            info(f"  -> GLiNER yields no measurable graph-coverage advantage")
     else:
-        warn("GLiNER nicht verfügbar — GL-Vergleich nicht möglich")
+        warn("GLiNER not available — GL comparison skipped")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -936,17 +934,17 @@ def test_multi_vector(n_questions: int):
         ok_count = sum(1 for r in valid_rows if 0.50 <= r[1] < 0.70)
         bad      = sum(1 for r in valid_rows if r[1] < 0.50)
 
-        print(f"\n  Zusammenfassung ({len(valid_rows)} Fragen):")
-        ok(f"Gut   (≥0.70): {good:>3} ({100*good/len(valid_rows):.0f}%)")
-        warn(f"OK    (≥0.50): {ok_count:>3} ({100*ok_count/len(valid_rows):.0f}%)")
-        fail(f"Schlecht (<0.50): {bad:>3} ({100*bad/len(valid_rows):.0f}%)")
-        info(f"Ø Top-1 Score: {avg_top1:.4f}")
+        print(f"\n  Summary ({len(valid_rows)} questions):")
+        ok(f"Good   (>=0.70): {good:>3} ({100*good/len(valid_rows):.0f}%)")
+        warn(f"OK     (>=0.50): {ok_count:>3} ({100*ok_count/len(valid_rows):.0f}%)")
+        fail(f"Poor    (<0.50): {bad:>3} ({100*bad/len(valid_rows):.0f}%)")
+        info(f"Mean top-1 score: {avg_top1:.4f}")
 
         if bad_idx:
-            print(f"\n  Schlechteste Fragen (idx für --idx nutzen):")
+            print(f"\n  Worst questions (use idx with --idx):")
             for idx in bad_idx[:5]:
                 r = next(r for r in valid_rows if r[0] == idx)
-                info(f"  [{idx}] score={r[1]:.3f} typ={r[3]} | \"{r[4][:70]}\"")
+                info(f"  [{idx}] score={r[1]:.3f} type={r[3]} | \"{r[4][:70]}\"")
                 info(f"       Gold: \"{r[5]}\"")
 
 
@@ -960,15 +958,15 @@ def main():
         "embedding", "retrieval", "planner", "navigator", "verifier", "pipeline", "all"
     ], default="all")
     parser.add_argument("--question", type=str, default=None,
-                        help="Eigene Frage statt HotpotQA Sample")
+                        help="Custom question instead of a HotpotQA sample")
     parser.add_argument("--idx", type=int, default=0,
-                        help="Index der HotpotQA Frage (default: 0)")
+                        help="HotpotQA sample index (default: 0)")
     parser.add_argument("--multi", type=int, default=0,
-                        help="Vector-Score-Analyse für N Fragen (kein LLM, z.B. --multi 30)")
+                        help="Vector-score analysis over N questions (no LLM, e.g. --multi 30)")
     parser.add_argument("--graph-quality", type=int, default=0, metavar="N",
-                        help="Graph-Qualitäts-Analyse: Hub-Kontamination, Answer Coverage, Vector-Vergleich")
+                        help="Graph quality analysis: hub contamination, answer coverage, vector comparison")
     parser.add_argument("--skip-llm", action="store_true",
-                        help="LLM-Calls überspringen (Verifier + Pipeline)")
+                        help="Skip LLM calls (Verifier + pipeline)")
     args = parser.parse_args()
 
     # ─── Graph-Quality Modus ─────────────────────────────────────────────────

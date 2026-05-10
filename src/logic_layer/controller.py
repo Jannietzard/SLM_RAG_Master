@@ -409,6 +409,9 @@ class AgenticController:
                             and len(full) > 4
                             # reject noise tokens (articles, punct residue)
                             and first not in {"The", "A", "An", "This", "In", "Of"}
+                            # reject [About: X] annotation artifacts — the colon
+                            # signals a prefix tag, not a proper-noun first name
+                            and ":" not in first
                         ):
                             seen.add(full_lower)
                             candidates.append(full)

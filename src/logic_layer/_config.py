@@ -71,6 +71,15 @@ class ControllerConfig:
     contradiction_ratio_threshold: float = 2.0     # settings.yaml: navigator.contradiction_ratio_threshold
     contradiction_min_value: float = 100.0         # settings.yaml: navigator.contradiction_min_value
 
+    # Cross-encoder reranker (§12.29)
+    # Disabled by default — 22 MB model download on first use.
+    # Set enable_reranker: true in settings.yaml to activate.
+    enable_reranker: bool = False        # navigator.enable_reranker
+    reranker_model: str = (              # navigator.reranker_model
+        "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    )
+    reranker_top_k: int = 10            # navigator.reranker_top_k
+
     def __post_init__(self) -> None:
         import warnings as _warnings
         if self.temperature != 0.0:
@@ -113,5 +122,10 @@ class ControllerConfig:
             corroboration_query_weight=nav.get("corroboration_query_weight", 0.05),
             contradiction_overlap_threshold=nav.get("contradiction_overlap_threshold", 0.3),
             contradiction_ratio_threshold=nav.get("contradiction_ratio_threshold", 2.0),
-            contradiction_min_value=nav.get("contradiction_min_value", 10.0),
+            contradiction_min_value=nav.get("contradiction_min_value", 100.0),
+            enable_reranker=nav.get("enable_reranker", False),
+            reranker_model=nav.get(
+                "reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+            ),
+            reranker_top_k=nav.get("reranker_top_k", 10),
         )

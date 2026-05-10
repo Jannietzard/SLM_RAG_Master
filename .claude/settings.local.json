@@ -16,7 +16,19 @@
       "Bash(python -X utf8 -m pytest test_system/test_embeddings.py test_system/test_gliner_boundary.py test_system/test_verifier_semantic.py test_system/test_pipeline.py -x --tb=short -q)",
       "Bash(python -X utf8 -m pytest test_system/ --ignore=test_system/test_graph_inspect.py -x --tb=short -q)",
       "Bash(python -X utf8 -m pytest test_system/ --ignore=test_system/test_graph_inspect.py -q)",
-      "Bash(python -X utf8 -m pytest test_system/ --ignore=test_system/test_graph_inspect.py)"
+      "Bash(python -X utf8 -m pytest test_system/ --ignore=test_system/test_graph_inspect.py)",
+      "PowerShell(ls \"C:\\\\Users\\\\Jan Nietzard\\\\Documents\\\\FOM\\\\FOM Masterarbeit\\\\Masterarbeit Edge\\\\Entwicklungfolder\" -File | Where-Object { $_.Extension -in @\\('.yaml', '.yml', '.txt', '.ini', '.md'\\) })",
+      "Bash(grep -E \"\\\\.\\(py|md|yaml|yml|txt|ini\\)$\")",
+      "Bash(python -X utf8 -c \"from src.data_layer.graph_quality import canonical_form, compute_graph_baseline, build_cooccurrence_edges, cleanup_graph, assert_graph_invariants, format_baseline_report; print\\('graph_quality imports OK'\\); tests = [\\('Local H \\(band\\)', 'local h'\\), \\('Dr. Christopher Nolan', 'christopher nolan'\\), \\('Edward Davis Wood Jr.', 'edward davis wood'\\), \\(\\\\\"Nolan's\\\\\", 'nolan'\\), \\('  Beyoncé  ', 'beyoncé'\\)]; [print\\(f'  canonical_form\\({orig!r:35}\\) = {canonical_form\\(orig\\)!r:25} expected={exp!r}'\\) for orig, exp in tests]\")",
+      "Bash(python -X utf8 -c \"import ast; ast.parse\\(open\\('local_importingestion.py', encoding='utf-8'\\).read\\(\\)\\); print\\('local_importingestion.py parses OK'\\)\")",
+      "Bash(python -X utf8 -c \"import ast; ast.parse\\(open\\('diagnose_graph_baseline.py', encoding='utf-8'\\).read\\(\\)\\); print\\('diagnose_graph_baseline.py parses OK'\\)\")",
+      "Bash(python -X utf8 diagnose_graph_baseline.py --help)",
+      "Bash(python -X utf8 local_importingestion.py --help)",
+      "Bash(python -X utf8 -c \"from src.data_layer import DEFAULT_STOPLIST, cleanup_graph, canonical_form; print\\(f'stop-list size: {len\\(DEFAULT_STOPLIST\\)}'\\); print\\('sample:', sorted\\(DEFAULT_STOPLIST\\)[:8]\\); print\\('canonical hits:', [\\(s, canonical_form\\(s\\) in DEFAULT_STOPLIST\\) for s in ['He', 'AMERICAN', 'British ', 'U.S.', 'Mr. Nolan', 'Christopher Nolan']]\\)\")",
+      "Bash(python -X utf8 -c \"import ast; ast.parse\\(open\\('local_importingestion.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('src/data_layer/graph_quality.py', encoding='utf-8'\\).read\\(\\)\\); print\\('all files parse OK'\\)\")",
+      "Bash(python -X utf8 dryrun_ingestion.py --dataset hotpotqa --n-chunks 5)",
+      "Bash(python -X utf8 dryrun_ingestion.py --dataset hotpotqa --n-chunks 50)",
+      "Bash(python -X utf8 dryrun_ingestion.py --n-chunks 10)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Jan Nietzard\\.claude\\projects\\c--Users-Jan-Nietzard-Documents-FOM-FOM-Masterarbeit-Masterarbeit-Edge-Entwicklungfolder\\memory"

@@ -176,7 +176,7 @@ class TestRedundancyFilter:
 
 class TestContradictionFilter:
     def test_removes_lower_scoring_contradicting_chunk(self, nav):
-        """Two chunks with same topic but contradictory numbers (3× ratio): lower removed."""
+        """Two chunks with same topic but contradictory numbers (3x ratio): lower removed."""
         results = [
             {"text": "Albert Einstein was born in the year 1000.", "rrf_score": 0.9},
             {"text": "Albert Einstein was born in the year 3000.", "rrf_score": 0.4},
@@ -201,7 +201,6 @@ class TestContradictionFilter:
             {"text": "Population 3000 versus target.", "rrf_score": 0.5},
         ]
         filtered = nav._contradiction_filter(results)
-        # lower_idx = j when scores are equal (strict < picks j)
         assert len(filtered) == 1
         assert filtered[0]["text"] == "Population 1000 versus target."
 
@@ -213,8 +212,8 @@ class TestContradictionFilter:
     def test_small_numbers_not_flagged_as_contradiction(self, nav):
         """Numbers below min_value=100 are ignored to avoid false positives.
 
-        §12.25: contradiction_min_value raised from 10 → 100 to prevent
-        day-of-month values (1–31) from triggering false contradictions.
+        §12.25: contradiction_min_value raised from 10 -> 100 to prevent
+        day-of-month values (1-31) from triggering false contradictions.
         """
         results = [
             {"text": "The team won 3 to 1.", "rrf_score": 0.9},
@@ -226,7 +225,7 @@ class TestContradictionFilter:
     def test_day_of_month_vs_year_not_a_contradiction(self, nav):
         """Day-of-month (e.g. 18) paired with a year (1992) must NOT trigger.
 
-        Before §12.25, the pair (18, 1992) → ratio 110× exceeded the threshold
+        Before §12.25, the pair (18, 1992) -> ratio 110x exceeded the threshold
         and incorrectly evicted biographical chunks containing birth dates.
         With min_value=100, 18 < 100 is excluded from the ratio comparison.
         """

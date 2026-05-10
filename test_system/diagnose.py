@@ -155,7 +155,7 @@ def test_vector_search(query: str, embeddings):
             warn("  - similarity_threshold zu hoch (aktuell: "
                  f"{vec_cfg.get('similarity_threshold', 0.3)})")
             warn("  - Embedding-Dimension stimmt nicht")
-            warn("  - LanceDB leer oder korruptes Index")
+            warn("  - LanceDB empty or corrupted index")
 
         return store
 
@@ -215,9 +215,9 @@ def test_hybrid_retriever(query: str, store, embeddings):
     vec_cfg = config.get("vector_store", {})
 
     retrieval_config = RetrievalConfig(
+        # vector_weight / graph_weight were removed in the 2026-05-06 audit;
+        # weighted-fusion ablation is now done by switching `mode`.
         mode=RetrievalMode.HYBRID,
-        vector_weight=rag_cfg.get("vector_weight", 0.7),
-        graph_weight=rag_cfg.get("graph_weight", 0.3),
         similarity_threshold=vec_cfg.get("similarity_threshold", 0.3),
     )
 
@@ -458,7 +458,7 @@ def test_full_pipeline(query: str, gold_answer: str, skip_llm: bool,
         )
         store = HybridStore(config=storage_config, embeddings=embeddings)
     else:
-        ok("Store aus früherem Layer wiederverwendet (kein KuzuDB-Lock-Konflikt)")
+        ok("Reused store from earlier layer (avoids KuzuDB lock conflict)")
 
     retrieval_config = RetrievalConfig(
         mode=RetrievalMode.HYBRID,
@@ -611,7 +611,7 @@ def test_multi_vector(n_questions: int):
         info(f"Ø Top-1 Score: {avg_top1:.4f}")
 
         if bad_idx:
-            print(f"\n  Schlechteste Fragen (idx für --idx nutzen):")
+            print(f"\n  Worst questions (use idx with --idx):")
             for idx in bad_idx[:5]:
                 r = next(r for r in valid_rows if r[0] == idx)
                 info(f"  [{idx}] score={r[1]:.3f} typ={r[3]} | \"{r[4][:70]}\"")

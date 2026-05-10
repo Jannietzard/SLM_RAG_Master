@@ -18,6 +18,9 @@
 # ============================================================================
 embeddings:
   # Model name (must match an Ollama installed model)
+  # Alternative (better score distribution, requires re-ingestion):
+  #   model_name: "BAAI/bge-small-en-v1.5"   # via sentence-transformers
+  # Changing this requires re-running ingestion (stored vectors become stale).
   model_name: "nomic-embed-text"
 
   # Ollama API endpoint
@@ -69,7 +72,12 @@ vector_store:
   normalize_embeddings: true
 
   # Retrieval parameters
-  top_k_vectors: 10
+  # top_k_vectors raised from 10 -> 20 (audit 2026-05-06):
+  # under nomic-embed-text score compression, bridge-answer chunks routinely
+  # rank 11-15. BM25 + cross-encoder reranker downstream make the wider funnel
+  # cheap. similarity_threshold remains at 0.3 because raising it filters
+  # nothing under compressed scores (all > 0.7) and lowering hurts no one.
+  top_k_vectors: 20
   similarity_threshold: 0.3    # Minimum similarity [0.0, 1.0]
   overfetch_factor: 3          # ANN candidates = top_k * overfetch_factor
   graph_text_max_chars: 500    # Max characters stored in graph node
@@ -93,8 +101,11 @@ graph:
   graph_path: "./data/graph"
 
   # Graph traversal settings
+  # top_k_entities raised from 5 -> 10 (audit 2026-05-06): mirrors widening of
+  # vector top-k. KuzuDB queries are <30 ms, so a wider funnel is essentially
+  # free and improves bridge-entity recall.
   max_hops: 2                    # Maximum path length for traversal
-  top_k_entities: 5              # Number of graph results
+  top_k_entities: 10             # Number of graph results
   expand_context: true           # Include surrounding chunks (KuzuDB only)
 
   # Entity extraction method during ingestion
@@ -125,16 +136,14 @@ rag:
   retrieval_mode: "hybrid"
 
   # =========================================================================
-  # HYBRID WEIGHTS — Ablation Study Configuration
+  # ABLATION MODE
   # =========================================================================
-  # Experiment 1: Vector-only  → vector_weight=1.0, graph_weight=0.0
-  # Experiment 2: Graph-only   → vector_weight=0.0, graph_weight=1.0
-  # Experiment 3: Hybrid 70/30 → vector_weight=0.7, graph_weight=0.3
-  # Experiment 4: Hybrid 50/50 → vector_weight=0.5, graph_weight=0.5
-  # Experiment 5: Graph-heavy  → vector_weight=0.3, graph_weight=0.7
+  # The current Hybrid path is RRF-only (see rrf_k below). Weighted-fusion
+  # ablation can be performed by setting retrieval_mode to "vector" or "graph"
+  # to disable the other paths entirely. The previous vector_weight /
+  # graph_weight knobs were never read by production code and were removed
+  # in the 2026-05-06 cleanup audit.
   # =========================================================================
-  vector_weight: 0.7
-  graph_weight: 0.3
 
   # RRF Fusion Parameter
   # Note: rrf_k here is consumed by HybridRetriever (data layer) for its own
@@ -145,9 +154,14 @@ rag:
   rrf_k: 60                    # Reciprocal Rank Fusion constant (standard: 60)
   cross_source_boost: 1.2      # Boost for chunks appearing in both retrieval paths
 
-  # Future work options
-  reranking_enabled: false
-  query_expansion_enabled: false
+  # BM25 sparse retrieval (§12.29 — Tier 1 improvement)
+  # Third retrieval path alongside dense vector search and graph traversal.
+  # No model download required; index built lazily from LanceDB on first query.
+  # Requires: pip install rank_bm25
+  # bm25_top_k raised from 10 -> 20 (audit 2026-05-06): BM25 cost is O(N) but
+  # tiny; widening funnel improves bridge-chunk recall before fusion.
+  enable_bm25: true             # Set false to disable for ablation studies
+  bm25_top_k: 20                # BM25 candidates per query
 
 # ============================================================================
 # LLM CONFIGURATION (Artifact B — Logic Layer)
@@ -174,36 +188,48 @@ llm:
   # Safety cap:      max_context_chars = 2500 chars (~625 tokens input to LLM)
   # Prompt overhead: ~150 chars → ~2650 chars total input
   #
-  # Raised from 900 → 2500 (2026-05-04): comparison queries need ≥2 birth-date
-  # facts in context across up to 5 chunks. At 900, a single 500-char chunk
-  # filled the budget; at 1800, 4 chunks × ~450 chars still left no room for
-  # the entity's own-article chunk at position 5 (see §12.24).
-  # 2500 chars ≈ 625 tokens; still well within qwen2:1.5b's 4k context window.
-  # max_docs was raised from 3 to 5 (2026-04-23) to prevent bridge-chunk
-  # truncation on multi-hop HotpotQA questions.
-  max_context_chars: 2500   # Safety cap (overrides theoretical max)
+  # Context budget evolution:
+  #   900 -> 2500 (2026-05-04, §12.24): bridge chunks were truncated.
+  #   2500 -> 3500, max_chars_per_doc 500 -> 800 (audit 2026-05-06):
+  #   IFFHS-style answer sentences plus minimal bio context routinely span
+  #   600-700 chars; 500 truncated the answer. qwen2:1.5b has a 4096-token
+  #   context window (~12 kB); the previous 2500-char cap used only ~20%.
+  #   3500 chars uses ~30% and leaves headroom for the prompt template.
+  # max_docs stays at 5 to preserve context-window discipline.
+  max_context_chars: 3500   # Safety cap (overrides theoretical max)
   max_docs: 5               # Max chunks forwarded to Verifier after Navigator filtering
-  max_chars_per_doc: 500    # ~125 words per chunk
+  max_chars_per_doc: 800    # ~200 words per chunk
 
 # ============================================================================
 # NAVIGATOR (S_N) — Pre-Generative Filtering
 # ============================================================================
 navigator:
   # Relevance Filter: keep chunks with score >= factor × max_rrf_score
-  relevance_threshold_factor: 0.85
+  # Lowered from 0.85 -> 0.6 (audit 2026-05-06): under nomic-embed-text score
+  # compression, the 0.85 cutoff routinely evicted bridge chunks that scored
+  # marginally below the top result. 0.6 still removes scoring outliers while
+  # preserving the answer-bearing chunk in multi-hop traces.
+  relevance_threshold_factor: 0.6
 
   # Redundancy Filter: Jaccard similarity threshold for deduplication
   redundancy_threshold: 0.8
 
   # Maximum chunk count after filtering (before context shrinkage)
-  max_context_chunks: 10
+  # Lowered from 10 -> 8 (audit 2026-05-06): prevents the double-trim
+  # pathology where Navigator caps at 10, then the Verifier drops to
+  # max_docs=5 with a different ranking criterion. 8 leaves a 3-chunk safety
+  # margin for the Verifier reorder (§12.27) without overshooting.
+  max_context_chunks: 8
 
   # Reciprocal Rank Fusion smoothing constant (standard: 60)
   # Reference: Cormack et al. (2009). SIGIR. DOI: 10.1145/1571941.1572114
   rrf_k: 60
 
   # Top-K results per sub-query from HybridRetriever
-  top_k_per_subquery: 10
+  # Raised from 10 -> 20 (audit 2026-05-06): matches upstream widening; the
+  # gain from vector_top_k=20 and bm25_top_k=20 is wasted if the Navigator
+  # only consumes 10 results per sub-query.
+  top_k_per_subquery: 20
 
   # Cross-source corroboration boost weights for RRF fusion.
   # A chunk appearing in N sources/M sub-queries receives:
@@ -212,17 +238,22 @@ navigator:
   corroboration_source_weight: 0.1
   corroboration_query_weight: 0.05
 
-  # Contradiction filter thresholds (numeric heuristic, original contribution).
+  # Cross-encoder reranker (§12.29 — Tier 1 improvement)
+  # Applies after RRF fusion; re-ranks top-K by (query, chunk) relevance score.
+  # Requires: pip install sentence-transformers  (+22 MB model on first use)
+  # Enabled by default after the 2026-05-06 audit: the 22 MB cross-encoder is
+  # edge-feasible (~30 ms/pair on CPU). Toggle false only for strict no-model-
+  # download deployments or for ablation comparison runs.
+  enable_reranker: true
+  reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  reranker_top_k: 10
+
+  # Contradiction filter thresholds (numeric heuristic).
   # Two chunks are flagged as contradictory when:
   #   word_overlap > overlap_threshold AND
   #   max(n1,n2)/min(n1,n2) > ratio_threshold AND min(n1,n2) > min_value
-  #
-  # min_value raised from 10 → 100 (§12.25, 2026-05-04):
-  # Biographical text routinely contains day-of-month values (1–31) alongside
-  # year values. With min_value=10, the pair (18, 1992) — "born 18 November"
-  # paired with a 1992 year from another chunk — yields ratio 110× > 2.0 and
-  # incorrectly evicts the answer chunk. Values < 100 (days, months, small
-  # counts) are not factual claim slots and must not drive contradiction logic.
+  # min_value=100 prevents day-of-month values (1-31) from triggering false
+  # contradictions with year-scale numbers (see §12.25).
   contradiction_overlap_threshold: 0.3
   contradiction_ratio_threshold: 2.0
   contradiction_min_value: 100.0
@@ -231,7 +262,7 @@ navigator:
 # PLANNER (S_P) — Query Analysis and Plan Generation
 # ============================================================================
 planner:
-  # Minimum NER confidence for entity extraction
+  # Minimum NER confidence for entity extraction.
   min_entity_confidence: 0.7
 
   # Maximum number of entities to extract per query
@@ -306,13 +337,23 @@ available_models:
     expected_latency_s: 55
     safe_60s: false
 
+  - name: "qwen3:4b"
+    description: "Qwen 3 4B — improved multi-hop reasoning, ~3.5 GB RAM"
+    params_b: 4.0
+    quantization: "Q4_K_M"
+    expected_latency_s: 35
+    safe_60s: true
+
 # ============================================================================
 # AGENTIC CONTROLLER (Artifact B)
 # ============================================================================
 agent:
-  # Maximum self-correction iterations in the Verifier loop
-  # 1 = no self-correction (baseline), 2 = thesis default (1 correction round)
-  max_verification_iterations: 2
+  # Maximum self-correction iterations in the Verifier loop.
+  # Lowered from 2 -> 1 (audit 2026-05-06): Madaan et al. (2023) Self-Refine
+  # results reproduce on GPT-3.5+; on a 1.5B-parameter SLM the second pass
+  # typically injects hallucinations rather than correcting them. Set to 2
+  # only as an ablation comparison.
+  max_verification_iterations: 1
 
   # Enable/disable individual pipeline stages (ablation flags)
   enable_planner: true
@@ -403,22 +444,21 @@ benchmark:
 verifier:
   # ---------------------------------------------------------------------------
   # PRE-GENERATION VALIDATION FLAGS
-  # Set enable_contradiction_detection: true only when Transformers is
-  # installed — the NLI model (~270 MB) is downloaded on first use.
+  # The Verifier-side NLI contradiction detection (270 MB cross-encoder
+  # download) was removed in the 2026-05-06 cleanup audit because it had been
+  # disabled by default since v3.x and conflicted with the edge-deployment
+  # constraint of the thesis. Reactivate by adding the relevant fields back.
   # ---------------------------------------------------------------------------
   enable_entity_path_validation: true
-  enable_contradiction_detection: false   # Disabled by default (NLI download required)
   enable_credibility_scoring: true
-
-  # NLI contradiction detection model and parameters.
-  # Reference: Reimers & Gurevych (2019). arXiv:1908.10084.
-  nli_model: "cross-encoder/nli-distilroberta-base"
-  contradiction_threshold: 0.85    # NLI confidence above which a pair is flagged
-  nli_max_input_chars: 200         # Truncation per chunk before NLI (edge CPU)
 
   # Entity-path validation: minimum fraction of query entities that must
   # appear in the retrieved context for the check to pass.
-  entity_coverage_threshold: 0.5
+  # Lowered from 0.5 -> 0.34 (audit 2026-05-06): for 3-entity bridge queries
+  # (subject + bridge + object), 0.5 demanded 2/3 entities present, but the
+  # bridge entity is unknown at S_P time and is added only after Hop 0. A
+  # 1/3 floor lets the gold chunk pass on the first hop.
+  entity_coverage_threshold: 0.34
 
   # Source credibility scoring thresholds.
   min_credibility_score: 0.5       # Chunks below this are filtered
@@ -454,6 +494,8 @@ ingestion:
   chunking_strategy: "sentence_spacy"
 
   # Sentence strategy (thesis default: 3 sentences per chunk, 1 overlap)
+  # Alternative (finer granularity, requires re-ingestion):
+  #   sentences_per_chunk: 2   # IFFHS award sentence → own chunk → perfect BM25 hit
   sentences_per_chunk: 3
   sentence_overlap: 1
 

@@ -1,29 +1,30 @@
 """
-diagnose_verbose.py — Vollständiger Pipeline-Trace (Megafile)
+diagnose_verbose.py — Full pipeline trace (mega-file).
 
-Läuft die komplette S_P → S_N → S_V Pipeline für eine Frage durch und zeigt
-den Output JEDER aufgerufenen Funktion an. Kein einziger Produktionscode wird
-geändert — alle Hooks werden via Monkey-Patching zur Laufzeit eingehängt.
+Runs the complete S_P -> S_N -> S_V pipeline for a single question and
+prints the output of EVERY function it reaches. No production code is
+modified; all hooks are installed via runtime monkey-patching.
 
 Usage:
     python -X utf8 diagnose_verbose.py --idx 0
     python -X utf8 diagnose_verbose.py --idx 5 --skip-llm
-    python -X utf8 diagnose_verbose.py --question "Wer gründete YG Entertainment?"
-    python -X utf8 diagnose_verbose.py --idx 0 --trace-calls   # alle src/-Funktionen tracken
+    python -X utf8 diagnose_verbose.py --question "Who founded YG Entertainment?"
+    python -X utf8 diagnose_verbose.py --idx 0 --trace-calls   # trace every src/ call
     python -X utf8 diagnose_verbose.py --idx 0 --no-color > trace.txt
 
 Flags:
-    --idx N           Frage N aus data/hotpotqa/questions.json (default: 0)
-    --question TEXT   Eigene Freitextfrage statt questions.json
-    --gold TEXT       Gold-Antwort (optional; wird automatisch aus questions.json gelesen)
-    --skip-llm        Verifier überspringen (Retrieval-Debugging ohne LLM-Wartezeit)
-    --trace-calls     sys.settrace: zeigt JEDEN Funktionsaufruf in src/ mit Dateiname
-    --no-color        Farbloses Output (für Pipe/Dateiausgabe)
+    --idx N           Question N from data/hotpotqa/questions.json (default: 0)
+    --question TEXT   Custom free-text question instead of questions.json
+    --gold TEXT       Gold answer (optional; auto-read from questions.json)
+    --skip-llm        Skip the Verifier (retrieval debugging without LLM wait)
+    --trace-calls     sys.settrace: print every function call in src/
+    --no-color        Plain output (for pipe / file capture)
 
-Gold-Tracking:
-    Wenn --gold gesetzt ist (oder automatisch aus questions.json), prüft das Tool
-    nach JEDEM Filter-Schritt, ob die Gold-Antwort noch in einem der verbleibenden
-    Chunks enthalten ist. Bei "✗ GOLD VERLOREN" ist der vorige Schritt der Täter.
+Gold-tracking:
+    When --gold is provided (or auto-loaded from questions.json), the tool
+    checks after EVERY filter step whether the gold answer is still present
+    in any of the remaining chunks. A "GOLD LOST" marker indicates that the
+    preceding step is the culprit.
 """
 
 import argparse
@@ -40,7 +41,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # ─── Farben ─────────────────────────────────────────────────────────────────
 USE_COLOR = True
 
-# ─── Gold-Antwort für Stage-Tracking ─────────────────────────────────────────
+# ─── Gold answer for stage tracking ──────────────────────────────────────────
 # Wird in main() gesetzt und von allen Patch-Funktionen über Closure gelesen.
 _GOLD_ANSWER: str = ""
 _HOP_COUNTER: list = [0]   # mutable container für Hop-Zähler in Closures
@@ -58,22 +59,23 @@ def magenta(t): return _c("\033[95m", t)
 def blue(t):    return _c("\033[94m", t)
 
 
-# ─── Gold-Answer-Tracking ────────────────────────────────────────────────────
+# ─── Gold-answer tracking ────────────────────────────────────────────────────
 
 def _gold_words(gold: str) -> list:
-    """Wichtige Wörter aus der Gold-Antwort (≥4 Zeichen, kein Stoppwort)."""
+    """Important words from the gold answer (>=4 chars, no stopword)."""
     _stops = {"that", "this", "with", "from", "have", "been", "were", "will", "would"}
     return [w for w in gold.lower().split() if len(w) >= 4 and w not in _stops]
 
 
 def _gold_check_texts(texts, stage: str, gold: str = "") -> None:
     """
-    Gibt aus, ob die Gold-Antwort noch in mindestens einem der übergebenen Texte vorkommt.
-    texts: Liste von str ODER Liste von dicts mit "text"-Key.
+    Print whether the gold answer is still contained in at least one of the
+    provided texts.
+    texts: list of str OR list of dicts with a "text" key.
     """
     if not gold:
         gold = _GOLD_ANSWER
-    if not gold or gold in ("?", "(unbekannt)"):
+    if not gold or gold in ("?", "(unknown)"):
         return
     words = _gold_words(gold)
     if not words:
@@ -85,17 +87,17 @@ def _gold_check_texts(texts, stage: str, gold: str = "") -> None:
             hits.append(i + 1)
     bar = "  " + "·" * 60
     if hits:
-        extra = f" (+ {len(hits)-1} weitere)" if len(hits) > 1 else ""
+        extra = f" (+ {len(hits)-1} more)" if len(hits) > 1 else ""
         print(f"{bar}")
-        print(f"  {green(bold('✓ GOLD'))}  «{gold}»  →  Chunk #{hits[0]}{extra}  [{stage}]")
+        print(f"  {green(bold('OK GOLD'))}  '{gold}'  ->  chunk #{hits[0]}{extra}  [{stage}]")
         print(f"{bar}")
     else:
         print(f"{bar}")
-        print(f"  {red(bold('✗ GOLD VERLOREN'))}  «{gold}»  nicht mehr in verbleibenden Chunks  [{stage}]")
+        print(f"  {red(bold('XX GOLD LOST'))}  '{gold}'  no longer in remaining chunks  [{stage}]")
         print(f"{bar}")
 
 
-# ─── Ausgabe-Hilfsfunktionen ─────────────────────────────────────────────────
+# ─── Output helpers ──────────────────────────────────────────────────────────
 
 def section(title: str) -> None:
     bar = "═" * 72
@@ -168,7 +170,7 @@ def _patch(obj, method_name: str, wrapper_factory):
 # =============================================================================
 
 _call_log: list = []          # (datei, funktion)
-_seen_files: set = set()      # einzigartige src/-Dateien
+_seen_files: set = set()      # unique src/ files
 
 def _make_tracer(src_root: Path):
     """
@@ -192,7 +194,7 @@ def _make_tracer(src_root: Path):
 
 def print_call_trace() -> None:
     section("FUNCTION CALL TRACE (alle src/-Aufrufe)")
-    subsection(f"Einzigartige Dateien ({len(_seen_files)})")
+    subsection(f"Unique files ({len(_seen_files)})")
     for f in sorted(_seen_files):
         print(f"    {blue('📄')} {f}")
 
@@ -249,20 +251,20 @@ def patch_planner(planner) -> None:
             field("entities", "")
             if result.entities:
                 for e in result.entities:
-                    # EntityInfo hat: text, label, confidence (kein entity_type!)
+                    # EntityInfo has: text, label, confidence (no entity_type!)
                     print(f"      {bold(e.text)}"
                           f"  {dim(e.label)}"
                           f"  {dim(f'conf={e.confidence:.2f}')}"
                           f"  {dim('bridge') if e.is_bridge else ''}")
             else:
-                print(f"      {red('(keine Entitäten erkannt — Entity-Mention Filter wird deaktiviert!)')}")
+                print(f"      {red('(no entities detected — entity-mention filter will be disabled!)')}")
 
             if result.hop_sequence:
                 field("hop_sequence", "")
                 for hop in result.hop_sequence:
                     print(f"      {dim(str(hop))}")
 
-            field("Dauer", f"{ms:.0f} ms")
+            field("Duration", f"{ms:.0f} ms")
             return result
         return _plan
 
@@ -270,46 +272,46 @@ def patch_planner(planner) -> None:
 
 
 # =============================================================================
-# HYBRID RETRIEVER HOOK — zeigt GLiNER-Entities + Vector/Graph-Roh-Ergebnisse
+# HYBRID RETRIEVER HOOK — shows GLiNER entities + raw vector/graph results
 # =============================================================================
 
 def patch_retriever(retriever) -> None:
     """
-    Patcht HybridRetriever.retrieve() um GLiNER-Query-Entities,
-    rohe Vector-/Graph-Ergebnisse und fusionierten Top-K sichtbar zu machen.
-    Das ist der wichtigste Hook: hier entscheidet sich ob Ed Wood überhaupt
-    aus der DB geholt wird.
+    Patch HybridRetriever.retrieve() to expose GLiNER query entities,
+    raw vector/graph results, and the fused top-K.
+    This is the most important hook: it determines whether the target
+    chunk is even pulled from the database.
 
-    GLiNER-Entities werden aus metrics.query_entities gelesen (kein
-    Doppelaufruf des Extraktors).
+    GLiNER entities are read from metrics.query_entities (no double call
+    of the extractor).
     """
     orig_retrieve = retriever.retrieve
 
     def _retrieve(query: str, top_k=None, entity_hints=None):
         subsection(f"HybridRetriever.retrieve()  query={query!r}")
 
-        # ── retrieve() ausführen ─────────────────────────────────────────────
+        # ── execute retrieve() ───────────────────────────────────────────────
         results, metrics = orig_retrieve(query, top_k, entity_hints=entity_hints)
 
-        # ── GLiNER-Entities aus Metrics lesen (kein Doppelaufruf) ────────────
-        print(f"    {bold('GLiNER Query-Entities:')}")
+        # ── read GLiNER entities from metrics (no double call) ───────────────
+        print(f"    {bold('GLiNER query entities:')}")
         if metrics.query_entities:
             for e in metrics.query_entities:
-                print(f"      {bold(e)}  {dim('(wird für Graph-Search verwendet)')}")
+                print(f"      {bold(e)}  {dim('(used for graph search)')}")
         else:
-            print(f"      {red('(keine Entities erkannt → Graph-Search wird ÜBERSPRUNGEN!)')}")
+            print(f"      {red('(no entities detected -> graph search will be SKIPPED!)')}")
 
-        # ── Metriken anzeigen ─────────────────────────────────────────────────
-        print(f"\n    {bold('Retrieval-Metriken:')}")
-        print(f"      Vector: {metrics.vector_results} Treffer  "
+        # ── show metrics ─────────────────────────────────────────────────────
+        print(f"\n    {bold('Retrieval metrics:')}")
+        print(f"      Vector: {metrics.vector_results} hits  "
               f"{dim(f'({metrics.vector_time_ms:.0f} ms)')}")
-        print(f"      Graph:  {metrics.graph_results} Treffer  "
+        print(f"      Graph:  {metrics.graph_results} hits  "
               f"{dim(f'({metrics.graph_time_ms:.0f} ms)')}")
-        print(f"      Fused:  {metrics.final_results} Ergebnisse  "
+        print(f"      Fused:  {metrics.final_results} results  "
               f"{dim(f'({metrics.fusion_time_ms:.0f} ms)')}")
 
-        # ── Top-5 Ergebnisse mit Retrieval-Methode und matched Entities ───────
-        print(f"\n    {bold('Top-5 fusionierte Ergebnisse:')}")
+        # ── top-5 results with retrieval method and matched entities ─────────
+        print(f"\n    {bold('Top-5 fused results:')}")
         for i, r in enumerate(results[:5]):
             src     = getattr(r, "source_doc", getattr(r, "source", "?"))
             score   = getattr(r, "rrf_score", getattr(r, "score", 0))
@@ -387,11 +389,11 @@ def patch_navigator(navigator) -> None:
             filtered = original(results)
             after = len(filtered)
             removed = before - after
-            subsection(f"Filter 1 — Relevanz  ({before} → {after}"
-                       + (f", {red(str(removed) + ' entfernt')})" if removed else ")"))
+            subsection(f"Filter 1 - Relevance  ({before} -> {after}"
+                       + (f", {red(str(removed) + ' removed')})" if removed else ")"))
             if results:
-                print(f"    {bold('Schwelle:')} {threshold:.4f}  "
-                      f"{dim(f'= {navigator.config.relevance_threshold_factor} × max({max_score:.4f})')}")
+                print(f"    {bold('Threshold:')} {threshold:.4f}  "
+                      f"{dim(f'= {navigator.config.relevance_threshold_factor} x max({max_score:.4f})')}")
             if removed:
                 kept_texts = {r["text"] for r in filtered}
                 for i, r in enumerate(results):
@@ -399,8 +401,8 @@ def patch_navigator(navigator) -> None:
                         removed_block(i, r["text"],
                                       f"rrf={r['rrf_score']:.4f} < {threshold:.4f}")
             else:
-                print(f"    {dim('(alle Chunks über Schwelle — kein Filtering)')}")
-            _gold_check_texts(filtered, "nach Relevanz-Filter")
+                print(f"    {dim('(all chunks above threshold — no filtering)')}")
+            _gold_check_texts(filtered, "after relevance filter")
             return filtered
         return _filt
 
@@ -411,17 +413,17 @@ def patch_navigator(navigator) -> None:
             filtered = original(results)
             after = len(filtered)
             removed = before - after
-            subsection(f"Filter 2 — Redundanz  Jaccard-Threshold={navigator.config.redundancy_threshold}"
-                       f"  ({before} → {after}"
-                       + (f", {red(str(removed) + ' entfernt')})" if removed else ")"))
+            subsection(f"Filter 2 - Redundancy  Jaccard threshold={navigator.config.redundancy_threshold}"
+                       f"  ({before} -> {after}"
+                       + (f", {red(str(removed) + ' removed')})" if removed else ")"))
             if removed:
                 kept_texts = {r["text"] for r in filtered}
                 for i, r in enumerate(results):
                     if r["text"] not in kept_texts:
-                        removed_block(i, r["text"], "Jaccard-Duplikat")
+                        removed_block(i, r["text"], "Jaccard duplicate")
             if not removed:
-                print(f"    {dim('(keine Duplikate)')}")
-            _gold_check_texts(filtered, "nach Redundanz-Filter")
+                print(f"    {dim('(no duplicates)')}")
+            _gold_check_texts(filtered, "after redundancy filter")
             return filtered
         return _filt
 
@@ -432,19 +434,19 @@ def patch_navigator(navigator) -> None:
             filtered = original(results)
             after = len(filtered)
             removed = before - after
-            subsection(f"Filter 3 — Widerspruch  overlap>={navigator.config.contradiction_overlap_threshold}"
+            subsection(f"Filter 3 - Contradiction  overlap>={navigator.config.contradiction_overlap_threshold}"
                        f"  ratio>={navigator.config.contradiction_ratio_threshold}"
                        f"  min_value>={navigator.config.contradiction_min_value}"
-                       f"  ({before} → {after}"
-                       + (f", {red(str(removed) + ' entfernt')})" if removed else ")"))
+                       f"  ({before} -> {after}"
+                       + (f", {red(str(removed) + ' removed')})" if removed else ")"))
             if removed:
                 kept_texts = {r["text"] for r in filtered}
                 for i, r in enumerate(results):
                     if r["text"] not in kept_texts:
-                        removed_block(i, r["text"], "Numerischer Widerspruch")
+                        removed_block(i, r["text"], "Numeric contradiction")
             if not removed:
-                print(f"    {dim('(keine Widersprüche)')}")
-            _gold_check_texts(filtered, "nach Widerspruchs-Filter")
+                print(f"    {dim('(no contradictions)')}")
+            _gold_check_texts(filtered, "after contradiction filter")
             return filtered
         return _filt
 
@@ -455,16 +457,16 @@ def patch_navigator(navigator) -> None:
             filtered = original(results)
             after = len(filtered)
             removed = before - after
-            subsection(f"Filter 4 — Entity-Overlap  ({before} → {after}"
-                       + (f", {red(str(removed) + ' entfernt')})" if removed else ")"))
+            subsection(f"Filter 4 - Entity overlap  ({before} -> {after}"
+                       + (f", {red(str(removed) + ' removed')})" if removed else ")"))
             if removed:
                 kept_texts = {r["text"] for r in filtered}
                 for i, r in enumerate(results):
                     if r["text"] not in kept_texts:
-                        removed_block(i, r["text"], "Entity-Set ist Teilmenge")
+                        removed_block(i, r["text"], "Entity set is a subset")
             if not removed:
-                print(f"    {dim('(keine Teilmengen)')}")
-            _gold_check_texts(filtered, "nach Entity-Overlap-Filter")
+                print(f"    {dim('(no subsets)')}")
+            _gold_check_texts(filtered, "after entity-overlap filter")
             return filtered
         return _filt
 
@@ -496,35 +498,35 @@ def patch_navigator(navigator) -> None:
                     return False
                 safety_fallback = not any(_mentions(r["text"], entity_names) for r in results)
 
-            label = f"{before} → {after}"
+            label = f"{before} -> {after}"
             if removed:
-                label += f", {red(str(removed) + ' entfernt')}"
+                label += f", {red(str(removed) + ' removed')}"
             elif safety_fallback:
-                label += f", {yellow('Safety-Fallback!')}"
-            subsection(f"Filter 5 — Entity-Mention  ({label})")
+                label += f", {yellow('safety fallback!')}"
+            subsection(f"Filter 5 - Entity mention  ({label})")
 
-            print(f"    {bold('Gesuchte Entities:')} "
+            print(f"    {bold('Searched entities:')} "
                   + (", ".join(bold(e) for e in entity_names) if entity_names
-                     else red("(keine!) → Filter deaktiviert, alle Chunks behalten")))
+                     else red("(none!) -> filter disabled, all chunks kept")))
 
             if not entity_names:
-                print(f"    {yellow('⚠ URSACHE: Planner-Entities leer')}")
-                print(f"    {yellow('⚠ FOLGE: Irrelevante Chunks kommen durch — Verifier hat schlechten Kontext')}")
+                print(f"    {yellow('* CAUSE: planner entities empty')}")
+                print(f"    {yellow('* CONSEQUENCE: irrelevant chunks pass through — Verifier sees poor context')}")
             elif safety_fallback:
-                print(f"    {yellow('⚠ SAFETY-FALLBACK: Kein einziger Chunk enthält eine der gesuchten Entities.')}")
-                print(f"    {yellow('⚠ URSACHE: Artikel wahrscheinlich nicht in der Datenbank (fehlt in Ingestion)')}")
-                print(f"    {yellow('⚠ FOLGE: Alle 10 irrelevanten Chunks bleiben — Verifier hat nutzlosen Kontext')}")
+                print(f"    {yellow('* SAFETY FALLBACK: no chunk contains any of the searched entities.')}")
+                print(f"    {yellow('* CAUSE: article likely not in the database (missing from ingestion)')}")
+                print(f"    {yellow('* CONSEQUENCE: all 10 irrelevant chunks stay — Verifier has useless context')}")
             elif removed:
                 kept_texts = {r["text"] for r in filtered}
                 for i, r in enumerate(results):
                     if r["text"] not in kept_texts:
-                        removed_block(i, r["text"], "Keine Entity-Erwähnung im Text")
+                        removed_block(i, r["text"], "No entity mention in the text")
 
             if after < before or not entity_names or safety_fallback:
-                print(f"    {bold('Verbleibende Chunks:')}")
+                print(f"    {bold('Remaining chunks:')}")
                 for i, r in enumerate(filtered):
                     chunk_block(i, r["text"], r.get("rrf_score"))
-            _gold_check_texts(filtered, "nach Entity-Mention-Filter")
+            _gold_check_texts(filtered, "after entity-mention filter")
             return filtered
         return _filt
 
@@ -536,15 +538,15 @@ def patch_navigator(navigator) -> None:
             total_before = sum(len(r["text"]) for r in results)
             total_after  = sum(len(r["text"]) for r in shrunk)
             reduction = 100 * (1 - total_after / max(total_before, 1))
-            subsection(f"Filter 6 — Context Shrinkage  "
-                       f"limit={limit} Zeichen/Chunk  "
-                       f"({total_before} → {total_after} Zeichen, {reduction:.0f}% Reduktion)")
+            subsection(f"Filter 6 - Context shrinkage  "
+                       f"limit={limit} chars/chunk  "
+                       f"({total_before} -> {total_after} chars, {reduction:.0f}% reduction)")
             for i, r in enumerate(shrunk):
                 orig_len = len(results[i]["text"]) if i < len(results) else "?"
                 new_len  = len(r["text"])
-                trunc = f"gekürzt {orig_len}→{new_len}" if orig_len != new_len else "unverändert"
+                trunc = f"truncated {orig_len}->{new_len}" if orig_len != new_len else "unchanged"
                 chunk_block(i, r["text"], r.get("rrf_score"), extra=trunc)
-            _gold_check_texts(shrunk, "nach Context-Shrinkage")
+            _gold_check_texts(shrunk, "after context shrinkage")
             return shrunk
         return _filt
 
@@ -566,16 +568,16 @@ def patch_navigator(navigator) -> None:
         field("Sub-Queries", len(sub_queries))
         for i, sq in enumerate(sub_queries, 1):
             print(f"    {bold(str(i) + '.')} {sq}")
-        field("Entity Names (für Entity-Mention Filter)", entity_names or [])
+        field("Entity names (for entity-mention filter)", entity_names or [])
         print(f"    {bold('max_context_chunks:')} {navigator.config.max_context_chunks}")
         print(f"    {bold('top_k_per_subquery:')} {navigator.config.top_k_per_subquery}")
 
         result = orig_navigate(retrieval_plan, sub_queries, entity_names)
 
-        subsection("NAVIGATOR ERGEBNIS")
-        field("Raw Chunks (vor allen Filtern)",    len(result.raw_context))
-        field("Filtered Chunks (nach allen Filtern)", len(result.filtered_context))
-        print(f"\n    {bold('Filter-Zähler:')}")
+        subsection("NAVIGATOR RESULT")
+        field("Raw chunks (before all filters)",    len(result.raw_context))
+        field("Filtered chunks (after all filters)", len(result.filtered_context))
+        print(f"\n    {bold('Filter counters:')}")
         filter_keys = [
             "pre_filter_count",
             "after_relevance_filter",
@@ -591,17 +593,17 @@ def patch_navigator(navigator) -> None:
             if k != "pre_filter_count" and isinstance(v, int) and isinstance(prev, int):
                 delta = v - prev
                 if delta < 0:
-                    diff = f"  {red(f'−{abs(delta)} entfernt')}"
+                    diff = f"  {red(f'-{abs(delta)} removed')}"
                 elif delta == 0:
-                    diff = f"  {dim('unverändert')}"
+                    diff = f"  {dim('unchanged')}"
             print(f"      {bold(k)}: {v}{diff}")
             prev = v
 
         if result.metadata.get("retrieval_errors"):
-            print(f"    {red('Retrieval-Fehler:')} {result.metadata['retrieval_errors']}")
+            print(f"    {red('Retrieval errors:')} {result.metadata['retrieval_errors']}")
 
-        # Gold-Check auf finales Navigator-Ergebnis
-        _gold_check_texts(result.filtered_context, f"Navigator-Ergebnis [{hop_label}]")
+        # Gold check on final Navigator result
+        _gold_check_texts(result.filtered_context, f"Navigator result [{hop_label}]")
         return result
 
     navigator.navigate = _nav_wrapper
@@ -618,24 +620,24 @@ def patch_verifier(verifier) -> None:
 
     def _reorder_wrapper(query, context):
         reordered = orig_reorder(query, context)
-        subsection(f"_reorder_by_question_relevance()  {len(context)} Chunks")
+        subsection(f"_reorder_by_question_relevance()  {len(context)} chunks")
         if reordered != context:
-            print(f"    {bold('Reihenfolge geändert')} — LLM sieht Chunks in dieser Reihenfolge:")
+            print(f"    {bold('Order changed')} — LLM sees chunks in this order:")
         else:
-            print(f"    {dim('(Reihenfolge unverändert)')}")
+            print(f"    {dim('(order unchanged)')}")
         for i, c in enumerate(reordered):
             orig_pos = context.index(c) + 1 if c in context else "?"
             gold_marker = ""
             if _GOLD_ANSWER:
                 words = _gold_words(_GOLD_ANSWER)
                 if words and all(w in c.lower() for w in words):
-                    gold_marker = f"  {green('← GOLD ✓')}"
-            pos_change = f"  {dim(f'(war #{orig_pos})')}" if orig_pos != i + 1 else ""
+                    gold_marker = f"  {green('<- GOLD ok')}"
+            pos_change = f"  {dim(f'(was #{orig_pos})')}" if orig_pos != i + 1 else ""
             print(f"    {bold(f'#{i+1}')}{pos_change}{gold_marker}")
             preview = c[:120].replace("\n", " ")
             for line in wrap(preview, 86):
                 print(f"      {dim(line)}")
-        _gold_check_texts(reordered, "nach Reorder (LLM-Eingang)")
+        _gold_check_texts(reordered, "after reorder (LLM input)")
         return reordered
 
     verifier._reorder_by_question_relevance = _reorder_wrapper
@@ -645,13 +647,13 @@ def patch_verifier(verifier) -> None:
 
     def _fmt_wrapper(context):
         formatted = orig_format(context)
-        subsection(f"_format_context()  {len(context)} Chunks → {len(formatted)} Zeichen")
+        subsection(f"_format_context()  {len(context)} chunks -> {len(formatted)} chars")
         max_docs = verifier.config.max_docs
         max_chars = verifier.config.max_chars_per_doc
         print(f"    {bold('Limits:')} max_docs={max_docs}, max_chars_per_doc={max_chars}, "
               f"max_context_chars={verifier.config.max_context_chars}")
         if len(context) > max_docs:
-            print(f"    {yellow(f'⚠ {len(context)} Chunks → nur die ersten {max_docs} werden verwendet!')}")
+            print(f"    {yellow(f'* {len(context)} chunks -> only the first {max_docs} will be used!')}")
         return formatted
 
     verifier._format_context = _fmt_wrapper
@@ -661,7 +663,7 @@ def patch_verifier(verifier) -> None:
 
     def _claims_wrapper(answer):
         claims = orig_extract(answer)
-        print(f"\n    {bold('Extrahierte Claims')} ({len(claims)}):")
+        print(f"\n    {bold('Extracted claims')} ({len(claims)}):")
         for c in claims:
             print(f"      {dim('·')} {c}")
         return claims
@@ -684,11 +686,11 @@ def patch_verifier(verifier) -> None:
 
     def _wrap_generate(query, context, entities=None, hop_sequence=None):
         section("S_V — VERIFIER")
-        field("Query",    query)
-        field("Chunks eingehend", len(context))
-        field("Entities", entities or [])
+        field("Query",       query)
+        field("Chunks in",   len(context))
+        field("Entities",    entities or [])
 
-        # Pre-Validation direkt aufrufen und anzeigen
+        # Run pre-validation and display its result
         subsection("Pre-Generation Validation")
         try:
             pre_val = verifier.pre_validator.validate(
@@ -697,42 +699,42 @@ def patch_verifier(verifier) -> None:
             )
             print(f"    {bold('Status:')}          {pre_val.status.value}")
             print(f"    {bold('entity_path_valid:')} {pre_val.entity_path_valid}")
-            print(f"    {bold('Widersprüche:')}")
+            print(f"    {bold('Contradictions:')}")
             if pre_val.contradictions:
                 for c in pre_val.contradictions[:3]:
-                    print(f"      {red('✗')} {dim(str(c)[:120])}")
+                    print(f"      {red('XX')} {dim(str(c)[:120])}")
             else:
-                print(f"      {dim('(keine)')}")
-            print(f"    {bold('Filtered Context:')} "
-                  f"{len(pre_val.filtered_context)}/{len(context)} Chunks behalten")
+                print(f"      {dim('(none)')}")
+            print(f"    {bold('Filtered context:')} "
+                  f"{len(pre_val.filtered_context)}/{len(context)} chunks kept")
             if len(pre_val.filtered_context) < len(context):
                 kept = set(id(c) for c in pre_val.filtered_context)
                 for i, c in enumerate(context):
                     if id(c) not in kept:
-                        print(f"      {red(f'✗ Chunk #{i+1} von Pre-Validator entfernt:')}")
+                        print(f"      {red(f'XX chunk #{i+1} removed by pre-validator:')}")
                         print(f"        {dim(c[:100])}")
-            print(f"    {bold('Credibility Scores:')}")
+            print(f"    {bold('Credibility scores:')}")
             if hasattr(pre_val, "credibility_scores") and pre_val.credibility_scores:
                 for i, sc in enumerate(pre_val.credibility_scores[:5]):
                     score_val = sc.score if hasattr(sc, "score") else sc
                     print(f"      Chunk #{i+1}: {score_val:.3f}")
             else:
-                print(f"      {dim('(keine)')}")
+                print(f"      {dim('(none)')}")
         except Exception as ex:
-            print(f"    {red(f'Pre-Validation Fehler: {ex}')}")
+            print(f"    {red(f'Pre-validation error: {ex}')}")
 
-        print(f"\n  {bold(yellow('Kontext-Chunks an Verifier:'))}")
+        print(f"\n  {bold(yellow('Context chunks sent to Verifier:'))}")
         for i, c in enumerate(context):
             chunk_block(i, c)
 
         result = orig_gen(query, context, entities, hop_sequence)
 
-        subsection("VERIFIER ERGEBNIS")
-        field("Antwort",      result.answer)
+        subsection("VERIFIER RESULT")
+        field("Answer",       result.answer)
         conf = result.confidence
         conf_str = conf.value if hasattr(conf, "value") else str(conf)
-        field("Konfidenz",    conf_str)
-        field("Iterationen",  result.iterations)
+        field("Confidence",   conf_str)
+        field("Iterations",   result.iterations)
         field("All verified", result.all_verified)
         if result.verified_claims:
             print(f"    {bold('Verified claims')} ({len(result.verified_claims)}):")
@@ -754,25 +756,25 @@ def patch_verifier(verifier) -> None:
 def load_question(idx: int) -> dict:
     questions_path = PROJECT_ROOT / "data" / "hotpotqa" / "questions.json"
     if not questions_path.exists():
-        print(red(f"Fehler: {questions_path} nicht gefunden"))
+        print(red(f"Error: {questions_path} not found"))
         sys.exit(1)
     with open(questions_path, encoding="utf-8") as f:
         questions = json.load(f)
     if idx >= len(questions):
-        print(red(f"Index {idx} zu groß (max: {len(questions)-1})"))
+        print(red(f"Index {idx} too large (max: {len(questions)-1})"))
         sys.exit(1)
     return questions[idx]
 
 
 # =============================================================================
-# CONTROLLER HOOK — Bridge-Entity-Extraktion sichtbar machen
+# CONTROLLER HOOK — make bridge-entity extraction visible
 # =============================================================================
 
 def patch_controller_bridge(controller) -> None:
     """
-    Patcht AgenticController._extract_bridge_entities so dass jede Erkennung
-    von Bridge-Entities im Output erscheint. Das zeigt ob der iterative Multi-Hop
-    tatsächlich läuft und welche Entities er entdeckt.
+    Patch AgenticController._extract_bridge_entities so that every detection
+    of bridge entities appears in the output. This shows whether the
+    iterative multi-hop is actually running and which entities it discovers.
     """
     from src.logic_layer.controller import AgenticController as _AC
     orig_extract = _AC._extract_bridge_entities  # raw function via class
@@ -782,19 +784,19 @@ def patch_controller_bridge(controller) -> None:
         bar = "  " + "·" * 60
         print(f"\n{bar}")
         if result:
-            print(f"  {green(bold('⚡ BRIDGE ENTITIES ENTDECKT:'))}  "
+            print(f"  {green(bold('** BRIDGE ENTITIES DETECTED:'))}  "
                   + "  ".join(bold(e) for e in result))
-            print(f"  {dim(f'(aus {len(chunks)} Chunk(s), exclude={exclude})')}")
+            print(f"  {dim(f'(from {len(chunks)} chunk(s), exclude={exclude})')}")
         else:
-            print(f"  {yellow(bold('⚠ KEINE BRIDGE ENTITIES GEFUNDEN'))}  "
-                  f"{dim(f'(exclude={exclude}, Chunks: {len(chunks)})')}")
+            print(f"  {yellow(bold('* NO BRIDGE ENTITIES FOUND'))}  "
+                  f"{dim(f'(exclude={exclude}, chunks: {len(chunks)})')}")
             if chunks:
                 preview = chunks[0][:120].replace("\n", " ")
-                print(f"  {dim(f'Chunk-Preview: {preview}')}")
+                print(f"  {dim(f'Chunk preview: {preview}')}")
         print(f"{bar}\n")
         return result
 
-    # Instanz-Dict-Patch: Python sucht zuerst in self.__dict__ → überschreibt Klassen-staticmethod
+    # Instance-dict patch: Python looks in self.__dict__ first -> overrides class staticmethod
     controller._extract_bridge_entities = _wrapped_extract
 
 
@@ -857,25 +859,25 @@ def main():
     global USE_COLOR, _GOLD_ANSWER
 
     parser = argparse.ArgumentParser(
-        description="Vollständiger Pipeline-Trace mit Output jeder Funktion"
+        description="Full pipeline trace with output from every function"
     )
     parser.add_argument("--idx",         type=int,  default=0)
     parser.add_argument("--question",    type=str,  default=None)
     parser.add_argument("--gold",        type=str,  default=None,
-                        help="Gold-Antwort für Stage-Tracking (wird sonst aus questions.json gelesen)")
+                        help="Gold answer for stage tracking (otherwise read from questions.json)")
     parser.add_argument("--skip-llm",    action="store_true")
     parser.add_argument("--trace-calls", action="store_true",
-                        help="sys.settrace: zeigt jeden src/-Funktionsaufruf")
+                        help="sys.settrace: show every src/ function call")
     parser.add_argument("--no-color",    action="store_true")
     args = parser.parse_args()
 
     if args.no_color:
         USE_COLOR = False
 
-    # ── Frage laden ──────────────────────────────────────────────────────────
+    # ── Load the question ────────────────────────────────────────────────────
     if args.question:
         q_text = args.question
-        gold   = args.gold or "(unbekannt)"
+        gold   = args.gold or "(unknown)"
         q_type = "custom"
     else:
         q = load_question(args.idx)
@@ -883,10 +885,10 @@ def main():
         gold   = args.gold or q.get("answer", "?")
         q_type = q.get("question_type", "?")
 
-    # Gold-Antwort global setzen (alle Patch-Hooks lesen daraus)
+    # Set the gold answer globally (all patch hooks read it from here)
     _GOLD_ANSWER = gold
 
-    # ── Config laden ─────────────────────────────────────────────────────────
+    # ── Load config ──────────────────────────────────────────────────────────
     import yaml
     with open(PROJECT_ROOT / "config" / "settings.yaml", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -895,13 +897,13 @@ def main():
     print("\n" + bold("═" * 72))
     print(f"  {bold(cyan('PIPELINE VERBOSE TRACE'))}")
     print(bold("═" * 72))
-    field("Frage",        q_text)
-    field("Gold-Antwort", gold)
-    field("Typ",          q_type)
+    field("Question",     q_text)
+    field("Gold answer",  gold)
+    field("Type",         q_type)
     if args.skip_llm:
-        print(f"\n  {yellow('⚠ --skip-llm: Verifier wird NICHT ausgeführt')}")
+        print(f"\n  {yellow('* --skip-llm: Verifier will NOT be executed')}")
     if args.trace_calls:
-        print(f"\n  {blue('ℹ --trace-calls: alle src/-Funktionsaufrufe werden geloggt')}")
+        print(f"\n  {blue('* --trace-calls: every src/ function call will be logged')}")
 
     # ── sys.settrace aktivieren ───────────────────────────────────────────────
     if args.trace_calls:
@@ -935,13 +937,13 @@ def main():
                             gold_marker = f"  {green('← GOLD ✓')}"
                     chunk_block(i, c)
                     if gold_marker:
-                        print(f"    {green(f'  ← GOLD «{_GOLD_ANSWER}» IN DIESEM CHUNK')}")
-                _gold_check_texts(context, "Verifier-Eingang (skip-llm)")
+                        print("    " + green("  <- GOLD ANSWER '" + _GOLD_ANSWER + "' IN THIS CHUNK"))
+                _gold_check_texts(context, "Verifier input (skip-llm)")
             else:
-                print(f"    {red('⚠ KEIN KONTEXT — Navigator hat 0 Chunks geliefert!')}")
-                print(f"    {yellow('  → Mögliche Ursachen: Retrieval-Fehler, Entity-Mention-Filter zu aggressiv')}")
+                print(f"    {red('* NO CONTEXT — Navigator returned 0 chunks!')}")
+                print(f"    {yellow('  -> Possible causes: retrieval error, entity-mention filter too aggressive')}")
             result = VerificationResult(
-                answer="[übersprungen]",
+                answer="[skipped]",
                 iterations=0,
                 verified_claims=[],
                 violated_claims=[],
@@ -950,30 +952,30 @@ def main():
                 iteration_history=[],
                 timing_ms=0.0,
             )
-            subsection("VERIFIER ERGEBNIS  (simuliert)")
-            field("Antwort",     result.answer)
-            field("Konfidenz",   result.confidence.value)
-            field("Iterationen", result.iterations)
+            subsection("VERIFIER RESULT  (simulated)")
+            field("Answer",     result.answer)
+            field("Confidence", result.confidence.value)
+            field("Iterations", result.iterations)
             return result
         verifier.generate_and_verify = _skip_verifier
 
-    # ── Pipeline ausführen ────────────────────────────────────────────────────
+    # ── Run pipeline ─────────────────────────────────────────────────────────
     t_start = time.time()
     final_state = controller.run(q_text)
     total_ms = (time.time() - t_start) * 1000
 
-    # ── sys.settrace deaktivieren ─────────────────────────────────────────────
+    # ── Disable sys.settrace ─────────────────────────────────────────────────
     if args.trace_calls:
         sys.settrace(None)
         print_call_trace()
 
-    # ── Zusammenfassung ───────────────────────────────────────────────────────
-    section("ZUSAMMENFASSUNG")
+    # ── Summary ──────────────────────────────────────────────────────────────
+    section("SUMMARY")
     pred = final_state.get("answer", "")
-    field("Frage",       q_text)
-    field("Gold",        gold)
-    field("Vorhersage",  pred)
-    field("Gesamtdauer", f"{total_ms:.0f} ms")
+    field("Question",   q_text)
+    field("Gold",       gold)
+    field("Prediction", pred)
+    field("Total time", f"{total_ms:.0f} ms")
 
     timings = final_state.get("stage_timings", {})
     if timings:
@@ -993,11 +995,11 @@ def main():
     em = pred_n == gold_n or (
         gold_n and bool(re.search(r'\b' + re.escape(gold_n) + r'\b', pred_n))
     )
-    print(f"\n  Ergebnis: {bold(green('✓ RICHTIG') if em else red('✗ FALSCH'))}")
+    print(f"\n  Result: {bold(green('OK CORRECT') if em else red('XX WRONG'))}")
 
     errors = final_state.get("errors", [])
     if errors:
-        print(f"\n  {red('Pipeline-Fehler:')}")
+        print(f"\n  {red('Pipeline errors:')}")
         for e in errors:
             print(f"    {red('!')} {dim(e)}")
 

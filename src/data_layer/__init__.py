@@ -72,7 +72,6 @@ from .hybrid_retriever import (
     RetrievalMode,
     RetrievalResult,
     RetrievalMetrics,
-    PreGenerativeFilter,
     ImprovedQueryEntityExtractor,
 )
 
@@ -104,6 +103,29 @@ from .ingestion import (
     create_data_layer_pipeline,
 )
 
+# ── Graph Quality (post-ingestion analysis + cleanup) ─────────────────────────
+from .graph_quality import (
+    canonical_form,
+    compute_graph_baseline,
+    format_baseline_report,
+    assert_graph_invariants,
+    GraphQualityViolation,
+    build_cooccurrence_edges,
+    cleanup_graph,
+    link_entities_by_embedding,
+    DEFAULT_STOPLIST,
+)
+
+# ── Optional pipeline stages (coreference, SVO) ─────────────────────────────
+from .coreference import (
+    resolve_coreferences,
+    is_available as coreference_available,
+)
+from .svo_extraction import (
+    extract_svo_relations,
+    is_available as svo_available,
+)
+
 __all__ = [
     # Storage
     "HybridStore",
@@ -120,7 +142,6 @@ __all__ = [
     "RetrievalMode",
     "RetrievalResult",
     "RetrievalMetrics",
-    "PreGenerativeFilter",
     "ImprovedQueryEntityExtractor",
     # Entity Extraction
     "EntityExtractionPipeline",
@@ -141,5 +162,20 @@ __all__ = [
     "ChunkingStrategy",
     "create_ingestion_config",
     "create_data_layer_pipeline",
+    # Graph quality
+    "canonical_form",
+    "compute_graph_baseline",
+    "format_baseline_report",
+    "assert_graph_invariants",
+    "GraphQualityViolation",
+    "build_cooccurrence_edges",
+    "cleanup_graph",
+    "link_entities_by_embedding",
+    "DEFAULT_STOPLIST",
+    # Coreference + SVO (optional pipeline stages)
+    "resolve_coreferences",
+    "coreference_available",
+    "extract_svo_relations",
+    "svo_available",
 ]
 

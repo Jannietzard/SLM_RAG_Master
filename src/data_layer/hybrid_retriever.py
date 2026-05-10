@@ -68,7 +68,6 @@ Review History:
                     except Exception narrowed in vector path;
                     entity_pipeline.ner_extractor.model guarded (AttributeError);
                     entity hints normalised via _normalize_query_entity;
-                    PreGenerativeFilter defaults match settings.yaml (0.85/distilroberta/0.85);
                     _ABBREV_SUFFIXES + _FP_LEN module constants; _SPACY_TYPE_MAP class constant;
                     seen_fps: set[str]; _embed_query np.ndarray annotation;
                     re module-level import; jaccard_similarity → @staticmethod;
@@ -225,10 +224,13 @@ class RetrievalConfig:
     # GLiNER model name (sourced from settings.yaml entity_extraction.gliner.model_name)
     gliner_model_name: str = "urchade/gliner_small-v2.1"
 
-    # Reserved for future weighted-fusion ablation mode. NOT used by the current
-    # RRF implementation.
-    vector_weight: float = 0.7
-    graph_weight: float = 0.3
+    # BM25 sparse retrieval (§12.29)
+    enable_bm25: bool = True    # settings.yaml: rag.enable_bm25
+    bm25_top_k: int = 10        # settings.yaml: rag.bm25_top_k
+
+    # vector_weight / graph_weight were removed in the 2026-05-06 cleanup audit.
+    # They were never read by production code; weighted-fusion ablation can be
+    # performed by setting `mode` to RetrievalMode.VECTOR or RetrievalMode.GRAPH.
 
 
 @dataclass
@@ -247,9 +249,13 @@ class RetrievalResult:
     graph_rank: Optional[int] = None
 
     # Metadata
-    retrieval_method: str = "hybrid"  # "vector", "graph", or "hybrid"
+    retrieval_method: str = "hybrid"  # "vector", "graph", "bm25", or "hybrid"
     hop_distance: Optional[int] = None
     matched_entities: List[str] = field(default_factory=list)
+
+    # BM25 scores (populated when enable_bm25=True)
+    bm25_score: Optional[float] = None
+    bm25_rank: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialise to plain dictionary."""
@@ -266,6 +272,8 @@ class RetrievalResult:
             "retrieval_method": self.retrieval_method,
             "hop_distance": self.hop_distance,
             "matched_entities": self.matched_entities,
+            "bm25_score": self.bm25_score,
+            "bm25_rank": self.bm25_rank,
         }
 
 
@@ -313,6 +321,7 @@ class RRFFusion:
         vector_results: List[Dict[str, Any]],
         graph_results: List[Dict[str, Any]],
         final_top_k: int = 10,
+        bm25_results: Optional[List[Dict[str, Any]]] = None,
     ) -> List[RetrievalResult]:
         """
         Fuse vector and graph result lists using RRF with additive cross-source boost.
@@ -404,11 +413,44 @@ class RRFFusion:
                     "position": result.get("position", 0),
                 }
 
-        # Additive cross-source boost for chunks present in both result lists
-        in_both = set(vector_ranks.keys()) & set(graph_ranks.keys())
-        for chunk_id in in_both:
-            bonus = self.cross_source_boost / (self.k + 1)
-            rrf_scores[chunk_id] += bonus
+        # BM25 sparse ranks — uses same document_id key as vector results
+        bm25_ranks: Dict[str, int] = {}
+        bm25_scores_map: Dict[str, float] = {}
+
+        if bm25_results:
+            for rank, result in enumerate(bm25_results, start=1):
+                chunk_id = result.get("document_id", "")
+                if not chunk_id:
+                    continue
+                rrf_scores[chunk_id] += 1.0 / (self.k + rank)
+                bm25_ranks[chunk_id] = rank
+                bm25_scores_map[chunk_id] = result.get("similarity", 0.0)
+
+                if chunk_id not in chunk_data:
+                    chunk_data[chunk_id] = {
+                        "chunk_id": chunk_id,
+                        "text": result.get("text", ""),
+                        "source_doc": result.get("metadata", {}).get("source_file", "unknown"),
+                        "position": result.get("position", 0),
+                    }
+
+        # Cross-source boost: any chunk in 2+ retrieval lists gets a bonus.
+        # Extends the original vector+graph pair to include BM25.
+        all_sources = [
+            set(vector_ranks.keys()),
+            set(graph_ranks.keys()),
+        ]
+        if bm25_results:
+            all_sources.append(set(bm25_ranks.keys()))
+
+        boosted: set = set()
+        for i, src_a in enumerate(all_sources):
+            for src_b in all_sources[i + 1:]:
+                for chunk_id in src_a & src_b:
+                    if chunk_id not in boosted:
+                        bonus = self.cross_source_boost / (self.k + 1)
+                        rrf_scores[chunk_id] += bonus
+                        boosted.add(chunk_id)
 
         # Sort by RRF score descending
         sorted_chunks = sorted(
@@ -425,11 +467,15 @@ class RRFFusion:
 
             in_vector = chunk_id in vector_ranks
             in_graph = chunk_id in graph_ranks
+            in_bm25 = chunk_id in bm25_ranks
 
-            if in_vector and in_graph:
+            sources = sum([in_vector, in_graph, in_bm25])
+            if sources >= 2:
                 method = "hybrid"
             elif in_vector:
                 method = "vector"
+            elif in_bm25:
+                method = "bm25"
             else:
                 method = "graph"
 
@@ -446,6 +492,8 @@ class RRFFusion:
                 retrieval_method=method,
                 hop_distance=gm.get("hop_distance"),
                 matched_entities=[e for e in gm.get("matched_entities", []) if e],
+                bm25_score=bm25_scores_map.get(chunk_id),
+                bm25_rank=bm25_ranks.get(chunk_id),
             ))
 
         return results
@@ -714,6 +762,15 @@ class HybridRetriever:
 
         vector_time = (time.time() - vector_start) * 1000
 
+        # 2b. BM25 sparse retrieval (§12.29)
+        bm25_results: List[Dict[str, Any]] = []
+        if self.config.enable_bm25 and self.config.mode in [RetrievalMode.VECTOR, RetrievalMode.HYBRID]:
+            try:
+                bm25_results = self._bm25_search(query, self.config.bm25_top_k)
+                logger.debug("BM25: %d results", len(bm25_results))
+            except Exception as _bm25_err:
+                logger.debug("BM25 search failed: %s", _bm25_err)
+
         # 3. Graph retrieval
         graph_start = time.time()
         graph_results: List[Dict[str, Any]] = []
@@ -730,48 +787,12 @@ class HybridRetriever:
                     logger.warning("Graph retrieval failed: %s", e)
                     graph_results = []
 
-            # Keyword entity fallback: compensates for nomic-embed-text score
-            # compression where domain-similar texts (e.g. all botanical genus
-            # descriptions) cluster together and the target entity chunk ranks
-            # outside the ANN top-K even when it literally contains the query
-            # entity name.
-            #
-            # Dual injection into both vector_results AND graph_results grants
-            # the chunk the RRF cross-source boost, pushing total score to
-            # ~0.050 — above the Navigator Relevance Filter threshold of
-            # 0.85 × max_rrf (~0.043 when the top chunk has both vector+graph).
-            if query_entities:
-                try:
-                    keyword_results = self._keyword_entity_search(query_entities, top_k)
-                    existing_vector_ids = {r["document_id"] for r in vector_results}
-                    existing_graph_ids = {r.get("chunk_id") for r in graph_results}
-                    for kr in keyword_results:
-                        chunk_id = kr["chunk_id"]
-                        if chunk_id not in existing_vector_ids:
-                            # Own-article chunks (source_file == entity name) get a
-                            # higher synthetic similarity so they out-rank mere-mention
-                            # chunks in RRF. "Terrence 'Uncle Terry' Richardson" would
-                            # otherwise rank below Amanda Lepore (which mentions TR but
-                            # is unrelated), pushing the bio chunk past max_docs. §12.24
-                            src_title = (
-                                kr.get("source_file", "")
-                                .lower()
-                                .replace("hotpotqa_", "")
-                            )
-                            entity_lower = kr.get("matched_entity", "").lower()
-                            sim = 0.95 if src_title == entity_lower else 0.76
-                            vector_results.append({
-                                "document_id": chunk_id,
-                                "text": kr["text"],
-                                "similarity": sim,
-                                "metadata": {"source_file": kr["source_file"]},
-                            })
-                            existing_vector_ids.add(chunk_id)
-                        if chunk_id not in existing_graph_ids:
-                            graph_results.append(kr)
-                            existing_graph_ids.add(chunk_id)
-                except Exception as _kw_err:
-                    logger.debug("Keyword entity search failed: %s", _kw_err)
+            # The previous _keyword_entity_search() substring scan with dual
+            # injection (§12.22) was removed in the 2026-05-06 cleanup audit.
+            # BM25 (§12.29) strictly subsumes the substring match: any chunk
+            # that contained the entity name verbatim is now surfaced by the
+            # BM25 path instead, with a principled term-frequency score rather
+            # than a synthetic 0.76/0.95 similarity.
 
         graph_time = (time.time() - graph_start) * 1000
 
@@ -787,6 +808,7 @@ class HybridRetriever:
                 vector_results,
                 graph_results,
                 final_top_k=top_k,
+                bm25_results=bm25_results or None,
             )
 
         fusion_time = (time.time() - fusion_start) * 1000
@@ -815,6 +837,76 @@ class HybridRetriever:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _build_bm25_index(self) -> None:
+        """Build BM25 index lazily from LanceDB DataFrame (shared with _keyword_df_cache)."""
+        try:
+            from rank_bm25 import BM25Okapi
+        except ImportError:
+            logger.warning("rank_bm25 not installed — BM25 disabled. Run: pip install rank_bm25")
+            self._bm25_index = None
+            return
+
+        vector_store = getattr(self.store, "vector_store", None)
+        if vector_store is None or getattr(vector_store, "table", None) is None:
+            self._bm25_index = None
+            return
+
+        try:
+            if not hasattr(self, "_keyword_df_cache"):
+                self._keyword_df_cache = vector_store.table.to_pandas()
+            df = self._keyword_df_cache
+            corpus = [str(t).lower().split() for t in df["text"].tolist()]
+            self._bm25_corpus_rows = df.to_dict("records")
+            self._bm25_index = BM25Okapi(corpus)
+            logger.info("BM25 index built: %d chunks", len(corpus))
+        except Exception as e:
+            logger.warning("BM25 index build failed: %s", e)
+            self._bm25_index = None
+
+    def _bm25_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        """
+        BM25 sparse keyword search.
+
+        Returns top-k chunks in vector-result dict format (document_id, text,
+        similarity, metadata, position) so they can be passed directly into
+        RRFFusion.fuse(bm25_results=...).  similarity is normalised to [0, 1].
+        """
+        if not hasattr(self, "_bm25_index"):
+            self._build_bm25_index()
+
+        if not self._bm25_index:
+            return []
+
+        tokens = query.lower().split()
+        raw_scores = self._bm25_index.get_scores(tokens)
+
+        max_score = float(raw_scores.max()) if raw_scores.size else 0.0
+        if max_score <= 0:
+            return []
+
+        top_indices = raw_scores.argsort()[::-1][:top_k]
+
+        results: List[Dict[str, Any]] = []
+        import json as _json
+        for idx in top_indices:
+            score = float(raw_scores[idx])
+            if score <= 0:
+                break
+            row = self._bm25_corpus_rows[idx]
+            try:
+                meta = _json.loads(row.get("metadata", "{}"))
+            except Exception:
+                meta = {}
+            results.append({
+                "document_id": str(row.get("document_id", "")),
+                "text": str(row.get("text", "")),
+                "similarity": score / max_score,
+                "metadata": {"source_file": row.get("source_file", meta.get("source_file", "unknown"))},
+                "position": int(row.get("position", 0)),
+            })
+
+        return results
+
     def _embed_query(self, query: str) -> np.ndarray:
         """Generate a query embedding vector."""
         if hasattr(self.embeddings, "embed_query"):
@@ -823,106 +915,11 @@ class HybridRetriever:
             embedding = self.embeddings.embed_documents([query])[0]
         return np.array(embedding, dtype=np.float32)
 
-    def _keyword_entity_search(
-        self,
-        entity_names: List[str],
-        top_k: int,
-    ) -> List[Dict[str, Any]]:
-        """
-        Verbatim keyword search across the full LanceDB table.
-
-        For each entity name, returns chunks whose text contains the name
-        as a substring (case-insensitive).  Results are returned in graph
-        result format so they can be merged into the graph_results list and
-        receive RRF scores via the standard fuse() call.
-
-        The DataFrame scan is O(N) over all stored chunks.  For the thesis
-        scale (< 50 k chunks) this runs in < 5 ms.  The pandas DataFrame is
-        cached on the first call so subsequent queries within the same
-        retriever instance pay no repeated scan overhead.
-
-        NOTE: The cache is intentionally NOT invalidated on add_documents()
-        calls.  This retriever instance is created once and used for queries
-        only; re-ingestion creates a new store and a new retriever instance.
-        """
-        import json as _json
-
-        vector_store = getattr(self.store, "vector_store", None)
-        if vector_store is None or getattr(vector_store, "table", None) is None:
-            return []
-
-        if not hasattr(self, "_keyword_df_cache"):
-            try:
-                self._keyword_df_cache = vector_store.table.to_pandas()
-            except Exception as _e:
-                logger.debug("Keyword search cache build failed: %s", _e)
-                return []
-
-        df = self._keyword_df_cache
-        results: List[Dict[str, Any]] = []
-        seen: set = set()
-
-        import pandas as _pd
-
-        for name in entity_names:
-            if len(name) < 4:
-                continue
-            try:
-                name_lower = name.lower()
-
-                # Own-document match: source_file == "hotpotqa_{name}" (case-insensitive).
-                # This is UNCONDITIONAL — the entity's own Wikipedia article is always
-                # included first, even when the article text uses a different surface form
-                # (e.g. 'Terrence "Uncle Terry" Richardson' does not contain the substring
-                # "Terry Richardson", so a pure text-contains search would miss chunk 173).
-                if "source_file" in df.columns:
-                    src_titles = (
-                        df["source_file"]
-                        .str.lower()
-                        .str.replace(r"^hotpotqa_", "", regex=True)
-                    )
-                    own_mask = src_titles == name_lower
-                else:
-                    own_mask = _pd.Series(False, index=df.index)
-
-                # Text-substring match: entity name appears verbatim in chunk text.
-                text_mask = df["text"].str.contains(name, na=False, case=False)
-
-                # Combine: own-doc chunks first (always), then text-mention chunks
-                # from OTHER articles. De-duplicate via index.
-                own_rows  = df[own_mask]
-                text_rows = df[text_mask & ~own_mask]
-                matched   = _pd.concat([own_rows, text_rows])
-
-                own_ids = set(str(r["document_id"]) for _, r in own_rows.iterrows())
-
-                for _, row in matched.head(top_k).iterrows():
-                    doc_id = str(row["document_id"])
-                    if doc_id in seen:
-                        continue
-                    seen.add(doc_id)
-                    try:
-                        metadata = _json.loads(row.get("metadata", "{}"))
-                    except Exception:
-                        metadata = {}
-                    text = str(row["text"])
-                    # For own-doc chunks where the canonical name doesn't appear
-                    # verbatim in the text (e.g. 'Terrence "Uncle Terry" Richardson'
-                    # for query entity 'Terry Richardson'), prepend an alias label so
-                    # the LLM can resolve the surface-form mismatch. §12.24
-                    if doc_id in own_ids and name.lower() not in text.lower():
-                        text = f"[About: {name}] {text}"
-                    results.append({
-                        "chunk_id": doc_id,
-                        "text": text,
-                        "source_file": row.get("source_file", metadata.get("source_file", "unknown")),
-                        "matched_entity": name,
-                        "hops": 0,
-                    })
-            except Exception as _e:
-                logger.debug("Keyword search for %r failed: %s", name, _e)
-
-        return results[:top_k]
+    # _keyword_entity_search() was removed in the 2026-05-06 cleanup audit.
+    # BM25 (§12.29) provides the same entity-name surfacing capability with a
+    # principled scoring function. The own-doc-boost behavior is replicated by
+    # BM25 because the entity name typically appears in the source_file path
+    # AND in the article text — both contribute to the BM25 score.
 
     def _vector_only_results(
         self,
@@ -980,182 +977,11 @@ class HybridRetriever:
 
 
 # ============================================================================
-# PRE-GENERATIVE FILTERING
-#
-# NOTE: This class logically belongs in the logic layer (src/logic_layer/) and
-# should be moved there in a future refactoring pass.  It lives here temporarily
-# because it depends on RetrievalResult, which is defined in this module.
-# HybridRetriever itself does NOT call PreGenerativeFilter in production; the
-# filter is applied by the Navigator agent (S_N) in logic_layer/navigator.py.
+# (PRE-GENERATIVE FILTERING was removed in the 2026-05-06 cleanup audit.)
+# The PreGenerativeFilter class lived here only as an unused helper —
+# HybridRetriever never invoked it in production. The Navigator (S_N) is the
+# single owner of pre-generative filtering; see src/logic_layer/navigator.py.
 # ============================================================================
-
-class PreGenerativeFilter:
-    """
-    Pre-generative context filter to reduce hallucination risk.
-
-    Implements the three-stage pipeline described in thesis Abschnitt 3.3:
-        1. Relevance filter  — dynamic threshold based on max RRF score
-        2. Redundancy filter — Jaccard similarity deduplication
-           (Jaccard, P. (1901). Distribution de la flore alpine.
-            Bulletin de la Societe Vaudoise des Sciences Naturelles, 37, 241-272.)
-        3. Contradiction filter — NLI-based (optional, computationally expensive)
-
-    Empirical motivation: 40-60% of LLM hallucinations are caused by irrelevant
-    or contradictory retrieval results.
-    """
-
-    def __init__(
-        self,
-        relevance_threshold_factor: float = 0.85,
-        jaccard_threshold: float = 0.8,
-        enable_contradiction: bool = True,
-        nli_model_name: str = "cross-encoder/nli-distilroberta-base",
-        nli_threshold: float = 0.85,
-    ) -> None:
-        """
-        Args:
-            relevance_threshold_factor: Relevance threshold = factor * max_score.
-            jaccard_threshold: Word-level Jaccard similarity above which two
-                chunks are considered redundant.
-            enable_contradiction: Whether to run the NLI contradiction filter.
-            nli_model_name: HuggingFace model ID for the CrossEncoder NLI model.
-            nli_threshold: Contradiction score above which a chunk is removed.
-        """
-        self.relevance_threshold_factor = relevance_threshold_factor
-        self.jaccard_threshold = jaccard_threshold
-        self.enable_contradiction = enable_contradiction
-        self.nli_threshold = nli_threshold
-
-        # NLI model — lazy loaded on first contradiction filter call
-        self._nli_model = None
-        self._nli_model_name = nli_model_name
-
-    def filter(self, results: List[RetrievalResult]) -> List[RetrievalResult]:
-        """
-        Apply all enabled filters in sequence.
-
-        Args:
-            results: Ranked list of retrieval results.
-
-        Returns:
-            Filtered list of retrieval results.
-        """
-        if not results:
-            return results
-
-        results = self._relevance_filter(results)
-        results = self._redundancy_filter(results)
-
-        if self.enable_contradiction:
-            results = self._contradiction_filter(results)
-
-        return results
-
-    def _relevance_filter(
-        self, results: List[RetrievalResult]
-    ) -> List[RetrievalResult]:
-        """
-        Remove chunks whose RRF score falls below a dynamic threshold.
-
-        Threshold = relevance_threshold_factor * max(rrf_score).
-        """
-        if not results:
-            return results
-
-        max_score = max(r.rrf_score for r in results)
-        threshold = self.relevance_threshold_factor * max_score
-        filtered = [r for r in results if r.rrf_score >= threshold]
-
-        removed = len(results) - len(filtered)
-        if removed > 0:
-            logger.debug("Relevance filter removed %d low-score chunks", removed)
-
-        return filtered
-
-    def _redundancy_filter(
-        self, results: List[RetrievalResult]
-    ) -> List[RetrievalResult]:
-        """
-        Remove near-duplicate chunks using word-level Jaccard similarity.
-
-        Reference:
-            Jaccard, P. (1901). Distribution de la flore alpine dans le
-            bassin des Dranses et dans quelques regions voisines.
-            Bulletin de la Societe Vaudoise des Sciences Naturelles, 37, 241-272.
-
-        Among a pair of near-duplicates the higher-scoring chunk is kept.
-        """
-        if len(results) <= 1:
-            return results
-
-        sorted_results = sorted(results, key=lambda r: r.rrf_score, reverse=True)
-
-        filtered: List[RetrievalResult] = []
-        for candidate in sorted_results:
-            is_redundant = any(
-                jaccard_similarity(candidate.text, accepted.text) >= self.jaccard_threshold
-                for accepted in filtered
-            )
-            if not is_redundant:
-                filtered.append(candidate)
-
-        removed = len(results) - len(filtered)
-        if removed > 0:
-            logger.debug("Redundancy filter removed %d duplicate chunks", removed)
-
-        return filtered
-
-    def _contradiction_filter(
-        self, results: List[RetrievalResult]
-    ) -> List[RetrievalResult]:
-        """
-        Remove chunks that contradict the top-ranked chunk (NLI-based).
-
-        Uses a CrossEncoder NLI model (lazy loaded).  The top chunk acts as
-        the premise; all other chunks are treated as hypotheses.  Chunks with
-        a contradiction score >= nli_threshold are discarded.
-        """
-        if len(results) <= 1:
-            return results
-
-        if self._nli_model is None:
-            try:
-                from sentence_transformers import CrossEncoder
-                self._nli_model = CrossEncoder(self._nli_model_name)
-                logger.info("NLI model loaded: %s", self._nli_model_name)
-            except ImportError:
-                logger.warning(
-                    "sentence-transformers not available — skipping contradiction filter"
-                )
-                return results
-            except (OSError, RuntimeError) as e:
-                logger.warning("Failed to load NLI model: %s", e)
-                return results
-
-        top_chunk = results[0]
-        filtered: List[RetrievalResult] = [top_chunk]
-
-        for candidate in results[1:]:
-            try:
-                scores = self._nli_model.predict([(top_chunk.text, candidate.text)])
-
-                if isinstance(scores[0], (list, np.ndarray)):
-                    contradiction_score = scores[0][0]
-                else:
-                    contradiction_score = 1 - scores[0] if scores[0] < 0.5 else 0.0
-
-                if contradiction_score < self.nli_threshold:
-                    filtered.append(candidate)
-                else:
-                    logger.debug(
-                        "Contradiction filter removed chunk (score=%.2f)",
-                        contradiction_score,
-                    )
-            except (RuntimeError, ValueError) as e:
-                logger.warning("NLI inference failed: %s", e)
-                filtered.append(candidate)
-
-        return filtered
 
 
 # ============================================================================
@@ -1206,133 +1032,12 @@ def create_hybrid_retriever(
         query_ner_confidence=gliner_cfg.get("confidence_threshold", 0.15),
         query_entity_types=gliner_cfg.get("entity_types", None),
         gliner_model_name=gliner_cfg.get("model_name", "urchade/gliner_small-v2.1"),
+        enable_bm25=rag_cfg.get("enable_bm25", True),
+        bm25_top_k=rag_cfg.get("bm25_top_k", 10),
     )
     return HybridRetriever(hybrid_store, embeddings, config)
 
 
-# ============================================================================
-# SMOKE DEMO / TEST RUNNER
-# ============================================================================
-
-def _main() -> None:
-    """
-    Smoke demo and test runner.
-
-    Performs:
-        1. RRF fusion smoke demo with correct storage-layer key names.
-        2. PreGenerativeFilter smoke demo.
-        3. pytest run targeting RRF / HybridRetriever / PreGenerativeFilter tests.
-    """
-    import subprocess
-    import sys
-
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-
-    logger.info("=" * 70)
-    logger.info("RRF FUSION SMOKE DEMO")
-    logger.info("=" * 70)
-
-    fusion = RRFFusion(k=60, cross_source_boost=1.2)
-
-    # Vector results use storage key "document_id" (from VectorStoreAdapter)
-    vector_results = [
-        {
-            "document_id": "c1",
-            "text": "Einstein born in Ulm",
-            "similarity": 0.95,
-            "metadata": {"source_file": "physics.pdf"},
-            "position": 0,
-        },
-        {
-            "document_id": "c2",
-            "text": "Theory of relativity",
-            "similarity": 0.85,
-            "metadata": {"source_file": "physics.pdf"},
-            "position": 1,
-        },
-        {
-            "document_id": "c3",
-            "text": "Nobel Prize 1921",
-            "similarity": 0.75,
-            "metadata": {"source_file": "physics.pdf"},
-            "position": 2,
-        },
-        {
-            "document_id": "c4",
-            "text": "Princeton University",
-            "similarity": 0.65,
-            "metadata": {"source_file": "biography.pdf"},
-            "position": 0,
-        },
-    ]
-
-    # Graph results use storage keys "chunk_id", "source_file", "hops", "matched_entity"
-    graph_results = [
-        {
-            "chunk_id": "c1",
-            "text": "Einstein born in Ulm",
-            "hops": 1,
-            "source_file": "physics.pdf",
-            "matched_entity": "Einstein",
-            "position": 0,
-        },
-        {
-            "chunk_id": "c4",
-            "text": "Princeton University",
-            "hops": 1,
-            "source_file": "biography.pdf",
-            "matched_entity": "Princeton",
-            "position": 0,
-        },
-        {
-            "chunk_id": "c5",
-            "text": "Worked with Oppenheimer",
-            "hops": 2,
-            "source_file": "history.pdf",
-            "matched_entity": "Oppenheimer",
-            "position": 0,
-        },
-    ]
-
-    results = fusion.fuse(vector_results, graph_results, final_top_k=5)
-
-    logger.info("--- RRF Fusion Results ---")
-    for i, r in enumerate(results, 1):
-        logger.info(
-            "%d. [%s] %s: RRF=%.4f  vector_rank=%s  graph_rank=%s",
-            i, r.retrieval_method, r.chunk_id, r.rrf_score,
-            r.vector_rank, r.graph_rank,
-        )
-
-    logger.info("=" * 70)
-    logger.info("PRE-GENERATIVE FILTER SMOKE DEMO")
-    logger.info("=" * 70)
-
-    pf = PreGenerativeFilter(
-        relevance_threshold_factor=0.6,
-        jaccard_threshold=0.8,
-        enable_contradiction=False,  # skip NLI in smoke demo
-    )
-    filtered = pf.filter(results)
-    logger.info(
-        "Before filter: %d  After: %d", len(results), len(filtered)
-    )
-
-    logger.info("=" * 70)
-    logger.info("RUNNING PYTEST")
-    logger.info("=" * 70)
-
-    proc = subprocess.run(
-        [
-            sys.executable, "-m", "pytest",
-            "src/data_layer/test_data_layer.py",
-            "-k", "RRF or HybridRetriever or PreGenerativeFilter",
-            "-v", "--tb=short",
-        ],
-        check=False,
-    )
-    sys.exit(proc.returncode)
-
-
-if __name__ == "__main__":
-    _main()
+# The previous _main() smoke demo and CLI entry point were removed in the
+# 2026-05-06 cleanup audit. Run `pytest test_system/test_data_layer.py` for the
+# canonical test suite covering RRFFusion and HybridRetriever.

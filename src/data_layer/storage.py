@@ -763,24 +763,52 @@ class KuzuGraphStore:
         entity1_id: str,
         entity2_id: str,
         relation_type: str = "related",
+        confidence: float = 0.0,
+        source_chunks: Optional[List[str]] = None,
     ) -> None:
-        """MERGE a RELATED_TO edge: Entity → Entity."""
+        """
+        MERGE a RELATED_TO edge: Entity -> Entity.
+
+        The schema (see `_init_schema`) defines three properties on this edge:
+        `relation_type`, `confidence`, and `source_chunks`. All three are
+        populated on insertion so that downstream consumers (graph retrieval,
+        analysis tools) can rank/filter relations by REBEL confidence and
+        trace them back to the source chunk(s).
+
+        Args:
+            entity1_id:    Source entity_id (subject).
+            entity2_id:    Target entity_id (object).
+            relation_type: Wikidata-style or REBEL relation label, or
+                           "cooccurs" for co-occurrence edges.
+            confidence:    Score in [0, 1]. REBEL emits 0.5 as a sentinel
+                           (no per-triplet score); co-occurrence edges
+                           pass 1.0 by convention.
+            source_chunks: List of chunk_ids that produced this relation.
+                           Stored as a comma-separated string (KuzuDB does
+                           not have a native list column on rel tables).
+                           None / empty -> empty string.
+        """
+        chunks_str = ",".join(source_chunks) if source_chunks else ""
         try:
             self.conn.execute(
                 """
                 MATCH (e1:Entity {entity_id: $entity1_id})
                 MATCH (e2:Entity {entity_id: $entity2_id})
-                MERGE (e1)-[:RELATED_TO {relation_type: $relation_type}]->(e2)
+                MERGE (e1)-[r:RELATED_TO {relation_type: $relation_type}]->(e2)
+                SET r.confidence = $confidence,
+                    r.source_chunks = $source_chunks
                 """,
                 {
                     "entity1_id": entity1_id,
                     "entity2_id": entity2_id,
                     "relation_type": relation_type,
+                    "confidence": float(confidence),
+                    "source_chunks": chunks_str,
                 },
             )
         except _STORAGE_ERRORS as exc:
             logger.warning(
-                "RELATED_TO relation failed (%s → %s): %s", entity1_id, entity2_id, exc
+                "RELATED_TO relation failed (%s -> %s): %s", entity1_id, entity2_id, exc
             )
 
     def add_relation(

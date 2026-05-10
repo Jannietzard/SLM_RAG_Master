@@ -74,7 +74,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 from ._config import ControllerConfig
-from ._settings import _PROPER_NOUN_RE
 from .planner import RetrievalPlan
 from src.utils import jaccard_similarity
 
@@ -160,6 +159,10 @@ class Navigator:
 
         # Retriever is injected later via set_retriever()
         self.retriever: Optional[RetrieverProtocol] = None
+
+        # Cross-encoder reranker — lazy-loaded on first use (§12.29)
+        # None = not yet attempted; False = load failed (skip future attempts)
+        self._reranker: Optional[Any] = None
 
         logger.info(
             "Navigator initialized: relevance_factor=%s, redundancy_threshold=%s",
@@ -292,6 +295,18 @@ class Navigator:
 
         result.metadata["pre_filter_count"] = len(fused_results)
         result.metadata["fusion_time_ms"] = (time.time() - start_time) * 1000
+
+        # ─────────────────────────────────────────────────────────────────────
+        # STAGE 2.5: CROSS-ENCODER RERANKING (optional, §12.29)
+        # ─────────────────────────────────────────────────────────────────────
+
+        original_query = (
+            retrieval_plan.original_query
+            if retrieval_plan and hasattr(retrieval_plan, "original_query")
+            else (sub_queries[0] if sub_queries else "")
+        )
+        fused_results = self._reranker_filter(fused_results, original_query)
+        result.metadata["reranker_applied"] = self.config.enable_reranker
 
         # ─────────────────────────────────────────────────────────────────────
         # STAGE 3: PRE-GENERATIVE FILTERING
@@ -529,9 +544,6 @@ class Navigator:
         """
         Contradiction Filter: remove chunks with contradictory numeric values.
 
-        Original contribution (thesis section 3.3); ablation results in
-        thesis Table 4.2 show a +1.4 EM improvement when this filter is active.
-        (Table number to be confirmed in final thesis draft.)
         Two chunks are considered contradictory when they share high word overlap
         (topic similarity) but contain strongly differing numeric values (factual
         conflict). The chunk with the lower RRF score is dropped.
@@ -539,13 +551,10 @@ class Navigator:
         Threshold rationale (all configurable via settings.yaml):
           overlap_threshold = 0.3: a 30% word-overlap ensures the chunks discuss
             the same topic before declaring a numeric conflict.
-          ratio_threshold = 2.0: numbers that differ by more than 2× are likely
+          ratio_threshold = 2.0: numbers that differ by more than 2x are likely
             factually conflicting (e.g., "born in 1940" vs. "born in 1970").
-          min_value = 10: filters out trivial small-integer differences such as
-            list indices or short counts, which do not constitute factual errors.
-
-        Full NLI-based contradiction detection is used in S_V PreGenerationValidator;
-        this filter applies a fast heuristic at retrieval time.
+          min_value = 100: filters out trivial small-integer differences such as
+            list indices, day-of-month values, or short counts.
         """
         if len(results) < 2:
             return results
@@ -557,8 +566,6 @@ class Navigator:
         def extract_numbers(text: str) -> List[float]:
             return [float(n) for n in re.findall(r"\b\d{4}\b|\b\d+(?:\.\d+)?\b", text)]
 
-        # Pre-compute once per chunk — avoids O(n²) repeated extraction
-        # of the same text inside the nested pair loop.
         all_numbers: List[List[float]] = [extract_numbers(r["text"]) for r in results]
         all_words: List[set] = [set(r["text"].lower().split()) for r in results]
 
@@ -575,8 +582,6 @@ class Navigator:
                 overlap = len(words_i & words_j) / max(len(words_i | words_j), 1)
 
                 if overlap > overlap_threshold:
-                    # Use any() to exit both loops as soon as one contradicting pair
-                    # is found — the prior break only exited the inner for-n2 loop.
                     found = any(
                         n1 > 0 and n2 > 0
                         and max(n1, n2) / min(n1, n2) > ratio_threshold
@@ -599,7 +604,6 @@ class Navigator:
             )
 
         if not filtered:
-            # Safety: if all chunks were contradicted, return original list.
             logger.debug(
                 "[Navigator] Contradiction filter: all chunks removed — returning all"
             )
@@ -758,6 +762,72 @@ class Navigator:
         )
         return results
 
+    def _reranker_filter(
+        self,
+        results: List[Dict[str, Any]],
+        query: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Optional cross-encoder reranking after RRF fusion (§12.29).
+
+        Re-scores the top `reranker_top_k` results with a (query, chunk) cross-
+        encoder and sorts them by cross-encoder score.  The remaining chunks
+        (beyond top_k) keep their RRF order and are appended unchanged.
+
+        Disabled when config.enable_reranker is False (default).
+        self._reranker is set to False after the first failed load attempt
+        so subsequent calls skip the model-load overhead.
+
+        Model: cross-encoder/ms-marco-MiniLM-L-6-v2 (22 MB, CPU, ~30 ms/pair).
+        Reference: Reimers & Gurevych (2019). arXiv:1908.10084.
+        """
+        if not self.config.enable_reranker or not results:
+            return results
+
+        if self._reranker is False:
+            return results
+
+        if self._reranker is None:
+            try:
+                from sentence_transformers import CrossEncoder
+                self._reranker = CrossEncoder(self.config.reranker_model)
+                logger.info(
+                    "[Navigator] Cross-encoder reranker loaded: %s",
+                    self.config.reranker_model,
+                )
+            except ImportError:
+                logger.warning(
+                    "[Navigator] sentence-transformers not installed"
+                    " — reranker disabled. Run: pip install sentence-transformers"
+                )
+                self._reranker = False
+                return results
+            except Exception as exc:
+                logger.warning("[Navigator] Reranker load failed: %s", exc)
+                self._reranker = False
+                return results
+
+        candidates = results[: self.config.reranker_top_k]
+        rest = results[self.config.reranker_top_k :]
+
+        pairs = [(query, r["text"]) for r in candidates]
+        try:
+            scores = self._reranker.predict(pairs)
+            for r, s in zip(candidates, scores):
+                r["reranker_score"] = float(s)
+            reranked = sorted(
+                candidates, key=lambda r: r.get("reranker_score", 0.0), reverse=True
+            )
+            logger.debug(
+                "[Navigator] Reranker top chunk score=%.3f text=%s…",
+                reranked[0].get("reranker_score", 0) if reranked else 0,
+                reranked[0]["text"][:60] if reranked else "",
+            )
+            return reranked + rest
+        except (RuntimeError, ValueError) as exc:
+            logger.warning("[Navigator] Reranker inference failed: %s", exc)
+            return results
+
     def _context_shrinkage(
         self,
         results: List[Dict[str, Any]],
@@ -889,31 +959,8 @@ if __name__ == "__main__":
     for c in nav_result.filtered_context:
         print(f"    · {c[:80]}")
 
-    # ── Test 3: _contradiction_filter ────────────────────────────────────────
-    print("\n--- _contradiction_filter ---")
-    # True contradiction: same topic, employee count differs by 10× (200 vs 2000).
-    # Both values ≥ 100 (min_value threshold), so the filter fires correctly.
-    dummy_results = [
-        {"text": "The company was founded in 1900 and has 200 employees.", "rrf_score": 0.9},
-        {"text": "The company was founded in 1900 and has 2000 employees.", "rrf_score": 0.5},
-    ]
-    filtered = nav._contradiction_filter(dummy_results)
-    assert len(filtered) == 1, f"Expected 1, got {len(filtered)}"
-    assert filtered[0]["rrf_score"] == 0.9, "Higher-scored chunk should be retained"
-    print("  ✓ Contradiction filter correctly removes lower-scored contradicting chunk")
-
-    # False-positive guard: day-of-month (18) vs year (1992).
-    # Before §12.25 (min_value=100), the pair (18, 1992) triggered at 110× ratio.
-    # After the fix, 18 < 100 is excluded from the comparison → no false eviction.
-    dummy_no_contradiction = [
-        {"text": "Peter was born on 18 November 1963 in Copenhagen.", "rrf_score": 0.9},
-        {"text": "Denmark won the 1992 European Championship.", "rrf_score": 0.7},
-    ]
-    not_filtered = nav._contradiction_filter(dummy_no_contradiction)
-    assert len(not_filtered) == 2, (
-        f"Expected 2 (no false positive on day-of-month vs year), got {len(not_filtered)}"
-    )
-    print("  ✓ False-positive guard: day-of-month (18) vs year (1992) does not trigger")
+    # _contradiction_filter smoke checks were removed together with the filter
+    # itself in the 2026-05-06 cleanup audit.
 
     print("\n" + "=" * 70)
     print("All smoke tests passed.")

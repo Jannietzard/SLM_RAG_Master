@@ -897,27 +897,8 @@ class TestNormalizeQueryEntity:
         assert _normalize_query_entity("", "PERSON") == ""
 
 
-class TestContradictionFilterPassthrough:
-    """Tests for PreGenerativeFilter._contradiction_filter()."""
-
-    def test_filter_with_contradiction_disabled_passes_all(self) -> None:
-        """_contradiction_filter with enable_contradiction=False returns all results unchanged."""
-        from src.data_layer.hybrid_retriever import PreGenerativeFilter, RetrievalResult
-
-        pf = PreGenerativeFilter(enable_contradiction=False)
-        results = [
-            RetrievalResult("c1", "Paris is the capital of France.", "a", 0, rrf_score=1.0),
-            RetrievalResult("c2", "France is not a country.", "a", 1, rrf_score=0.9),
-        ]
-        filtered = pf._contradiction_filter(results)
-        assert len(filtered) == len(results)
-
-    def test_filter_empty_list_returns_empty(self) -> None:
-        """_contradiction_filter on empty input returns empty list."""
-        from src.data_layer.hybrid_retriever import PreGenerativeFilter
-
-        pf = PreGenerativeFilter()
-        assert pf._contradiction_filter([]) == []
+# PreGenerativeFilter contradiction-passthrough tests were removed together
+# with the PreGenerativeFilter class itself in the 2026-05-06 cleanup audit.
 
 
 # ============================================================================
@@ -1046,49 +1027,10 @@ class TestRRFFusion:
         assert results_boosted[0].rrf_score > results_unboosted[0].rrf_score
 
 
-class TestPreGenerativeFilter:
-    """Tests for pre-generative (Navigator) relevance and redundancy filtering."""
-
-    def test_relevance_filter(self) -> None:
-        """Relevance filter removes chunks below factor * max_score threshold."""
-        from src.data_layer.hybrid_retriever import (
-            PreGenerativeFilter,
-            RetrievalResult,
-        )
-
-        pf = PreGenerativeFilter(relevance_threshold_factor=0.5)
-
-        results = [
-            RetrievalResult("c1", "High score", "a", 0, rrf_score=1.0),
-            RetrievalResult("c2", "Medium score", "a", 1, rrf_score=0.6),
-            RetrievalResult("c3", "Low score", "a", 2, rrf_score=0.3),
-        ]
-
-        filtered = pf._relevance_filter(results)
-
-        # threshold = 0.5 * max_score(1.0) = 0.5; c3 (0.3) is below threshold.
-        assert len(filtered) == 2
-        assert all(r.rrf_score >= 0.5 for r in filtered)
-
-    def test_redundancy_filter(self) -> None:
-        """Redundancy filter removes chunks with Jaccard similarity above threshold."""
-        from src.data_layer.hybrid_retriever import (
-            PreGenerativeFilter,
-            RetrievalResult,
-        )
-
-        pf = PreGenerativeFilter(jaccard_threshold=0.8)
-
-        results = [
-            RetrievalResult("c1", "Einstein was a physicist", "a", 0, rrf_score=1.0),
-            RetrievalResult("c2", "Einstein was a great physicist", "a", 1, rrf_score=0.9),
-            RetrievalResult("c3", "Darwin studied evolution", "a", 2, rrf_score=0.8),
-        ]
-
-        filtered = pf._redundancy_filter(results)
-
-        # c2 is near-duplicate of c1; only c1 + c3 should survive.
-        assert len(filtered) == 2
+# TestPreGenerativeFilter was removed in the 2026-05-06 cleanup audit
+# together with the PreGenerativeFilter class. Equivalent relevance- and
+# redundancy-filter behaviour is exercised by the Navigator filter tests
+# in test_navigator_semantic.py and test_logic_layer.py.
 
 
 class TestHybridRetriever:
@@ -1198,12 +1140,12 @@ class TestFullPipeline:
         store.add_documents(chunked_docs)
 
         # 3. Retrieve — threshold=0.0 ensures all chunks are eligible candidates
+        # vector_weight / graph_weight removed in the 2026-05-06 cleanup audit
+        # (never read by production code).
         retrieval_config = RetrievalConfig(
             mode=RetrievalMode.VECTOR,
             vector_top_k=3,
             graph_top_k=2,
-            vector_weight=0.7,
-            graph_weight=0.3,
             similarity_threshold=0.0,
         )
 

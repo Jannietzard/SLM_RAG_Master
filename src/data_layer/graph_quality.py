@@ -1,0 +1,913 @@
+"""
+Graph quality utilities for the Edge-RAG knowledge graph.
+
+This module provides four orthogonal capabilities used at ingestion time and
+in standalone diagnostics:
+
+  1. Stronger surface-form canonicalisation (`canonical_form`) for detecting
+     entities that differ only in punctuation, parentheticals, honorifics,
+     possessives, or Unicode form.
+
+  2. Read-only baseline metrics (`compute_graph_baseline`) to quantify graph
+     health: density, isolated-entity rate, duplicate rate, top hubs.
+
+  3. Co-occurrence edge construction (`build_cooccurrence_edges`): for every
+     pair of entities mentioned in the same chunk, add a RELATED_TO edge with
+     `relation_type='cooccurs'`. This guarantees that no entity is isolated
+     as long as it appears with at least one other entity anywhere in the
+     corpus — typically true for narrative text.
+
+  4. Post-ingestion cleanup (`cleanup_graph`): drop extraction-orphaned
+     entities, drop generic hubs that pollute graph retrieval, and merge
+     duplicate entities sharing a canonical surface form.
+
+All mutating Cypher uses the same patterns as `KuzuGraphStore.clear()` —
+edges deleted before nodes, no DETACH DELETE — so it works on every Kuzu
+version that the existing codebase already targets.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import unicodedata
+from itertools import combinations
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CANONICAL SURFACE-FORM NORMALISATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Strip a trailing parenthetical disambiguator ("Local H (band)" → "Local H").
+_PARENTHETICAL_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+# Strip possessive markers (straight + curly apostrophe).
+_POSSESSIVE_RE = re.compile(r"[’']s\b", re.IGNORECASE)
+
+# Strip leading honorifics (Mr., Mrs., Dr., Prof., Sir, Lord, Saint, ...).
+# These are respect markers, never part of the canonical name.
+_HONORIFIC_RE = re.compile(
+    r"^(?:Mr|Mrs|Ms|Mx|Dr|Prof|Sir|Lord|Lady|Saint|St)\.?\s+",
+    re.IGNORECASE,
+)
+
+# Strip trailing ACADEMIC credentials (PhD, MD, Esq) only.
+# Generation suffixes (Jr., Sr., II, III, IV, V) are deliberately kept —
+# they distinguish father/son and same-name family members ("Ed Wood Sr."
+# vs. "Ed Wood" must NOT collapse into one graph node).
+_TITLE_SUFFIX_RE = re.compile(
+    r"[,]?\s+(?:PhD|Ph\.D|MD|M\.D|Esq)\.?\s*$",
+    re.IGNORECASE,
+)
+
+# Collapse runs of whitespace.
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def canonical_form(name: str) -> str:
+    """
+    Strong canonicalisation for duplicate detection.
+
+    Applies, in order:
+      1. NFKC Unicode normalisation (collapses presentation variants such as
+         combined accents, full-width digits, fancy quotes/dashes).
+      2. Strip leading/trailing whitespace.
+      3. Strip a trailing parenthetical disambiguator.
+      4. Strip a leading honorific.
+      5. Strip a trailing name suffix.
+      6. Strip possessive 's.
+      7. Collapse internal whitespace.
+      8. Lowercase.
+
+    The result is suitable as a deduplication key but NOT for display:
+    it is irreversibly lossy. Use the original surface form for rendering.
+
+    Examples:
+        "Ed Wood (filmmaker)"        -> "ed wood"
+        "Dr. Christopher Nolan"      -> "christopher nolan"
+        "Edward Davis Wood Jr."      -> "edward davis wood"
+        "Nolan's"                    -> "nolan"
+        "Beyoncé "                   -> "beyonce"   (after NFKC + casefold)
+    """
+    if not name:
+        return ""
+    s = unicodedata.normalize("NFKC", name).strip()
+    s = _PARENTHETICAL_RE.sub("", s)
+    s = _HONORIFIC_RE.sub("", s)
+    s = _TITLE_SUFFIX_RE.sub("", s)
+    s = _POSSESSIVE_RE.sub("", s)
+    # Strip a trailing period so "Ed Wood Sr." and "Ed Wood Sr" collapse to
+    # the same canonical form while both staying distinct from "Ed Wood".
+    if s.endswith("."):
+        s = s[:-1].rstrip()
+    s = _WHITESPACE_RE.sub(" ", s).strip()
+    return s.casefold()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BASELINE METRICS (read-only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_graph_baseline(graph_store) -> Dict[str, Any]:
+    """
+    Quantify graph health for diagnostics and invariant checks.
+
+    Args:
+        graph_store: A KuzuGraphStore-compatible object exposing
+                     `conn.execute(query, params)` and `get_statistics()`.
+
+    Returns:
+        A dict with keys:
+          - totals       : raw node/edge counts
+          - densities    : per-chunk and per-entity ratios
+          - isolated     : entities with zero RELATED_TO edges
+          - duplicates   : clusters of entities sharing canonical_form
+          - top_hubs     : entities with the most MENTIONS edges
+    """
+    raw = graph_store.get_statistics()
+    chunks = max(1, raw.get("document_chunks", 0))
+    entities = raw.get("entities", 0)
+    mentions = raw.get("mentions_edges", 0)
+    relations = raw.get("related_to_edges", 0)
+
+    isolated_count = _count_isolated_entities(graph_store)
+    duplicate_clusters = _find_duplicate_clusters(graph_store)
+    top_hubs = _top_promiscuous_entities(graph_store, limit=20)
+
+    duplicate_count = sum(len(c) - 1 for c in duplicate_clusters)
+
+    return {
+        "totals": {
+            "chunks": raw.get("document_chunks", 0),
+            "entities": entities,
+            "mentions": mentions,
+            "relations": relations,
+        },
+        "densities": {
+            "entities_per_chunk": entities / chunks,
+            "mentions_per_chunk": mentions / chunks,
+            "relations_per_chunk": relations / chunks,
+            "relations_per_entity": relations / max(1, entities),
+        },
+        "isolated": {
+            "count": isolated_count,
+            "rate": isolated_count / max(1, entities),
+        },
+        "duplicates": {
+            "cluster_count": len(duplicate_clusters),
+            "duplicate_count": duplicate_count,
+            "rate": duplicate_count / max(1, entities),
+            "top_clusters": duplicate_clusters[:10],
+        },
+        "top_hubs": top_hubs,
+    }
+
+
+def _fetch_all(graph_store, query: str, params: Optional[Dict] = None) -> List[Tuple]:
+    """Drain a Cypher query into a list of tuples. Defensive against empty results."""
+    try:
+        result = graph_store.conn.execute(query, params or {})
+    except Exception as exc:
+        logger.warning("Cypher fetch failed (%s): %s", query.split()[0], exc)
+        return []
+    rows: List[Tuple] = []
+    while result.has_next():
+        rows.append(tuple(result.get_next()))
+    return rows
+
+
+def _count_isolated_entities(graph_store) -> int:
+    """Count entities with zero incoming or outgoing RELATED_TO edges."""
+    all_ids: Set[str] = {row[0] for row in _fetch_all(
+        graph_store, "MATCH (e:Entity) RETURN e.entity_id"
+    )}
+    if not all_ids:
+        return 0
+    connected: Set[str] = set()
+    for a, b in _fetch_all(
+        graph_store,
+        "MATCH (a:Entity)-[:RELATED_TO]->(b:Entity) RETURN a.entity_id, b.entity_id",
+    ):
+        connected.add(a)
+        connected.add(b)
+    return len(all_ids - connected)
+
+
+def _find_duplicate_clusters(
+    graph_store,
+    max_clusters: int = 100,
+) -> List[List[Tuple[str, str]]]:
+    """
+    Group entities sharing (canonical_form, type). Return clusters with >1 member.
+
+    Each cluster is a list of (entity_id, surface_name) tuples, sorted by name.
+    """
+    rows = _fetch_all(
+        graph_store, "MATCH (e:Entity) RETURN e.entity_id, e.name, e.type"
+    )
+    by_key: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+    for eid, name, etype in rows:
+        if not name:
+            continue
+        key = (canonical_form(name), (etype or "unknown"))
+        by_key.setdefault(key, []).append((eid, name))
+    clusters = [sorted(members, key=lambda x: x[1]) for members in by_key.values() if len(members) > 1]
+    clusters.sort(key=len, reverse=True)
+    return clusters[:max_clusters]
+
+
+def _top_promiscuous_entities(graph_store, limit: int = 20) -> List[Dict[str, Any]]:
+    """Return the top-N entities by chunk-MENTIONS count."""
+    rows = _fetch_all(
+        graph_store,
+        """
+        MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity)
+        RETURN e.name, e.type, count(DISTINCT c) AS mention_count
+        ORDER BY mention_count DESC
+        LIMIT $limit
+        """,
+        {"limit": limit},
+    )
+    return [
+        {"name": name, "type": etype or "unknown", "mention_count": int(count)}
+        for name, etype, count in rows
+    ]
+
+
+def format_baseline_report(metrics: Dict[str, Any]) -> str:
+    """Format the baseline metrics as a human-readable report."""
+    t = metrics["totals"]
+    d = metrics["densities"]
+    iso = metrics["isolated"]
+    dup = metrics["duplicates"]
+
+    lines: List[str] = []
+    lines.append("─" * 70)
+    lines.append("  GRAPH QUALITY BASELINE")
+    lines.append("─" * 70)
+    lines.append(f"  Chunks:     {t['chunks']:>8,}")
+    lines.append(
+        f"  Entities:   {t['entities']:>8,}    "
+        f"(per chunk: {d['entities_per_chunk']:>5.2f})"
+    )
+    lines.append(
+        f"  Mentions:   {t['mentions']:>8,}    "
+        f"(per chunk: {d['mentions_per_chunk']:>5.2f})"
+    )
+    lines.append(
+        f"  Relations:  {t['relations']:>8,}    "
+        f"(per chunk: {d['relations_per_chunk']:>5.2f}, "
+        f"per entity: {d['relations_per_entity']:>5.2f})"
+    )
+    lines.append("")
+    iso_marker = "✓" if iso["rate"] < 0.05 else "⚠"
+    lines.append(
+        f"  {iso_marker} Isolated entities (no RELATED_TO): "
+        f"{iso['count']:>5,} ({iso['rate']:.1%})"
+    )
+    dup_marker = "✓" if dup["rate"] < 0.02 else "⚠"
+    lines.append(
+        f"  {dup_marker} Duplicate clusters (same canonical form): "
+        f"{dup['cluster_count']:>5,}  "
+        f"(redundant entities: {dup['duplicate_count']:,}, {dup['rate']:.1%})"
+    )
+    if dup["top_clusters"]:
+        lines.append("")
+        lines.append("  Top duplicate clusters:")
+        for cluster in dup["top_clusters"][:5]:
+            names = ", ".join(f"'{n}'" for _, n in cluster[:4])
+            extra = f" +{len(cluster) - 4} more" if len(cluster) > 4 else ""
+            lines.append(f"    [{len(cluster)}x]  {names}{extra}")
+
+    if metrics["top_hubs"]:
+        lines.append("")
+        lines.append("  Top entities by chunk-MENTIONS count:")
+        for hub in metrics["top_hubs"][:10]:
+            lines.append(
+                f"    {hub['mention_count']:>4} chunks  ·  "
+                f"{hub['type']:<14}  ·  {hub['name']}"
+            )
+    lines.append("─" * 70)
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INVARIANTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GraphQualityViolation(RuntimeError):
+    """Raised by `assert_graph_invariants(strict=True)` on threshold violation."""
+
+
+DEFAULT_THRESHOLDS: Dict[str, float] = {
+    "max_isolated_rate": 0.05,
+    "max_duplicate_rate": 0.02,
+    "min_relation_density": 5.0,
+}
+
+
+def assert_graph_invariants(
+    metrics: Dict[str, Any],
+    thresholds: Optional[Dict[str, float]] = None,
+    strict: bool = False,
+) -> List[str]:
+    """
+    Check graph-quality invariants against `thresholds`.
+
+    Returns a list of human-readable violation messages (empty on success).
+    If `strict=True`, raises `GraphQualityViolation` instead of returning.
+    """
+    t = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
+    violations: List[str] = []
+
+    iso_rate = metrics["isolated"]["rate"]
+    if iso_rate > t["max_isolated_rate"]:
+        violations.append(
+            f"isolated_rate={iso_rate:.1%} exceeds threshold "
+            f"{t['max_isolated_rate']:.1%}"
+        )
+
+    dup_rate = metrics["duplicates"]["rate"]
+    if dup_rate > t["max_duplicate_rate"]:
+        violations.append(
+            f"duplicate_rate={dup_rate:.1%} exceeds threshold "
+            f"{t['max_duplicate_rate']:.1%}"
+        )
+
+    rel_density = metrics["densities"]["relations_per_chunk"]
+    if rel_density < t["min_relation_density"]:
+        violations.append(
+            f"relations_per_chunk={rel_density:.2f} below threshold "
+            f"{t['min_relation_density']:.2f}"
+        )
+
+    if strict and violations:
+        raise GraphQualityViolation("; ".join(violations))
+    return violations
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CO-OCCURRENCE EDGES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_cooccurrence_edges(
+    graph_store,
+    extraction_results: Iterable[Dict[str, Any]],
+    name_to_id: Dict[str, str],
+    min_confidence: float = 0.5,
+    relation_type: str = "cooccurs",
+    max_entities_per_chunk: int = 30,
+) -> int:
+    """
+    Add a RELATED_TO edge for every pair of entities co-mentioned in a chunk.
+
+    Each unordered pair receives a single edge with `relation_type='cooccurs'`,
+    `confidence=1.0`, and `source_chunks` containing the originating chunk_id.
+    The edge is idempotent because `KuzuGraphStore.add_related_to_relation`
+    uses MERGE under the hood. Pairs are deduplicated via canonical pair
+    ordering so that A-B and B-A are not double-counted within this function.
+
+    Args:
+        graph_store: KuzuGraphStore-compatible.
+        extraction_results: Phase-2 extraction records (one dict per chunk
+            with an `entities` list of {name, confidence, ...}).
+        name_to_id: Mapping from `canonical_form(entity.name)` -> resolved
+            entity_id in the graph (built by the caller during entity import).
+        min_confidence: Skip entities below this NER confidence.
+        relation_type: Stored on the edge; default `"cooccurs"`.
+        max_entities_per_chunk: Combinatorial safeguard. A chunk with N
+            entities yields C(N, 2) pairs. With N=30 that is 435 pairs;
+            with N=100 it is 4950. Chunks exceeding this cap are truncated
+            to the highest-confidence top-N entities to bound the worst case.
+
+    Returns:
+        Number of edges written (excluding silent failures).
+    """
+    written = 0
+    seen_pairs: Set[Tuple[str, str]] = set()
+    truncated_chunks = 0
+
+    for result in extraction_results:
+        chunk_id = str(result.get("chunk_id", ""))
+
+        # Collect (eid, confidence) so we can sort if a cap is hit.
+        candidates: List[Tuple[str, float]] = []
+        for ent in result.get("entities", []) or []:
+            conf = float(ent.get("confidence", 0.0))
+            if conf < min_confidence:
+                continue
+            name = (ent.get("name") or "").strip()
+            if not name:
+                continue
+            eid = name_to_id.get(canonical_form(name))
+            if eid:
+                candidates.append((eid, conf))
+
+        # Deduplicate IDs within the chunk (keep highest-confidence occurrence).
+        by_id: Dict[str, float] = {}
+        for eid, conf in candidates:
+            if conf > by_id.get(eid, -1.0):
+                by_id[eid] = conf
+        ids_with_conf = sorted(by_id.items(), key=lambda x: -x[1])
+
+        # Cap the number of entities per chunk to avoid combinatorial blow-up.
+        if len(ids_with_conf) > max_entities_per_chunk:
+            ids_with_conf = ids_with_conf[:max_entities_per_chunk]
+            truncated_chunks += 1
+
+        unique_ids = [eid for eid, _ in ids_with_conf]
+        for a, b in combinations(unique_ids, 2):
+            pair = (a, b) if a < b else (b, a)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            try:
+                graph_store.add_related_to_relation(
+                    entity1_id=pair[0],
+                    entity2_id=pair[1],
+                    relation_type=relation_type,
+                    confidence=1.0,
+                    source_chunks=[chunk_id] if chunk_id else None,
+                )
+                written += 1
+            except Exception as exc:
+                logger.debug("CO_OCCURS edge failed (%s, %s): %s", pair[0], pair[1], exc)
+
+    if truncated_chunks:
+        logger.info(
+            "Co-occurrence: truncated %d chunks at max_entities_per_chunk=%d",
+            truncated_chunks, max_entities_per_chunk,
+        )
+    logger.info("Co-occurrence edges added: %d (from %d unique pairs)", written, len(seen_pairs))
+    return written
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST-INGESTION CLEANUP
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Surface forms that GLiNER frequently misclassifies as PERSON or GPE entities.
+# These are pronouns, nationality adjectives, and other generic tokens that
+# carry no entity-resolution value and pollute graph retrieval. Compared
+# against `canonical_form(name)` (already lowercased + NFKC), so periods,
+# whitespace, and case variants are handled automatically.
+DEFAULT_STOPLIST: frozenset = frozenset({
+    # Pronouns misclassified as PERSON
+    "he", "she", "they", "it", "we", "i", "you", "him", "her", "his", "hers",
+    "us", "them", "their", "theirs", "this", "that", "these", "those",
+    # Nationality adjectives misclassified as GPE
+    "american", "british", "english", "german", "french", "italian", "spanish",
+    "japanese", "chinese", "russian", "australian", "canadian", "european",
+    "asian", "african", "indian", "korean", "mexican", "brazilian", "polish",
+    "irish", "scottish", "welsh", "dutch", "swedish", "norwegian", "danish",
+    "greek", "turkish", "arab", "arabic", "swiss", "austrian", "belgian",
+    # Generic / ambiguous tokens
+    "u.s.", "us", "uk", "u.k.",  # use the canonical "United States" / "United Kingdom" forms
+})
+
+
+def cleanup_graph(
+    graph_store,
+    drop_orphans: bool = True,
+    hub_threshold_ratio: Optional[float] = 0.03,
+    hub_threshold_min: int = 50,
+    merge_duplicates: bool = True,
+    stoplist: Optional[Iterable[str]] = None,
+    dry_run: bool = False,
+) -> Dict[str, int]:
+    """
+    Four-pass post-ingestion graph cleanup.
+
+    Args:
+        drop_orphans:       Delete Entity nodes that no chunk MENTIONS.
+        hub_threshold_ratio: Delete entities mentioned in more than
+                             `ratio × total_chunks` chunks. None disables.
+                             Default lowered from 0.05 to 0.03 because at
+                             0.05, common GLiNER misclassifications such as
+                             "He" and "England" survive (4.1 % and 1.7 % of
+                             chunks respectively).
+        hub_threshold_min:  Lower bound on the absolute hub threshold (so
+                             small corpora do not drop everything).
+        merge_duplicates:   Merge entities sharing (canonical_form, type) by
+                             redirecting all edges to the highest-mentioned
+                             surface form, then deleting the rest.
+        stoplist:           Iterable of surface forms (compared against
+                             `canonical_form`) to drop unconditionally.
+                             None uses `DEFAULT_STOPLIST`. Pass an empty
+                             iterable to disable.
+        dry_run:            If True, only count operations; do not mutate.
+
+    Returns:
+        Dict with counts: orphans_dropped, hubs_dropped, duplicates_merged,
+        stoplist_dropped.
+    """
+    ops = {
+        "orphans_dropped": 0,
+        "hubs_dropped": 0,
+        "duplicates_merged": 0,
+        "stoplist_dropped": 0,
+    }
+
+    # Stop-list pass runs first so hubs and duplicates do not waste work on
+    # entities that would have been dropped anyway.
+    if stoplist is None:
+        stoplist = DEFAULT_STOPLIST
+    stoplist_set = {canonical_form(s) for s in stoplist if s}
+    if stoplist_set:
+        ops["stoplist_dropped"] = _drop_stoplist_entities(
+            graph_store, stoplist_set, dry_run=dry_run
+        )
+
+    if drop_orphans:
+        ops["orphans_dropped"] = _drop_orphan_entities(graph_store, dry_run=dry_run)
+
+    if hub_threshold_ratio is not None and hub_threshold_ratio > 0:
+        chunks = graph_store.get_statistics().get("document_chunks", 0)
+        hub_threshold = max(hub_threshold_min, int(hub_threshold_ratio * chunks))
+        ops["hubs_dropped"] = _drop_hub_entities(
+            graph_store, hub_threshold, dry_run=dry_run
+        )
+
+    if merge_duplicates:
+        ops["duplicates_merged"] = _merge_duplicate_entities(graph_store, dry_run=dry_run)
+
+    return ops
+
+
+def _drop_stoplist_entities(
+    graph_store,
+    stoplist_set: Set[str],
+    dry_run: bool = False,
+) -> int:
+    """Delete Entity nodes whose canonical_form(name) is in the stop-list."""
+    rows = _fetch_all(graph_store, "MATCH (e:Entity) RETURN e.entity_id, e.name")
+    targets = [eid for eid, name in rows
+               if name and canonical_form(name) in stoplist_set]
+    if dry_run:
+        return len(targets)
+    for eid in targets:
+        _delete_entity_safely(graph_store, eid)
+    if targets:
+        logger.info(
+            "Dropped %d stop-list entities (pronouns, nationality adjectives, ...).",
+            len(targets),
+        )
+    return len(targets)
+
+
+def _delete_entity_safely(graph_store, entity_id: str) -> None:
+    """
+    Delete an entity and all its incident edges.
+
+    Kuzu requires edges to be deleted before nodes (no DETACH DELETE in older
+    versions). This helper deletes edges in four passes, then the node itself.
+    Failures are logged at DEBUG level and do not propagate.
+    """
+    cypher_steps = (
+        # Outgoing RELATED_TO
+        "MATCH (e:Entity {entity_id: $eid})-[r:RELATED_TO]->(:Entity) DELETE r",
+        # Incoming RELATED_TO
+        "MATCH (:Entity)-[r:RELATED_TO]->(e:Entity {entity_id: $eid}) DELETE r",
+        # Incoming MENTIONS
+        "MATCH (:DocumentChunk)-[r:MENTIONS]->(e:Entity {entity_id: $eid}) DELETE r",
+        # The node itself
+        "MATCH (e:Entity {entity_id: $eid}) DELETE e",
+    )
+    for cypher in cypher_steps:
+        try:
+            graph_store.conn.execute(cypher, {"eid": entity_id})
+        except Exception as exc:
+            logger.debug("delete step failed for %s: %s", entity_id, exc)
+
+
+def _drop_orphan_entities(graph_store, dry_run: bool = False) -> int:
+    """Delete Entity nodes with no incoming MENTIONS edge."""
+    all_ids: Set[str] = {row[0] for row in _fetch_all(
+        graph_store, "MATCH (e:Entity) RETURN e.entity_id"
+    )}
+    mentioned: Set[str] = {row[0] for row in _fetch_all(
+        graph_store,
+        "MATCH (:DocumentChunk)-[:MENTIONS]->(e:Entity) RETURN DISTINCT e.entity_id",
+    )}
+    orphans = all_ids - mentioned
+    if dry_run:
+        return len(orphans)
+    for eid in orphans:
+        _delete_entity_safely(graph_store, eid)
+    if orphans:
+        logger.info("Dropped %d orphan entities (zero MENTIONS).", len(orphans))
+    return len(orphans)
+
+
+def _drop_hub_entities(
+    graph_store,
+    hub_threshold: int,
+    dry_run: bool = False,
+) -> int:
+    """Delete Entity nodes mentioned in more than `hub_threshold` distinct chunks."""
+    rows = _fetch_all(
+        graph_store,
+        """
+        MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity)
+        WITH e.entity_id AS eid, count(DISTINCT c) AS mc
+        WHERE mc > $threshold
+        RETURN eid, mc
+        """,
+        {"threshold": hub_threshold},
+    )
+    if dry_run:
+        return len(rows)
+    for eid, _ in rows:
+        _delete_entity_safely(graph_store, eid)
+    if rows:
+        logger.info(
+            "Dropped %d hub entities (mention_count > %d).",
+            len(rows), hub_threshold,
+        )
+    return len(rows)
+
+
+def _merge_duplicate_entities(graph_store, dry_run: bool = False) -> int:
+    """
+    Merge entities sharing (canonical_form, type).
+
+    Strategy: for each cluster, keep the entity with the highest MENTIONS count
+    and redirect all incident edges of the other cluster members to it. The
+    other members are then deleted via `_delete_entity_safely`.
+    """
+    rows = _fetch_all(
+        graph_store,
+        """
+        MATCH (e:Entity)
+        OPTIONAL MATCH (c:DocumentChunk)-[:MENTIONS]->(e)
+        WITH e.entity_id AS eid, e.name AS name, e.type AS etype, count(c) AS mc
+        RETURN eid, name, etype, mc
+        """,
+    )
+    by_key: Dict[Tuple[str, str], List[Tuple[str, str, int]]] = {}
+    for eid, name, etype, mc in rows:
+        if not name:
+            continue
+        key = (canonical_form(name), etype or "unknown")
+        by_key.setdefault(key, []).append((eid, name, int(mc or 0)))
+
+    merged = 0
+    for cluster in by_key.values():
+        if len(cluster) < 2:
+            continue
+        # Keep the surface form with the highest mention count (most canonical
+        # in practice). Ties broken by length-then-lexicographic order so the
+        # choice is deterministic across runs.
+        cluster.sort(key=lambda x: (-x[2], len(x[1]), x[1]))
+        keeper_id = cluster[0][0]
+        if dry_run:
+            merged += len(cluster) - 1
+            continue
+        for old_id, _, _ in cluster[1:]:
+            _redirect_entity_edges(graph_store, old_id=old_id, new_id=keeper_id)
+            _delete_entity_safely(graph_store, old_id)
+            merged += 1
+    if merged:
+        logger.info("Merged %d duplicate entities into canonical surface forms.", merged)
+    return merged
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMBEDDING-BASED ENTITY LINKING (alias resolution beyond canonical_form)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def link_entities_by_embedding(
+    graph_store,
+    embedder,
+    similarity_threshold: float = 0.92,
+    min_type_size: int = 2,
+    max_type_size: int = 8000,
+    length_ratio_floor: float = 0.4,
+    dry_run: bool = False,
+) -> int:
+    """
+    Merge entity nodes whose embedded names are sufficiently similar within type.
+
+    Solves the alias problem that `canonical_form` cannot:
+        "Ed Wood"               <-> "Edward Davis Wood Jr."
+        "Christopher Nolan"     <-> "Chris Nolan"
+        "United States"         <-> "U.S. of America"
+
+    Algorithm:
+      1. Group all entities by canonical type (PERSON, GPE, WORK_OF_ART, ...).
+      2. For each type bucket, batch-embed entity names via `embedder`.
+      3. Compute pairwise cosine similarity inside the bucket.
+      4. Greedy union-find: pairs with sim >= `similarity_threshold` merge.
+      5. Within each merged cluster, keep the entity with the highest
+         MENTIONS count and redirect all incident edges to it.
+
+    Args:
+        graph_store:           KuzuGraphStore-compatible.
+        embedder:              An object with `embed_documents(List[str])
+                               -> List[List[float]]` (e.g., the project's
+                               BatchedOllamaEmbeddings).
+        similarity_threshold:  Cosine cutoff. Higher = stricter merge.
+                               0.92 is conservative; 0.88 is aggressive.
+        min_type_size:         Skip type buckets with fewer entities than this.
+        max_type_size:         Skip type buckets larger than this (memory
+                               safety: 8000 entities -> 8000^2 floats =
+                               ~256 MB similarity matrix).
+        length_ratio_floor:    Reject pairs whose surface-form length ratio
+                               is below this. Prevents "X" from merging into
+                               "X World Championship" purely because the
+                               embedder maps short names to similar vectors.
+        dry_run:               Count operations without mutating the graph.
+
+    Returns:
+        Number of entities merged (i.e., deleted because they had a parent).
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        logger.warning(
+            "FALLBACK ACTIVE: numpy not installed; embedding-based entity "
+            "linking disabled."
+        )
+        return 0
+
+    rows = _fetch_all(
+        graph_store,
+        """
+        MATCH (e:Entity)
+        OPTIONAL MATCH (c:DocumentChunk)-[:MENTIONS]->(e)
+        WITH e.entity_id AS eid, e.name AS name, e.type AS etype, count(c) AS mc
+        RETURN eid, name, etype, mc
+        """,
+    )
+
+    by_type: Dict[str, List[Tuple[str, str, int]]] = {}
+    for eid, name, etype, mc in rows:
+        if not name:
+            continue
+        by_type.setdefault(etype or "unknown", []).append(
+            (eid, name, int(mc or 0))
+        )
+
+    merged_total = 0
+
+    for etype, members in by_type.items():
+        if len(members) < min_type_size:
+            continue
+        if len(members) > max_type_size:
+            logger.warning(
+                "Embed-link: skipping type=%s with %d entities (above max_type_size=%d)",
+                etype, len(members), max_type_size,
+            )
+            continue
+
+        names = [name for _, name, _ in members]
+        try:
+            embeds_raw = embedder.embed_documents(names)
+        except Exception as exc:
+            logger.warning(
+                "Embed-link: embedder failed for type=%s (%s); skipping",
+                etype, exc,
+            )
+            continue
+
+        embeds = np.asarray(embeds_raw, dtype=np.float32)
+        if embeds.ndim != 2 or embeds.shape[0] != len(members):
+            logger.warning(
+                "Embed-link: bad embedding shape %s for type=%s",
+                embeds.shape, etype,
+            )
+            continue
+
+        # L2-normalise so dot product == cosine similarity.
+        norms = np.linalg.norm(embeds, axis=1, keepdims=True)
+        embeds = embeds / np.where(norms > 0, norms, 1.0)
+
+        n = len(members)
+        sim = embeds @ embeds.T          # n x n cosine similarity
+        np.fill_diagonal(sim, 0.0)       # self-similarity ignored
+
+        # Union-Find with mention-count as the "win" criterion.
+        parent = list(range(n))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i: int, j: int) -> None:
+            pi, pj = find(i), find(j)
+            if pi == pj:
+                return
+            # Keep the entity with more MENTIONS as the cluster root.
+            if members[pi][2] >= members[pj][2]:
+                parent[pj] = pi
+            else:
+                parent[pi] = pj
+
+        # Iterate the upper triangle. Length ratio guard prevents merging
+        # short surface forms into long unrelated ones.
+        for i in range(n):
+            name_i = members[i][1]
+            for j in range(i + 1, n):
+                if sim[i, j] < similarity_threshold:
+                    continue
+                name_j = members[j][1]
+                short, long_ = sorted((len(name_i), len(name_j)))
+                if long_ > 0 and short / long_ < length_ratio_floor:
+                    continue
+                union(i, j)
+
+        # Apply merges: anyone whose root is not themselves gets redirected.
+        merged_in_type = 0
+        for i in range(n):
+            root = find(i)
+            if root == i:
+                continue
+            old_id = members[i][0]
+            new_id = members[root][0]
+            if old_id == new_id:
+                continue
+            if dry_run:
+                merged_in_type += 1
+                continue
+            _redirect_entity_edges(graph_store, old_id=old_id, new_id=new_id)
+            _delete_entity_safely(graph_store, old_id)
+            merged_in_type += 1
+
+        if merged_in_type:
+            logger.info(
+                "Embed-link merged %d entities in type=%s (threshold=%.2f, %d total)",
+                merged_in_type, etype, similarity_threshold, n,
+            )
+        merged_total += merged_in_type
+
+    return merged_total
+
+
+def _redirect_entity_edges(graph_store, old_id: str, new_id: str) -> None:
+    """
+    Move every MENTIONS / RELATED_TO edge incident on `old_id` to `new_id`.
+
+    Kuzu does not provide native edge rewriting, so we re-create edges via
+    MERGE and then delete the originals. Self-loops (`new_id == new_id` after
+    redirect) are filtered out.
+    """
+    if old_id == new_id:
+        return
+    # MENTIONS: chunk -> old becomes chunk -> new
+    for (chunk_id,) in _fetch_all(
+        graph_store,
+        """
+        MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity {entity_id: $old_id})
+        RETURN DISTINCT c.chunk_id
+        """,
+        {"old_id": old_id},
+    ):
+        try:
+            graph_store.add_mentions_relation(chunk_id=chunk_id, entity_id=new_id)
+        except Exception as exc:
+            logger.debug("redirect MENTIONS failed (%s -> %s): %s", chunk_id, new_id, exc)
+
+    # RELATED_TO outgoing: old -> other becomes new -> other
+    for other_id, rel_type in _fetch_all(
+        graph_store,
+        """
+        MATCH (:Entity {entity_id: $old_id})-[r:RELATED_TO]->(o:Entity)
+        RETURN o.entity_id, r.relation_type
+        """,
+        {"old_id": old_id},
+    ):
+        if other_id == new_id:
+            continue
+        try:
+            graph_store.add_related_to_relation(
+                entity1_id=new_id,
+                entity2_id=other_id,
+                relation_type=rel_type or "related",
+            )
+        except Exception as exc:
+            logger.debug("redirect RELATED_TO out failed: %s", exc)
+
+    # RELATED_TO incoming: other -> old becomes other -> new
+    for other_id, rel_type in _fetch_all(
+        graph_store,
+        """
+        MATCH (o:Entity)-[r:RELATED_TO]->(:Entity {entity_id: $old_id})
+        RETURN o.entity_id, r.relation_type
+        """,
+        {"old_id": old_id},
+    ):
+        if other_id == new_id:
+            continue
+        try:
+            graph_store.add_related_to_relation(
+                entity1_id=other_id,
+                entity2_id=new_id,
+                relation_type=rel_type or "related",
+            )
+        except Exception as exc:
+            logger.debug("redirect RELATED_TO in failed: %s", exc)

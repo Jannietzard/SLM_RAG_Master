@@ -695,13 +695,9 @@ class TestNavigator:
         """Lower-scored chunk with a contradictory number is removed.
 
         Setup: two chunks discuss the same topic (high word overlap) but cite
-        conflicting numeric values (200 vs 2000 → ratio 10× > threshold 2.0;
-        both values ≥ min_value=100).  The chunk with the lower rrf_score (0.5)
+        conflicting numeric values (200 vs 2000 -> ratio 10x > threshold 2.0;
+        both values >= min_value=100).  The chunk with the lower rrf_score (0.5)
         must be removed; the higher-scored chunk (0.9) must survive.
-
-        Note: contradiction_min_value was raised from 10 → 100 (§12.25) to
-        prevent day-of-month values (1–31) from creating false contradictions
-        with year-scale numbers. Test data uses values ≥ 100 on both sides.
         """
         results = [
             {
@@ -728,7 +724,7 @@ class TestNavigator:
             {"text": "Quantum mechanics was formulated in 1925.", "rrf_score": 0.7},
         ]
         filtered = navigator._contradiction_filter(results)
-        # Different topics → word overlap below threshold → no chunk removed.
+        # Different topics -> word overlap below threshold -> no chunk removed.
         assert len(filtered) == 2
 
     def test_contradiction_filter_empty_input(self, navigator) -> None:

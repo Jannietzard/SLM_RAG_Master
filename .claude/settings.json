@@ -94,7 +94,24 @@
       "Bash(python -X utf8 -m pytest test_system/ -x --tb=short -q --ignore=test_system/test_graph_inspect.py -m \"not nightly and not llm\")",
       "Bash(python -X utf8 -m pytest test_system/ --tb=short -q --ignore=test_system/test_graph_inspect.py -m \"not nightly and not llm\")",
       "Bash(python -X utf8 -m pytest test_system/test_verifier_semantic.py --tb=short)",
-      "Bash(python -X utf8 -m py_compile diagnose_verbose.py)"
+      "Bash(python -X utf8 -m py_compile diagnose_verbose.py)",
+      "Bash(python -X utf8 -m pytest test_system/ --ignore=test_system/test_graph_inspect.py -m \"not nightly and not llm\" -x --tb=short -q)",
+      "Bash(python -X utf8 -m pytest test_system/ --ignore=test_system/test_graph_inspect.py -m \"not nightly and not llm\" --tb=short -q)",
+      "WebSearch",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:supermemory.ai)",
+      "Bash(python -X utf8 -m pytest test_system/test_data_layer.py test_system/test_logic_layer.py -q --tb=short -m \"not slow and not nightly and not llm and not integration\")",
+      "Bash(python -X utf8 -m pytest test_system/test_data_layer.py test_system/test_logic_layer.py --tb=short -m \"not slow and not nightly and not llm and not integration\")",
+      "Bash(Select-String \"passed|failed|error\")",
+      "Bash(python -X utf8 -m pytest test_system/ --tb=short -m \"not slow and not nightly and not llm and not integration\" --ignore=test_system/test_graph_inspect.py --ignore=test_system/diagnose.py --ignore=test_system/diagnose_gliner_quality.py --ignore=test_system/graph_inspect.py --ignore=test_system/graph_3d.py)",
+      "Bash(python -X utf8 -m pytest test_system/test_navigator_semantic.py test_system/test_logic_layer.py test_system/test_data_layer.py -v --tb=short -m \"not slow and not nightly and not llm and not integration\")",
+      "Bash(venv/Scripts/python.exe -m pip install rank_bm25 sentence-transformers)",
+      "Bash(venv/Scripts/python.exe -c ' *)",
+      "Bash(venv/Scripts/python.exe -X utf8 -m pytest test_system/ --tb=short -m \"not slow and not nightly and not llm and not integration\" --ignore=test_system/test_graph_inspect.py --ignore=test_system/diagnose.py --ignore=test_system/diagnose_gliner_quality.py --ignore=test_system/graph_inspect.py --ignore=test_system/graph_3d.py)",
+      "Bash(venv/Scripts/python.exe -X utf8 -m pytest test_system/ --tb=short -m \"not slow and not nightly and not llm and not integration\" --ignore=test_system/test_graph_inspect.py --ignore=test_system/diagnose.py --ignore=test_system/diagnose_gliner_quality.py --ignore=test_system/graph_inspect.py --ignore=test_system/graph_3d.py -p no:cacheprovider)",
+      "Bash(venv/Scripts/python.exe -X utf8 diagnose_verbose.py --idx 32 --no-color)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\Jan Nietzard\\\\Documents\\\\FOM\\\\FOM Masterarbeit\\\\Masterarbeit Edge\\\\Entwicklungfolder\" -Depth 1)",
+      "Bash(Select-Object Name, FullName)"
     ]
   }
 }

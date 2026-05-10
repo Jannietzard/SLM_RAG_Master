@@ -58,6 +58,10 @@ GLINER_LABEL_MAP: Dict[str, str] = {
     "work of art":  "WORK_OF_ART",
     "award":        "WORK_OF_ART",
     "prize":        "WORK_OF_ART",
+    # Temporal
+    "date":         "DATE",
+    "year":         "DATE",
+    "time":         "DATE",
     # Events / other
     "event":        "EVENT",
     "product":      "PRODUCT",

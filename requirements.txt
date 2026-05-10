@@ -45,6 +45,9 @@ numpy>=1.24.0,<2.0.0
 scipy>=1.11.0
 scikit-learn>=1.3.0
 
+# BM25 sparse retrieval (§12.29)
+rank_bm25>=0.2.2
+
 # Networking
 requests>=2.31.0
 httpx>=0.25.0
@@ -92,6 +95,18 @@ datasets>=2.14.0
 
 # GLiNER — zero-shot NER (larger, more flexible)
 # gliner>=0.2.0
+
+# ============================================================================
+# OPTIONAL: Coreference resolution at chunking time (Phase 1)
+# ============================================================================
+# Replaces pronouns ("He", "She") with their antecedent noun phrases before
+# chunking, so GLiNER (Phase 2) and the graph (Phase 3) capture the named
+# entity behind each mention. Falls back to a no-op if not installed.
+# Installation:
+#   pip install coreferee
+#   python -m coreferee install en
+#   python -m spacy download en_core_web_md   # required (sm is not enough)
+# coreferee>=1.4.0
 
 # ============================================================================
 # OPTIONAL: Thesis Evaluation and Visualization
