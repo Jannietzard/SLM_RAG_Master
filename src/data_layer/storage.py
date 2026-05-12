@@ -79,7 +79,7 @@ import logging
 import shutil
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
 
 if TYPE_CHECKING:
@@ -432,21 +432,87 @@ def _entity_name_variants(name: str) -> List[str]:
     """
     Build a prioritised list of name variants for alias-tolerant entity lookup.
 
-    Handles common patterns without a full alias table:
-      "Ed Wood"          → also try "Wood" (last-name-only for short first names)
-      "Scott Derrickson" → also try "Derrickson" (multi-token fallback)
+    Priority order (most → least specific):
+      1. Full name                     "Giuseppe Arimondi"
+      2. Last token (surname)          "Arimondi"          — skipped if ≤4 chars
+      3. Individual tokens ≥7 chars    (middle names, long first names)
 
-    Used by KuzuGraphStore.find_chunks_by_entity_multihop.
+    Tokens ≤6 chars are excluded from single-token fallbacks because short
+    given names like "Giuseppe" or "Scott" match unrelated hub entities
+    (Giuseppe Verdi, Scott …) and flood results before the correct surname hit.
+    The only exception is step 1 (full name always tried first).
+
+    Examples:
+      "Giuseppe Arimondi" → ["Giuseppe Arimondi", "Arimondi"]
+      "Ed Wood"           → ["Ed Wood", "Wood"]
+      "Scott Derrickson"  → ["Scott Derrickson", "Derrickson"]
+      "Carlo Rovelli"     → ["Carlo Rovelli", "Rovelli"]
+      "Masakazu Katsura"  → ["Masakazu Katsura", "Katsura", "Masakazu"]
     """
-    variants = [name]
+    variants: List[str] = [name]
     tokens = name.split()
-    if len(tokens) == 2 and len(tokens[0]) <= 3:
-        variants.append(tokens[-1])
-    if len(tokens) > 1:
-        for tok in tokens:
-            if len(tok) >= 4 and tok not in variants:
-                variants.append(tok)
+    if len(tokens) < 2:
+        return variants
+
+    # Surname (last token) — always add if long enough to be discriminative.
+    last = tokens[-1]
+    if len(last) >= 4 and last not in variants:
+        variants.append(last)
+
+    # Remaining tokens that are long enough to be discriminative on their own.
+    for tok in tokens[:-1]:
+        if len(tok) >= 7 and tok not in variants:
+            variants.append(tok)
+
     return variants
+
+
+# ---------------------------------------------------------------------------
+# FIX P-9: which entity strings are worth a graph lookup?
+# ---------------------------------------------------------------------------
+# `e.name CONTAINS $x` in KuzuDB is an un-indexed substring scan over every
+# Entity node, run once per query-entity × per hop × per name-variant. A
+# low-value string ("Italian", "Physics", "2014", a question-word like "what
+# year") matches many high-degree hub nodes and the hop-2/3 expansion from a
+# hub blows up to tens of seconds. We therefore (a) skip the lookup entirely
+# for such strings, and (b) cap the hop-2/3 hub expansion below.
+#
+# This stoplist is intentionally small and conservative — generic nationality
+# adjectives, broad academic-field nouns, and a few question fragments. Real
+# named entities (people, organisations, works, specific places) are never on
+# it. Co-occurrence/cleanup already drop most of these from the graph, but the
+# query-side filter is cheaper and catches NORP/field-noun query terms that
+# the Planner emits.
+_GRAPH_LOOKUP_STOPWORDS: frozenset = frozenset({
+    # nationality / NORP-style adjectives commonly extracted from queries
+    "american", "british", "english", "irish", "italian", "french", "german",
+    "spanish", "russian", "chinese", "japanese", "canadian", "australian",
+    "scottish", "welsh", "dutch", "swedish", "norwegian", "danish", "polish",
+    "european", "asian", "african", "indian", "mexican", "brazilian",
+    # broad field / category nouns that fragment off real titles
+    "physics", "chemistry", "biology", "mathematics", "history", "science",
+    "music", "art", "film", "movie", "book", "novel", "band", "album", "song",
+    "writer", "actor", "director", "singer", "physicist", "scientist", "author",
+    # question-word fragments that sometimes survive as "entities"
+    "what", "which", "who", "whom", "whose", "where", "when", "why", "how",
+    "what year", "which year", "what city", "what country", "the same",
+})
+
+
+def _is_graph_worthy_entity(name: str) -> bool:
+    """True if `name` should be used as a graph-lookup key. Rejects empty/short
+    strings, bare numbers/years, and known generic single-word stop-terms."""
+    s = (name or "").strip()
+    if len(s) < 3:
+        return False
+    low = s.lower()
+    if low in _GRAPH_LOOKUP_STOPWORDS:
+        return False
+    # bare year / number, with optional thousands separators or s-suffix ("1990s")
+    bare = low.replace(",", "").rstrip("s")
+    if bare.isdigit():
+        return False
+    return True
 
 
 # ============================================================================
@@ -492,7 +558,10 @@ class KuzuGraphStore:
         if not KUZU_AVAILABLE:
             raise ImportError("KuzuDB not installed. Install with: pip install kuzu")
 
-        self.db_path.mkdir(parents=True, exist_ok=True)
+        try:
+            self.db_path.mkdir(parents=True, exist_ok=True)
+        except FileExistsError:
+            pass  # WinError 183: directory already exists — normal on --resume
         kuzu_file = self.db_path / self.KUZU_DIR_NAME
 
         self.db = kuzu.Database(str(kuzu_file))
@@ -758,6 +827,34 @@ class KuzuGraphStore:
                 "MENTIONS relation failed (%s → %s): %s", chunk_id, entity_id, exc
             )
 
+    # ── Batch transaction helpers ─────────────────────────────────────────────
+    # KuzuDB auto-commits every conn.execute() individually, which means one
+    # fsync per statement.  Wrapping N inserts in a single BEGIN/COMMIT reduces
+    # the fsync count from N to 1 and speeds up bulk imports by 10–30×.
+    # Usage:
+    #     graph_store.batch_begin()
+    #     for item in items:
+    #         graph_store.add_entity(...)   # no individual fsync
+    #     graph_store.batch_commit()       # single fsync for the whole batch
+
+    def batch_begin(self) -> None:
+        """Open an explicit transaction (suppresses auto-commit per statement)."""
+        if self.conn is not None:
+            self.conn.execute("BEGIN TRANSACTION")
+
+    def batch_commit(self) -> None:
+        """Commit the current transaction (single fsync for all pending writes)."""
+        if self.conn is not None:
+            self.conn.execute("COMMIT")
+
+    def batch_rollback(self) -> None:
+        """Roll back the current transaction (discard all pending writes)."""
+        if self.conn is not None:
+            try:
+                self.conn.execute("ROLLBACK")
+            except Exception:
+                pass
+
     def add_related_to_relation(
         self,
         entity1_id: str,
@@ -810,6 +907,79 @@ class KuzuGraphStore:
             logger.warning(
                 "RELATED_TO relation failed (%s -> %s): %s", entity1_id, entity2_id, exc
             )
+
+    def add_related_to_relations_bulk(
+        self,
+        pairs: List[Tuple[str, str, str, float, str]],
+        batch_size: int = 500,
+        use_create: bool = False,
+    ) -> int:
+        """
+        Bulk-insert RELATED_TO edges using explicit transactions.
+
+        Grouped commits (500 edges per transaction) are ~20-50× faster than
+        auto-commit on Windows because KuzuDB only fsyncs once per commit
+        instead of once per MERGE statement.
+
+        Args:
+            pairs:       List of (entity1_id, entity2_id, relation_type,
+                         confidence, source_chunks_str).
+            batch_size:  Edges per transaction commit.
+            use_create:  Use CREATE instead of MERGE.  Safe when the caller
+                         has already deduplicated pairs in Python (e.g.
+                         co-occurrence edges).  CREATE skips KuzuDB's
+                         adjacency-list existence scan, which makes it
+                         ~100× faster on large tables.
+
+        Returns:
+            Number of edges successfully written.
+        """
+        # CREATE skips the per-edge adjacency-list scan; MERGE checks for an
+        # existing edge with matching relation_type before inserting.
+        if use_create:
+            _query = """
+                MATCH (e1:Entity {entity_id: $entity1_id})
+                MATCH (e2:Entity {entity_id: $entity2_id})
+                CREATE (e1)-[:RELATED_TO {
+                    relation_type: $relation_type,
+                    confidence:    $confidence,
+                    source_chunks: $source_chunks
+                }]->(e2)
+            """
+        else:
+            _query = """
+                MATCH (e1:Entity {entity_id: $entity1_id})
+                MATCH (e2:Entity {entity_id: $entity2_id})
+                MERGE (e1)-[r:RELATED_TO {relation_type: $relation_type}]->(e2)
+                SET r.confidence    = $confidence,
+                    r.source_chunks = $source_chunks
+            """
+
+        written = 0
+        for i in range(0, len(pairs), batch_size):
+            batch = pairs[i : i + batch_size]
+            try:
+                self.conn.execute("BEGIN TRANSACTION")
+                for e1, e2, rel_type, conf, src in batch:
+                    self.conn.execute(
+                        _query,
+                        {
+                            "entity1_id": e1,
+                            "entity2_id": e2,
+                            "relation_type": rel_type,
+                            "confidence": float(conf),
+                            "source_chunks": src,
+                        },
+                    )
+                    written += 1
+                self.conn.execute("COMMIT")
+            except _STORAGE_ERRORS as exc:
+                logger.warning("Bulk RELATED_TO batch failed at offset %d: %s", i, exc)
+                try:
+                    self.conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+        return written
 
     def add_relation(
         self,
@@ -1018,14 +1188,18 @@ class KuzuGraphStore:
         self,
         entity_name: str,
         max_results: int = 5,
+        enable_hop3: bool = False,
     ) -> List[Dict[str, Any]]:
         """
-        3-hop entity search: returns chunks related to entity_name through
-        up to 3 hops of RELATED_TO edges.
+        Multi-hop entity search: returns chunks related to entity_name through
+        1–3 hops of RELATED_TO edges.
 
-        Hop=0 (direct):   DocumentChunk -[MENTIONS]-> Entity (name CONTAINS query)
+        Hop=0 (direct):   DocumentChunk -[MENTIONS]-> Entity (name = / CONTAINS query)
         Hop=2 (1 bridge): e1 -[RELATED_TO]- e2 <-[MENTIONS]- Chunk
         Hop=3 (2 bridges): e1 -[REL]-> e2 -[REL]-> e3 <-[MENTIONS]- Chunk
+                           — only run when enable_hop3=True (FIX P-9: the
+                           two-edge expansion is the dominant cost and rarely
+                           needed on HotpotQA; off by default).
 
         This design enables bridge-entity reasoning as described in thesis
         section 2.4 (original architectural contribution): a query about
@@ -1036,6 +1210,7 @@ class KuzuGraphStore:
         Args:
             entity_name: Entity name substring to match.
             max_results: Maximum total results across all hops.
+            enable_hop3: Run the 2-bridge hop as well (slow; default False).
 
         Returns:
             List of dicts: chunk_id, text, source_file, matched_entity,
@@ -1049,22 +1224,37 @@ class KuzuGraphStore:
 
         name_variants = _entity_name_variants(entity_name)
 
+        # FIX P-9: cap how many `e1` matches feed the hop-2/3 bridge expansion.
+        # `e1.name CONTAINS $x` can match dozens of hub entities; expanding
+        # RELATED_TO from each (every hub has ~30 co-occurrence neighbours) is
+        # what produces 40-second graph queries. Bridging through a hub adds no
+        # signal anyway, so we only ever expand from the first few matches.
+        _HUB_FANOUT_CAP = 5
+
         try:
-            # Hop 0: direct MENTIONS — try name variants until we get a hit
+            # Hop 0: direct MENTIONS — try name variants until we get a hit.
+            # Prefer an EXACT name match (cheap, precise) before falling back to
+            # the un-indexed CONTAINS substring scan.
             effective_name = entity_name  # will be updated on first hit
             for candidate in name_variants:
-                res = self.conn.execute(
-                    """
-                    MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity)
-                    WHERE e.name CONTAINS $entity_name
-                    RETURN c.chunk_id, c.text, c.source_file, e.name
-                    LIMIT $limit
-                    """,
-                    {"entity_name": candidate, "limit": max_results},
-                )
                 hop0_rows = []
-                while res.has_next():
-                    hop0_rows.append(res.get_next())
+                for clause, params in (
+                    ("e.name = $entity_name", {"entity_name": candidate, "limit": max_results}),
+                    ("e.name CONTAINS $entity_name", {"entity_name": candidate, "limit": max_results}),
+                ):
+                    res = self.conn.execute(
+                        f"""
+                        MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity)
+                        WHERE {clause}
+                        RETURN c.chunk_id, c.text, c.source_file, e.name
+                        LIMIT $limit
+                        """,
+                        params,
+                    )
+                    while res.has_next():
+                        hop0_rows.append(res.get_next())
+                    if hop0_rows:
+                        break  # exact match hit — don't run the CONTAINS scan
                 if hop0_rows:
                     effective_name = candidate
                     if candidate != entity_name:
@@ -1089,20 +1279,23 @@ class KuzuGraphStore:
             # Use effective_name (the variant that matched) for hop 2/3 queries
             entity_name = effective_name  # noqa: PLW2901 — intentional rebinding for hop queries
 
-            # Hop 2: one RELATED_TO bridge (bidirectional)
+            # Hop 2: one RELATED_TO bridge (bidirectional), capped fan-out
             remaining = max_results - len(chunks)
             if remaining > 0:
                 res = self.conn.execute(
                     """
-                    MATCH (e1:Entity)-[r:RELATED_TO]-(e2:Entity)
+                    MATCH (e1:Entity)
                     WHERE e1.name CONTAINS $entity_name
+                    WITH e1 LIMIT $hub_cap
+                    MATCH (e1)-[r:RELATED_TO]-(e2:Entity)
                     WITH e2, r.relation_type AS rel
                     MATCH (c:DocumentChunk)-[:MENTIONS]->(e2)
                     RETURN c.chunk_id, c.text, c.source_file,
                            e2.name AS bridge, rel
                     LIMIT $limit
                     """,
-                    {"entity_name": entity_name, "limit": remaining},
+                    {"entity_name": entity_name, "limit": remaining,
+                     "hub_cap": _HUB_FANOUT_CAP},
                 )
                 while res.has_next():
                     row = res.get_next()
@@ -1119,21 +1312,24 @@ class KuzuGraphStore:
                             "relation_type": row[4],
                         })
 
-            # Hop 3: two RELATED_TO bridges
+            # Hop 3: two RELATED_TO bridges, capped fan-out (opt-in — slow)
             remaining = max_results - len(chunks)
-            if remaining > 0:
+            if enable_hop3 and remaining > 0:
                 res = self.conn.execute(
                     """
-                    MATCH (e1:Entity)-[:RELATED_TO]-(e2:Entity)-[r2:RELATED_TO]-(e3:Entity)
+                    MATCH (e1:Entity)
                     WHERE e1.name CONTAINS $entity_name
-                      AND e3.name <> e1.name
+                    WITH e1 LIMIT $hub_cap
+                    MATCH (e1)-[:RELATED_TO]-(e2:Entity)-[r2:RELATED_TO]-(e3:Entity)
+                    WHERE e3.name <> e1.name
                     WITH e3, e2.name AS mid_entity, r2.relation_type AS rel
                     MATCH (c:DocumentChunk)-[:MENTIONS]->(e3)
                     RETURN c.chunk_id, c.text, c.source_file,
                            e3.name AS bridge, mid_entity, rel
                     LIMIT $limit
                     """,
-                    {"entity_name": entity_name, "limit": remaining},
+                    {"entity_name": entity_name, "limit": remaining,
+                     "hub_cap": _HUB_FANOUT_CAP},
                 )
                 while res.has_next():
                     row = res.get_next()
@@ -1587,7 +1783,32 @@ class HybridStore:
         results: List[Dict[str, Any]] = []
         seen_chunks: set = set()
 
-        for entity_name in entities:
+        # FIX P-9: filter out low-value graph-lookup keys (NORP adjectives,
+        # broad field nouns, bare years, question-word fragments). These match
+        # high-degree hub nodes and make the un-indexed CONTAINS scan + hop-2/3
+        # expansion catastrophically slow without adding signal. Specific named
+        # entities are kept; if *everything* is filtered out we fall back to the
+        # original list so the call still returns something.
+        worthy = [e for e in entities if _is_graph_worthy_entity(e)]
+        if not worthy and entities:
+            logger.debug("graph_search: all %d entities below worthiness bar; "
+                         "using full list", len(entities))
+            worthy = list(entities)
+        elif len(worthy) < len(entities):
+            dropped = [e for e in entities if e not in worthy]
+            logger.debug("graph_search: skipping low-value entities %s", dropped)
+
+        # Per-call wall-clock budget so a pathological hub query can't stall the
+        # whole pipeline (the multihop helper also caps hub expansion internally).
+        budget_s = 8.0
+        t_start = time.time()
+
+        for entity_name in worthy:
+            if time.time() - t_start > budget_s:
+                logger.warning("graph_search: time budget (%.0fs) exhausted after "
+                               "%d/%d entities — returning partial results",
+                               budget_s, len(results), len(worthy))
+                break
             entity_chunks = self.graph_store.find_chunks_by_entity_multihop(
                 entity_name=entity_name,
                 max_results=top_k,

@@ -215,10 +215,14 @@ navigator:
   redundancy_threshold: 0.8
 
   # Maximum chunk count after filtering (before context shrinkage)
-  # Lowered from 10 -> 8 (audit 2026-05-06): prevents the double-trim
-  # pathology where Navigator caps at 10, then the Verifier drops to
-  # max_docs=5 with a different ranking criterion. 8 leaves a 3-chunk safety
-  # margin for the Verifier reorder (§12.27) without overshooting.
+  # Kept at 8 (audit 2026-05-06): prevents the double-trim pathology where the
+  # Navigator caps at N, then the Verifier drops to max_docs=5 with a different
+  # ranking criterion. 8 leaves a 3-chunk margin for the Verifier reorder
+  # (§12.27). NOTE: bridge chunks that the cross-encoder would otherwise demote
+  # past rank 8 are handled at the source — §12.30 makes the reranker score each
+  # chunk against the sub-query that retrieved it (not the surface query), and
+  # §12.31 (Planner Pattern H) decomposes chained-attribution bridges so the
+  # bridge chunk is retrieved by its own focused hop.
   max_context_chunks: 8
 
   # Reciprocal Rank Fusion smoothing constant (standard: 60)
@@ -538,21 +542,44 @@ entity_extraction:
   # Reference: Zaratiana et al. (2023). arXiv:2311.08526.
   gliner:
     model_name: "urchade/gliner_small-v2.1"
+    # ─────────────────────────────────────────────────────────────────────
+    # FIXED: OntoNotes-5 core entity-type set
+    # Reference: Weischedel, R. et al. (2013). OntoNotes Release 5.0.
+    #            Linguistic Data Consortium, LDC2013T19.
+    #
+    # 9 GLiNER prompts → 8 canonical types (via GLINER_LABEL_MAP):
+    #   person                       → PERSON
+    #   organization                 → ORGANIZATION
+    #   location                     → LOCATION
+    #   city, country                → GPE
+    #   date                         → DATE
+    #   event                        → EVENT
+    #   work of art                  → WORK_OF_ART
+    #   product                      → PRODUCT
+    #
+    # The multi-prompt expansion (city + country alongside location) gives
+    # GLiNER higher recall than a single abstract label — Zaratiana et al.
+    # (2023, §4.2). All prompts collapse to OntoNotes-5 canonical types in
+    # the graph, so retrieval semantics are unchanged.
+    #
+    # ⚠ DO NOT add domain-specific types (state, landmark, album, film,
+    # movie, award, ...). They transfer poorly across the three benchmark
+    # datasets (HotpotQA + 2WikiMultiHopQA + StrategyQA) and break the
+    # scientific reproducibility of the thesis evaluation. This list is
+    # fixed by deliberate design — same set used by spaCy en_core_web_sm
+    # and by Stanford NER (Manning et al. 2014).
+    # ─────────────────────────────────────────────────────────────────────
     entity_types:
       - "person"
       - "organization"
+      - "location"
       - "city"
       - "country"
-      - "state"
-      - "location"
-      - "film"
-      - "movie"
-      - "album"           # music albums (Abbey Road etc.)
-      - "work of art"     # catch-all for unusual titles, paintings, books
-      - "landmark"        # buildings/monuments → maps to LOCATION
+      - "date"
       - "event"
-      - "award"
-    confidence_threshold: 0.15   # recall-optimised for HotpotQA
+      - "work of art"
+      - "product"
+    confidence_threshold: 0.15   # recall-optimised; junk filtered downstream
     batch_size: 16
 
   # REBEL Relation Extraction

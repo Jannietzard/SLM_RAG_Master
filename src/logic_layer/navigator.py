@@ -316,8 +316,26 @@ class Navigator:
 
         filter_start = time.time()
 
-        # Filter 1: Relevance filter
-        relevance_filtered = self._relevance_filter(fused_results)
+        # Filter 1: Relevance filter.
+        # With >1 parallel sub-query (comparison / intersection decomposition),
+        # RRF runs over *disjoint* per-entity result sets, so the score
+        # distribution is flat and low: no chunk gets the cross-query
+        # corroboration boost except suffix-noise chunks that happen to match
+        # the shared tail of every sub-query ("… was from England"). A global
+        # `relevance_threshold_factor × max` then keys off that inflated noise
+        # max and discards the genuine per-entity answer chunks (each present in
+        # only one sub-query's list). So: relax the relevance filter to a no-op
+        # when there are multiple parallel sub-queries — the entity-mention /
+        # redundancy / cap stages still trim the context.
+        n_parallel = len(sub_queries) if sub_queries else 1
+        if n_parallel > 1:
+            relevance_filtered = fused_results
+            logger.debug(
+                "[Navigator] Relevance filter: skipped (%d parallel sub-queries → "
+                "flat RRF distribution)", n_parallel,
+            )
+        else:
+            relevance_filtered = self._relevance_filter(fused_results)
         result.metadata["after_relevance_filter"] = len(relevance_filtered)
 
         # Filter 2: Redundancy filter (lexical deduplication)
@@ -346,7 +364,9 @@ class Navigator:
                 if (retrieval_plan and retrieval_plan.entities)
                 else []
             )
-        mention_filtered = self._entity_mention_filter(entity_pruned, query_entity_names)
+        mention_filtered = self._entity_mention_filter(
+            entity_pruned, query_entity_names, sub_queries=sub_queries
+        )
         result.metadata["after_entity_mention_filter"] = len(mention_filtered)
 
         # Cap at max_context_chunks
@@ -430,6 +450,13 @@ class Navigator:
                 text = r["text"]
                 if "rrf_contributions" not in text_groups[text]:
                     text_groups[text]["rrf_contributions"] = []
+                    text_groups[text]["_best_sub_query"] = sq      # sub-query with best rank
+                    text_groups[text]["_best_rank"] = rank
+                else:
+                    # Track the sub-query where this chunk ranked highest (lowest rank index)
+                    if rank < text_groups[text]["_best_rank"]:
+                        text_groups[text]["_best_sub_query"] = sq
+                        text_groups[text]["_best_rank"] = rank
                 text_groups[text]["rrf_contributions"].append(1.0 / (k + rank))
 
         # Aggregate RRF scores with cross-source corroboration boost.
@@ -453,6 +480,10 @@ class Navigator:
                 "original_scores": group["scores"],
                 "source_count": source_count,
                 "query_count": query_count,
+                # Sub-query where this chunk ranked best — used by the cross-encoder
+                # reranker so bridge chunks are scored against the hop that retrieved
+                # them, not the surface query (§12.30).
+                "_best_sub_query": group.get("_best_sub_query", ""),
             })
 
         # Sort descending by RRF score
@@ -667,100 +698,151 @@ class Navigator:
 
         return kept if kept else results
 
+    # Content-word stopword set for the P-11 overlap fallback. Small and
+    # query-oriented (function words + the WH/auxiliary scaffolding of a
+    # question); proper-noun content is never on it.
+    _QUERY_STOPWORDS: frozenset = frozenset({
+        "a", "an", "and", "are", "as", "at", "be", "been", "by", "did", "do",
+        "does", "for", "from", "had", "has", "have", "he", "her", "his", "in",
+        "into", "is", "it", "its", "of", "on", "or", "she", "that", "the",
+        "their", "this", "to", "was", "were", "what", "when", "where", "which",
+        "who", "whom", "whose", "will", "with", "would", "they", "them", "you",
+        "your", "we", "our", "i", "than", "more", "most", "less", "fewer",
+        "first", "used", "during",
+    })
+    _WORD_RE = re.compile(r"[a-z0-9]+(?:[''][a-z]+)?")
+
     def _entity_mention_filter(
         self,
         results: List[Dict[str, Any]],
         entity_names: List[str],
+        sub_queries: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Entity-mention filter: drop chunks that mention none of the query entities.
+        Entity-mention filter (re-ranking with a relevance floor).
 
-        Original contribution (thesis section 3.3); ablation results in
-        thesis Table 4.2 show a +2.1 EM improvement when this filter is active
-        (Table number to be confirmed in final thesis draft.)
-        on bridge questions. A chunk passes if it contains at least one token
-        (≥ 5 chars) from any query entity name as a whole word.
+        Original contribution (thesis section 3.3); the ablation showed an EM
+        improvement on bridge questions when the entity layer is reliable.
 
-        Token-length threshold rationale: short tokens like "Were" or "Wood" are
-        too generic to confirm topical relevance; requiring ≥ 5 characters avoids
-        false positives from SpaCy extracting partial or stop-word tokens.
+        The earlier design *hard-dropped* any chunk that mentioned none of the
+        query's named entities. On HotpotQA that is unsafe: many questions name
+        the answer by *description* ("which British first-generation jet-powered
+        medium bomber …"), so the answer chunk contains the *description words*
+        but not any of the noisy SpaCy entities ("Which British", "World War").
+        That chunk would be retrieved at RRF rank #1 (near-verbatim dense match)
+        and then *deleted by this filter*, leaving the Verifier with strictly
+        worse context (FIX P-11).
 
-        Multi-word entity strategy (e.g., "Scott Derrickson", "Ed Wood"):
-          1. Try full phrase match first (exact, case-insensitive).
-          2. Fall back to individual tokens ≥ 5 chars as whole words.
+        New behaviour — three tiers, stable-sorted:
+          tier 0  chunk mentions a *specific* query entity (multi-word phrase,
+                  or a distinctive single token ≥8 chars)
+          tier 1  chunk mentions only a *generic* entity (short token like
+                  "England") OR has strong content-word overlap with the query
+                  (covers "description-subject" chunks whose answer words are
+                  present but whose only "entities" are SpaCy noise)
+          tier 2  chunk does neither
+        Within each tier the original RRF order is preserved. Tier-2 chunks are
+        dropped. Safety: if everything would be dropped, return all (never an
+        empty context). The content-word fallback (tier 1) is the floor that
+        keeps the answer chunk for hidden-bridge questions — it does not depend
+        on RRF rank, so a noise chunk that the retriever happened to rank highly
+        is still dropped if it shares no query content words.
 
-        Safety: if all chunks would be filtered, return all (never empty context).
+        When `sub_queries` is None (e.g. unit tests, or a reconstructed plan),
+        the content-word fallback is inactive and the filter degrades to the
+        classic entity-only behaviour.
 
-        Regexes are pre-compiled before the chunk loop to avoid repeated compilation
-        overhead (Python's re module cache is 512 entries; 5 entities × 3 tokens ×
-        50 chunks = 750 distinct patterns can overflow it).
+        Regexes are pre-compiled before the chunk loop (Python's re cache is 512
+        entries; many entities × tokens × chunks can overflow it).
         """
         if not entity_names:
             return results
 
-        # Pre-compile one regex per qualifying token to avoid per-chunk compilation.
-        # Each entry is (phrase_lower, token_patterns) where token_patterns is a
-        # list of compiled regexes for individual long tokens.
-        #
-        # §12.28: Fallback token threshold raised from ≥5 → ≥8 chars for multi-word
-        # entities.  Short first-name tokens (e.g. "Kasper" = 6 chars) match
-        # unrelated articles ("Kasper Barfoed", "Kasper Williams") and let false-positive
-        # chunks through.  Raising to ≥8 keeps distinctive surnames ("Schmeichel" = 10)
-        # while excluding common first names from the fallback path.
-        _SINGLE_TOKEN_MIN = 5   # unchanged: single-token entity minimum
-        _FALLBACK_TOKEN_MIN = 8  # raised: per-token fallback for multi-word entities
+        # §12.28: per-token fallback raised to ≥8 chars for multi-word entities
+        # (distinctive surnames kept, common first names excluded).
+        _SINGLE_TOKEN_MIN = 5
+        _FALLBACK_TOKEN_MIN = 8
+        _SPECIFIC_SINGLE_MIN = 8   # P-4: single-token entity counts as "specific" iff ≥8 chars
 
-        compiled: List[Any] = []
+        compiled: List[Any] = []   # (phrase_lower, tokens, token_patterns, is_specific)
         for name in entity_names:
             tokens = name.split()
-            if len(tokens) >= 2:
-                token_patterns = [
-                    re.compile(r"\b" + re.escape(t.lower()) + r"\b")
-                    for t in tokens if len(t) >= _FALLBACK_TOKEN_MIN
-                ]
-            else:
-                token_patterns = [
-                    re.compile(r"\b" + re.escape(t.lower()) + r"\b")
-                    for t in tokens if len(t) >= _SINGLE_TOKEN_MIN
-                ]
-            compiled.append((name.lower(), tokens, token_patterns))
+            min_tok = _FALLBACK_TOKEN_MIN if len(tokens) >= 2 else _SINGLE_TOKEN_MIN
+            token_patterns = [
+                re.compile(r"\b" + re.escape(t.lower()) + r"\b")
+                for t in tokens if len(t) >= min_tok
+            ]
+            is_specific = len(tokens) >= 2 or len(name) >= _SPECIFIC_SINGLE_MIN
+            compiled.append((name.lower(), tokens, token_patterns, is_specific))
 
-        def mentions_any(text: str) -> bool:
+        # Content words of the query (P-11 overlap fallback): everything in the
+        # sub-queries that isn't a stopword and isn't part of an entity string
+        # (entities are handled by the exact-match path above).
+        query_content: set = set()
+        for q in (sub_queries or []):
+            for w in self._WORD_RE.findall((q or "").lower()):
+                if len(w) >= 4 and w not in self._QUERY_STOPWORDS:
+                    query_content.add(w)
+        # remove entity tokens — those are the entity path's job
+        for name_lower, *_ in compiled:
+            for tok in self._WORD_RE.findall(name_lower):
+                query_content.discard(tok)
+        # below this fraction of query content words present, "overlap" doesn't
+        # count as topical confirmation
+        _OVERLAP_MIN_FRACTION = 0.5
+        _OVERLAP_MIN_ABS = 2
+
+        def tier_of(text: str) -> int:
+            """0 = specific-entity match, 1 = generic-entity or strong content-word
+            overlap, 2 = neither."""
             text_lower = text.lower()
-            for name_lower, tokens, token_patterns in compiled:
+            matched_generic = False
+            for name_lower, tokens, token_patterns, is_specific in compiled:
+                hit = False
                 if len(tokens) >= 2:
-                    # Multi-word entity: try full phrase first
                     if name_lower in text_lower:
-                        return True
-                    # Fallback: any individual long token (≥8 chars) as whole word.
-                    # Threshold ≥8 excludes common first names while retaining
-                    # distinctive surnames.
-                    for pat in token_patterns:
-                        if pat.search(text_lower):
-                            return True
+                        hit = True
+                    else:
+                        for pat in token_patterns:
+                            if pat.search(text_lower):
+                                hit = True
+                                break
                 else:
-                    # Single-token entity: only check if long enough (≥ 5 chars)
                     for pat in token_patterns:
                         if pat.search(text_lower):
-                            return True
-            return False
+                            hit = True
+                            break
+                if hit:
+                    if is_specific:
+                        return 0
+                    matched_generic = True
+            if matched_generic:
+                return 1
+            # content-word overlap fallback (covers "description subject" chunks)
+            if query_content:
+                chunk_words = set(self._WORD_RE.findall(text_lower))
+                shared = len(query_content & chunk_words)
+                if shared >= _OVERLAP_MIN_ABS and shared >= _OVERLAP_MIN_FRACTION * len(query_content):
+                    return 1
+            return 2
 
-        filtered = [r for r in results if mentions_any(r["text"])]
+        tiers = [tier_of(r["text"]) for r in results]
+        kept = [(t, rank, r) for rank, (t, r) in enumerate(zip(tiers, results)) if t < 2]
+        dropped = len(results) - len(kept)
 
-        if filtered:
-            removed = len(results) - len(filtered)
-            if removed:
-                logger.debug(
-                    "[Navigator] Entity-mention filter: removed %d, kept %d/%d",
-                    removed, len(filtered), len(results),
-                )
-            return filtered
+        if not kept:
+            logger.debug("[Navigator] Entity-mention filter: all chunks filtered — returning all")
+            return results
 
-        # Safety: if all chunks were filtered out, return all (never empty context)
-        logger.debug(
-            "[Navigator] Entity-mention filter: all chunks filtered — returning all"
-        )
-        return results
+        kept.sort(key=lambda x: (x[0], x[1]))   # tier asc, then original RRF rank
+        out = [r for _, _, r in kept]
+        if dropped:
+            logger.debug(
+                "[Navigator] Entity-mention filter: dropped %d, kept %d/%d (tiers 0/1/2: %d/%d/%d)",
+                dropped, len(out), len(results),
+                tiers.count(0), tiers.count(1), tiers.count(2),
+            )
+        return out
 
     def _reranker_filter(
         self,
@@ -810,7 +892,12 @@ class Navigator:
         candidates = results[: self.config.reranker_top_k]
         rest = results[self.config.reranker_top_k :]
 
-        pairs = [(query, r["text"]) for r in candidates]
+        # Score each chunk against the sub-query where it ranked best (§12.30).
+        # For single-hop queries _best_sub_query == the original query, so there
+        # is no regression. For bridge/multi-hop queries this ensures that a
+        # second-hop answer chunk (e.g. author bio) is scored against the hop
+        # sub-query that retrieved it, not the surface question.
+        pairs = [(r.get("_best_sub_query") or query, r["text"]) for r in candidates]
         try:
             scores = self._reranker.predict(pairs)
             for r, s in zip(candidates, scores):

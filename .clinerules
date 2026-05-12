@@ -1,0 +1,4 @@
+Rule: Maintain Architecture Documentation
+Whenever you make general architecture changes, adjust project settings, or implement new features, you MUST immediately update Architecture.md to reflect these changes.
+
+Self-Correction step: Before completing any task, review the changes you made in the current session. If any structural or technical updates are missing from Architecture.md, add them before finishing your response.

@@ -90,6 +90,12 @@ except ImportError:
         metadata: dict
 
 try:
+    from sentence_transformers import SentenceTransformer as _ST
+    _HF_AVAILABLE = True
+except ImportError:
+    _HF_AVAILABLE = False
+
+try:
     from src.data_layer import HybridStore, StorageConfig, KuzuGraphStore
     from src.data_layer import BatchedOllamaEmbeddings
     from src.data_layer.graph_quality import (
@@ -116,6 +122,56 @@ except ImportError:
 
 
 # ============================================================================
+# PHASE CHECKPOINTING
+# ============================================================================
+# After each phase completes successfully, we write a small JSON file to disk.
+# On re-run with --resume, phases that already have "done": true are skipped.
+# This means a crash (power cut, Ctrl-C, etc.) after Phase 3b doesn't require
+# re-running the full 45-minute entity import — you just resume from 3c.
+#
+# Checkpoint file location:  data/<dataset>/graph/.import_checkpoint.json
+# name_to_id cache:          data/<dataset>/graph/.name_to_id.json
+#
+# The checkpoint is deleted by --clear.
+
+_CP_DONE = "done"
+_CP_TS   = "ts"
+
+def _checkpoint_path(graph_path: Path) -> Path:
+    return graph_path / ".import_checkpoint.json"
+
+def _name_to_id_path(graph_path: Path) -> Path:
+    return graph_path / ".name_to_id.json"
+
+def _load_checkpoint(graph_path: Path) -> Dict[str, Any]:
+    """Load existing checkpoint or return empty dict."""
+    p = _checkpoint_path(graph_path)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def _save_checkpoint(graph_path: Path, phase: str, data: Dict[str, Any]) -> None:
+    """Mark a phase as done and persist phase-level stats to the checkpoint."""
+    cp = _load_checkpoint(graph_path)
+    cp[phase] = {_CP_DONE: True, _CP_TS: time.time(), **data}
+    _checkpoint_path(graph_path).write_text(
+        json.dumps(cp, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    logger.info("  Checkpoint saved: phase=%s", phase)
+
+def _phase_done(checkpoint: Dict[str, Any], phase: str) -> bool:
+    return checkpoint.get(phase, {}).get(_CP_DONE, False)
+
+def _phase_eta(label: str, elapsed_s: float) -> str:
+    """Format a phase timing line for the console."""
+    m, s = divmod(int(elapsed_s), 60)
+    return f"  [{label}]  elapsed: {m}m {s:02d}s"
+
+
+# ============================================================================
 # CANONICAL ENTITY IDENTIFIERS
 # ============================================================================
 
@@ -135,6 +191,40 @@ def _canonical_entity_id(name: str, entity_type: str) -> str:
     canon = canonical_form(name)
     combined = f"{canon}:{entity_type or 'UNKNOWN'}"
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:24]
+
+class _HFEmbeddings:
+    """Thin wrapper so SentenceTransformer has the same interface as BatchedOllamaEmbeddings."""
+
+    def __init__(self, model_name: str = "nomic-ai/nomic-embed-text-v1", batch_size: int = 64):
+        if not _HF_AVAILABLE:
+            raise RuntimeError(
+                "sentence-transformers not installed. "
+                "Run: pip install sentence-transformers"
+            )
+        logger.info("  Loading HuggingFace model: %s", model_name)
+        self._model = _ST(model_name, trust_remote_code=True)
+        self._batch_size = batch_size
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        vecs = self._model.encode(
+            texts,
+            batch_size=self._batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        return vecs.tolist()
+
+    def embed_query(self, text: str) -> List[float]:
+        vec = self._model.encode(
+            [text],
+            batch_size=1,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        return vec[0].tolist()
+
 
 try:
     from tqdm import tqdm
@@ -242,11 +332,13 @@ def ingest_vector_store(
     vector_path: Path,
     config: Dict,
     dataset_name: str,
+    embeddings=None,
 ) -> None:
     """
     Ingest chunks into the LanceDB vector store.
 
-    Verwendet BatchedOllamaEmbeddings für Embedding-Generierung.
+    Uses BatchedOllamaEmbeddings by default; pass a pre-built embeddings
+    object (e.g. _HFEmbeddings) to switch backends.
     """
     if not STORAGE_AVAILABLE:
         logger.error("Storage-Module nicht verfügbar!")
@@ -256,20 +348,18 @@ def ingest_vector_store(
     logger.info(f"PHASE 3a: VECTOR STORE INGESTION ({len(documents)} Chunks)")
     logger.info(f"{'─'*70}")
 
-    embedding_config = config.get("embeddings", {})
-    perf_config = config.get("performance", {})
-
-    # Embedding-Cache
-    cache_path = Path(f"./cache/{dataset_name}_embeddings.db")
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-
-    embeddings = BatchedOllamaEmbeddings(
-        model_name=embedding_config.get("model_name", "nomic-embed-text"),
-        base_url=embedding_config.get("base_url", "http://localhost:11434"),
-        batch_size=perf_config.get("batch_size", 32),
-        cache_path=cache_path,
-        device=perf_config.get("device", "cpu"),
-    )
+    if embeddings is None:
+        embedding_config = config.get("embeddings", {})
+        perf_config = config.get("performance", {})
+        cache_path = Path(f"./cache/{dataset_name}_embeddings.db")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        embeddings = BatchedOllamaEmbeddings(
+            model_name=embedding_config.get("model_name", "nomic-embed-text"),
+            base_url=embedding_config.get("base_url", "http://localhost:11434"),
+            batch_size=perf_config.get("batch_size", 32),
+            cache_path=cache_path,
+            device=perf_config.get("device", "cpu"),
+        )
 
     # StorageConfig OHNE Entity Extraction (wir machen das separat)
     vector_config = config.get("vector_store", {})
@@ -447,7 +537,26 @@ def ingest_knowledge_graph(
         for i, doc in enumerate(documents)
     }
 
-    for result in tqdm(extraction_results, desc="Entities & Relations", unit="chunk"):
+    # ── Batch-transaction constants for Phase 3b ─────────────────────────────
+    # KuzuDB auto-commits every conn.execute() call individually (one fsync
+    # per statement). For ~94 000 entity inserts + 94 000 MENTIONS + 12 000
+    # REBEL relations = ~200 000 individual fsyncs → 45 min on Windows.
+    # Grouping 200 chunks per transaction (typically ~2 000 inserts) cuts
+    # the fsync count by 200× and brings Phase 3b down to ~3-5 min.
+    _PHASE3B_BATCH = 200   # chunks per transaction commit
+
+    for _batch_i, result in enumerate(
+        tqdm(extraction_results, desc="Entities & Relations", unit="chunk")
+    ):
+        # Open a new transaction at the start of each batch.
+        if _batch_i % _PHASE3B_BATCH == 0:
+            if _batch_i > 0:
+                try:
+                    graph_store.batch_commit()
+                except Exception:
+                    pass
+            graph_store.batch_begin()
+
         chunk_id = str(result["chunk_id"])
 
         # Step 4: Entity Nodes
@@ -529,6 +638,12 @@ def ingest_knowledge_graph(
                     subject, obj,
                 )
 
+    # Commit the final (potentially partial) batch.
+    try:
+        graph_store.batch_commit()
+    except Exception:
+        pass
+
     logger.info(
         "    OK %d entities, %d mentions, %d REBEL relations",
         stats["unique_entities"], stats["mentions"], stats["relations"],
@@ -593,30 +708,108 @@ def run_full_import(
     hub_threshold_ratio: float = 0.03,
     enable_entity_linking: bool = True,
     linking_threshold: float = 0.92,
+    resume: bool = False,
+    embeddings_backend: str = "ollama",
 ) -> None:
     """
     Run the full Phase-3 import (vector store + knowledge graph + cleanup).
+
+    ═══════════════════════════════════════════════════════════════════════
+    WHAT DOES THIS FUNCTION DO?
+    ═══════════════════════════════════════════════════════════════════════
+
+    This is the main entry point for Phase 3 of the three-phase ingestion
+    pipeline.  Phases 1 and 2 ran earlier:
+
+        Phase 1 (benchmark_datasets.py)
+            Splits raw Wikipedia/HotpotQA text into overlapping chunks and
+            writes chunks_export.json.  Runs on CPU, fast (~1 min).
+
+        Phase 2 (Colab notebook)
+            Runs GLiNER (NER) and REBEL (relation extraction) on every chunk
+            using a GPU.  Writes extraction_results.json (~2 h on Colab T4).
+
+        Phase 3 (this file) — runs on your local machine
+            Imports the GPU outputs into the local databases:
+
+            3a  Vector store   → LanceDB (ANN index for dense retrieval).
+                                 Skipped with --graph-only.
+            3b  Knowledge graph → KuzuDB.
+                                 Sub-steps:
+                                   1. DocumentChunk nodes (one per chunk)
+                                   2. SourceDocument nodes (one per source file)
+                                   3. FROM_SOURCE + NEXT_CHUNK relations
+                                   4. Entity nodes from extraction_results.json
+                                   5. MENTIONS edges (chunk → entity)
+                                   6. RELATED_TO edges from REBEL extractions
+                                   7. SVO (Subject-Verb-Object) narrative edges
+            3c  Co-occurrence edges
+                                 Every pair of entities that appear in the SAME
+                                 chunk gets a RELATED_TO(cooccurs) edge.  This
+                                 dramatically increases graph density (~171 000
+                                 additional edges for HotpotQA).
+            3d  Graph cleanup   Drop orphan entities, hub entities, and merge
+                                 surface-form duplicates (canonical_form).
+            3d.5 Entity linking  Embed all entity names via nomic-embed-text and
+                                 merge near-duplicates within each type bucket
+                                 (cosine >= 0.92). Handles "VCU" ↔ "Virginia
+                                 Commonwealth University" style aliases.
+            3e  Baseline metrics Print graph health statistics and warn on
+                                 threshold violations.
+
+    ═══════════════════════════════════════════════════════════════════════
+    CHECKPOINTING (--resume)
+    ═══════════════════════════════════════════════════════════════════════
+
+    After each phase completes, a checkpoint is saved to:
+        data/<dataset>/graph/.import_checkpoint.json
+
+    If a phase crashes (Ctrl-C, power cut, KuzuDB lock error) you can
+    restart with --resume and skip all already-completed phases.  The
+    name_to_id mapping needed by Phase 3c is also persisted to:
+        data/<dataset>/graph/.name_to_id.json
+
+    --clear deletes the checkpoint, forcing a full fresh import.
+    --resume and --clear are mutually exclusive.
+
+    ═══════════════════════════════════════════════════════════════════════
 
     Args:
         chunks_path:                  Path to chunks_export.json (Phase 1).
         extractions_path:             Path to extraction_results.json (Phase 2).
         dataset_name:                 Dataset name (e.g. "hotpotqa").
         config:                       Settings dict (from settings.yaml or defaults).
-        graph_only:                   Skip the vector-store ingestion.
+        graph_only:                   Skip the vector-store ingestion (Phase 3a).
         clear:                        Delete existing stores before import.
-        skip_cleanup:                 Disable the post-ingestion cleanup pass.
-        skip_cooccurrence:            Disable co-occurrence edge construction.
-        cleanup_dry_run:              Cleanup pass counts operations only.
-        cooccurrence_min_confidence:  Minimum NER confidence required for an
-                                      entity to participate in co-occurrence.
-        hub_threshold_ratio:          Drop entities mentioned in more than
-                                      ratio * total_chunks chunks.
+        skip_cleanup:                 Disable Phase 3d cleanup pass.
+        skip_cooccurrence:            Disable Phase 3c co-occurrence edges.
+        cleanup_dry_run:              Cleanup pass counts only, no DB writes.
+        cooccurrence_min_confidence:  Min NER confidence for co-occurrence.
+        hub_threshold_ratio:          Hub cutoff: ratio × total_chunks.
+        enable_entity_linking:        Run Phase 3d.5 embedding-based linking.
+        linking_threshold:            Cosine threshold for entity merging.
+        resume:                       Skip phases recorded as done in checkpoint.
     """
     if not STORAGE_AVAILABLE:
         logger.error("Storage modules not available - aborting")
         sys.exit(1)
 
+    if resume and clear:
+        logger.error("--resume and --clear are mutually exclusive. Use one or the other.")
+        sys.exit(1)
+
     total_start = time.time()
+
+    # Paths (defined early so --clear and checkpoint logic can use them)
+    base_path = Path("./data") / dataset_name
+    vector_path = base_path / "vector"
+    graph_path  = base_path / "graph"
+
+    # ── Load checkpoint (--resume) ────────────────────────────────────────────
+    checkpoint = _load_checkpoint(graph_path) if resume else {}
+    if resume and checkpoint:
+        done = [p for p, v in checkpoint.items() if v.get(_CP_DONE)]
+        logger.info("  Resuming: phases already done: %s", done)
 
     print()
     print("═" * 70)
@@ -626,15 +819,25 @@ def run_full_import(
     print(f"  Chunks:       {chunks_path}")
     print(f"  Extractions:  {extractions_path}")
     print(f"  Graph only:   {graph_only}")
+    print(f"  Resume:       {'on' if resume else 'off'}")
     print(f"  Cleanup:      {'off' if skip_cleanup else ('dry-run' if cleanup_dry_run else 'on')}")
     print(f"  Co-occur:     {'off' if skip_cooccurrence else 'on'} "
           f"(conf >= {cooccurrence_min_confidence})")
+    print(f"  Embeddings:   {embeddings_backend}")
     print("═" * 70)
 
-    # Paths
-    base_path = Path("./data") / dataset_name
-    vector_path = base_path / "vector"
-    graph_path = base_path / "graph"
+    # Build the shared embeddings object once; both Phase 3a and 3d.5 use it.
+    if embeddings_backend == "huggingface":
+        embedding_config = config.get("embeddings", {})
+        perf_config = config.get("performance", {})
+        _hf_model = embedding_config.get("hf_model_name", "nomic-ai/nomic-embed-text-v1")
+        _shared_embeddings = _HFEmbeddings(
+            model_name=_hf_model,
+            batch_size=perf_config.get("batch_size", 64),
+        )
+        logger.info("  HuggingFace embeddings ready (%s)", _hf_model)
+    else:
+        _shared_embeddings = None  # Phase 3a/3d.5 build BatchedOllamaEmbeddings lazily
 
     # Clear if requested.
     # IMPORTANT: extraction_results.json and chunks_export.json are NEVER
@@ -642,7 +845,42 @@ def run_full_import(
     # be preserved. Only the derived stores (vector, KuzuDB graph files) are
     # removed.
     if clear:
-        import shutil
+        import shutil, os, stat
+
+        # Windows / KuzuDB compatibility: KuzuDB holds an OS-level lock on
+        # its .lock and shadow files until the holding process exits.  A
+        # bare shutil.rmtree raises PermissionError [WinError 5] on any
+        # locked file.  This handler chmod+retries each failed entry and
+        # skips the ones that remain locked, so a partial clean still
+        # succeeds and the next run can recreate what was missed.
+        def _rm_retry(func, path):
+            try:
+                os.chmod(path, stat.S_IWRITE)
+            except OSError:
+                pass
+            for _ in range(3):
+                try:
+                    func(path)
+                    return
+                except PermissionError:
+                    time.sleep(0.4)
+                except FileNotFoundError:
+                    return
+            logger.warning(
+                "  Skipped (still locked, close Python/IDE holders and retry): %s",
+                path,
+            )
+
+        # Python 3.12 deprecates onerror in favour of onexc; support both.
+        if sys.version_info >= (3, 12):
+            def _rm_handler(func, path, exc):  # onexc signature
+                _rm_retry(func, path)
+            _rmtree_kwargs = {"onexc": _rm_handler}
+        else:
+            def _rm_handler(func, path, exc_info):  # onerror signature
+                _rm_retry(func, path)
+            _rmtree_kwargs = {"onerror": _rm_handler}
+
         if graph_only:
             targets = [graph_path]
         else:
@@ -650,33 +888,91 @@ def run_full_import(
         for target in targets:
             if not target.exists():
                 continue
-            # ── SAFETY: rescue every .json file before deletion ───────────────
-            # JSON files are source artifacts (extraction_results.json,
-            # chunks_export.json) or derived metadata - never regenerated by
-            # external GPU jobs. Delete only database files, never JSON.
-            rescued: dict[str, bytes] = {}
-            for json_file in target.rglob("*.json"):
-                rescued[json_file.name] = json_file.read_bytes()
-                logger.info(f"  Protected before --clear: {json_file.name}")
-            # ── DELETE database directory ─────────────────────────────────────
-            shutil.rmtree(target)
-            logger.info(f"  Cleared: {target}")
-            # ── RESTORE rescued JSON files ────────────────────────────────────
-            if rescued:
+            # ── SAFETY: filesystem sidecar for every .json file ───────────────
+            # JSON files are SOURCE ARTIFACTS (extraction_results.json,
+            # chunks_export.json) that take ~30 min of GPU time to regenerate
+            # and MUST survive --clear.
+            #
+            # CRITICAL: rescue must be filesystem-based, not in-memory.  If
+            # rmtree raises mid-way (Windows DB lock, Ctrl-C, OOM, segfault
+            # in a C extension, etc.) the in-memory dict is lost with the
+            # process while the on-disk JSON is already deleted.  Sidecar
+            # the files OUT of the target first, then delete, then move
+            # them back — at every point the data lives on disk somewhere.
+            sidecar = target.parent / f".{target.name}_rescue"
+            if sidecar.exists():
+                # Leftover from a prior crashed run — restore those first
+                # before we touch anything else, so we never overwrite a
+                # rescued file with a fresh one.
+                logger.warning(
+                    "  Found prior rescue dir %s; restoring before --clear.",
+                    sidecar,
+                )
                 target.mkdir(parents=True, exist_ok=True)
-                for fname, data in rescued.items():
-                    restored = target / fname
-                    restored.write_bytes(data)
-                    logger.info(f"  Restored: {restored}")
+                for f in sidecar.iterdir():
+                    dst = target / f.name
+                    if not dst.exists():
+                        f.replace(dst)
+                        logger.info(f"  Recovered from prior rescue: {dst}")
+                # Remove leftover empty sidecar; ignore if anything remains.
+                try:
+                    sidecar.rmdir()
+                except OSError:
+                    pass
+
+            sidecar.mkdir(parents=True, exist_ok=True)
+            json_files = list(target.rglob("*.json"))
+            for json_file in json_files:
+                dst = sidecar / json_file.name
+                # os.replace is atomic on a single filesystem
+                os.replace(json_file, dst)
+                logger.info(f"  Sidecarred before --clear: {json_file.name}")
+
+            # ── DELETE database directory (try/finally so restore ALWAYS
+            #    runs, even if rmtree raises) ─────────────────────────────────
+            rmtree_error: Optional[BaseException] = None
+            try:
+                shutil.rmtree(target, **_rmtree_kwargs)
+                logger.info(f"  Cleared: {target}")
+            except BaseException as exc:   # noqa: BLE001 — must restore on ANY failure
+                rmtree_error = exc
+                logger.error(
+                    "  rmtree failed (%s); will restore JSON sidecar before re-raising.",
+                    exc,
+                )
+            finally:
+                # ── RESTORE rescued JSON files ────────────────────────────
+                target.mkdir(parents=True, exist_ok=True)
+                for f in sidecar.iterdir():
+                    dst = target / f.name
+                    os.replace(f, dst)
+                    logger.info(f"  Restored: {dst}")
+                try:
+                    sidecar.rmdir()
+                except OSError:
+                    logger.warning(
+                        "  Sidecar dir %s not empty after restore — inspect manually.",
+                        sidecar,
+                    )
+
+            if rmtree_error is not None:
+                raise rmtree_error
+
+    # --clear also invalidates the checkpoint so the next run starts fresh.
+    if clear:
+        for _cp in [_checkpoint_path(graph_path), _name_to_id_path(graph_path)]:
+            try:
+                _cp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     base_path.mkdir(parents=True, exist_ok=True)
 
-    # Load source data.
+    # Load source data (needed by all phases).
     chunks = load_chunks(chunks_path)
     extraction_data = load_extractions(extractions_path)
     extraction_results = extraction_data.get("results", [])
 
-    # Validation: chunk count should match extraction count.
     if len(chunks) != len(extraction_results):
         logger.warning(
             "  WARNING: chunk count mismatch (chunks=%d, extractions=%d)",
@@ -686,128 +982,245 @@ def run_full_import(
 
     documents = chunks_to_documents(chunks)
 
-    # Phase 3a: Vector Store
+    # ══════════════════════════════════════════════════════════════════════
+    # PHASE 3a — VECTOR STORE  (skipped with --graph-only)
+    # ══════════════════════════════════════════════════════════════════════
+    # Builds a LanceDB IVF-Flat index from the chunk texts.
+    # This index is used for dense (embedding) retrieval at query time.
+    # Typical time: ~2-5 min for 9 000 chunks on CPU.
+    # ══════════════════════════════════════════════════════════════════════
+    _t0 = time.time()
     if not graph_only:
-        try:
-            ingest_vector_store(documents, vector_path, config, dataset_name)
-        except Exception as e:
-            logger.error(f"Vector store ingestion failed: {e}")
-            logger.error("Use --graph-only when the vector store is built separately.")
-            raise
+        if _phase_done(checkpoint, "3a"):
+            logger.info("  Phase 3a (vector store): SKIPPED — already in checkpoint")
+        else:
+            try:
+                ingest_vector_store(documents, vector_path, config, dataset_name,
+                                    embeddings=_shared_embeddings)
+                _save_checkpoint(graph_path, "3a", {"chunks": len(documents)})
+                logger.info(_phase_eta("3a vector store", time.time() - _t0))
+            except Exception as e:
+                logger.error(f"Vector store ingestion failed: {e}")
+                logger.error("Use --graph-only when the vector store is built separately.")
+                raise
     else:
-        logger.info("  Vector store skipped (--graph-only)")
+        logger.info("  Phase 3a (vector store): SKIPPED — --graph-only")
 
-    # Phase 3b: Knowledge Graph
-    try:
-        entity_conf = (
-            config.get("entity_extraction", {})
-                  .get("gliner", {})
-                  .get("confidence_threshold", 0.5)
-        )
-        graph_store, stats = ingest_knowledge_graph(
-            documents, extraction_results, graph_path, dataset_name,
-            entity_confidence_threshold=entity_conf,
-        )
-    except Exception as e:
-        logger.error(f"Knowledge graph ingestion failed: {e}")
-        raise
+    # ══════════════════════════════════════════════════════════════════════
+    # PHASE 3b — KNOWLEDGE GRAPH  (KuzuDB)
+    # ══════════════════════════════════════════════════════════════════════
+    # Imports ALL entities, relations, and chunk-graph structure into KuzuDB.
+    # Sub-steps:
+    #   1-3  DocumentChunk + SourceDocument nodes + FROM_SOURCE / NEXT_CHUNK
+    #   4    Entity nodes (deduplicated via canonical_form + SHA-256 id)
+    #   5    MENTIONS edges: chunk → entity
+    #   6    RELATED_TO edges from REBEL relation extraction
+    #   7    SVO narrative edges from SpaCy dependency parse
+    #
+    # Typical time (9 000 chunks, Windows, SSD):
+    #   Without batch transactions:  ~45 min  (one fsync per statement)
+    #   With batch transactions:     ~5-8 min (one fsync per 200 chunks)
+    # ══════════════════════════════════════════════════════════════════════
+    _t0 = time.time()
+    graph_store = None
+    stats: Dict[str, Any] = {}
+    name_to_id: Dict[str, str] = {}
 
-    name_to_id = stats.pop("_name_to_id", {})
+    if _phase_done(checkpoint, "3b"):
+        logger.info("  Phase 3b (knowledge graph): SKIPPED — already in checkpoint")
+        # Re-open the existing graph store so downstream phases can use it.
+        # KuzuGraphStore takes the *container* directory and appends
+        # KUZU_DIR_NAME itself — pass graph_path, not graph_path/"graph_KuzuDB",
+        # otherwise the path is doubled (.../graph_KuzuDB/graph_KuzuDB).
+        graph_store = KuzuGraphStore(str(graph_path))
+        stats = checkpoint["3b"].get("stats", {})
+        # Reload name_to_id from the sidecar file saved by the previous run.
+        n2i_path = _name_to_id_path(graph_path)
+        if n2i_path.exists():
+            name_to_id = json.loads(n2i_path.read_text(encoding="utf-8"))
+            logger.info("  Loaded name_to_id: %d entries", len(name_to_id))
+        else:
+            logger.warning(
+                "  name_to_id cache not found — Phase 3c (co-occurrence) "
+                "will produce 0 edges. Re-run without --resume to rebuild."
+            )
+    else:
+        try:
+            entity_conf = (
+                config.get("entity_extraction", {})
+                      .get("gliner", {})
+                      .get("confidence_threshold", 0.5)
+            )
+            graph_store, stats = ingest_knowledge_graph(
+                documents, extraction_results, graph_path, dataset_name,
+                entity_confidence_threshold=entity_conf,
+            )
+            name_to_id = stats.pop("_name_to_id", {})
+            # Persist name_to_id so --resume can reload it for Phase 3c.
+            _name_to_id_path(graph_path).write_text(
+                json.dumps(name_to_id, ensure_ascii=False), encoding="utf-8"
+            )
+            _save_checkpoint(graph_path, "3b", {"stats": stats})
+            logger.info(_phase_eta("3b knowledge graph", time.time() - _t0))
+        except Exception as e:
+            logger.error(f"Knowledge graph ingestion failed: {e}")
+            raise
 
-    # Phase 3c: Co-occurrence edges (every pair of entities co-mentioned in
-    # the same chunk gets a RELATED_TO {relation_type='cooccurs'} edge).
+    # ══════════════════════════════════════════════════════════════════════
+    # PHASE 3c — CO-OCCURRENCE EDGES
+    # ══════════════════════════════════════════════════════════════════════
+    # Every pair of entities that appear in the SAME chunk gets a
+    # RELATED_TO(cooccurs) edge.  This is the primary mechanism for
+    # increasing graph density from ~25% to ~95%+ chunk coverage.
+    #
+    # Example: chunk mentions ["Tim Burton", "Johnny Depp", "Ed Wood"]
+    #   → 3 new edges: Tim Burton↔Johnny Depp, Tim Burton↔Ed Wood,
+    #                  Johnny Depp↔Ed Wood
+    #
+    # Typical result: ~171 000 unique edges for 9 412 HotpotQA chunks.
+    # Typical time:   ~3-5 min (bulk transactional writes, 500/batch).
+    # ══════════════════════════════════════════════════════════════════════
+    _t0 = time.time()
     cooccurrence_edges = 0
     if graph_store is not None and not skip_cooccurrence:
-        logger.info(f"\n{'─'*70}")
-        logger.info("PHASE 3c: CO-OCCURRENCE EDGES")
-        logger.info(f"{'─'*70}")
-        try:
-            cooccurrence_edges = build_cooccurrence_edges(
-                graph_store=graph_store,
-                extraction_results=extraction_results,
-                name_to_id=name_to_id,
-                min_confidence=cooccurrence_min_confidence,
-                relation_type="cooccurs",
-            )
-            logger.info("  OK %d co-occurrence edges added", cooccurrence_edges)
-        except Exception as e:
-            logger.error("Co-occurrence edge construction failed: %s", e)
+        if _phase_done(checkpoint, "3c"):
+            logger.info("  Phase 3c (co-occurrence): SKIPPED — already in checkpoint")
+            cooccurrence_edges = checkpoint["3c"].get("edges", 0)
+        else:
+            logger.info(f"\n{'─'*70}")
+            logger.info("PHASE 3c: CO-OCCURRENCE EDGES")
+            logger.info(f"{'─'*70}")
+            try:
+                cooccurrence_edges = build_cooccurrence_edges(
+                    graph_store=graph_store,
+                    extraction_results=extraction_results,
+                    name_to_id=name_to_id,
+                    min_confidence=cooccurrence_min_confidence,
+                    relation_type="cooccurs",
+                )
+                logger.info("  OK %d co-occurrence edges added", cooccurrence_edges)
+                _save_checkpoint(graph_path, "3c", {"edges": cooccurrence_edges})
+                logger.info(_phase_eta("3c co-occurrence", time.time() - _t0))
+            except Exception as e:
+                logger.error("Co-occurrence edge construction failed: %s", e)
 
-    # Phase 3d: Cleanup pass (orphans + hubs + duplicate merge).
-    cleanup_ops = {
-        "orphans_dropped": 0,
-        "hubs_dropped": 0,
-        "duplicates_merged": 0,
-        "stoplist_dropped": 0,
-    }
+    # ══════════════════════════════════════════════════════════════════════
+    # PHASE 3d — GRAPH CLEANUP
+    # ══════════════════════════════════════════════════════════════════════
+    # Four-pass cleanup to improve graph quality:
+    #   Pass 1  Stop-list:   Drop entities matching DEFAULT_STOPLIST
+    #           (pronouns "He", "She", nationality adjectives "American", etc.)
+    #   Pass 2  Orphans:     Drop entities with 0 MENTIONS edges.
+    #           (entities that GLiNER extracted but no chunk references)
+    #   Pass 3  Hubs:        Drop entities mentioned in > 3% of all chunks.
+    #           (overly generic nodes like "United States" that link
+    #            unrelated chunks and reduce retrieval precision)
+    #   Pass 4  Duplicates:  Merge entities sharing the same canonical_form
+    #           within a type bucket ("Ed Wood" + "ed wood" → one node).
+    # Typical time: < 1 min.
+    # ══════════════════════════════════════════════════════════════════════
+    _t0 = time.time()
+    cleanup_ops = {"orphans_dropped": 0, "hubs_dropped": 0,
+                   "duplicates_merged": 0, "stoplist_dropped": 0}
     if graph_store is not None and not skip_cleanup:
-        logger.info(f"\n{'─'*70}")
-        logger.info(
-            "PHASE 3d: GRAPH CLEANUP%s",
-            " (DRY RUN)" if cleanup_dry_run else "",
-        )
-        logger.info(f"{'─'*70}")
-        try:
-            cleanup_ops = cleanup_graph(
-                graph_store=graph_store,
-                drop_orphans=True,
-                hub_threshold_ratio=hub_threshold_ratio,
-                merge_duplicates=True,
-                dry_run=cleanup_dry_run,
-            )
+        if _phase_done(checkpoint, "3d"):
+            logger.info("  Phase 3d (cleanup): SKIPPED — already in checkpoint")
+            cleanup_ops = checkpoint["3d"].get("ops", cleanup_ops)
+        else:
+            logger.info(f"\n{'─'*70}")
             logger.info(
-                "  Stop-list dropped:  %d (pronouns, nationality adjectives)",
-                cleanup_ops["stoplist_dropped"],
+                "PHASE 3d: GRAPH CLEANUP%s",
+                " (DRY RUN)" if cleanup_dry_run else "",
             )
-            logger.info(
-                "  Orphans dropped:    %d",
-                cleanup_ops["orphans_dropped"],
-            )
-            logger.info(
-                "  Hubs dropped:       %d (threshold ratio = %.1f%% of chunks)",
-                cleanup_ops["hubs_dropped"], hub_threshold_ratio * 100,
-            )
-            logger.info(
-                "  Duplicates merged:  %d",
-                cleanup_ops["duplicates_merged"],
-            )
-        except Exception as e:
-            logger.error("Cleanup pass failed: %s", e)
+            logger.info(f"{'─'*70}")
+            try:
+                cleanup_ops = cleanup_graph(
+                    graph_store=graph_store,
+                    drop_orphans=True,
+                    hub_threshold_ratio=hub_threshold_ratio,
+                    merge_duplicates=True,
+                    dry_run=cleanup_dry_run,
+                )
+                logger.info(
+                    "  Stop-list dropped:  %d (pronouns, nationality adjectives)",
+                    cleanup_ops["stoplist_dropped"],
+                )
+                logger.info("  Orphans dropped:    %d", cleanup_ops["orphans_dropped"])
+                logger.info(
+                    "  Hubs dropped:       %d (threshold ratio = %.1f%% of chunks)",
+                    cleanup_ops["hubs_dropped"], hub_threshold_ratio * 100,
+                )
+                logger.info("  Duplicates merged:  %d", cleanup_ops["duplicates_merged"])
+                _save_checkpoint(graph_path, "3d", {"ops": cleanup_ops})
+                logger.info(_phase_eta("3d cleanup", time.time() - _t0))
+            except Exception as e:
+                logger.error("Cleanup pass failed: %s", e)
 
     # Phase 3d.5: Embedding-based entity linking (alias resolution beyond
     # canonical_form). Merges "Ed Wood" with "Edward Davis Wood Jr." etc.
     # by clustering name embeddings within each canonical type bucket.
+    #
+    # ══════════════════════════════════════════════════════════════════════
+    # PHASE 3d.5 — EMBEDDING-BASED ENTITY LINKING
+    # ══════════════════════════════════════════════════════════════════════
+    # After canonical_form deduplication, some aliases still differ:
+    #   "VCU" ≠ "Virginia Commonwealth University"
+    #   "Ed Wood" ≠ "Edward Davis Wood Jr."  (after removing Jr. suffix)
+    # This phase embeds every entity name using nomic-embed-text (via Ollama)
+    # and merges pairs with cosine similarity >= 0.92 within the same type.
+    # Typical time: ~10 min for ~5 000 entities (Ollama on CPU).
+    # ══════════════════════════════════════════════════════════════════════
+    _t0 = time.time()
     linked_count = 0
     if graph_store is not None and enable_entity_linking and not skip_cleanup:
-        logger.info(f"\n{'─'*70}")
-        logger.info("PHASE 3d.5: EMBEDDING-BASED ENTITY LINKING")
-        logger.info(f"{'─'*70}")
-        try:
-            embedding_config = config.get("embeddings", {})
-            perf_config = config.get("performance", {})
-            cache_path = Path(f"./cache/{dataset_name}_embeddings.db")
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            embedder = BatchedOllamaEmbeddings(
-                model_name=embedding_config.get("model_name", "nomic-embed-text"),
-                base_url=embedding_config.get("base_url", "http://localhost:11434"),
-                batch_size=perf_config.get("batch_size", 64),
-                cache_path=cache_path,
-                device=perf_config.get("device", "cpu"),
-            )
-            linked_count = link_entities_by_embedding(
-                graph_store=graph_store,
-                embedder=embedder,
-                similarity_threshold=linking_threshold,
-                dry_run=cleanup_dry_run,
-            )
-            logger.info(
-                "  Embedding-linked entities merged: %d (threshold=%.2f)",
-                linked_count, linking_threshold,
-            )
-        except Exception as exc:
-            logger.error("Entity linking failed: %s", exc)
+        if _phase_done(checkpoint, "3d5"):
+            logger.info("  Phase 3d.5 (entity linking): SKIPPED — already in checkpoint")
+            linked_count = checkpoint["3d5"].get("linked", 0)
+        else:
+            logger.info(f"\n{'─'*70}")
+            logger.info("PHASE 3d.5: EMBEDDING-BASED ENTITY LINKING")
+            logger.info(f"{'─'*70}")
+            try:
+                if _shared_embeddings is not None:
+                    embedder = _shared_embeddings
+                else:
+                    embedding_config = config.get("embeddings", {})
+                    perf_config = config.get("performance", {})
+                    cache_path = Path(f"./cache/{dataset_name}_embeddings.db")
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    embedder = BatchedOllamaEmbeddings(
+                        model_name=embedding_config.get("model_name", "nomic-embed-text"),
+                        base_url=embedding_config.get("base_url", "http://localhost:11434"),
+                        batch_size=perf_config.get("batch_size", 64),
+                        cache_path=cache_path,
+                        device=perf_config.get("device", "cpu"),
+                    )
+                linked_count = link_entities_by_embedding(
+                    graph_store=graph_store,
+                    embedder=embedder,
+                    similarity_threshold=linking_threshold,
+                    dry_run=cleanup_dry_run,
+                )
+                logger.info(
+                    "  Embedding-linked entities merged: %d (threshold=%.2f)",
+                    linked_count, linking_threshold,
+                )
+                _save_checkpoint(graph_path, "3d5", {"linked": linked_count})
+                logger.info(_phase_eta("3d.5 entity linking", time.time() - _t0))
+            except Exception as exc:
+                logger.error("Entity linking failed: %s", exc)
 
-    # Phase 3e: Baseline metrics + invariant assertions.
+    # ══════════════════════════════════════════════════════════════════════
+    # PHASE 3e — BASELINE METRICS
+    # ══════════════════════════════════════════════════════════════════════
+    # Computes graph health statistics and checks invariants:
+    #   - total nodes / edges / densities
+    #   - isolated entity rate (should be < 5% after co-occurrence)
+    #   - duplicate cluster rate (should be < 2%)
+    #   - relations per chunk (should be >= 5.0)
+    # Warnings are printed but never abort the import.
+    # Typical time: < 30 seconds.
+    # ══════════════════════════════════════════════════════════════════════
     baseline: Dict[str, Any] = {}
     violations: List[str] = []
     if graph_store is not None:
@@ -995,10 +1408,28 @@ Examples:
         help="Cosine similarity threshold for embedding-based entity linking "
              "(default: 0.92). Higher = stricter merging. Range [0.85, 0.97].",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip phases already recorded as complete in the checkpoint file "
+             "(data/<dataset>/graph/.import_checkpoint.json). "
+             "Mutually exclusive with --clear.",
+    )
+    parser.add_argument(
+        "--embeddings-backend",
+        choices=["ollama", "huggingface"],
+        default="ollama",
+        help="Embedding backend: 'ollama' (default, requires Ollama running locally) "
+             "or 'huggingface' (uses sentence-transformers, no Ollama needed — "
+             "ideal for Colab/GPU environments).",
+    )
 
     args = parser.parse_args()
 
     # Validation
+    if args.resume and args.clear:
+        logger.error("--resume and --clear are mutually exclusive.")
+        sys.exit(1)
     if not args.chunks.exists():
         logger.error(f"Chunks file not found: {args.chunks}")
         sys.exit(1)
@@ -1022,6 +1453,8 @@ Examples:
         hub_threshold_ratio=args.hub_threshold_ratio,
         enable_entity_linking=not args.no_entity_linking,
         linking_threshold=args.linking_threshold,
+        resume=args.resume,
+        embeddings_backend=args.embeddings_backend,
     )
 
 

@@ -506,12 +506,70 @@ class StoreManager:
         paths = self.get_paths(dataset)
         paths["root"].mkdir(parents=True, exist_ok=True)
     
-    def clear_dataset(self, dataset: str) -> None:
-        """Clear all data for a dataset."""
+    def clear_dataset(self, dataset: str, chunks_only: bool = False) -> None:
+        """
+        Clear data for a dataset.
+
+        Two modes:
+          chunks_only=True:   delete ONLY chunks_export.json (Phase 1 output).
+                              Leaves vector/graph/extraction_results.json
+                              alone. Use when re-running Phase 1 and the
+                              KuzuDB graph might be locked by another
+                              process (Windows holds Kuzu file locks until
+                              the OS releases them).
+
+          chunks_only=False:  full reset. Rescues every .json file in the
+                              tree (chunks_export, questions, articles_info,
+                              extraction_results — all expensive to
+                              regenerate, especially the Colab output),
+                              then deletes the rest. PermissionError on
+                              individual files (typically Kuzu .lock files
+                              still held by the OS) is logged as a warning
+                              and skipped — partial cleanup is acceptable
+                              because re-ingest will MERGE-overwrite.
+        """
         paths = self.get_paths(dataset)
-        if paths["root"].exists():
-            shutil.rmtree(paths["root"])
-            logger.info(f"Cleared: {paths['root']}")
+        root = paths["root"]
+        if not root.exists():
+            return
+
+        # ── Mode A: chunks-only -> remove just chunks_export.json ─────────
+        if chunks_only:
+            chunks_file = root / "chunks_export.json"
+            if chunks_file.exists():
+                try:
+                    chunks_file.unlink()
+                    logger.info(f"Cleared: {chunks_file}")
+                except PermissionError as exc:
+                    logger.warning(f"Could not remove {chunks_file}: {exc}")
+            return
+
+        # ── Mode B: full reset with .json rescue + lock-tolerant rmtree ──
+        rescued: dict[Path, bytes] = {}
+        for json_file in root.rglob("*.json"):
+            try:
+                rescued[json_file.relative_to(root)] = json_file.read_bytes()
+                logger.info(f"  Protected before --clear: {json_file}")
+            except OSError as exc:
+                logger.warning(f"  Could not read {json_file}: {exc}")
+
+        # Best-effort rmtree. PermissionError on individual files (typical
+        # cause: a still-held Kuzu .lock file) is logged but does not abort.
+        def _on_error(func, path, exc_info):
+            logger.warning(f"  Could not remove {path}: {exc_info[1]}")
+
+        try:
+            shutil.rmtree(root, onerror=_on_error)
+            logger.info(f"Cleared (best-effort): {root}")
+        except Exception as exc:
+            logger.warning(f"Partial clear of {root}: {exc}")
+
+        # Restore the rescued JSON files
+        for relpath, data in rescued.items():
+            target = root / relpath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            logger.info(f"  Restored: {target}")
     
     def save_questions(self, questions: List[TestQuestion], dataset: str) -> None:
         """Save test questions."""
@@ -904,11 +962,13 @@ def create_pipeline(
     else:
         retrieval_mode = RetrievalMode.HYBRID
 
-    # Wrap HybridStore in HybridRetriever (Navigator needs .retrieve())
+    # Wrap HybridStore in HybridRetriever (Navigator needs .retrieve()).
+    # NOTE: vector_weight / graph_weight were removed from RetrievalConfig in the
+    # 2026-05-06 cleanup audit (never read by production code — weighted-fusion
+    # ablation is done via `mode`). The weights are still used above to pick the
+    # RetrievalMode; they are not forwarded to the config.
     retrieval_config = RetrievalConfig(
         mode=retrieval_mode,
-        vector_weight=vector_weight,
-        graph_weight=graph_weight,
         similarity_threshold=vector_config.get("similarity_threshold", 0.3),
     )
     retriever = HybridRetriever(
@@ -1037,8 +1097,14 @@ def cmd_ingest(args, config: Dict, store_manager: StoreManager):
             continue
         
         if args.clear:
-            store_manager.clear_dataset(dataset)
-        
+            # When --chunks-only is set we only want to wipe Phase-1 output;
+            # the existing graph (often locked by KuzuDB on Windows) and the
+            # Colab-produced extraction_results.json must NOT be touched.
+            store_manager.clear_dataset(
+                dataset,
+                chunks_only=getattr(args, "chunks_only", False),
+            )
+
         if store_manager.dataset_exists(dataset) and not args.clear:
             logger.info(f"  Already exists. Use --clear to re-ingest.")
             continue

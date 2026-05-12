@@ -462,8 +462,6 @@ def test_full_pipeline(query: str, gold_answer: str, skip_llm: bool,
 
     retrieval_config = RetrievalConfig(
         mode=RetrievalMode.HYBRID,
-        vector_weight=rag_cfg.get("vector_weight", 0.7),
-        graph_weight=rag_cfg.get("graph_weight", 0.3),
     )
     retriever = HybridRetriever(hybrid_store=store, embeddings=embeddings,
                                 config=retrieval_config)

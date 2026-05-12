@@ -197,16 +197,33 @@ class ExtractionConfig:
     # ── GLiNER NER ────────────────────────────────────────────────────────────
     # Reference: Zaratiana et al. (2023). arXiv:2311.08526.
     gliner_model: str = "urchade/gliner_small-v2.1"
+    # ──────────────────────────────────────────────────────────────────────────
+    # FIXED: OntoNotes-5 core entity-type set (Weischedel et al. 2013,
+    # LDC2013T19). Mirrors config/settings.yaml exactly.
+    # 9 GLiNER prompts -> 8 canonical types via GLINER_LABEL_MAP:
+    #   person, organization, location, city, country, date, event,
+    #   work of art, product.
+    #
+    # ⚠ DO NOT change this list. It is the scientifically defensible label
+    # set across HotpotQA + 2WikiMultiHopQA + StrategyQA. Adding domain-
+    # specific types (state, landmark, album, film, movie, award, ...)
+    # breaks cross-dataset transfer and the reproducibility of the thesis.
+    # The multi-prompt expansion (city + country alongside location) is a
+    # recall optimisation, not a domain specialisation - all prompts map
+    # to the same OntoNotes-5 canonical types in the graph.
+    # ──────────────────────────────────────────────────────────────────────────
     entity_types: List[str] = field(default_factory=lambda: [
-        # Lowercase natural-language labels produce better zero-shot results
-        # with GLiNER's bidirectional span-prediction approach.
-        "person", "organization",
-        "city", "country", "state", "location",
-        "film", "movie", "album", "work of art",
-        "landmark",    # buildings/monuments → maps to LOCATION
-        "event", "award",
+        "person",
+        "organization",
+        "location",
+        "city",
+        "country",
+        "date",
+        "event",
+        "work of art",
+        "product",
     ])
-    ner_confidence_threshold: float = 0.15   # recall-optimised for HotpotQA
+    ner_confidence_threshold: float = 0.15   # recall-optimised; junk filtered downstream
     ner_batch_size: int = 16
 
     # ── REBEL Relation Extraction ─────────────────────────────────────────────

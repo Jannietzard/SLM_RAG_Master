@@ -1023,6 +1023,26 @@ Question: {query}
 
 Answer (as short as possible):"""
 
+    COMPARISON_PROMPT = """You are a factual QA assistant. Answer based ONLY on the context below.
+
+The question compares two people or things. Follow these steps:
+1. Find the relevant fact for the FIRST person/thing in the context.
+2. Find the relevant fact for the SECOND person/thing in the context.
+3. Compare the two facts and give the answer.
+
+Rules:
+- For yes/no questions: reply with just "yes" or "no".
+- For "which one" questions: reply with just the name.
+- Do NOT explain beyond the direct answer.
+- If the context does not contain enough information: reply with "I don't know."
+
+Context:
+{context}
+
+Question: {query}
+
+Answer (as short as possible):"""
+
     CORRECTION_PROMPT = """Your previous answer contained unverified claims.
 
 Unverified claims:
@@ -1065,6 +1085,47 @@ Please provide a partial answer based on the available evidence, clearly indicat
         "American", "British", "European", "Australian", "Canadian",
         "Yes", "No",
     })
+
+    # Epistemic-disclaimer phrases that signal the LLM did NOT answer.
+    # When an answer matches any of these, it must not be reported as
+    # HIGH confidence with all_verified=True (Bug 4).
+    _DISCLAIMER_PATTERNS: Tuple[str, ...] = (
+        "i don't know",
+        "i do not know",
+        "i cannot determine",
+        "i can't determine",
+        "i cannot find",
+        "i can't find",
+        "i was unable to find",
+        "unable to find",
+        "no information",
+        "no specific information",
+        "not provided in the context",
+        "not provided",
+        "not mentioned",
+        "not specified",
+        "not stated",
+        "not available",
+        "is not in the context",
+        "the context does not",
+        "the context doesn't",
+        "context does not contain",
+        "context doesn't contain",
+        "insufficient evidence",
+        "insufficient information",
+        "based on the available",
+        "no answer can be",
+        "cannot be determined",
+        "however, there is no",
+    )
+
+    @classmethod
+    def _is_disclaimer_answer(cls, answer: str) -> bool:
+        """Return True if the answer is an epistemic disclaimer (Bug 4)."""
+        if not answer or answer.startswith("[Error:"):
+            return True
+        a = answer.lower()
+        return any(p in a for p in cls._DISCLAIMER_PATTERNS)
 
     def __init__(
         self,
@@ -1366,6 +1427,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
         context: List[str],
         entities: Optional[List[str]] = None,
         hop_sequence: Optional[List[Dict[str, Any]]] = None,
+        query_type: Optional[str] = None,
     ) -> VerificationResult:
         """
         Main entry point: pre-validation, generation, and self-correction.
@@ -1423,6 +1485,40 @@ Please provide a partial answer based on the available evidence, clearly indicat
             len(working_context),
             len(context),
         )
+
+        # ── Hard early-return on truly empty evidence (Bug 3) ────────────────
+        # Skip the ~18 s LLM call when pre-validation produced no usable
+        # context: an empty filtered_context, or INSUFFICIENT_EVIDENCE
+        # combined with zero entities found by the entity-path check.
+        # We still hand non-empty INSUFFICIENT_EVIDENCE contexts to the LLM
+        # via INSUFFICIENT_EVIDENCE_PROMPT — the LLM may extract a partial
+        # answer from the surviving chunks.
+        path_details = pre_validation.details.get("entity_path", {}) or {}
+        entities_found = path_details.get("entities_found", []) or []
+        if not working_context or (
+            pre_validation.status == ValidationStatus.INSUFFICIENT_EVIDENCE
+            and not entities_found
+        ):
+            logger.warning(
+                "[Verifier] Hard early-return: no usable context "
+                "(working_context=%d, entities_found=%d) — skipping LLM call.",
+                len(working_context),
+                len(entities_found),
+            )
+            total_time = (time.time() - start_time) * 1000
+            return VerificationResult(
+                answer="I cannot determine the answer from the provided context.",
+                iterations=0,
+                verified_claims=[],
+                violated_claims=[],
+                all_verified=False,
+                pre_validation=pre_validation,
+                timing_ms=total_time,
+                iteration_history=[],
+                confidence_high_threshold=self.config.confidence_high_threshold,
+                confidence_medium_threshold=self.config.confidence_medium_threshold,
+            )
+
         working_context = self._reorder_by_question_relevance(query, working_context)
         formatted_context = self._format_context(working_context)
 
@@ -1444,6 +1540,10 @@ Please provide a partial answer based on the available evidence, clearly indicat
             if iteration == 1:
                 if pre_validation.status == ValidationStatus.INSUFFICIENT_EVIDENCE:
                     prompt = self.INSUFFICIENT_EVIDENCE_PROMPT.format(
+                        context=formatted_context, query=query
+                    )
+                elif query_type == "comparison":
+                    prompt = self.COMPARISON_PROMPT.format(
                         context=formatted_context, query=query
                     )
                 else:
@@ -1512,6 +1612,20 @@ Please provide a partial answer based on the available evidence, clearly indicat
                     logger.debug(
                         "[Verifier] VIOLATED '%s...' (%s)", claim[:50], reason
                     )
+
+            # ── Disclaimer override (Bug 4) ──────────────────────────────
+            # If the answer is an epistemic disclaimer, _extract_claims has
+            # already stripped the meta-statement and the claim list is
+            # often empty — which silently maps to all_verified=True / HIGH
+            # confidence via the (0,0) ratio in VerificationResult.confidence.
+            # Force a single violated claim so downstream sees this as a
+            # non-answer with LOW confidence.
+            if self._is_disclaimer_answer(answer):
+                logger.warning(
+                    "[Verifier] Disclaimer answer detected — forcing LOW confidence."
+                )
+                violated_claims = [answer.strip()[:200]]
+                verified_claims = []
             logger.info(
                 "[Verifier] Verification: %d verified, %d violated",
                 len(verified_claims),
@@ -1585,6 +1699,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
         context: List[str],
         entities: Optional[List[str]] = None,
         hop_sequence: Optional[List[Dict[str, Any]]] = None,
+        query_type: Optional[str] = None,
     ) -> VerificationResult:
         """Callable interface — forwards all arguments to generate_and_verify."""
         return self.generate_and_verify(
@@ -1592,6 +1707,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
             context=context,
             entities=entities,
             hop_sequence=hop_sequence,
+            query_type=query_type,
         )
 
 

@@ -16,6 +16,8 @@
    - 3.3 [Entity Extraction](#33-entity-extraction)
    - 3.4 [Storage Layer](#34-storage-layer)
    - 3.5 [Hybrid Retriever](#35-hybrid-retriever)
+   - 3.6 [Graph Quality Module](#36-graph-quality-module)
+   - 3.7 [Optional Pipeline Stages](#37-optional-pipeline-stages)
 4. [Logic Layer — Artifact B](#4-logic-layer--artifact-b)
    - 4.1 [Planner Agent (S_P)](#41-planner-agent-s_p)
    - 4.2 [Navigator Agent (S_N)](#42-navigator-agent-s_n)
@@ -24,6 +26,7 @@
 5. [Pipeline Layer](#5-pipeline-layer)
    - 5.1 [Agent Pipeline](#51-agent-pipeline)
    - 5.2 [Ingestion Pipeline](#52-ingestion-pipeline)
+   - 5.3 [Decoupled Three-Phase Ingestion (Production)](#53-decoupled-three-phase-ingestion-production)
 6. [Configuration System](#6-configuration-system)
 7. [Evaluation Framework — Artifact C](#7-evaluation-framework--artifact-c)
 8. [Technology Stack](#8-technology-stack)
@@ -65,7 +68,11 @@ Entwicklungfolder/
 │   │   ├── embeddings.py           # BatchedOllamaEmbeddings + SQLite cache
 │   │   ├── chunking.py             # SpacySentenceChunker, SemanticChunker
 │   │   ├── entity_extraction.py    # GLiNER NER + REBEL RE pipeline
-│   │   ├── entity_types.py         # Canonical label maps (single source of truth)
+│   │   ├── entity_types.py         # Canonical OntoNotes-5 label maps
+│   │   ├── coreference.py          # Pronoun -> antecedent resolution (Phase 1)
+│   │   ├── svo_extraction.py       # SpaCy SVO triples (Phase 3, narrative relations)
+│   │   ├── graph_quality.py        # canonical_form, cleanup, cooccurrence,
+│   │   │                           # entity-linking, baseline + invariants
 │   │   ├── storage.py              # HybridStore, VectorStoreAdapter, KuzuGraphStore
 │   │   ├── hybrid_retriever.py     # HybridRetriever, RRFFusion, BM25, query NER
 │   │   ├── ingestion.py            # DocumentIngestionPipeline (data-layer side)
@@ -120,7 +127,9 @@ Entwicklungfolder/
 ├── diagnose.py                     # Layer-by-layer pipeline diagnostic
 ├── diagnose_verbose.py             # Trace-mode diagnostic with gold tracking
 ├── diagnose_ingestion.py           # Ingestion consistency checker
-├── local_importingestion.py        # Phase-3 import: chunks + extraction → stores
+├── diagnose_graph_baseline.py      # Read-only graph-quality baseline tool
+├── dryrun_ingestion.py             # Pre-ingest sanity check on N chunks
+├── local_importingestion.py        # Phase-3 import: chunks + extraction -> stores
 │
 ├── test_system/                    # Test suite + visualisation tooling
 │   ├── conftest.py                 # Pytest fixtures, sys.path setup
@@ -279,13 +288,22 @@ Entity extraction populates the knowledge graph with named entities and their re
 @dataclass
 class ExtractionConfig:
     gliner_model: str = "urchade/gliner_small-v2.1"
+    # FIXED: OntoNotes-5 core entity-type set (Weischedel et al. 2013).
+    # 9 GLiNER prompts -> 8 canonical types via GLINER_LABEL_MAP.
+    # Cross-dataset defensible (HotpotQA + 2WikiMultiHopQA + StrategyQA);
+    # do not specialise.
     entity_types: List[str] = [
-        # Lowercase natural-language labels yield better zero-shot performance.
-        "person", "organization", "city", "country", "state",
-        "location", "film", "movie", "album", "work of art",
-        "landmark", "event", "award",
+        "person",
+        "organization",
+        "location",
+        "city",
+        "country",
+        "date",
+        "event",
+        "work of art",
+        "product",
     ]
-    ner_confidence_threshold: float = 0.15   # Recall-optimised for HotpotQA
+    ner_confidence_threshold: float = 0.15   # recall-optimised; junk filtered downstream
     ner_batch_size: int = 16
     rebel_max_input_length: int = 256
     rebel_max_output_length: int = 256
@@ -293,7 +311,13 @@ class ExtractionConfig:
     device: str = "cpu"
 ```
 
-**`ExtractedEntity`** carries `entity_id` (24-character SHA-256 hex), `name` (normalised surface form), `entity_type` (one of the canonical 13), `confidence`, `mention_span`, and `source_chunk_id`. The serialised key for the type field is `"entity_type"` (not `"type"`).
+The label set is the **OntoNotes-5 core** (Weischedel et al. 2013, *OntoNotes Release 5.0*, LDC2013T19) — the de-facto standard for English narrative NER, also shipped with `spacy.en_core_web_sm`. The multi-prompt expansion (`city`, `country` alongside `location`) is a recall optimisation following Zaratiana et al. (2023, §4.2): GLiNER scores higher on specific natural-language prompts, but `GLINER_LABEL_MAP` collapses them to the canonical OntoNotes-5 buckets so the graph stays uniform.
+
+**Canonical buckets** produced by the label map: `PERSON`, `ORGANIZATION`, `LOCATION`, `GPE`, `DATE`, `EVENT`, `WORK_OF_ART`, `PRODUCT` — 8 total.
+
+> **Fixed by design.** The label set is identical across the three benchmark datasets (HotpotQA, 2WikiMultiHopQA, StrategyQA) and across `config/settings.yaml` and `ExtractionConfig`. Domain-specific subtypes (`state`, `landmark`, `album`, `film`, `movie`, `award`, …) are intentionally absent: they transfer poorly across datasets and break the scientific reproducibility of the evaluation. Both `settings.yaml` and `ExtractionConfig` carry inline `DO NOT CHANGE` comments to prevent silent drift.
+
+**`ExtractedEntity`** carries `entity_id` (24-character SHA-256 hex), `name` (normalised surface form), `entity_type` (one of the 8 canonical buckets above), `confidence`, `mention_span`, and `source_chunk_id`. The serialised key for the type field is `"entity_type"` (not `"type"`).
 
 A fallback chain ensures availability: GLiNER → SpaCy NER → regex. Each fallback hop emits `logger.warning("FALLBACK ACTIVE: …")` so silent degradations are observable in production logs.
 
@@ -390,7 +414,7 @@ Wraps KuzuDB with a domain-specific schema:
 | `MENTIONS` | `DocumentChunk → Entity` |
 | `RELATED_TO` | `Entity → Entity` (with `relation_type`, `confidence`) |
 
-Public methods include `add_chunk_node`, `add_entity_node`, `add_relation`, `find_chunks_by_entity_multihop(entity_name, max_hops)`, and `get_statistics`. The multi-hop helper applies a lightweight name-variant heuristic: for two-token names whose first token is ≤ 3 characters (e.g., `"Ed Wood"`), it also queries the surname; for any name, it tries individual tokens of length ≥ 4. Full alias resolution (e.g., `"Ed Wood"` ↔ `"Edward Davis Wood Jr."`) requires an entity-linking system and is documented as a known limitation (§12.3).
+Public methods include `add_chunk_node`, `add_entity_node`, `add_relation`, `find_chunks_by_entity_multihop(entity_name, max_hops)`, and `get_statistics`. The multi-hop helper resolves names through a prioritised variant list (`_entity_name_variants`): full name first, then the surname (last token, if ≥ 4 chars), then any remaining token ≥ 7 chars. Short given names ("Giuseppe", "Scott") are deliberately excluded from single-token fallbacks because they match unrelated hub entities ("Giuseppe Verdi") and would flood results before the correct surname hit — so `"Giuseppe Arimondi"` resolves via `"Arimondi"`, not `"Giuseppe"`. Full alias resolution (e.g., `"Ed Wood"` ↔ `"Edward Davis Wood Jr."`) requires an entity-linking system and is documented as a known limitation (§12.3).
 
 #### 3.4.4 HybridStore
 
@@ -513,6 +537,162 @@ The `entity_hints` parameter is essential for iterative multi-hop retrieval: whe
 `RetrievalMetrics` carries `total_time_ms`, `vector_time_ms`, `graph_time_ms`, `n_vector_results`, `n_graph_results`, `n_final_results`, and `retrieval_mode`.
 
 > **Filter ownership.** Pre-generative filtering is a **Logic Layer** concern owned by the Navigator (§4.2). The data layer is intentionally filter-free: it returns ranked candidates, not curated context.
+
+---
+
+### 3.6 Graph Quality Module
+
+**File:** [src/data_layer/graph_quality.py](src/data_layer/graph_quality.py)
+
+A self-contained module that handles all post-extraction graph integrity work. Used at ingestion time (Phase 3d/3d') and as a standalone diagnostic via [diagnose_graph_baseline.py](diagnose_graph_baseline.py). The module has four orthogonal responsibilities.
+
+#### 3.6.1 Surface-Form Canonicalisation
+
+```python
+def canonical_form(name: str) -> str
+```
+
+A loss-bearing string normalisation used as the deduplication key for entity nodes. Applies, in order:
+
+1. NFKC Unicode normalisation (collapses fancy quotes, full-width digits, combined accents).
+2. Strip a trailing parenthetical disambiguator (`"Local H (band)"` → `"Local H"`).
+3. Strip leading honorifics (`Mr.`, `Mrs.`, `Dr.`, `Prof.`, `Sir`, `Lord`, `Saint`, `St`).
+4. Strip trailing **academic credentials only** (`PhD`, `MD`, `Esq`).
+5. Strip possessive `'s`.
+6. Strip a single trailing `.`.
+7. Collapse whitespace, casefold.
+
+> **Generation suffixes (`Jr.`, `Sr.`, `II`, `III`, `IV`, `V`) are deliberately preserved.** They distinguish father from son and same-name family members. Stripping them merges distinct real-world entities — empirically observed on `"Ed Wood"` (filmmaker) vs. `"Ed Wood Sr."` (plantation owner) in the HotpotQA `Woodson, Arkansas` article.
+
+The canonical form drives `_canonical_entity_id(name, type) = SHA-256(canonical_form(name) + ":" + type)[:24]` in [local_importingestion.py](local_importingestion.py), so identical canonical forms collapse to the same Entity node at MERGE time.
+
+#### 3.6.2 Baseline Metrics and Invariants
+
+```python
+def compute_graph_baseline(graph_store) -> Dict[str, Any]
+def format_baseline_report(metrics) -> str
+def assert_graph_invariants(metrics, thresholds=None, strict=False) -> List[str]
+```
+
+Read-only graph health metrics:
+
+| Field | Meaning |
+|---|---|
+| `totals` | chunk, entity, mention, relation counts |
+| `densities` | per-chunk and per-entity ratios |
+| `isolated.count`, `isolated.rate` | entities with zero RELATED_TO edges |
+| `duplicates.cluster_count`, `duplicates.rate` | entities sharing `(canonical_form, type)` |
+| `top_hubs` | top-N entities by chunk-MENTIONS count |
+
+Default invariants enforced at the end of every Phase-3 ingestion:
+
+| Invariant | Threshold |
+|---|---|
+| `max_isolated_rate` | 5 % |
+| `max_duplicate_rate` | 2 % |
+| `min_relation_density` | 5.0 relations per chunk |
+
+Violations are logged at WARNING and persisted to `extraction_metadata.json` but never abort the ingestion — they are diagnostic, not gating.
+
+#### 3.6.3 Co-Occurrence Edges
+
+```python
+def build_cooccurrence_edges(
+    graph_store, extraction_results, name_to_id,
+    min_confidence=0.5, relation_type="cooccurs",
+    max_entities_per_chunk=30,
+) -> int
+```
+
+For every chunk, every pair of entities co-mentioned in that chunk gets a `RELATED_TO {relation_type='cooccurs', confidence=1.0, source_chunks=[chunk_id]}` edge. Idempotent (MERGE-backed). The `max_entities_per_chunk=30` cap bounds combinatorial explosion: a chunk with 100 entities would otherwise produce 4 950 pairs. With the OntoNotes-5 entity set on HotpotQA, the per-chunk entity count is typically 4–8, with rare outliers at 20–33.
+
+This single step typically lifts `relations_per_chunk` from ~1.5 (REBEL only) to ~14–18, and drives `isolated_rate` from > 60 % to < 3 % on a populated graph.
+
+#### 3.6.4 Cleanup Pass
+
+```python
+def cleanup_graph(
+    graph_store,
+    drop_orphans=True,
+    hub_threshold_ratio=0.03,
+    merge_duplicates=True,
+    stoplist=None,
+    dry_run=False,
+) -> Dict[str, int]
+```
+
+Four sub-passes, in order:
+
+1. **Stop-list drop** — entities whose `canonical_form` is in `DEFAULT_STOPLIST` (56 entries: pronouns `he`/`she`/`it`/...; nationality adjectives `american`/`british`/...; ambiguous abbreviations `u.s.`/`uk`). Compared via `canonical_form`, so case/punctuation variants all match.
+2. **Orphan drop** — entities with zero MENTIONS edges (extraction artefacts).
+3. **Hub drop** — entities mentioned in more than `hub_threshold_ratio × total_chunks` chunks (default 3 %). Lower than the literature default of 5 % because GLiNER misclassifies common pronouns and nationality adjectives at frequencies of 1.5–4.5 % of chunks.
+4. **Duplicate merge** — entities sharing `(canonical_form, type)` are unioned into the entity with the highest mention count; all incident MENTIONS and RELATED_TO edges are redirected to the keeper, then the others are deleted via the `_delete_entity_safely` helper (Kuzu does not support `DETACH DELETE` on every version, so edges are deleted explicitly).
+
+The pass returns counts: `stoplist_dropped`, `orphans_dropped`, `hubs_dropped`, `duplicates_merged`. With `dry_run=True`, no mutation is performed and only the counts are returned — useful for previewing on production data.
+
+#### 3.6.5 Embedding-Based Entity Linking
+
+```python
+def link_entities_by_embedding(
+    graph_store, embedder,
+    similarity_threshold=0.92,
+    min_type_size=2,
+    max_type_size=8000,
+    length_ratio_floor=0.4,
+    dry_run=False,
+) -> int
+```
+
+Resolves aliases that `canonical_form` cannot detect — e.g., `"Ed Wood"` ↔ `"Edward Davis Wood Jr."` (both refer to the filmmaker, but the canonical forms differ). Algorithm:
+
+1. Group all entities by canonical type.
+2. Within each type bucket, embed every name via the project's `BatchedOllamaEmbeddings`.
+3. Compute the upper-triangular cosine similarity matrix.
+4. Greedy union-find: pairs with cosine ≥ `similarity_threshold` are merged. The `length_ratio_floor=0.4` guard prevents short surface forms from being merged into much longer unrelated ones.
+5. Within each merged cluster, keep the entity with the highest MENTIONS count and redirect all incident edges via `_redirect_entity_edges`.
+
+`max_type_size=8000` is a memory safety cap: a type bucket with 8 000 entities produces an 8 000 × 8 000 float32 similarity matrix (~256 MB). Larger buckets are skipped with a warning. The threshold of 0.92 is conservative; lowering to 0.88 catches more aliases at the cost of false-positive merges.
+
+> **Order matters.** Cleanup runs BEFORE linking: dropping orphans/hubs/duplicates first reduces the embedding workload and keeps the similarity computation focused on real entities.
+
+---
+
+### 3.7 Optional Pipeline Stages
+
+Two optional modules sit alongside the data layer's mandatory components. Both are silently skipped when their dependencies are absent — the pipeline keeps working with reduced graph density.
+
+#### 3.7.1 Coreference Resolution (Phase 1)
+
+**File:** [src/data_layer/coreference.py](src/data_layer/coreference.py)
+
+```python
+def resolve_coreferences(text: str, max_chars: int = 100_000) -> str
+```
+
+Replaces pronoun mentions in raw article text with the longest mention from each coreference chain, BEFORE chunking. This means `"Christopher Nolan was born in London. He directed Inception."` becomes `"Christopher Nolan was born in London. Christopher Nolan directed Inception."` — and the second sentence now provides the cooccurrence pair `(Christopher Nolan, Inception)` that would otherwise be lost when `He` is correctly dropped by the stoplist.
+
+Optional dependency: `coreferee` + `en_core_web_md` (or `_lg`/`_trf`). Falls back to identity passthrough if unavailable. Wired into Phase 1 via `benchmark_datasets.py:create_langchain_documents(..., apply_coreference=True)`. Disable with `--no-coreference` for ablation.
+
+#### 3.7.2 SVO Relation Extraction (Phase 3)
+
+**File:** [src/data_layer/svo_extraction.py](src/data_layer/svo_extraction.py)
+
+```python
+def extract_svo_relations(
+    text, name_to_id, chunk_id, canonical_form_fn,
+    min_verb_length=3,
+) -> List[Tuple[str, str, str, float]]
+```
+
+Complements REBEL by extracting **narrative relations** that REBEL misses. REBEL is trained on Wikipedia infoboxes (`publication_date`, `country`, `date_of_birth`) — useful but not what HotpotQA bridges ask about. SpaCy's dependency parse extracts narrative `(subject, verb_lemma, object)` triples for free at ingestion time:
+
+- Active voice: `"Nolan directed Inception"` → `(Nolan, direct, Inception)`.
+- Passive voice: `"Inception was directed by Nolan"` → `(Nolan, direct, Inception)` (logical roles inferred from `nsubjpass` + `agent` / `pobj`).
+- Conjunct verbs: `"Nolan directed and produced Inception"` → both `(Nolan, direct, Inception)` and `(Nolan, produce, Inception)` (subject inherited from the conjunct head).
+
+Both subject and object MUST resolve to known entities via `name_to_id` (canonical-form-keyed). Unmatched triples are dropped silently. Stop-verbs (`be`, `have`, `do`, `say`, `tell`, `make`) are excluded as they produce mostly noise. Stored as RELATED_TO edges with `relation_type=verb_lemma` and `confidence=0.7` (between REBEL's 0.5 sentinel and cooccurrence's 1.0).
+
+Without coreference resolution, SVO is largely dormant on Wikipedia text because most sentences after the first use pronouns. The two stages are complementary — coreference at Phase 1 unlocks SVO at Phase 3.
 
 ---
 
@@ -777,7 +957,11 @@ if status == INSUFFICIENT:
 
 context_str = build_context(context, max_chars=max_context_chars,
                             max_docs=max_docs, max_chars_per_doc=max_chars_per_doc)
-answer = call_llm(GENERATION_PROMPT, query, context_str)
+# Prompt is selected by query_type (forwarded from the Planner via the
+# Controller): COMPARISON_PROMPT — a step-by-step "find fact A, find fact B,
+# compare" template — for comparison questions, GENERATION_PROMPT otherwise.
+prompt = COMPARISON_PROMPT if query_type == "comparison" else GENERATION_PROMPT
+answer = call_llm(prompt, query, context_str)
 
 # With max_iterations=1 (default) the loop body never runs; raise to ≥ 2
 # for the self-correction ablation comparison.
@@ -790,7 +974,7 @@ for iteration in range(1, max_iterations):
 return VerificationResult(answer, confidence, iterations_used)
 ```
 
-The correction prompt embeds concrete claim-level violations as feedback (Madaan et al. 2023, *Self-Refine*). On a 1.5 B-parameter SLM the second pass tends to inject hallucinations rather than correct them, so the default is a single pass; the loop is opt-in for ablation.
+The correction prompt embeds concrete claim-level violations as feedback (Madaan et al. 2023, *Self-Refine*). On a 1.5 B-parameter SLM the second pass tends to inject hallucinations rather than correct them, so the default is a single pass; the loop is opt-in for ablation. `query_type` is an optional argument on `generate_and_verify()`; when the Verifier is used directly without a Planner it is `None` and the generic `GENERATION_PROMPT` applies.
 
 #### 4.3.6 VerificationResult
 
@@ -1024,6 +1208,57 @@ def create_ingestion_pipeline(config: Dict[str, Any], use_mocks: bool = False) -
 
 ---
 
+### 5.3 Decoupled Three-Phase Ingestion (Production)
+
+The thesis evaluation uses a **decoupled three-phase pipeline** that splits GPU-bound entity extraction off the edge target. All three phases are idempotent and re-runnable independently.
+
+```
+Phase 1 (CPU, local)         Phase 2 (GPU, Colab)            Phase 3 (CPU, local)
+─────────────────────        ────────────────────             ───────────────────
+benchmark_datasets.py        Colab notebook                   local_importingestion.py
+       │                            │                                │
+       │ chunks_export.json ──────► │ extraction_results.json ─────► │
+       ▼                            ▼                                ▼
+   chunking +                  GLiNER NER +                     ingest +
+   coreference                 REBEL RE +                       SVO +
+                               junk filter                      cooccurrence +
+                                                                cleanup +
+                                                                entity linking
+```
+
+**Phase 1 — local chunking** ([benchmark_datasets.py](benchmark_datasets.py) `ingest --chunks-only`):
+- Loads dataset from HuggingFace (HotpotQA, 2WikiMultiHopQA, StrategyQA).
+- Optional **per-article coreference resolution** via `src/data_layer/coreference.py` — replaces pronouns with their antecedents BEFORE chunking, so GLiNER (Phase 2) and the graph (Phase 3) capture the named entity behind every mention. Optional dependency on `coreferee` + `en_core_web_md`; silently skipped if not installed.
+- Chunks via `SpacySentenceChunker` (3-sentence sliding window, overlap 1).
+- Emits `chunks_export.json` (one record per chunk: `text`, `metadata`).
+
+**Phase 2 — GPU extraction** (external Colab notebook):
+- Reads `chunks_export.json`.
+- Runs GLiNER with the **OntoNotes-5 9-prompt list** (§3.3) at threshold 0.15.
+- Junk-filters pronouns and nationality adjectives at extraction time (mirror of `DEFAULT_STOPLIST`).
+- Runs REBEL RE conditionally (≥ 2 entities per chunk).
+- Emits `extraction_results.json` with `metadata` (model versions, thresholds) and `results[]` (entities, relations, source_chunk_ids).
+
+**Phase 3 — local import** ([local_importingestion.py](local_importingestion.py)):
+
+| Step | Purpose | Module |
+|---|---|---|
+| **3a** | Embed chunks, write to LanceDB | `BatchedOllamaEmbeddings` (default) or `_HFEmbeddings` (`--embeddings-backend huggingface`), `VectorStoreAdapter` |
+| **3b** | Insert Entity nodes (canonical IDs), MENTIONS edges, REBEL RELATED_TO edges with `relation_type` + `confidence` + `source_chunks` | `KuzuGraphStore`, `_canonical_entity_id` |
+| **3b'** | **SVO extraction** — narrative `(subject, verb_lemma, object)` triples from SpaCy dependency parse; supports active, passive, and conjunct verbs; both endpoints must resolve to known entities | `src/data_layer/svo_extraction.py` |
+| **3c** | **Co-occurrence edges** — every pair of entities co-mentioned in the same chunk gets a `RELATED_TO {relation_type='cooccurs', confidence=1.0, source_chunks=[chunk_id]}` edge. Capped at `max_entities_per_chunk=30` per chunk to bound combinatorial explosion. | `build_cooccurrence_edges` |
+| **3d** | **Cleanup pass** — drops stop-list entities (pronouns, nationality adjectives), orphan entities (zero MENTIONS), hub entities (mentioned in > 3 % of chunks), and merges duplicates sharing `(canonical_form, type)` | `cleanup_graph` |
+| **3d'** | **Embedding-based entity linking** — clusters surface forms within each canonical type by `nomic-embed-text` cosine similarity (default threshold 0.92); resolves aliases that `canonical_form` cannot (e.g., `Ed Wood` ↔ `Edward Davis Wood Jr.`) | `link_entities_by_embedding` |
+| **3e** | Compute baseline metrics, assert invariants (isolated_rate < 5 %, duplicate_rate < 2 %, relations_per_chunk > 5), persist to `extraction_metadata.json` | `compute_graph_baseline`, `assert_graph_invariants` |
+
+**CLI flags for ablation/debugging** (Phase 3): `--no-cleanup`, `--no-cooccurrence`, `--no-entity-linking`, `--cleanup-dry-run`, `--linking-threshold`, `--cooccurrence-min-confidence`, `--hub-threshold-ratio`, `--embeddings-backend {ollama|huggingface}` (the latter swaps `nomic-ai/nomic-embed-text-v1` via `sentence-transformers` for `BatchedOllamaEmbeddings` — used to re-ingest on a Colab GPU with no Ollama daemon; embedding dimensionality is unchanged so stored vectors stay compatible).
+
+**Pre-ingestion sanity check** ([dryrun_ingestion.py](dryrun_ingestion.py)): runs the entire Phase 3 pipeline on the first N chunks (default 5) into a disposable `./data/_dryrun/graph` and prints every node and every edge for visual inspection. Exercises the same code paths as the full ingestion. Use before committing to a full re-ingest.
+
+**Baseline diagnostics** ([diagnose_graph_baseline.py](diagnose_graph_baseline.py)): standalone read-only CLI that opens an existing KuzuDB and prints density, isolated rate, duplicate clusters, and top hub entities. Use to compare graph quality before vs. after re-ingestion.
+
+---
+
 ## 6. Configuration System
 
 **File:** [config/settings.yaml](config/settings.yaml)
@@ -1131,21 +1366,20 @@ verifier:
 entity_extraction:
   gliner:
     model_name: "urchade/gliner_small-v2.1"
+    # FIXED: OntoNotes-5 core (Weischedel et al. 2013, LDC2013T19).
+    # 9 prompts -> 8 canonical types via GLINER_LABEL_MAP.
+    # DO NOT add domain-specific types - breaks cross-dataset transfer.
     entity_types:
       - person
       - organization
+      - location
       - city
       - country
-      - state
-      - location
-      - film
-      - movie
-      - album
-      - work of art
-      - landmark
+      - date
       - event
-      - award
-    confidence_threshold: 0.15       # recall-optimised for HotpotQA
+      - work of art
+      - product
+    confidence_threshold: 0.15       # recall-optimised; junk filtered downstream
     batch_size: 16
   rebel:
     model_name: "Babelscape/rebel-large"
@@ -1622,6 +1856,16 @@ Bridge queries cannot be answered by dispatching all sub-queries simultaneously:
 4. Passes the extended hint set to subsequent hops via `HybridRetriever.retrieve(..., entity_hints=...)`, bypassing query-time GLiNER on short, low-context sub-query fragments.
 
 Safety constraints (max 3 iterative hops, max 3 bridge entities per step, retain prior hints on empty extraction) bound the worst-case fan-out.
+
+### 12.11 Bridge-Aware Reranking and Chained-Attribution Decomposition
+
+Two coupled refinements address a failure mode where the answer-bearing chunk of a multi-hop query is *semantically distant from the surface question* and gets evicted before the Verifier sees it.
+
+**Bridge-aware reranking.** The cross-encoder reranker (§12.7) originally scored every fused chunk against one query string — the user's surface question. For a multi-hop plan whose sub-queries differ from that surface form, a second-hop answer chunk (e.g. an author's biography) looks irrelevant to the surface vocabulary and is demoted below the context cap. The fusion step now tags each chunk with the sub-query under which it ranked highest, and the reranker scores `(best_sub_query, chunk)` rather than `(surface_query, chunk)`. Single-hop queries are unaffected — there the best sub-query *is* the surface query.
+
+**Chained-attribution decomposition (Planner Pattern H).** Existing bridge patterns each recognise a *single* pivot ("the X of Y", "the X in which Y…"). Some questions chain two pivots — "a [work] based on [Entity], is [created] by someone [attribute]?" links `Entity → work → agent → attribute`. The Planner detects this with a SpaCy dependency-parse signature (a passive ROOT with an `agent` `by`-phrase whose object is an indefinite pronoun, plus an `acl` attribution clause on the subject noun linking it to a named entity) and emits a three-hop sequence: resolve the work, resolve the agent, then answer the original question with both in context. The recogniser keys only on dependency *relation labels* and a closed inventory of English attribution-clause verbs — never on the work's vocabulary, the entity's name, or the question's phrasing — so a structurally identical question over unseen subject matter decomposes with no new code. The agent hop reuses the participle verbatim from the query ("illustrated", "written") rather than re-inflecting from a lemma, so the codebase carries no list of verbs the system has encountered. A parse-confidence gate (the full relation chain must be present and the anchor must overlap a detected entity) makes the recogniser fail safe: an ambiguous parse falls through to the existing patterns, never to a worse plan.
+
+**Classification–decomposition consistency.** A query classified multi-hop that matches no pattern and resists the connector split previously emitted the unsplit query as its sole sub-query — indistinguishable from a working single-hop plan. It now emits a deliberate two-hop fallback seeded on the detected entities, degrading to single-hop only when no anchor entity exists, and then with a logged warning so the gap is visible.
 
 ---
 

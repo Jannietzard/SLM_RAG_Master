@@ -420,6 +420,11 @@ class AgenticController:
             return candidates[:3]
 
         # ── Pass 2: general proper-noun fallback ──────────────────────────────
+        # Prefer 2-token person-name spans ("Carlo Rovelli") over longer title
+        # fragments ("Seven Brief Lessons on Physics").  Collect all candidates
+        # first, then sort: 2-token names first, longer spans last.
+        two_token: List[str] = []
+        multi_token: List[str] = []
         for chunk in chunks:
             for m in _PROPER_NOUN_RE.finditer(chunk):
                 phrase = m.group(1)
@@ -430,9 +435,11 @@ class AgenticController:
                     and phrase_lower not in seen
                 ):
                     seen.add(phrase_lower)
-                    candidates.append(phrase)
-            if len(candidates) >= 5:
-                break
+                    if len(phrase.split()) == 2:
+                        two_token.append(phrase)
+                    else:
+                        multi_token.append(phrase)
+        candidates = two_token + multi_token
         return candidates[:3]
 
     def _iterative_navigator_node(
@@ -690,6 +697,7 @@ class AgenticController:
                 context=state["context"],
                 entities=state.get("entities", []),
                 hop_sequence=hop_sequence,
+                query_type=plan_dict.get("query_type") if plan_dict else None,
             )
 
             logger.info("[S_V] Iterations: %d", result.iterations)

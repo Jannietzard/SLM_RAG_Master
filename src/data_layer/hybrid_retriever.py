@@ -89,9 +89,37 @@ from enum import Enum
 import numpy as np
 from .entity_extraction import normalize_entity_name
 from .entity_types import GLINER_LABEL_MAP, SPACY_LABEL_MAP
+from .graph_quality import DEFAULT_STOPLIST, canonical_form
 from src.utils import jaccard_similarity
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# BM25 tokenisation
+# ---------------------------------------------------------------------------
+# Bug fix (P-10, 2026-05-11): BM25 previously used bare `text.lower().split()`,
+# which leaves punctuation glued to tokens — so a query token like "childers?"
+# never matches the corpus token "childers", and the single most discriminative
+# query term (the subject's surname) is silently lost. We now tokenise on word
+# characters only and drop a small set of English function words so common words
+# ("which", "was", "from", "the", ...) don't dominate the BM25 score over the
+# proper-noun content terms.
+_BM25_TOKEN_RE = re.compile(r"[a-z0-9]+(?:[''][a-z]+)?")
+_BM25_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "been", "by", "for", "from",
+    "had", "has", "have", "he", "her", "his", "in", "into", "is", "it", "its",
+    "of", "on", "or", "she", "that", "the", "their", "this", "to", "was", "were",
+    "what", "when", "where", "which", "who", "whom", "whose", "will", "with",
+    "would", "they", "them", "you", "your", "we", "our", "i",
+})
+
+
+def _bm25_tokenize(text: str) -> List[str]:
+    """Lowercase, strip punctuation, drop English function words. Used for BOTH
+    the BM25 corpus and the query so the token vocabularies line up."""
+    toks = _BM25_TOKEN_RE.findall((text or "").lower())
+    return [t for t in toks if t not in _BM25_STOPWORDS]
+
 
 # ---------------------------------------------------------------------------
 # Entity-name normalisation
@@ -517,6 +545,72 @@ class ImprovedQueryEntityExtractor:
         3. Regex (last-resort fallback)
     """
 
+    # ── Junk-entity filter (Bug 2) ────────────────────────────────────────
+    # GLiNER over-extracts on question text and produces non-entities like
+    # "what year", "third year", "this person" that pollute the graph
+    # lookup and Verifier entity-path validation.  Combined with the
+    # ingestion-time DEFAULT_STOPLIST so that query-side filtering and
+    # graph-side cleanup agree on what counts as an entity.
+    _QUERY_JUNK_REGEXES: Tuple[re.Pattern, ...] = (
+        re.compile(r"^(what|which|who|whose|whom|how|where|when|why)\b", re.IGNORECASE),
+        re.compile(r"\b(year|years|month|months|day|days|date|dates|time|times)\b\s*$", re.IGNORECASE),
+        re.compile(r"^(first|second|third|fourth|fifth|last|next|previous)\s+(year|month|day|time|one|kind|sort|type)$", re.IGNORECASE),
+        re.compile(r"^(this|that|these|those|some|any|many|few|several)\s+\w+$", re.IGNORECASE),
+        re.compile(r"^(how\s+many|how\s+much)\b", re.IGNORECASE),
+        re.compile(r"^(is|was|were|are|do|does|did|has|have|had|can|could|should|would|may|might|will)\b", re.IGNORECASE),
+    )
+    # Single-token junk that survives canonical_form but is not stoplisted
+    # (mostly question stems and generic determiners).
+    _QUERY_JUNK_TOKENS: frozenset = frozenset({
+        "year", "years", "month", "months", "day", "days", "date", "dates",
+        "time", "times", "person", "people", "thing", "things", "place", "places",
+        "name", "names", "kind", "kinds", "sort", "sorts", "type", "types",
+        "one", "ones", "way", "ways", "case", "cases",
+        "what", "which", "who", "whom", "whose", "when", "where", "why", "how",
+        "the", "a", "an",
+    })
+
+    @classmethod
+    def _is_junk_entity(cls, text: str) -> bool:
+        """Return True if `text` is a question phrase or stoplisted token.
+
+        Combines three checks (Bug 2):
+        1. Length / canonical_form normalisation (drops empty + single chars).
+        2. canonical_form ∈ DEFAULT_STOPLIST (pronouns, demonyms — shared
+           with ingestion-time graph cleanup, so query side and graph side
+           agree).
+        3. canonical_form is a generic question stem (e.g. "what year").
+        """
+        if not text or len(text.strip()) < 2:
+            return True
+        canon = canonical_form(text)
+        if not canon or len(canon) < 2:
+            return True
+        if canon in DEFAULT_STOPLIST:
+            return True
+        if canon in cls._QUERY_JUNK_TOKENS:
+            return True
+        for rx in cls._QUERY_JUNK_REGEXES:
+            if rx.search(canon):
+                return True
+        return False
+
+    @classmethod
+    def _filter_entities(cls, entities: List[str]) -> List[str]:
+        """De-duplicate and drop junk entities while preserving input order."""
+        seen: set = set()
+        out: List[str] = []
+        for e in entities:
+            if cls._is_junk_entity(e):
+                logger.debug("Dropping junk query entity: %r", e)
+                continue
+            key = e.lower().strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(e)
+        return out
+
     def __init__(
         self,
         gliner_model: Optional[Any] = None,
@@ -589,7 +683,8 @@ class ImprovedQueryEntityExtractor:
                     self.entity_types,
                     threshold=threshold,
                 )
-                return [_normalize_query_entity(ent["text"], ent["label"]) for ent in entities]
+                raw = [_normalize_query_entity(ent["text"], ent["label"]) for ent in entities]
+                return self._filter_entities(raw)
             except (RuntimeError, ValueError) as e:
                 logger.warning("GLiNER query extraction failed: %s", e)
 
@@ -598,14 +693,14 @@ class ImprovedQueryEntityExtractor:
             logger.warning(
                 "FALLBACK ACTIVE: GLiNER not available -> SpaCy extraction for query entities."
             )
-            return self._spacy_extract(query)
+            return self._filter_entities(self._spacy_extract(query))
 
         # Method 3: Regex (last resort — neither GLiNER nor SpaCy available)
         logger.warning(
             "FALLBACK ACTIVE: Neither GLiNER nor SpaCy available -> regex extraction."
             " Graph retrieval will be severely limited!"
         )
-        return self._fallback_extract(query)
+        return self._filter_entities(self._fallback_extract(query))
 
     # SpaCy label → canonical type; GPE→GPE matches entity_extraction.py ingestion path
     # so that entity IDs are consistent across query-time and ingestion-time extraction.
@@ -855,7 +950,7 @@ class HybridRetriever:
             if not hasattr(self, "_keyword_df_cache"):
                 self._keyword_df_cache = vector_store.table.to_pandas()
             df = self._keyword_df_cache
-            corpus = [str(t).lower().split() for t in df["text"].tolist()]
+            corpus = [_bm25_tokenize(str(t)) for t in df["text"].tolist()]
             self._bm25_corpus_rows = df.to_dict("records")
             self._bm25_index = BM25Okapi(corpus)
             logger.info("BM25 index built: %d chunks", len(corpus))
@@ -877,7 +972,9 @@ class HybridRetriever:
         if not self._bm25_index:
             return []
 
-        tokens = query.lower().split()
+        tokens = _bm25_tokenize(query)
+        if not tokens:
+            return []
         raw_scores = self._bm25_index.get_scores(tokens)
 
         max_score = float(raw_scores.max()) if raw_scores.size else 0.0

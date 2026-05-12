@@ -90,6 +90,81 @@ class TestSubQueryQuality:
         assert plan.sub_queries == [query]
 
 
+# ── Pattern H: chained-attribution bridge (§12.31) ─────────────────────────────
+
+@pytest.mark.skipif(not SPACY_AVAILABLE, reason="Pattern H requires SpaCy dependency parse")
+class TestAttributionChain:
+    """
+    "[work] based on/featuring [Entity], is [created] by someone [attribute]?"
+    must decompose into 3 hops: resolve the work → resolve the agent → answer.
+    Grammar-driven (acl + agent dep labels) — no verb lists, no seen-examples.
+    """
+
+    _CHAINED_Q = (
+        "A Japanese manga series based on a 16 year old high school student "
+        "Ichitaka Seto, is written and illustrated by someone born in what year?"
+    )
+
+    def test_chained_attribution_produces_three_hops(self, planner):
+        plan = planner.plan(self._CHAINED_Q)
+        assert plan.query_type == QueryType.MULTI_HOP
+        assert len(plan.hop_sequence) == 3, \
+            f"chained-attribution bridge must yield 3 hops, got {len(plan.hop_sequence)}: {plan.sub_queries}"
+
+    def test_chained_attribution_hop_dependencies_chained(self, planner):
+        plan = planner.plan(self._CHAINED_Q)
+        h0, h1, h2 = plan.hop_sequence
+        assert h0.depends_on == [] and h0.is_bridge
+        assert h1.depends_on == [0] and h1.is_bridge
+        assert h2.depends_on == [1] and not h2.is_bridge
+
+    def test_chained_attribution_anchor_is_the_named_entity(self, planner):
+        plan = planner.plan(self._CHAINED_Q)
+        # hop0 must mention the proper-noun anchor, not the whole noun phrase
+        assert "Ichitaka Seto" in plan.hop_sequence[0].sub_query
+        # and it must be the *short* form (no "16 year old high school student" baggage)
+        assert "16 year old" not in plan.hop_sequence[0].sub_query
+
+    def test_chained_attribution_final_hop_is_original_query(self, planner):
+        plan = planner.plan(self._CHAINED_Q)
+        assert plan.hop_sequence[-1].sub_query == self._CHAINED_Q
+
+    def test_named_agent_is_not_a_chain(self, planner):
+        """Passive with a *named* agent (Pattern F territory) must NOT become a 3-hop chain."""
+        plan = planner.plan(
+            "Seven Brief Lessons on Physics was written by an Italian physicist "
+            "that has worked in France since what year?"
+        )
+        # Whatever pattern handles it, it must not be the 3-hop attribution chain
+        # (which would emit "What ... is based on ...?" as hop0).
+        assert not (len(plan.hop_sequence) == 3
+                    and plan.hop_sequence[0].sub_query.lower().startswith("what ")
+                    and "based on" in plan.hop_sequence[0].sub_query.lower())
+
+    def test_single_hop_query_is_not_a_chain(self, planner):
+        plan = planner.plan("What is the capital of France?")
+        assert plan.query_type == QueryType.SINGLE_HOP
+        assert len(plan.hop_sequence) == 1
+
+
+# ── Classification–decomposition consistency (§12.31) ──────────────────────────
+
+class TestMultiHopConsistency:
+    """A query classified MULTI_HOP must never silently emit the unsplit query as
+    its sole sub-query — either a pattern fires, or the generic 2-hop fallback does."""
+
+    def test_multihop_never_emits_only_original_query(self, planner):
+        # A multi-hop-shaped query that none of the named patterns specifically
+        # target should still produce ≥2 sub-queries via the generic fallback.
+        plan = planner.plan(
+            "In what country is the headquarters of the company that employs "
+            "the scientist who discovered penicillin?"
+        )
+        if plan.query_type == QueryType.MULTI_HOP:
+            assert len(plan.sub_queries) >= 2, \
+                f"multi-hop must not collapse to single sub-query: {plan.sub_queries}"
+
+
 # ── Entity extraction quality ──────────────────────────────────────────────────
 
 class TestEntityExtraction:

@@ -21,10 +21,16 @@ Flags:
     --no-color        Plain output (for pipe / file capture)
 
 Gold-tracking:
-    When --gold is provided (or auto-loaded from questions.json), the tool
-    checks after EVERY filter step whether the gold answer is still present
-    in any of the remaining chunks. A "GOLD LOST" marker indicates that the
-    preceding step is the culprit.
+    The tool tracks the *true gold supporting paragraphs* by source-document
+    title (HotpotQA `supporting_facts`), NOT by substring-matching the answer
+    string.  After every filter step it reports which gold paragraphs are still
+    present; a "GOLD LOST" marker means the preceding step dropped one.  This
+    avoids false positives where a relative's biography happens to contain the
+    answer string (e.g. "Robert Erskine Childers" appears in his wife's bio,
+    but only his own bio states he was English).
+
+    When `supporting_facts` is unavailable (e.g. --question with no --gold-docs),
+    the tool falls back to the old answer-string heuristic and prints a warning.
 """
 
 import argparse
@@ -34,17 +40,22 @@ import time
 from pathlib import Path
 from textwrap import wrap
 
-# ─── Projekt-Root ins sys.path ──────────────────────────────────────────────
+# ─── Project root into sys.path ─────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# ─── Farben ─────────────────────────────────────────────────────────────────
+# ─── Colors ─────────────────────────────────────────────────────────────────
 USE_COLOR = True
 
 # ─── Gold answer for stage tracking ──────────────────────────────────────────
-# Wird in main() gesetzt und von allen Patch-Funktionen über Closure gelesen.
+# Set in main() and read by all patch functions via closure.
 _GOLD_ANSWER: str = ""
-_HOP_COUNTER: list = [0]   # mutable container für Hop-Zähler in Closures
+# Gold supporting-paragraph titles (HotpotQA supporting_facts) — the authoritative
+# signal for "is the gold evidence still present?". Empty list ⇒ fall back to the
+# answer-string heuristic (and print a warning the first time).
+_GOLD_DOC_TITLES: list = []
+_GOLD_FALLBACK_WARNED: list = [False]
+_HOP_COUNTER: list = [0]   # mutable container for hop counter in closures
 
 def _c(code: str, text: str) -> str:
     return f"{code}{text}\033[0m" if USE_COLOR else text
@@ -59,7 +70,16 @@ def magenta(t): return _c("\033[95m", t)
 def blue(t):    return _c("\033[94m", t)
 
 
-# ─── Gold-answer tracking ────────────────────────────────────────────────────
+# ─── Gold tracking ───────────────────────────────────────────────────────────
+#
+# Two modes:
+#   (A) supporting-facts mode (preferred): we know the gold paragraph titles
+#       from HotpotQA `supporting_facts`. A chunk "is gold" iff its source-doc
+#       title equals one of those titles. This is exact and never fires on a
+#       relative's biography that merely mentions the answer string.
+#   (B) fallback mode: no supporting_facts ⇒ heuristically match the answer
+#       string's content words against chunk text (the old behaviour). Marked
+#       with a one-time warning so the reader knows it's lossy.
 
 def _gold_words(gold: str) -> list:
     """Important words from the gold answer (>=4 chars, no stopword)."""
@@ -67,34 +87,152 @@ def _gold_words(gold: str) -> list:
     return [w for w in gold.lower().split() if len(w) >= 4 and w not in _stops]
 
 
+def _norm_title(t: str) -> str:
+    """Normalise a doc title for comparison: lowercase, strip a leading
+    'hotpotqa_' (or similar dataset_) prefix, collapse whitespace."""
+    t = (t or "").strip().lower()
+    if "_" in t:
+        prefix, _, rest = t.partition("_")
+        # only strip if the prefix looks like a dataset tag (no spaces)
+        if prefix and " " not in prefix and rest:
+            t = rest
+    return " ".join(t.split())
+
+
+_GOLD_TITLES_NORM: set = set()   # populated in main() from supporting_facts
+
+# The Navigator's _rrf_fusion drops the source_doc from chunk dicts (it groups by
+# text), so downstream filter stages only have {"text", "rrf_score", ...}. We
+# therefore build a text→title index from the HybridRetriever's raw results
+# (which DO carry .source_doc) and look the title up by chunk text everywhere
+# else. Keyed by the first ~200 chars of text to tolerate later truncation.
+_TEXT_TO_TITLE: dict = {}
+
+
+def _text_key(text: str) -> str:
+    return (text or "").strip()[:200].lower()
+
+
+def _register_titles(results) -> None:
+    """Record text→source_doc for a batch of RetrievalResult-like objects/dicts."""
+    for r in results:
+        title = _chunk_doc_title(r)
+        txt = (r.get("text", "") if isinstance(r, dict) else getattr(r, "text", "")) or ""
+        if title and txt:
+            _TEXT_TO_TITLE.setdefault(_text_key(txt), title)
+
+
+def _chunk_doc_title(item) -> str:
+    """Best-effort extraction of the source-document title from a chunk —
+    a RetrievalResult-like object, a fused dict, or (via the text→title index)
+    a plain string / a stripped-down dict that only has "text"."""
+    # direct attributes / keys
+    if isinstance(item, dict):
+        direct = (item.get("source_doc")
+                  or item.get("source_file")
+                  or (item.get("metadata", {}) or {}).get("source_file")
+                  or (item.get("metadata", {}) or {}).get("article_title"))
+        if direct:
+            return direct
+        txt = item.get("text", "")
+    elif isinstance(item, str):
+        txt = item
+    else:
+        for attr in ("source_doc", "source_file", "source"):
+            v = getattr(item, attr, None)
+            if v:
+                return v
+        meta = getattr(item, "metadata", None)
+        if isinstance(meta, dict):
+            v = meta.get("source_file") or meta.get("article_title")
+            if v:
+                return v
+        txt = getattr(item, "text", "") or ""
+    # fall back to the text→title index
+    return _TEXT_TO_TITLE.get(_text_key(txt), "")
+
+
+def _is_gold_chunk(item) -> bool:
+    """True if this chunk is one of the gold supporting paragraphs (mode A),
+    or — in fallback mode B — if it contains all content words of the answer."""
+    if _GOLD_TITLES_NORM:
+        return _norm_title(_chunk_doc_title(item)) in _GOLD_TITLES_NORM
+    # fallback mode
+    gold = _GOLD_ANSWER
+    if not gold or gold in ("?", "(unknown)"):
+        return False
+    words = _gold_words(gold)
+    if not words:
+        return False
+    t = (item if isinstance(item, str) else
+         (item.get("text", "") if isinstance(item, dict) else getattr(item, "text", ""))).lower()
+    return all(w in t for w in words)
+
+
+def _gold_marker_inline(item) -> str:
+    """Short inline marker for per-chunk listings, or '' if not gold."""
+    if not _is_gold_chunk(item):
+        return ""
+    if _GOLD_TITLES_NORM:
+        return f"  {green('← GOLD ¶')}"
+    return f"  {green('← GOLD (answer-string)')}"
+
+
 def _gold_check_texts(texts, stage: str, gold: str = "") -> None:
     """
-    Print whether the gold answer is still contained in at least one of the
-    provided texts.
-    texts: list of str OR list of dicts with a "text" key.
+    Report which gold supporting paragraphs are still present after `stage`.
+    In supporting-facts mode this lists hit/missing titles; in fallback mode it
+    behaves like the old answer-string check (with a one-time warning).
+    `texts`: list of str OR dicts with a "text" key OR result objects.
     """
-    if not gold:
-        gold = _GOLD_ANSWER
-    if not gold or gold in ("?", "(unknown)"):
+    bar = "  " + "·" * 60
+
+    if _GOLD_TITLES_NORM:
+        present_titles = {_norm_title(_chunk_doc_title(it)) for it in texts}
+        present_titles.discard("")
+        hit  = sorted(t for t in _GOLD_TITLES_NORM if t in present_titles)
+        miss = sorted(t for t in _GOLD_TITLES_NORM if t not in present_titles)
+        print(f"{bar}")
+        if not miss:
+            print(f"  {green(bold('OK GOLD'))}  all {len(hit)} gold paragraph(s) present  "
+                  f"[{stage}]  {dim('¶: ' + ', '.join(hit))}")
+        elif hit:
+            print(f"  {yellow(bold('~ GOLD PARTIAL'))}  {len(hit)}/{len(_GOLD_TITLES_NORM)} present  "
+                  f"[{stage}]")
+            print(f"      {green('present:')} {', '.join(hit)}")
+            print(f"      {red('MISSING:')} {', '.join(miss)}")
+        else:
+            print(f"  {red(bold('XX GOLD LOST'))}  none of the {len(_GOLD_TITLES_NORM)} gold "
+                  f"paragraph(s) present  [{stage}]")
+            print(f"      {red('MISSING:')} {', '.join(miss)}")
+        print(f"{bar}")
         return
-    words = _gold_words(gold)
+
+    # ── fallback mode (no supporting_facts) ──────────────────────────────────
+    if not _GOLD_FALLBACK_WARNED[0]:
+        _msg = ("* gold-tracking fallback: no supporting_facts — matching answer-string "
+                "content words against chunk text (lossy; may mark relatives' bios).")
+        print(f"  {yellow(_msg)}")
+        _GOLD_FALLBACK_WARNED[0] = True
+    g = gold or _GOLD_ANSWER
+    if not g or g in ("?", "(unknown)"):
+        return
+    words = _gold_words(g)
     if not words:
         return
     hits = []
     for i, item in enumerate(texts):
-        t = (item if isinstance(item, str) else item.get("text", "")).lower()
+        t = (item if isinstance(item, str) else
+             (item.get("text", "") if isinstance(item, dict) else getattr(item, "text", ""))).lower()
         if all(w in t for w in words):
             hits.append(i + 1)
-    bar = "  " + "·" * 60
+    print(f"{bar}")
     if hits:
         extra = f" (+ {len(hits)-1} more)" if len(hits) > 1 else ""
-        print(f"{bar}")
-        print(f"  {green(bold('OK GOLD'))}  '{gold}'  ->  chunk #{hits[0]}{extra}  [{stage}]")
-        print(f"{bar}")
+        print(f"  {green(bold('OK GOLD'))}  '{g}'  ~ chunk #{hits[0]}{extra}  [{stage}]")
     else:
-        print(f"{bar}")
-        print(f"  {red(bold('XX GOLD LOST'))}  '{gold}'  no longer in remaining chunks  [{stage}]")
-        print(f"{bar}")
+        print(f"  {red(bold('XX GOLD LOST'))}  '{g}'  no chunk contains all answer words  [{stage}]")
+    print(f"{bar}")
 
 
 # ─── Output helpers ──────────────────────────────────────────────────────────
@@ -166,16 +304,16 @@ def _patch(obj, method_name: str, wrapper_factory):
 
 
 # =============================================================================
-# FRAGE 1: sys.settrace — alle Funktionsaufrufe in src/ tracken
+# PART 1: sys.settrace — track every function call in src/
 # =============================================================================
 
-_call_log: list = []          # (datei, funktion)
+_call_log: list = []          # (file, function)
 _seen_files: set = set()      # unique src/ files
 
 def _make_tracer(src_root: Path):
     """
-    Gibt eine trace-Funktion zurück, die jeden Funktionsaufruf innerhalb
-    von src/ mitschreibt. Über --trace-calls aktivierbar.
+    Return a trace function that records every function call inside src/.
+    Enabled via --trace-calls.
     """
     src_str = str(src_root / "src")
 
@@ -193,7 +331,7 @@ def _make_tracer(src_root: Path):
     return _tracer
 
 def print_call_trace() -> None:
-    section("FUNCTION CALL TRACE (alle src/-Aufrufe)")
+    section("FUNCTION CALL TRACE (all src/ calls)")
     subsection(f"Unique files ({len(_seen_files)})")
     for f in sorted(_seen_files):
         print(f"    {blue('📄')} {f}")
@@ -292,6 +430,9 @@ def patch_retriever(retriever) -> None:
 
         # ── execute retrieve() ───────────────────────────────────────────────
         results, metrics = orig_retrieve(query, top_k, entity_hints=entity_hints)
+        # Record text→source_doc so downstream stages (which drop source_doc)
+        # can still resolve the gold paragraph by chunk text.
+        _register_titles(results)
 
         # ── read GLiNER entities from metrics (no double call) ───────────────
         print(f"    {bold('GLiNER query entities:')}")
@@ -354,27 +495,24 @@ def patch_navigator(navigator) -> None:
             fused = original(results, k)
             k_val = navigator.config.rrf_k if k is None else k
             subsection(f"RRF Fusion  k={k_val}  "
-                       f"({len(results)} Roh-Einträge → {len(fused)} einzigartige Chunks)")
+                       f"({len(results)} raw entries → {len(fused)} unique chunks)")
             for i, r in enumerate(fused[:8]):
                 score = r.get("rrf_score", 0)
                 src   = r.get("source_count", "?")
                 qc    = r.get("query_count", "?")
                 txt   = r["text"][:120].replace("\n", " ")
-                # Mark chunks that contain the gold answer
-                gold_marker = ""
-                if _GOLD_ANSWER and _gold_words(_GOLD_ANSWER):
-                    words = _gold_words(_GOLD_ANSWER)
-                    if all(w in txt.lower() for w in words):
-                        gold_marker = f"  {green('← GOLD')}"
+                gold_marker = _gold_marker_inline(r)
+                src_doc = r.get("source_doc") or _chunk_doc_title(r) or "?"
                 print(f"    {bold(f'#{i+1}')}"
                       f"  {green(f'rrf={score:.4f}')}"
                       f"  {dim(f'src_count={src} query_count={qc}')}"
+                      f"  {dim(f'src={src_doc}')}"
                       f"{gold_marker}")
                 for line in wrap(txt, 86):
                     print(f"      {dim(line)}")
             if len(fused) > 8:
-                print(f"    {dim(f'… {len(fused)-8} weitere Chunks')}")
-            _gold_check_texts(fused, "nach RRF-Fusion")
+                print(f"    {dim(f'… {len(fused)-8} more chunks')}")
+            _gold_check_texts(fused, "after RRF fusion")
             return fused
         return _rrf
 
@@ -472,9 +610,9 @@ def patch_navigator(navigator) -> None:
 
     # ── _entity_mention_filter ───────────────────────────────────────────────
     def _wrap_entity_mention(original):
-        def _filt(results, entity_names):
+        def _filt(results, entity_names, *args, **kwargs):
             before = len(results)
-            filtered = original(results, entity_names)
+            filtered = original(results, entity_names, *args, **kwargs)
             after = len(filtered)
             removed = before - after
 
@@ -627,11 +765,7 @@ def patch_verifier(verifier) -> None:
             print(f"    {dim('(order unchanged)')}")
         for i, c in enumerate(reordered):
             orig_pos = context.index(c) + 1 if c in context else "?"
-            gold_marker = ""
-            if _GOLD_ANSWER:
-                words = _gold_words(_GOLD_ANSWER)
-                if words and all(w in c.lower() for w in words):
-                    gold_marker = f"  {green('<- GOLD ok')}"
+            gold_marker = _gold_marker_inline(c)
             pos_change = f"  {dim(f'(was #{orig_pos})')}" if orig_pos != i + 1 else ""
             print(f"    {bold(f'#{i+1}')}{pos_change}{gold_marker}")
             preview = c[:120].replace("\n", " ")
@@ -684,7 +818,7 @@ def patch_verifier(verifier) -> None:
     # ── generate_and_verify ───────────────────────────────────────────────────
     orig_gen = verifier.generate_and_verify
 
-    def _wrap_generate(query, context, entities=None, hop_sequence=None):
+    def _wrap_generate(query, context, entities=None, hop_sequence=None, query_type=None):
         section("S_V — VERIFIER")
         field("Query",       query)
         field("Chunks in",   len(context))
@@ -727,7 +861,7 @@ def patch_verifier(verifier) -> None:
         for i, c in enumerate(context):
             chunk_block(i, c)
 
-        result = orig_gen(query, context, entities, hop_sequence)
+        result = orig_gen(query, context, entities, hop_sequence, query_type=query_type)
 
         subsection("VERIFIER RESULT")
         field("Answer",       result.answer)
@@ -856,7 +990,7 @@ def build_pipeline(cfg: dict):
 # =============================================================================
 
 def main():
-    global USE_COLOR, _GOLD_ANSWER
+    global USE_COLOR, _GOLD_ANSWER, _GOLD_TITLES_NORM
 
     parser = argparse.ArgumentParser(
         description="Full pipeline trace with output from every function"
@@ -865,6 +999,9 @@ def main():
     parser.add_argument("--question",    type=str,  default=None)
     parser.add_argument("--gold",        type=str,  default=None,
                         help="Gold answer for stage tracking (otherwise read from questions.json)")
+    parser.add_argument("--gold-docs",   type=str,  default=None,
+                        help="Comma-separated gold paragraph titles for --question mode "
+                             "(otherwise read from questions.json supporting_facts)")
     parser.add_argument("--skip-llm",    action="store_true")
     parser.add_argument("--trace-calls", action="store_true",
                         help="sys.settrace: show every src/ function call")
@@ -875,18 +1012,34 @@ def main():
         USE_COLOR = False
 
     # ── Load the question ────────────────────────────────────────────────────
+    gold_doc_titles: list = []
     if args.question:
         q_text = args.question
         gold   = args.gold or "(unknown)"
         q_type = "custom"
+        if args.gold_docs:
+            gold_doc_titles = [t.strip() for t in args.gold_docs.split(",") if t.strip()]
     else:
         q = load_question(args.idx)
         q_text = q["question"]
         gold   = args.gold or q.get("answer", "?")
         q_type = q.get("question_type", "?")
+        # HotpotQA supporting_facts: [[title, sent_idx], ...] — collect unique titles
+        for sf in q.get("supporting_facts", []):
+            if isinstance(sf, (list, tuple)) and sf:
+                gold_doc_titles.append(str(sf[0]))
+            elif isinstance(sf, str):
+                gold_doc_titles.append(sf)
+        if args.gold_docs:  # explicit override always wins
+            gold_doc_titles = [t.strip() for t in args.gold_docs.split(",") if t.strip()]
 
-    # Set the gold answer globally (all patch hooks read it from here)
+    # Set the gold answer + gold paragraph titles globally (patch hooks read these)
     _GOLD_ANSWER = gold
+    # de-dup while preserving order
+    seen = set()
+    _GOLD_DOC_TITLES[:] = [t for t in gold_doc_titles if not (t in seen or seen.add(t))]
+    _GOLD_TITLES_NORM = {_norm_title(t) for t in _GOLD_DOC_TITLES}
+    _GOLD_TITLES_NORM.discard("")
 
     # ── Load config ──────────────────────────────────────────────────────────
     import yaml
@@ -900,22 +1053,26 @@ def main():
     field("Question",     q_text)
     field("Gold answer",  gold)
     field("Type",         q_type)
+    if _GOLD_DOC_TITLES:
+        field("Gold paragraphs", ", ".join(_GOLD_DOC_TITLES) + "  (tracked by source-doc title)")
+    else:
+        print(f"  {yellow('* no supporting_facts — gold-tracking will use the lossy answer-string heuristic')}")
     if args.skip_llm:
         print(f"\n  {yellow('* --skip-llm: Verifier will NOT be executed')}")
     if args.trace_calls:
         print(f"\n  {blue('* --trace-calls: every src/ function call will be logged')}")
 
-    # ── sys.settrace aktivieren ───────────────────────────────────────────────
+    # ── Enable sys.settrace ───────────────────────────────────────────────────
     if args.trace_calls:
         sys.settrace(_make_tracer(PROJECT_ROOT))
 
-    # ── Pipeline bauen ────────────────────────────────────────────────────────
-    print(f"\n{dim('Lade Pipeline...')} ", end="", flush=True)
+    # ── Build pipeline ────────────────────────────────────────────────────────
+    print(f"\n{dim('Loading pipeline...')} ", end="", flush=True)
     t0 = time.time()
     controller, planner, verifier, store, retriever = build_pipeline(cfg)
     print(f"{green('OK')}  {dim(f'({(time.time()-t0)*1000:.0f} ms)')}")
 
-    # ── Hooks einsetzen ───────────────────────────────────────────────────────
+    # ── Install hooks ─────────────────────────────────────────────────────────
     patch_planner(planner)
     patch_retriever(retriever)
     patch_navigator(controller.navigator)
@@ -924,21 +1081,39 @@ def main():
     if not args.skip_llm:
         patch_verifier(verifier)
     else:
-        def _skip_verifier(query, context, entities=None, hop_sequence=None):
+        def _skip_verifier(query, context, entities=None, hop_sequence=None, query_type=None):
             from src.logic_layer import VerificationResult
-            section("S_V — VERIFIER  (übersprungen via --skip-llm)")
-            field("Kontext-Chunks", len(context))
+            section("S_V — VERIFIER  (skipped via --skip-llm)")
+            field("Context chunks", len(context))
+            if _GOLD_TITLES_NORM:
+                # Navigator drops source metadata before S_V (context is plain
+                # strings) — see TECHNICAL_ARCHITECTURE.md §4.3.3. So at this stage
+                # we can only do answer-string matching; the authoritative
+                # paragraph-level tracking already happened at the Navigator output.
+                print(f"    {dim('(verifier context is text-only — paragraph-level gold tracking '
+                              'happened at the Navigator output above; answer-string check below)')}")
             if context:
                 for i, c in enumerate(context):
-                    gold_marker = ""
-                    if _GOLD_ANSWER:
-                        words = _gold_words(_GOLD_ANSWER)
-                        if words and all(w in c.lower() for w in words):
-                            gold_marker = f"  {green('← GOLD ✓')}"
-                    chunk_block(i, c)
-                    if gold_marker:
-                        print("    " + green("  <- GOLD ANSWER '" + _GOLD_ANSWER + "' IN THIS CHUNK"))
-                _gold_check_texts(context, "Verifier input (skip-llm)")
+                    txt = c if isinstance(c, str) else getattr(c, "text", str(c))
+                    words = _gold_words(_GOLD_ANSWER) if _GOLD_ANSWER else []
+                    has_ans = bool(words) and all(w in txt.lower() for w in words)
+                    chunk_block(i, txt)
+                    if has_ans:
+                        print("    " + green(f"  <- answer string '{_GOLD_ANSWER}' appears in this chunk"))
+                # answer-string fallback report (titles unavailable here by design)
+                bar = "  " + "·" * 60
+                any_ans = any(
+                    _GOLD_ANSWER and _gold_words(_GOLD_ANSWER)
+                    and all(w in (c if isinstance(c, str) else getattr(c, "text", "")).lower()
+                            for w in _gold_words(_GOLD_ANSWER))
+                    for c in context
+                )
+                print(f"{bar}")
+                if any_ans:
+                    print(f"  {green(bold('OK'))}  answer string present in S_V context  [Verifier input (skip-llm)]")
+                else:
+                    print(f"  {red(bold('XX'))}  answer string NOT in S_V context  [Verifier input (skip-llm)]")
+                print(f"{bar}")
             else:
                 print(f"    {red('* NO CONTEXT — Navigator returned 0 chunks!')}")
                 print(f"    {yellow('  -> Possible causes: retrieval error, entity-mention filter too aggressive')}")

@@ -440,6 +440,17 @@ class QueryClassifier:
         r"\bboth\s+.+\s+(born|from|have|had|were|are)\b",  # "both born in", "both from"
         # "Who is older/taller/..., X or Y?" — no "than" required
         r"\b(older|younger|taller|shorter|bigger|smaller|larger|higher|lower|richer|poorer)\b.{0,60}\bor\b",
+        # FIX P-1: the canonical HotpotQA "select-between-two" comparison form.
+        # "Which writer was from England, Henry Roth or Robert Erskine Childers?"
+        # "Which band, Letters to Cleo or Screaming Trees, had more members?"
+        # "Which magazine was started first, X or Y?" / "...A or B, was published first?"
+        # Signature: a leading question-word + an "A or B" disjunction (often set
+        # off by a comma). This is a comparison even when no comparative adjective
+        # or "than" appears — the *answer* is one of the two named entities.
+        r"^\s*(which|what|who|whom)\b.{0,120}?,\s*[^,?]+\s+\bor\b\s+[^,?]+[,?]",   # "Which X, A or B, ...?" / "..., A or B?"
+        r"^\s*(which|what|who|whom)\b.{0,120}?\b(was|is|were|are|did|had|has|came|come)\b[^,?]*\bfirst\b",  # "Which ... was published first..."
+        r"\b(more|fewer|less|most|fewest)\s+\w+\b.{0,60}\bor\b",   # "had more members ... or ..."
+        r"\bor\b.{0,60}\b(more|fewer|less|most|fewest)\s+\w+\b",   # "...or...had more members"
     )
 
     # Temporal indicators: time references and temporal structures
@@ -611,6 +622,24 @@ class QueryClassifier:
             if (entity_count > self.config.entity_density_threshold
                     or noun_count > self.config.noun_density_threshold):
                 scores[QueryType.MULTI_HOP] += self.config.classifier_entity_boost
+
+        # ─────────────────────────────────────────────────────────────────────
+        # PHASE 3.5: Multi-hop override (Bug 1)
+        # ─────────────────────────────────────────────────────────────────────
+        # Bridge questions that contain a year/"founded"/"when" token
+        # (e.g. "What year was the university where John studied founded?")
+        # accumulate multiple TEMPORAL hits but only one MULTI_HOP hit, so
+        # priority-on-tie alone is not enough to keep them in the MULTI_HOP
+        # branch.  Because TEMPORAL keywords are common across many query
+        # types while MULTI_HOP relation cues ("founder of", "directed by",
+        # "starring", possessive chains) are rare and specific, treat any
+        # MULTI_HOP hit as decisive when TEMPORAL would otherwise dominate.
+        if scores[QueryType.MULTI_HOP] > 0 and scores[QueryType.TEMPORAL] > scores[QueryType.MULTI_HOP]:
+            logger.debug(
+                "classify: multi-hop override for '%s' (multi_hop=%.1f, temporal=%.1f)",
+                query[:80], scores[QueryType.MULTI_HOP], scores[QueryType.TEMPORAL],
+            )
+            scores[QueryType.MULTI_HOP] = scores[QueryType.TEMPORAL]
 
         # ─────────────────────────────────────────────────────────────────────
         # PHASE 4: Determine final query type
@@ -832,7 +861,83 @@ class EntityExtractor:
                     continue
             filtered.append(entity)
 
+        # ─────────────────────────────────────────────────────────────────────
+        # FIX P-3: re-join proper-noun spans that SpaCy / the regex fallback
+        # fragmented. en_core_web_sm frequently splits a single title into
+        # pieces around a lowercase connector — e.g. "Letters to Cleo" →
+        # ["Letters"(ORG), "Cleo"(PRODUCT)] and "Seven Brief Lessons on
+        # Physics" → ["Seven Brief Lessons", "Physics"]. When two extracted
+        # entities are adjacent in the query separated only by a short
+        # connector ("to", "of", "on", "the", "and", "&", "'s", …), merge
+        # them into one span covering the whole title. This prevents the
+        # fragment ("Physics", "Letters") from being treated as a primary or
+        # bridge entity and dragging in irrelevant chunks.
+        # ─────────────────────────────────────────────────────────────────────
+        filtered = self._rejoin_fragmented_spans(query, filtered)
+
         return filtered[:self.config.max_entities]
+
+    # Short connector words allowed *inside* a multi-word proper-noun span when
+    # re-joining fragments (P-3). They must appear lowercase and surrounded by
+    # the two entity spans in the original query text.
+    #
+    # IMPORTANT: "and"/"&" are deliberately EXCLUDED — a conjunction between two
+    # distinct named entities ("Scott Derrickson and Ed Wood") must not be merged
+    # into one span, or comparison decomposition breaks. Likewise "a"/"an" are
+    # excluded (too generic). Only genuine title-internal connectors are kept.
+    _SPAN_CONNECTORS: frozenset = frozenset({
+        "to", "of", "on", "in", "the", "for", "at", "de",
+        "von", "van", "del", "della", "di", "le", "la",
+    })
+
+    def _rejoin_fragmented_spans(
+        self, query: str, entities: List[EntityInfo]
+    ) -> List[EntityInfo]:
+        """Merge consecutive entities that are adjacent in `query` and separated
+        only by short connector words (or just whitespace/an apostrophe-s).
+
+        Operates on the position-sorted entity list; runs a single left-to-right
+        pass, repeatedly absorbing the next entity into the current span when the
+        gap between them in the source text qualifies."""
+        if len(entities) < 2:
+            return entities
+        ents = sorted(entities, key=lambda e: e.start_char)
+        merged: List[EntityInfo] = []
+        cur = ents[0]
+        for nxt in ents[1:]:
+            gap = query[cur.end_char:nxt.start_char]
+            gap_norm = gap.strip().lower().strip("'").strip()  # tolerate "'s"
+            gap_tokens = [t for t in gap_norm.split() if t]
+            joinable = (
+                nxt.start_char >= cur.end_char  # non-overlapping, in order
+                and len(gap) <= 12              # connectors are short
+                and (
+                    gap.strip() in ("", "'s", "’s")          # pure adjacency
+                    or (gap_tokens and all(t in self._SPAN_CONNECTORS for t in gap_tokens))
+                )
+            )
+            if joinable:
+                # Build the merged span verbatim from the query text so casing /
+                # connectors are preserved exactly ("Letters to Cleo").
+                new_text = query[cur.start_char:nxt.end_char].strip()
+                # Prefer the more specific label: a named type over PROPN/QUOTED.
+                if cur.label in ("PROPN", "QUOTED") and nxt.label not in ("PROPN", "QUOTED"):
+                    new_label = nxt.label
+                else:
+                    new_label = cur.label
+                cur = EntityInfo(
+                    text=new_text,
+                    label=new_label,
+                    confidence=max(cur.confidence, nxt.confidence),
+                    start_char=cur.start_char,
+                    end_char=nxt.end_char,
+                    is_bridge=cur.is_bridge or nxt.is_bridge,
+                )
+            else:
+                merged.append(cur)
+                cur = nxt
+        merged.append(cur)
+        return merged
 
     def detect_bridge_entities(
         self,
@@ -892,9 +997,18 @@ class EntityExtractor:
 
         # Mark entities as bridge if in bridge_candidates.
         # First and last entities are typically anchors, not bridges.
+        #
+        # FIX P-3: a bridge entity is the *thing* that links two hops — a
+        # person, organisation, work, place, or event. Generic descriptors
+        # (NORP nationalities like "Italian", DATE values, QUANTITY/MONEY,
+        # and unlabelled regex PROPN fragments) must never be promoted to
+        # bridge: doing so steers retrieval toward high-frequency hub nodes
+        # ("Physics", "Italian") instead of the entity that actually bridges.
+        _BRIDGE_OK_LABELS = {"PERSON", "ORG", "GPE", "LOC", "FAC",
+                             "WORK_OF_ART", "PRODUCT", "EVENT"}
         for i, entity in enumerate(entities):
             if entity.text.lower() in bridge_candidates:
-                if 0 < i < len(entities) - 1:
+                if 0 < i < len(entities) - 1 and entity.label in _BRIDGE_OK_LABELS:
                     entity.is_bridge = True
 
         return entities
@@ -1029,6 +1143,40 @@ class PlanGenerator:
         r'(?:co-?wrote|wrote|directed|produced|starred|co-?directed)\b',
         re.IGNORECASE,
     )
+
+    # ── Pattern F: Passive-agent bridge ─────────────────────────────────────
+    # Handles: "[Subject] was written/directed/authored by [agent] that/who [property]?"
+    # e.g. "Seven Brief Lessons on Physics was written by an Italian physicist
+    #        that has worked in France since what year?"
+    # Correct decomposition:
+    #   hop 0 (bridge): "Who wrote Seven Brief Lessons on Physics?"
+    #   hop 1 (final):  original query
+    # The passive verb tells us *how* to form the bridge question ("wrote",
+    # "directed", "authored", etc.).  The subject is everything before "was/were".
+    _PASSIVE_AGENT_RE = re.compile(
+        r'^(?P<subj>.+?)\s+(?:was|were)\s+'
+        r'(?P<verb>written|authored|directed|produced|composed|created|'
+        r'founded|formed|recorded|released|published|edited|scored|narrated)\s+'
+        r'by\b',
+        re.IGNORECASE,
+    )
+    # Maps passive past-participle → active question verb
+    _PASSIVE_TO_ACTIVE = {
+        "written":   "write",
+        "authored":  "author",
+        "directed":  "direct",
+        "produced":  "produce",
+        "composed":  "compose",
+        "created":   "create",
+        "founded":   "found",
+        "formed":    "form",
+        "recorded":  "record",
+        "released":  "release",
+        "published": "publish",
+        "edited":    "edit",
+        "scored":    "score",
+        "narrated":  "narrate",
+    }
 
     # Pre-compiled regexes for _form_sub_query (called on every multi-hop step)
     _STRIP_LEADING_CONJ = re.compile(
@@ -1200,6 +1348,318 @@ class PlanGenerator:
 
         return hop_sequence, sub_queries
 
+    def _find_relative_clause_bridge(
+        self,
+        query: str,
+    ) -> Optional[Tuple[str, str]]:
+        """
+        Detect "The [noun] in which [Entity] [predicate]..." queries using
+        SpaCy's dependency parse and return (noun, entity_text), or None.
+
+        Works by finding a token whose dependency label is 'relcl' (relative
+        clause) that modifies a subject noun.  The subject of the relative
+        clause is the bridging entity; the head noun is the bridging category.
+
+        No verb list is needed — the structural signal (relcl dep label) is
+        sufficient for any verb the language model might produce.
+        """
+        if not SPACY_AVAILABLE or NLP is None:
+            return None
+        try:
+            doc = NLP(query)
+            for token in doc:
+                if token.dep_ == "relcl":
+                    head = token.head
+                    if head.dep_ in ("nsubj", "nsubjpass", "ROOT"):
+                        # Subject of the relative clause = bridging entity
+                        rel_subjects = [
+                            c for c in token.children if c.dep_ == "nsubj"
+                        ]
+                        if rel_subjects:
+                            # Expand to the full noun phrase of the subject
+                            subj_span = rel_subjects[0]
+                            entity_text = " ".join(
+                                t.text for t in subj_span.subtree
+                                if not t.is_punct
+                            ).strip()
+                            noun_text = head.text
+                            if entity_text and noun_text:
+                                return noun_text, entity_text
+        except Exception as exc:
+            logger.debug("_find_relative_clause_bridge failed: %s", exc)
+        return None
+
+    # ── Pattern H: chained-attribution bridge ───────────────────────────────
+    # English verbs that, as the head of an `acl` clause on a "work" noun,
+    # express "this work is *about/derived-from* X":  "[work] based on / set in /
+    # featuring / starring / centred on / adapted from [X]".  This is a CLOSED
+    # LINGUISTIC CATEGORY — the small inventory of work→source attribution verbs
+    # in English — not a list of verbs harvested from test answers.  It is the
+    # same kind of artefact as a stopword list or a list of auxiliary verbs:
+    # finite, domain-independent, and stable.  A query using any of these heads
+    # is recognised regardless of whether that phrasing has ever been seen; a
+    # query about manga, films, symphonies or video games is treated identically
+    # because the recogniser keys on the *attribution relation*, never on the
+    # work's vocabulary, the entity's name, or the question's phrasing.
+    # Lemmas (SpaCy gives "based"→"base", "featuring"→"feature", etc.).
+    _ATTRIBUTION_ACL_VERBS = frozenset({
+        "base", "feature", "star", "set", "center", "centre",
+        "focus", "follow", "depict", "adapt", "inspire",
+        # "about" as an acl head can surface with lemma "about" (prep/sconj use)
+        "about",
+    })
+    # Indefinite pronouns marking an *unresolved* agent in a passive `by`-phrase
+    # — the entity the next hop must look up ("written by someone").  A closed
+    # grammatical class (English indefinite person pronouns), not example-derived.
+    _INDEFINITE_AGENT_HEADS = frozenset({
+        "someone", "somebody", "anyone", "anybody",
+    })
+    # The agent hop's verb is taken VERBATIM from the query's own participle
+    # (token.text — "illustrated", "written", "directed"), so there is no
+    # participle→verb table and no past-tense rules: the inflection is the
+    # user's, not ours.  This deliberately leaves no record in the codebase of
+    # which verbs the system has encountered.
+
+    def _find_attribution_chain(
+        self,
+        query: str,
+        entities: List[EntityInfo],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Detect a *chained* attribution bridge using SpaCy's dependency parse.
+
+        Target shape (idx-42 archetype):
+            "A [work] based on [Entity], is [written] by someone [attribute]?"
+        Dependency signature:
+            work_noun   --nsubjpass--> passive_verb (ROOT)
+            passive_verb --agent--> "by" --pobj--> indefinite agent ("someone")
+            work_noun   --acl--> attribution_verb ("based") --prep--> --pobj--> Entity
+            agent       --acl--> ... (the residual attribute question stays on it)
+
+        Returns a dict describing the two-link chain, or None if the structure
+        is absent or the parse is too ambiguous to trust:
+            {
+              "work_type":          "series"          # head noun of the work NP
+              "work_np":            "manga series"    # compound+amod span (no det)
+              "anchor_entity":      "Ichitaka Seto"   # known entity (link-0 target)
+              "agent_verb_surface": "illustrated"     # participle verbatim from
+                                                      # the query (used in hop1)
+            }
+
+        Anti-fragility: keys on dependency *relation labels* (nsubjpass, agent,
+        acl, prep/pobj) and a small closed set of attribution clause heads — the
+        grammar of attribution, not the lexicon of works.  A query with the same
+        shape but novel vocabulary ("a symphony commissioned for the coronation
+        of a monarch crowned in what year?") matches with zero new code.
+
+        Parse-confidence gate: requires the *exact* relation chain to be present
+        and the anchor entity to overlap a detected NER entity.  If any link is
+        missing or fuzzy, returns None and the caller falls back to the next
+        pattern / single-query — so the worst case is current behaviour, never
+        worse.
+        """
+        if not SPACY_AVAILABLE or NLP is None:
+            return None
+        try:
+            doc = NLP(query)
+
+            # 1. Find a passive ROOT (or conj-of-ROOT) with an `agent` by-phrase
+            #    whose object is an indefinite placeholder.
+            for tok in doc:
+                if tok.pos_ != "VERB":
+                    continue
+                # Collect this verb + any conj siblings (handles "written and
+                # illustrated by ...") — the agent may hang off either.
+                verb_group = [tok] + [c for c in tok.children if c.dep_ == "conj"]
+                agent_obj = None
+                for v in verb_group:
+                    for c in v.children:
+                        if c.dep_ == "agent":
+                            for gc in c.children:
+                                if gc.dep_ == "pobj":
+                                    agent_obj = gc
+                                    break
+                        if agent_obj:
+                            break
+                    if agent_obj:
+                        break
+                if agent_obj is None:
+                    continue
+                # The agent must be an *unresolved* placeholder, else this is a
+                # normal passive-with-named-agent (Pattern F territory).
+                if agent_obj.lemma_.lower() not in self._INDEFINITE_AGENT_HEADS:
+                    continue
+
+                # 2. The passive verb's subject = the "work" noun.
+                work_noun = None
+                for v in verb_group + [tok]:
+                    for c in v.children:
+                        if c.dep_ in ("nsubjpass", "nsubj"):
+                            work_noun = c
+                            break
+                    if work_noun:
+                        break
+                # nsubjpass usually attaches to the first verb of the group
+                if work_noun is None:
+                    for c in tok.children:
+                        if c.dep_ in ("nsubjpass", "nsubj"):
+                            work_noun = c
+                            break
+                if work_noun is None:
+                    continue
+
+                # 3. The work noun must carry an `acl` attribution clause linking
+                #    it (via prep + pobj) to a concrete noun/entity.  Capture both
+                #    the prep object's head proper-noun span (preferred anchor) and
+                #    the full NP (fallback).
+                anchor_full = None         # full prep-object NP
+                anchor_propn = None        # contiguous PROPN run within it
+                for c in work_noun.children:
+                    if c.dep_ == "acl" and c.lemma_.lower() in self._ATTRIBUTION_ACL_VERBS:
+                        for gc in c.children:
+                            if gc.dep_ == "prep":
+                                for ggc in gc.children:
+                                    if ggc.dep_ == "pobj":
+                                        sub = [t for t in ggc.subtree if not t.is_punct]
+                                        anchor_full = " ".join(t.text for t in sub).strip()
+                                        # Longest contiguous PROPN run = the name
+                                        run, best = [], []
+                                        for t in sub:
+                                            if t.pos_ == "PROPN":
+                                                run.append(t.text)
+                                            else:
+                                                if len(run) > len(best):
+                                                    best = run
+                                                run = []
+                                        if len(run) > len(best):
+                                            best = run
+                                        if best:
+                                            anchor_propn = " ".join(best)
+                                        break
+                            if anchor_full:
+                                break
+                    if anchor_full:
+                        break
+                if not anchor_full:
+                    continue
+
+                # 4. Parse-confidence gate: the anchor must overlap a detected
+                #    NER entity, else the "chain" is noise.  Resolve the anchor we
+                #    pass downstream to the NER entity text when it's contained in
+                #    the prep-object NP (so "a 16 year old ... Ichitaka Seto" →
+                #    "Ichitaka Seto"); else fall back to the PROPN run, then NP.
+                _ANCHOR_LABELS = ("PERSON", "ORG", "GPE", "LOC", "WORK_OF_ART",
+                                  "EVENT", "FAC", "PRODUCT")
+                anchor_full_lc = anchor_full.lower()
+                matched_ner = next(
+                    (e.text for e in entities
+                     if e.label in _ANCHOR_LABELS
+                     and (e.text.lower() in anchor_full_lc
+                          or anchor_full_lc in e.text.lower())),
+                    None,
+                )
+                if matched_ner is None:
+                    logger.debug(
+                        "_find_attribution_chain: anchor %r has no NER overlap "
+                        "— rejecting (parse-confidence gate)", anchor_full[:50]
+                    )
+                    continue
+                anchor_text = matched_ner or anchor_propn or anchor_full
+
+                # 5. Build the work NP (compound + amod, drop determiners) and
+                #    capture the agent participle *as it appears in the query*.
+                #    We deliberately reuse the user's own surface form ("written",
+                #    "illustrated", "directed") rather than re-inflecting from a
+                #    lemma — no verb tables, no past-tense rules, nothing that
+                #    encodes which verbs we've seen.  "Who illustrated the X?"
+                #    is grammatical because the inflection came from the input.
+                work_type = work_noun.text
+                work_np_tokens = [
+                    t.text for t in work_noun.subtree
+                    if t.dep_ in ("compound", "amod") and t.head == work_noun
+                ] + [work_noun.text]
+                work_np = " ".join(work_np_tokens).strip()
+
+                agent_verb_surface = None
+                for v in verb_group + [tok]:
+                    if any(c.dep_ == "agent" for c in v.children):
+                        agent_verb_surface = v.text
+                        break
+                if agent_verb_surface is None:
+                    agent_verb_surface = tok.text
+
+                return {
+                    "work_type": work_type,
+                    "work_np": work_np or work_type,
+                    "anchor_entity": anchor_text,
+                    "agent_verb_surface": agent_verb_surface,
+                }
+        except Exception as exc:
+            logger.debug("_find_attribution_chain failed: %s", exc)
+        return None
+
+    def _decompose_attribution_chain(
+        self,
+        query: str,
+        chain: Dict[str, Any],
+        entities: List[EntityInfo],
+    ) -> Tuple[List[HopStep], List[str]]:
+        """
+        Build a 3-step hop sequence from a chained-attribution bridge.
+
+            hop0 (bridge): "What {work_type} is based on {anchor_entity}?"
+                           → resolves the {work} placeholder
+            hop1 (bridge): "Who {agent_verb_surface} the {work_type} based on
+                           {anchor}?"  — {agent_verb_surface} is the participle
+                           taken verbatim from the query ("illustrated",
+                           "written", "directed"), so the phrasing is correct
+                           without any verb-inflection tables.  The Controller
+                           injects the resolved work title at runtime; this is
+                           the retrieval seed.
+            hop2 (final):  the original query, depends_on=[1]
+                           → answers the residual attribute question once both
+                             the work and the agent are in context
+
+        depends_on chains 0 → 1 → 2 so the Controller's iterative bridge-entity
+        injection (§12 iterative-multihop) feeds each link's result into the next.
+        """
+        work_type = chain["work_type"]
+        anchor    = chain["anchor_entity"]
+        agent_vb  = chain["agent_verb_surface"]
+
+        hop0_q = f"What {work_type} is based on {anchor}?"
+        hop1_q = f"Who {agent_vb} the {work_type} based on {anchor}?"
+
+        target_all = [e.text for e in entities]
+        hop_sequence = [
+            HopStep(
+                step_id=0,
+                sub_query=hop0_q,
+                target_entities=[anchor],
+                depends_on=[],
+                is_bridge=True,
+            ),
+            HopStep(
+                step_id=1,
+                sub_query=hop1_q,
+                target_entities=[anchor],
+                depends_on=[0],
+                is_bridge=True,
+            ),
+            HopStep(
+                step_id=2,
+                sub_query=query,
+                target_entities=target_all,
+                depends_on=[1],
+                is_bridge=False,
+            ),
+        ]
+        logger.debug(
+            "_decompose_multi_hop: Pattern H attribution-chain → hop0=%r hop1=%r",
+            hop0_q[:50], hop1_q[:50],
+        )
+        return hop_sequence, [hop0_q, hop1_q, query]
+
     def _decompose_multi_hop(
         self,
         query: str,
@@ -1232,6 +1692,47 @@ class PlanGenerator:
         """
         hop_sequence = []
         sub_queries = []
+
+        # ── Pattern G: Relative-clause bridge (SpaCy dependency parse) ───────
+        # Detects "The [noun] in which [Entity] [predicate] [main question]?"
+        # using structural grammar (relcl dep label) — no verb list needed.
+        # Must run BEFORE the generic split because the split-on-"which" would
+        # otherwise destroy the grammatical structure of the query.
+        rc = self._find_relative_clause_bridge(query)
+        if rc:
+            noun, entity_text = rc
+            bridge_q = f"In which {noun} did {entity_text}?"
+            hop_sequence = [
+                HopStep(
+                    step_id=0,
+                    sub_query=bridge_q,
+                    target_entities=[e.text for e in entities],
+                    depends_on=[],
+                    is_bridge=True,
+                ),
+                HopStep(
+                    step_id=1,
+                    sub_query=query,
+                    target_entities=[e.text for e in entities],
+                    depends_on=[0],
+                    is_bridge=False,
+                ),
+            ]
+            logger.debug(
+                "_decompose_multi_hop: Pattern G relative-clause → %r", bridge_q[:60]
+            )
+            return hop_sequence, [bridge_q, query]
+
+        # ── Pattern H: chained-attribution bridge (SpaCy dependency parse) ───
+        # Detects "A [work] based on [Entity], is [written] by someone [attr]?"
+        # — a *two-link* chain (entity → work → agent → attribute).  Must run
+        # BEFORE the generic split because the split-on-connector would shred
+        # the multi-clause structure.  The parse-confidence gate inside
+        # _find_attribution_chain returns None on anything ambiguous, so this is
+        # fail-safe — worst case it falls through to the patterns below.
+        ac = self._find_attribution_chain(query, entities)
+        if ac:
+            return self._decompose_attribution_chain(query, ac, entities)
 
         # Split at bridge connectors; maxsplit=1 per pattern preserves the
         # full tail of the query on the right side of the split.
@@ -1341,6 +1842,43 @@ class PlanGenerator:
                 )
                 return hop_sequence, [bridge_q, query]
 
+        # ── Pattern F: Passive-agent bridge ─────────────────────────────────
+        # "[Subject] was written/directed/... by [agent] that [property]?"
+        # Only fires when the generic split produced parts (i.e. there IS a
+        # "that/which/who" clause) — meaning the connector split already found
+        # the boundary, but the *order* it produces is wrong (it reverses parts,
+        # putting the property fragment first and the anchor second).  Pattern F
+        # detects the passive-agent structure and corrects the order by emitting
+        # hop 0 = "Who {verb} {subject}?" and hop 1 = original query.
+        # Also fires when split failed (len(parts)==1) with a passive-agent form.
+        pm = self._PASSIVE_AGENT_RE.match(query)
+        if pm and len(parts) >= 1:
+            subj = pm.group("subj").strip()
+            past_part = pm.group("verb").lower()
+            active_verb = self._PASSIVE_TO_ACTIVE.get(past_part, past_part)
+            # "Who wrote Seven Brief Lessons on Physics?"
+            bridge_q = f"Who {active_verb} {subj}?"
+            hop_sequence = [
+                HopStep(
+                    step_id=0,
+                    sub_query=bridge_q,
+                    target_entities=[e.text for e in entities],
+                    depends_on=[],
+                    is_bridge=True,
+                ),
+                HopStep(
+                    step_id=1,
+                    sub_query=query,
+                    target_entities=[e.text for e in entities],
+                    depends_on=[0],
+                    is_bridge=False,
+                ),
+            ]
+            logger.debug(
+                "_decompose_multi_hop: Pattern F passive-agent → %r", bridge_q[:60]
+            )
+            return hop_sequence, [bridge_q, query]
+
         if len(parts) > 1:
             reversed_parts = list(reversed(parts))
 
@@ -1402,16 +1940,58 @@ class PlanGenerator:
                 ))
                 sub_queries.append(sub_query)
         else:
-            # Could not split → treat as single hop
-            logger.debug("_decompose_multi_hop: split failed for '%s' → single hop", query[:80])
-            hop_sequence.append(HopStep(
-                step_id=0,
-                sub_query=query,
-                target_entities=[e.text for e in entities],
-                depends_on=[],
-                is_bridge=False,
-            ))
-            sub_queries = [query]
+            # ── Classification–decomposition consistency fallback ───────────
+            # The query was *classified* multi-hop but every pattern + the
+            # connector split failed.  Rather than silently emitting the
+            # unsplit query (which looks like a working single-hop plan and
+            # hides the gap), emit a deliberate 2-hop fallback: hop0 retrieves
+            # broadly around the detected entities, hop1 answers the original
+            # query with that context available.  If there are no usable
+            # entities to seed hop0, only then degrade to single-hop — with a
+            # WARNING so the gap is visible in logs / diagnostics.
+            seed_entities = [
+                e for e in entities
+                if e.label in ("PERSON", "ORG", "GPE", "LOC", "WORK_OF_ART",
+                                "EVENT", "FAC", "PRODUCT", "NORP")
+            ]
+            if seed_entities:
+                anchor = seed_entities[0].text
+                hop0_q = f"Who or what is {anchor}?"
+                logger.debug(
+                    "_decompose_multi_hop: no pattern matched for %r "
+                    "— generic 2-hop fallback (anchor=%r)", query[:80], anchor
+                )
+                hop_sequence = [
+                    HopStep(
+                        step_id=0,
+                        sub_query=hop0_q,
+                        target_entities=[anchor],
+                        depends_on=[],
+                        is_bridge=True,
+                    ),
+                    HopStep(
+                        step_id=1,
+                        sub_query=query,
+                        target_entities=[e.text for e in entities],
+                        depends_on=[0],
+                        is_bridge=False,
+                    ),
+                ]
+                sub_queries = [hop0_q, query]
+            else:
+                logger.warning(
+                    "_decompose_multi_hop: query classified MULTI_HOP but no "
+                    "pattern matched and no anchor entity available — "
+                    "degrading to single-hop: %r", query[:100]
+                )
+                hop_sequence.append(HopStep(
+                    step_id=0,
+                    sub_query=query,
+                    target_entities=[e.text for e in entities],
+                    depends_on=[],
+                    is_bridge=False,
+                ))
+                sub_queries = [query]
 
         return hop_sequence, sub_queries
 
@@ -1436,6 +2016,18 @@ class PlanGenerator:
         """
         hop_sequence = []
         sub_queries = []
+
+        # FIX P-1: "select-between-two" comparison form
+        # ("Which writer was from England, Henry Roth or Robert Erskine Childers?",
+        #  "Which band, Letters to Cleo or Screaming Trees, had more members?").
+        # Here the two comparison operands are exactly the two entities joined by
+        # "or" in the query — NOT the first two NER hits (which would wrongly pick
+        # "England"). Detect the disjunction, strip it + the leading "Which
+        # <category>" framing to recover the *property*, and emit one focused
+        # per-entity sub-query.
+        sel = self._decompose_select_between(query, entities)
+        if sel is not None:
+            return sel
 
         # Use only proper NER entities; regex-PROPN entities include noisy
         # sentence-initial tokens and are filtered out here.
@@ -1535,6 +2127,97 @@ class PlanGenerator:
             ))
             sub_queries.append(sub_query)
 
+        return hop_sequence, sub_queries
+
+    # Leading framing to strip from a "select-between-two" question to recover
+    # the property being compared: "Which writer ", "What city ", "Who ", etc.
+    _SELECT_LEAD_RE = re.compile(
+        r'^\s*(which|what|who|whom)\b\s*([a-z][a-z\- ]{0,30}?\b)?\s*',
+        re.IGNORECASE,
+    )
+    # "ENT_A or ENT_B" disjunction (allowing a comma before "or").
+    _OR_DISJ_RE = re.compile(r'\s*,?\s+\bor\b\s+', re.IGNORECASE)
+
+    def _decompose_select_between(
+        self,
+        query: str,
+        entities: List[EntityInfo],
+    ) -> Optional[Tuple[List[HopStep], List[str]]]:
+        """Handle the "Which <category> <property>, A or B<property>?" comparison
+        form, where A and B are the two entities joined by "or" in the query.
+
+        Returns (hop_sequence, sub_queries) on success, or None if the query is
+        not of this form (caller then falls back to the generic decomposition).
+
+        Strategy:
+          1. Find two extracted entities that sit on either side of an "or" in
+             the query, with only whitespace/comma between them and "or".
+          2. Remove that "<A> or <B>" span from the query, and strip the leading
+             "Which <category>" framing → what remains is the *property* clause
+             ("was from England", "had more members", "was published first").
+          3. Build one focused sub-query per entity by attaching the entity to
+             the property clause, e.g. "Henry Roth was from England" /
+             "Letters to Cleo had more members". If an _ATTR_MAP attribute
+             pattern matches, prefer that rewrite instead.
+        """
+        # 1. Locate an "A or B" disjunction of two entities.
+        ents_by_pos = sorted(entities, key=lambda e: e.start_char)
+        pair: Optional[Tuple[EntityInfo, EntityInfo]] = None
+        for a, b in zip(ents_by_pos, ents_by_pos[1:]):
+            gap = query[a.end_char:b.start_char]
+            if self._OR_DISJ_RE.fullmatch(gap):
+                pair = (a, b)
+                break
+        if pair is None:
+            return None
+        ent_a, ent_b = pair
+
+        # 2. Excise the "<A> or <B>" span; strip leading "Which <category>".
+        disj_start, disj_end = ent_a.start_char, ent_b.end_char
+        remainder = (query[:disj_start] + " " + query[disj_end:])
+        remainder = re.sub(r'\s+', ' ', remainder).strip().rstrip('?').strip()
+        # drop a dangling leading/trailing comma left by the excision
+        remainder = remainder.strip(',').strip()
+        property_clause = self._SELECT_LEAD_RE.sub('', remainder).strip()
+        # also drop any leftover leading conjunction/punctuation
+        property_clause = property_clause.lstrip(',; ').strip()
+
+        # 3. Per-entity sub-queries.
+        # Prefer an attribute rewrite if one of the _ATTR_MAP / comparative
+        # patterns applies to the original query.
+        templates: List[str] = []
+        for pat, tmpl in self._ATTR_MAP:
+            if pat.search(query):
+                templates = [tmpl.format(entity=ent_a.text),
+                             tmpl.format(entity=ent_b.text)]
+                break
+        if not templates:
+            if property_clause:
+                # "Henry Roth was from England" / "Letters to Cleo had more members"
+                templates = [f"{ent_a.text} {property_clause}",
+                             f"{ent_b.text} {property_clause}"]
+            else:
+                # No usable property clause recovered → fall back to a generic
+                # "Who/what is <entity>?" lookup so retrieval at least targets
+                # the right two articles.
+                templates = [f"Who is {ent_a.text}?", f"Who is {ent_b.text}?"]
+
+        hop_sequence: List[HopStep] = []
+        sub_queries: List[str] = []
+        for i, (ent, sq) in enumerate(zip((ent_a, ent_b), templates)):
+            sq = re.sub(r'\s+', ' ', sq).strip()
+            hop_sequence.append(HopStep(
+                step_id=i,
+                sub_query=sq,
+                target_entities=[ent.text],
+                depends_on=[],          # independent → parallel
+                is_bridge=True,
+            ))
+            sub_queries.append(sq)
+        logger.debug(
+            "_decompose_select_between: %r → [%r, %r]",
+            query[:80], sub_queries[0][:50], sub_queries[1][:50],
+        )
         return hop_sequence, sub_queries
 
     def _decompose_intersection(

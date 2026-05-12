@@ -386,14 +386,24 @@ def build_cooccurrence_edges(
     Returns:
         Number of edges written (excluding silent failures).
     """
-    written = 0
+    try:
+        from tqdm import tqdm as _tqdm
+    except ImportError:
+        _tqdm = None
+
     seen_pairs: Set[Tuple[str, str]] = set()
+    all_pairs: List[Tuple[str, str, str, float, str]] = []   # (e1, e2, rel_type, conf, src_str)
     truncated_chunks = 0
 
-    for result in extraction_results:
+    # ── Phase 1: collect all unique pairs (fast — no DB writes) ──────────────
+    results_list = list(extraction_results)
+    chunk_iter = (
+        _tqdm(results_list, desc="Co-occurrence pairs", unit="chunk")
+        if _tqdm else results_list
+    )
+    for result in chunk_iter:
         chunk_id = str(result.get("chunk_id", ""))
 
-        # Collect (eid, confidence) so we can sort if a cap is hit.
         candidates: List[Tuple[str, float]] = []
         for ent in result.get("entities", []) or []:
             conf = float(ent.get("confidence", 0.0))
@@ -406,14 +416,12 @@ def build_cooccurrence_edges(
             if eid:
                 candidates.append((eid, conf))
 
-        # Deduplicate IDs within the chunk (keep highest-confidence occurrence).
         by_id: Dict[str, float] = {}
         for eid, conf in candidates:
             if conf > by_id.get(eid, -1.0):
                 by_id[eid] = conf
         ids_with_conf = sorted(by_id.items(), key=lambda x: -x[1])
 
-        # Cap the number of entities per chunk to avoid combinatorial blow-up.
         if len(ids_with_conf) > max_entities_per_chunk:
             ids_with_conf = ids_with_conf[:max_entities_per_chunk]
             truncated_chunks += 1
@@ -424,24 +432,52 @@ def build_cooccurrence_edges(
             if pair in seen_pairs:
                 continue
             seen_pairs.add(pair)
+            src_str = chunk_id if chunk_id else ""
+            all_pairs.append((pair[0], pair[1], relation_type, 1.0, src_str))
+
+    logger.info(
+        "Co-occurrence: %d unique pairs collected from %d chunks "
+        "(%d chunks capped at max=%d)",
+        len(all_pairs), len(results_list), truncated_chunks, max_entities_per_chunk,
+    )
+
+    # ── Phase 2: bulk-insert via transactional batches ────────────────────────
+    # Use add_related_to_relations_bulk (500 edges/commit) when available;
+    # fall back to the single-edge method for HybridStore / mock stores.
+    BATCH = 500
+    if hasattr(graph_store, "add_related_to_relations_bulk"):
+        if _tqdm:
+            batch_iter = _tqdm(
+                range(0, len(all_pairs), BATCH),
+                desc="Writing co-occur edges",
+                unit="batch",
+                total=(len(all_pairs) + BATCH - 1) // BATCH,
+            )
+        else:
+            batch_iter = range(0, len(all_pairs), BATCH)
+        written = 0
+        for i in batch_iter:
+            written += graph_store.add_related_to_relations_bulk(
+                all_pairs[i : i + BATCH], batch_size=BATCH, use_create=True
+            )
+    else:
+        # Fallback: single-edge writes (HybridStore / tests)
+        edge_iter = _tqdm(all_pairs, desc="Writing co-occur edges", unit="edge") if _tqdm else all_pairs
+        written = 0
+        for e1, e2, rel_type, conf, src_str in edge_iter:
             try:
                 graph_store.add_related_to_relation(
-                    entity1_id=pair[0],
-                    entity2_id=pair[1],
-                    relation_type=relation_type,
-                    confidence=1.0,
-                    source_chunks=[chunk_id] if chunk_id else None,
+                    entity1_id=e1,
+                    entity2_id=e2,
+                    relation_type=rel_type,
+                    confidence=conf,
+                    source_chunks=[src_str] if src_str else None,
                 )
                 written += 1
             except Exception as exc:
-                logger.debug("CO_OCCURS edge failed (%s, %s): %s", pair[0], pair[1], exc)
+                logger.debug("CO_OCCURS edge failed (%s, %s): %s", e1, e2, exc)
 
-    if truncated_chunks:
-        logger.info(
-            "Co-occurrence: truncated %d chunks at max_entities_per_chunk=%d",
-            truncated_chunks, max_entities_per_chunk,
-        )
-    logger.info("Co-occurrence edges added: %d (from %d unique pairs)", written, len(seen_pairs))
+    logger.info("Co-occurrence edges written: %d / %d pairs", written, len(all_pairs))
     return written
 
 
