@@ -342,8 +342,11 @@ class Navigator:
         redundancy_filtered = self._redundancy_filter(relevance_filtered)
         result.metadata["after_redundancy_filter"] = len(redundancy_filtered)
 
-        # Filter 3: Contradiction filter (numeric heuristic)
-        contradiction_filtered = self._contradiction_filter(redundancy_filtered)
+        # Filter 3: Contradiction filter (numeric heuristic, disabled by default)
+        if self.config.enable_contradiction_filter:
+            contradiction_filtered = self._contradiction_filter(redundancy_filtered)
+        else:
+            contradiction_filtered = redundancy_filtered
         result.metadata["after_contradiction_filter"] = len(contradiction_filtered)
 
         # Filter 4: Entity overlap pruning
@@ -597,6 +600,9 @@ class Navigator:
         def extract_numbers(text: str) -> List[float]:
             return [float(n) for n in re.findall(r"\b\d{4}\b|\b\d+(?:\.\d+)?\b", text)]
 
+        def _is_year(n: float) -> bool:
+            return 1000.0 <= n <= 2100.0 and n == int(n)
+
         all_numbers: List[List[float]] = [extract_numbers(r["text"]) for r in results]
         all_words: List[set] = [set(r["text"].lower().split()) for r in results]
 
@@ -617,6 +623,11 @@ class Navigator:
                         n1 > 0 and n2 > 0
                         and max(n1, n2) / min(n1, n2) > ratio_threshold
                         and min(n1, n2) > min_value
+                        # Only flag as contradiction when both numbers are the
+                        # same kind (both years, or both counts/populations).
+                        # A year paired with a population figure (e.g. 1940 vs
+                        # 276170) measures different things and is not a conflict.
+                        and _is_year(n1) == _is_year(n2)
                         for n1 in nums_i
                         for n2 in nums_j
                     )
@@ -826,8 +837,24 @@ class Navigator:
                     return 1
             return 2
 
+        # §12.33 Fix: top-K RRF immunity — the top 2 chunks by RRF score are
+        # never dropped by the entity-mention filter, regardless of entity match.
+        # Rationale: a chunk ranked #1 or #2 by a three-path RRF (dense + sparse
+        # + graph) is almost certainly topically relevant; if its entity happens
+        # to be the implicit bridge target (not in the Planner's entity list) the
+        # filter would otherwise destroy the answer chunk.  Two is the threshold:
+        # position #1 might be a Scott-Parkin biography that names both entities,
+        # position #2 might be the Halliburton article that contains the answer —
+        # both must survive.  Position #3 and beyond are still filtered normally.
+        _RRF_IMMUNE_TOP_K = 2
+        immune_indices: set = set(range(min(_RRF_IMMUNE_TOP_K, len(results))))
+
         tiers = [tier_of(r["text"]) for r in results]
-        kept = [(t, rank, r) for rank, (t, r) in enumerate(zip(tiers, results)) if t < 2]
+        kept = [
+            (t, rank, r)
+            for rank, (t, r) in enumerate(zip(tiers, results))
+            if t < 2 or rank in immune_indices
+        ]
         dropped = len(results) - len(kept)
 
         if not kept:

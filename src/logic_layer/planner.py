@@ -112,6 +112,28 @@ from ._settings import _load_settings, _PROPER_NOUN_RE
 # avoid false positives on port numbers or other 4-digit tokens.
 _YEAR_RE = re.compile(r"\b(1\d{3}|20\d{2})\b")
 
+# Auxiliary verbs and articles that SpaCy NER sometimes absorbs into an entity
+# span when they precede it at sentence start (e.g. "Are Random House Tower"
+# where "Are" is the sentence-initial auxiliary verb, not part of the name).
+# Stripped from entity text before downstream use; char offsets adjusted.
+_LEADING_FUNCTION_WORDS = frozenset({
+    "are", "is", "was", "were", "did", "do", "does", "have", "has",
+    "a", "an", "the",
+})
+
+
+def _strip_leading_function_words(text: str) -> str:
+    """Remove leading auxiliary verbs / articles absorbed into an NER span.
+
+    SpaCy en_core_web_sm occasionally includes the sentence-initial function
+    word in a named-entity span (e.g. "Are Random House Tower" → ORG).
+    Stripping these tokens recovers the correct entity surface form.
+    """
+    tokens = text.split()
+    while tokens and tokens[0].lower() in _LEADING_FUNCTION_WORDS:
+        tokens = tokens[1:]
+    return " ".join(tokens)
+
 
 # =============================================================================
 # SPACY INTEGRATION
@@ -582,6 +604,38 @@ class QueryClassifier:
         scores = {qt: 0.0 for qt in QueryType}
 
         # ─────────────────────────────────────────────────────────────────────
+        # PHASE 0: Boolean-conjunction pre-empt (Pattern I)
+        # "Are/Did/Were X and Y both P?" — parallel yes/no, never a bridge chain.
+        # Must run before Phase 1 so the "both" and "and" tokens cannot boost
+        # MULTI_HOP or INTERSECTION scores past COMPARISON.
+        # ─────────────────────────────────────────────────────────────────────
+        _BOOL_CONJ_PRE = re.compile(
+            r'^\s*(are|is|were|was|did|do|does|have|has)\b.+\band\b.+\bboth\b',
+            re.IGNORECASE,
+        )
+        if _BOOL_CONJ_PRE.match(query):
+            logger.debug("classify: Boolean conjunction pre-empt for '%s' → COMPARISON", query[:80])
+            return QueryType.COMPARISON, 0.90
+
+        # ─────────────────────────────────────────────────────────────────────
+        # PHASE 0.5: Implicit bridge pre-empt (Pattern J)
+        # "X and another [noun] that …" — the answer requires first resolving
+        # the bridge ("which corporation is the 'another'?") then following it.
+        # The AGGREGATE pattern r"\bhow\s+many\b" fires on "how many countries"
+        # and would otherwise classify this as AGGREGATE (single-pass).
+        # ─────────────────────────────────────────────────────────────────────
+        _IMPLICIT_BRIDGE_PRE = re.compile(
+            r'\banother\s+\w+\b',
+            re.IGNORECASE,
+        )
+        if _IMPLICIT_BRIDGE_PRE.search(query):
+            logger.debug(
+                "classify: implicit-bridge pre-empt (Pattern J) for '%s' → MULTI_HOP",
+                query[:80],
+            )
+            return QueryType.MULTI_HOP, 0.80
+
+        # ─────────────────────────────────────────────────────────────────────
         # PHASE 1: Regex pattern matching
         # ─────────────────────────────────────────────────────────────────────
 
@@ -696,21 +750,21 @@ class EntityExtractor:
      Yang et al., 2018 HotpotQA EMNLP)
     """
 
-    # SpaCy NER labels relevant to RAG queries
+    # SpaCy NER labels that map to the GLiNER taxonomy used at ingestion time.
+    # Only these labels are accepted — MONEY, QUANTITY, TIME, NORP, LAW, CARDINAL,
+    # ORDINAL, PERCENT, LANGUAGE are excluded because they have no GLiNER equivalent
+    # and produce false-positive entities (e.g. "888 7th Avenue" → MONEY).
+    # Reference: settings.yaml → entity_extraction.gliner.entity_types
     RELEVANT_ENTITY_TYPES = frozenset({
-        "PERSON",      # people
-        "ORG",         # organisations
-        "GPE",         # geo-political entities (countries, cities)
-        "LOC",         # locations
-        "PRODUCT",     # products
-        "EVENT",       # events
-        "WORK_OF_ART", # artworks, films, books
-        "LAW",         # laws
-        "DATE",        # dates
-        "TIME",        # times
-        "MONEY",       # monetary amounts
-        "QUANTITY",    # quantities
-        "NORP",        # nationalities, religious/political groups
+        "PERSON",      # → person
+        "ORG",         # → organization
+        "GPE",         # → city / country / location
+        "LOC",         # → location
+        "FAC",         # → location (facility)
+        "PRODUCT",     # → product
+        "EVENT",       # → event
+        "WORK_OF_ART", # → work of art
+        "DATE",        # → date
     })
 
     # Regex fallback patterns for entity extraction when SpaCy is unavailable
@@ -797,14 +851,18 @@ class EntityExtractor:
                     confidence = self._estimate_confidence(ent)
 
                     if confidence >= self.config.min_entity_confidence:
-                        entity_text = ent.text.strip()
+                        entity_text = _strip_leading_function_words(ent.text.strip())
+                        if not entity_text:
+                            continue
 
                         if entity_text.lower() not in seen_texts:
+                            # Adjust start_char to match the stripped text
+                            stripped_offset = ent.text.index(entity_text) if entity_text in ent.text else 0
                             entities.append(EntityInfo(
                                 text=entity_text,
                                 label=ent.label_,
                                 confidence=confidence,
-                                start_char=ent.start_char,
+                                start_char=ent.start_char + stripped_offset,
                                 end_char=ent.end_char,
                                 is_bridge=False,
                             ))
@@ -1348,6 +1406,102 @@ class PlanGenerator:
 
         return hop_sequence, sub_queries
 
+    # ── Pattern J: Implicit bridge ("another [noun]") ───────────────────────
+    # Matches queries like "X and another corporation that has operations in …"
+    # where the answer-bearing entity is described by a common noun + relative
+    # clause, not named.  The anchor is the named entity alongside "another".
+    _IMPLICIT_BRIDGE_RE = re.compile(
+        r'\banother\s+(\w+)\b',
+        re.IGNORECASE,
+    )
+
+    def _find_implicit_bridge(
+        self,
+        query: str,
+        entities: List["EntityInfo"],
+    ) -> Optional[Tuple[str, str]]:
+        """
+        Detect "X and another [noun] that …" queries.
+
+        Returns (anchor_entity_text, bridge_noun) when the pattern is found and
+        at least one named entity is present to serve as the anchor, else None.
+        """
+        m = self._IMPLICIT_BRIDGE_RE.search(query)
+        if not m:
+            return None
+        if not entities:
+            return None
+        bridge_noun = m.group(1)
+        # Anchor: pick the entity that appears BEFORE "another" in the query
+        another_pos = m.start()
+        anchor = None
+        for ent in entities:
+            idx = query.lower().find(ent.text.lower())
+            if 0 <= idx < another_pos:
+                anchor = ent.text
+                break
+        if anchor is None:
+            # Fall back to first entity
+            anchor = entities[0].text
+        return anchor, bridge_noun
+
+    def _decompose_implicit_bridge(
+        self,
+        query: str,
+        bridge_info: Tuple[str, str],
+        entities: List["EntityInfo"],
+    ) -> Tuple[List["HopStep"], List[str]]:
+        """
+        Decompose an implicit-bridge query (Pattern J) into two hops.
+
+        hop 0 (bridge resolution): identify the unnamed second entity.
+          "What [bridge_noun] besides [anchor] is [subject] a critic of?"
+        hop 1 (attribute lookup): original query, answered with bridge entity
+          materialised in the retrieved context.
+        """
+        anchor, bridge_noun = bridge_info
+
+        # Extract the subject of the sentence (the person/thing doing the
+        # critiquing / comparing) — everything before the named anchor entity.
+        # Simple heuristic: take the first named entity if it is the subject,
+        # otherwise fall back to the full query prefix before the anchor.
+        subject = ""
+        anchor_idx = query.lower().find(anchor.lower())
+        if anchor_idx > 0:
+            prefix = query[:anchor_idx].strip().rstrip("of").strip()
+            # Take last sentence fragment as subject
+            subject_match = re.search(r'(\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)', prefix)
+            if subject_match:
+                subject = subject_match.group(1)
+
+        if subject:
+            hop0_q = (
+                f"What {bridge_noun} besides {anchor} is {subject} a critic of?"
+            )
+        else:
+            hop0_q = f"What {bridge_noun} besides {anchor} is mentioned in the context?"
+
+        hop_sequence = [
+            HopStep(
+                step_id=0,
+                sub_query=hop0_q,
+                target_entities=[e.text for e in entities],
+                depends_on=[],
+                is_bridge=True,
+            ),
+            HopStep(
+                step_id=1,
+                sub_query=query,
+                target_entities=[e.text for e in entities],
+                depends_on=[0],
+                is_bridge=False,
+            ),
+        ]
+        logger.debug(
+            "_decompose_implicit_bridge: Pattern J → hop0=%r", hop0_q[:80]
+        )
+        return hop_sequence, [hop0_q, query]
+
     def _find_relative_clause_bridge(
         self,
         query: str,
@@ -1693,6 +1847,20 @@ class PlanGenerator:
         hop_sequence = []
         sub_queries = []
 
+        # ── Pattern J: Implicit bridge ("X and another [noun] that …") ───────
+        # "Scott Parkin has been a critic of Exxonmobil and another corporation
+        #  that has operations in how many countries?"
+        # The phrase "another [noun]" signals that the answer-bearing entity is
+        # unnamed in the query; it must be resolved via the named anchor entity
+        # before the count/attribute question can be answered.
+        # hop 0: resolve the bridge — "What corporation besides Exxonmobil is
+        #         Scott Parkin a vocal critic of?"
+        # hop 1: answer the attribute question — original query (answered with
+        #         the bridge entity now materialised in context)
+        imb = self._find_implicit_bridge(query, entities)
+        if imb:
+            return self._decompose_implicit_bridge(query, imb, entities)
+
         # ── Pattern G: Relative-clause bridge (SpaCy dependency parse) ───────
         # Detects "The [noun] in which [Entity] [predicate] [main question]?"
         # using structural grammar (relcl dep label) — no verb list needed.
@@ -1995,6 +2163,123 @@ class PlanGenerator:
 
         return hop_sequence, sub_queries
 
+    # Boolean-conjunction surface form: "Are/Did/Were/Is/Do/Does/Have/Has [X] and [Y] both [P]?"
+    # The "both" keyword is a reliable discriminator — genuine bridge questions almost
+    # never contain it. Lexical detection avoids SpaCy parse dependency.
+    # §12.32: Pattern I — Boolean conjunction decomposition.
+    _BOOL_CONJ_RE = re.compile(
+        r'^\s*(are|is|were|was|did|do|does|have|has)\b.+\band\b.+\bboth\b',
+        re.IGNORECASE,
+    )
+
+    def _decompose_boolean_conjunction(
+        self,
+        query: str,
+        entities: List[EntityInfo],
+    ) -> Optional[Tuple[List[HopStep], List[str]]]:
+        """Decompose "Are [X] and [Y] both [predicate]?" into two parallel yes/no
+        sub-queries, one per subject entity.
+
+        Returns (hop_sequence, sub_queries) when the Boolean conjunction form is
+        detected and at least two named entities are present; otherwise None so
+        the caller falls through to the generic comparison path.
+
+        The predicate fragment is recovered by removing the "[X] and [Y]" span
+        from the query, leaving e.g. "Are ... both used for real estate?" which
+        is then specialised per entity: "Is Random House Tower used for real estate?"
+        """
+        if not self._BOOL_CONJ_RE.match(query):
+            return None
+
+        # Extract entity names directly from the query's conjunction structure:
+        # "[AUX] [X] and [Y] both [P]?" — split on " and " then on " both ".
+        # This bypasses SpaCy NER entirely for entity identification in this
+        # pattern, avoiding MONEY/CARDINAL misclassification of address-like
+        # strings such as "888 7th Avenue".
+        _and_re = re.compile(r'\band\b', re.IGNORECASE)
+        _both_re = re.compile(r'\bboth\b', re.IGNORECASE)
+        both_m = _both_re.search(query)
+        and_m  = _and_re.search(query)
+        if both_m and and_m and and_m.start() < both_m.start():
+            # Strip the leading auxiliary verb to get ent_a text
+            after_aux = re.sub(
+                r'^\s*(are|is|were|was|did|do|does|have|has)\s+',
+                '', query, count=1, flags=re.IGNORECASE,
+            )
+            raw_a = after_aux[:and_m.start() - (len(query) - len(after_aux))].strip()
+            raw_b = query[and_m.end():both_m.start()].strip().rstrip(',').strip()
+            if raw_a and raw_b:
+                # Build synthetic EntityInfo objects with correct char offsets
+                a_idx = query.find(raw_a)
+                b_idx = query.find(raw_b)
+                ent_a = EntityInfo(
+                    text=raw_a, label="PROPN", confidence=0.75,
+                    start_char=a_idx if a_idx >= 0 else 0,
+                    end_char=(a_idx + len(raw_a)) if a_idx >= 0 else len(raw_a),
+                )
+                ent_b = EntityInfo(
+                    text=raw_b, label="PROPN", confidence=0.75,
+                    start_char=b_idx if b_idx >= 0 else 0,
+                    end_char=(b_idx + len(raw_b)) if b_idx >= 0 else len(raw_b),
+                )
+                logger.debug(
+                    "_decompose_boolean_conjunction: conjunction parse → a=%r b=%r",
+                    raw_a, raw_b,
+                )
+                # Skip the NER-based entity selection below
+                ner_entities = [ent_a, ent_b]
+            else:
+                ner_entities = [e for e in entities if e.label in self._NER_LABELS]
+                if len(ner_entities) < 2:
+                    return None
+        else:
+            ner_entities = [e for e in entities if e.label in self._NER_LABELS]
+            if len(ner_entities) < 2:
+                return None
+
+        ent_a, ent_b = ner_entities[0], ner_entities[1]
+
+        # Strip the leading auxiliary verb and swap to singular "Is/Did/Was..."
+        _AUX_MAP = {
+            "are": "Is", "were": "Was", "did": "Did",
+            "do": "Does", "does": "Does", "have": "Has", "has": "Has", "is": "Is",
+        }
+        first_token = query.split()[0].lower()
+        singular_aux = _AUX_MAP.get(first_token, "Is")
+
+        # Build the predicate fragment: remove "[X] and [Y]" span from query
+        a_idx = query.find(ent_a.text)
+        b_idx = query.find(ent_b.text)
+        if a_idx < 0 or b_idx < 0:
+            return None
+
+        conj_start = a_idx
+        conj_end   = b_idx + len(ent_b.text)
+        # Eat the word "both" immediately after the conjunction if present
+        after_conj = query[conj_end:].lstrip()
+        if after_conj.lower().startswith("both "):
+            conj_end += query[conj_end:].index("both") + len("both")
+
+        predicate = query[conj_end:].strip().rstrip("?").strip()
+
+        hop_sequence = []
+        sub_queries  = []
+        for i, ent in enumerate([ent_a, ent_b]):
+            sq = f"{singular_aux} {ent.text} {predicate}?"
+            hop_sequence.append(HopStep(
+                step_id=i,
+                sub_query=sq,
+                target_entities=[ent.text],
+                depends_on=[],
+                is_bridge=False,
+            ))
+            sub_queries.append(sq)
+            logger.debug(
+                "_decompose_boolean_conjunction: Pattern I → hop%d=%r", i, sq[:80]
+            )
+
+        return hop_sequence, sub_queries
+
     def _decompose_comparison(
         self,
         query: str,
@@ -2004,6 +2289,7 @@ class PlanGenerator:
         Decompose a comparison query into parallel retrieval steps.
 
         Strategy:
+        0. Boolean conjunction check: "Are [X] and [Y] both [P]?" → Pattern I.
         1. Identify the two primary entities to compare (prefer NER over regex).
         2. Generate one sub-query per entity (can run in parallel).
         3. Apply attribute rewriting (_ATTR_MAP) to improve vector similarity.
@@ -2016,6 +2302,13 @@ class PlanGenerator:
         """
         hop_sequence = []
         sub_queries = []
+
+        # ── Pattern I: Boolean conjunction ("Are X and Y both P?") ──────────────
+        # Must run before select-between-two: "both" keyword is a reliable signal
+        # that this is a parallel yes/no check, not a selection-between-two-options.
+        bool_conj = self._decompose_boolean_conjunction(query, entities)
+        if bool_conj is not None:
+            return bool_conj
 
         # FIX P-1: "select-between-two" comparison form
         # ("Which writer was from England, Henry Roth or Robert Erskine Childers?",

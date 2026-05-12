@@ -818,11 +818,13 @@ def patch_verifier(verifier) -> None:
     # ── generate_and_verify ───────────────────────────────────────────────────
     orig_gen = verifier.generate_and_verify
 
-    def _wrap_generate(query, context, entities=None, hop_sequence=None, query_type=None):
+    def _wrap_generate(query, context, entities=None, hop_sequence=None, query_type=None, bridge_entities=None):
         section("S_V — VERIFIER")
         field("Query",       query)
         field("Chunks in",   len(context))
         field("Entities",    entities or [])
+        if bridge_entities:
+            field("Bridge entities", bridge_entities)
 
         # Run pre-validation and display its result
         subsection("Pre-Generation Validation")
@@ -861,7 +863,7 @@ def patch_verifier(verifier) -> None:
         for i, c in enumerate(context):
             chunk_block(i, c)
 
-        result = orig_gen(query, context, entities, hop_sequence, query_type=query_type)
+        result = orig_gen(query, context, entities, hop_sequence, query_type=query_type, bridge_entities=bridge_entities)
 
         subsection("VERIFIER RESULT")
         field("Answer",       result.answer)
@@ -1081,7 +1083,7 @@ def main():
     if not args.skip_llm:
         patch_verifier(verifier)
     else:
-        def _skip_verifier(query, context, entities=None, hop_sequence=None, query_type=None):
+        def _skip_verifier(query, context, entities=None, hop_sequence=None, query_type=None, bridge_entities=None):
             from src.logic_layer import VerificationResult
             section("S_V — VERIFIER  (skipped via --skip-llm)")
             field("Context chunks", len(context))
@@ -1150,6 +1152,8 @@ def main():
     field("Question",   q_text)
     field("Gold",       gold)
     field("Prediction", pred)
+    ctrl_cfg = getattr(controller, "config", None)
+    field("Model",      ctrl_cfg.model_name if ctrl_cfg else "(unknown)")
     field("Total time", f"{total_ms:.0f} ms")
 
     timings = final_state.get("stage_timings", {})

@@ -1,25 +1,25 @@
 """
-diagnose.py - Layer-by-Layer Pipeline Diagnostik mit echten HotpotQA Daten
+diagnose.py - Layer-by-Layer Pipeline Diagnostics with real HotpotQA data
 
-Testet jeden Stack-Layer einzeln:
+Tests each stack layer individually:
   Layer 1: Embedding (nomic-embed-text via Ollama)
   Layer 2: Vector Search (LanceDB)
   Layer 3: Graph Search (KuzuDB)
   Layer 4: HybridRetriever (RRF Fusion)
   Layer 5: Planner / S_P (Query Decomposition)
   Layer 6: Navigator / S_N (Retrieval + Filtering)
-  Layer 7: Verifier / S_V (Antwortgenerierung mit Kontext)
+  Layer 7: Verifier / S_V (answer generation with context)
   Layer 8: Full Pipeline (End-to-End)
 
 Usage:
-    python diagnose.py                        # Test alle Layer (Frage idx=0)
-    python diagnose.py --idx 5                # Frage Nr. 5 aus questions.json
-    python diagnose.py --multi 20             # Vector-Scores für 20 Fragen (kein LLM)
-    python diagnose.py --layer embedding      # Nur Embedding
-    python diagnose.py --layer retrieval      # Nur Vector + Graph
-    python diagnose.py --layer pipeline       # Nur Full Pipeline
-    python diagnose.py --question "Who is..."  # Eigene Frage
-    python diagnose.py --skip-llm             # LLM-Calls überspringen (Verifier)
+    python diagnose.py                        # Test all layers (question idx=0)
+    python diagnose.py --idx 5                # Question #5 from questions.json
+    python diagnose.py --multi 20             # Vector scores for 20 questions (no LLM)
+    python diagnose.py --layer embedding      # Embedding only
+    python diagnose.py --layer retrieval      # Vector + Graph only
+    python diagnose.py --layer pipeline       # Full pipeline only
+    python diagnose.py --question "Who is..."  # Custom question
+    python diagnose.py --skip-llm             # Skip LLM calls (Verifier)
 """
 
 import json
@@ -28,7 +28,7 @@ import time
 import argparse
 from pathlib import Path
 
-# ─── Farben für Terminal-Output ───────────────────────────────────────────────
+# ─── Terminal colour codes ────────────────────────────────────────────────────
 GREEN  = "\033[92m"
 RED    = "\033[91m"
 YELLOW = "\033[93m"
@@ -42,12 +42,12 @@ def warn(msg):  print(f"  {YELLOW}⚠{RESET} {msg}")
 def info(msg):  print(f"  {BLUE}→{RESET} {msg}")
 def header(msg): print(f"\n{BOLD}{'─'*70}\n  {msg}\n{'─'*70}{RESET}")
 
-# ─── Konfiguration ─────────────────────────────────────────────────────────────
+# ─── Configuration ─────────────────────────────────────────────────────────────
 DATASET   = "hotpotqa"
 DATA_DIR  = Path("./data/hotpotqa")
 CONFIG_PATH = Path("./config/settings.yaml")
 
-# ─── Setup ─────────────────────────────────────────────────────────────────────
+# ─── Setup ──────────────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 
 import yaml
@@ -56,7 +56,7 @@ with open(CONFIG_PATH, encoding="utf-8") as f:
 
 
 def load_sample_question(idx: int = 0) -> dict:
-    """Lade eine echte HotpotQA Frage."""
+    """Load a real HotpotQA question."""
     q_path = DATA_DIR / "questions.json"
     if not q_path.exists():
         return None
@@ -86,25 +86,25 @@ def test_embedding(query: str):
             cache_path=cache_path,
         )
         init_time = (time.time() - t0) * 1000
-        ok(f"Ollama erreichbar ({init_time:.0f}ms)")
+        ok(f"Ollama reachable ({init_time:.0f}ms)")
 
         t0 = time.time()
         vec = embeddings.embed_query(query)
         embed_time = (time.time() - t0) * 1000
 
         if vec and len(vec) > 0:
-            ok(f"Embedding erzeugt: dim={len(vec)}, Zeit={embed_time:.0f}ms")
-            info(f"Erste 5 Werte: {[round(v, 4) for v in vec[:5]]}")
+            ok(f"Embedding produced: dim={len(vec)}, time={embed_time:.0f}ms")
+            info(f"First 5 values: {[round(v, 4) for v in vec[:5]]}")
             if len(vec) != 768:
-                warn(f"Erwartet dim=768, bekommen dim={len(vec)}")
+                warn(f"Expected dim=768, got dim={len(vec)}")
         else:
-            fail("Leerer Embedding-Vektor zurückgegeben")
+            fail("Empty embedding vector returned")
             return None
 
         return embeddings
 
     except Exception as e:
-        fail(f"Embedding fehlgeschlagen: {e}")
+        fail(f"Embedding failed: {e}")
         return None
 
 
@@ -133,35 +133,33 @@ def test_vector_search(query: str, embeddings):
         t0 = time.time()
         store = HybridStore(config=storage_config, embeddings=embeddings)
         init_time = (time.time() - t0) * 1000
-        ok(f"HybridStore geladen ({init_time:.0f}ms)")
+        ok(f"HybridStore loaded ({init_time:.0f}ms)")
 
-        # Embedding des Query-Textes berechnen
-        info("Berechne Query-Embedding...")
+        info("Computing query embedding...")
         query_embedding = embeddings.embed_query(query)
 
-        # Test: direkter Vektorabruf (erwartet vorberechneten Vektor)
         t0 = time.time()
         results = store.vector_search(query_embedding, top_k=5)
         search_time = (time.time() - t0) * 1000
 
         if results:
-            ok(f"Vector Search: {len(results)} Treffer in {search_time:.0f}ms")
+            ok(f"Vector Search: {len(results)} hits in {search_time:.0f}ms")
             for i, r in enumerate(results[:3], 1):
                 score = r.get("similarity", r.get("score", "?"))
                 text  = r.get("text", "")[:80]
                 info(f"  #{i} score={score:.3f}: \"{text}...\"")
         else:
-            fail(f"Vector Search: 0 Treffer (Zeit={search_time:.0f}ms)")
-            warn("Mögliche Ursachen:")
-            warn("  - similarity_threshold zu hoch (aktuell: "
+            fail(f"Vector Search: 0 hits (time={search_time:.0f}ms)")
+            warn("Possible causes:")
+            warn("  - similarity_threshold too high (current: "
                  f"{vec_cfg.get('similarity_threshold', 0.3)})")
-            warn("  - Embedding-Dimension stimmt nicht")
+            warn("  - Embedding dimension mismatch")
             warn("  - LanceDB empty or corrupted index")
 
         return store
 
     except Exception as e:
-        fail(f"Vector Search fehlgeschlagen: {e}")
+        fail(f"Vector Search failed: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -174,15 +172,15 @@ def test_vector_search(query: str, embeddings):
 def test_graph_search(query: str, store):
     header("LAYER 3 — Graph Search (KuzuDB direkt)")
 
-    # GLiNER-Entitätsextraktion (konsistent mit Ingestion)
+    # GLiNER entity extraction (consistent with ingestion)
     from src.data_layer import ImprovedQueryEntityExtractor
     _qee = ImprovedQueryEntityExtractor()
     entities = _qee.extract(query)
     if not entities:
-        # Fallback: großgeschriebene Wörter falls GLiNER leer
+        # Fallback: capitalised words if GLiNER returns nothing
         import re
         entities = list(dict.fromkeys(re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', query)))
-    info(f"Extrahierte Entitäten: {entities}")
+    info(f"Extracted entities: {entities}")
 
     try:
         t0 = time.time()
@@ -190,20 +188,20 @@ def test_graph_search(query: str, store):
         search_time = (time.time() - t0) * 1000
 
         if results:
-            ok(f"Graph Search: {len(results)} Treffer in {search_time:.0f}ms")
+            ok(f"Graph Search: {len(results)} hits in {search_time:.0f}ms")
             for i, r in enumerate(results[:3], 1):
                 entity = r.get("matched_entity", "?")
                 hops   = r.get("hops", "?")
                 text   = r.get("text", "")[:80]
                 info(f"  #{i} entity='{entity}' hops={hops}: \"{text}...\"")
         else:
-            warn(f"Graph Search: 0 Treffer (Zeit={search_time:.0f}ms)")
-            warn("  - Entitätsextraktion findet keine Keywords in der Query")
-            warn("  - Knowledge Graph hat keine passenden Nodes")
-            info("  → Ist normal wenn keine Named Entities in der Query")
+            warn(f"Graph Search: 0 hits (time={search_time:.0f}ms)")
+            warn("  - Entity extraction found no keywords in the query")
+            warn("  - Knowledge graph has no matching nodes")
+            info("  → Normal when the query contains no named entities")
 
     except Exception as e:
-        fail(f"Graph Search fehlgeschlagen: {e}")
+        fail(f"Graph Search failed: {e}")
         import traceback
         traceback.print_exc()
 
@@ -232,15 +230,15 @@ def test_hybrid_retriever(query: str, store, embeddings):
             embeddings=embeddings,
             config=retrieval_config,
         )
-        ok("HybridRetriever initialisiert")
+        ok("HybridRetriever initialised")
 
         t0 = time.time()
         results, metrics = retriever.retrieve(query)
         retrieval_time = (time.time() - t0) * 1000
 
         if results:
-            ok(f"HybridRetriever: {len(results)} Treffer in {retrieval_time:.0f}ms")
-            info(f"Metriken: vector={metrics.vector_results}, "
+            ok(f"HybridRetriever: {len(results)} hits in {retrieval_time:.0f}ms")
+            info(f"Metrics: vector={metrics.vector_results}, "
                  f"graph={metrics.graph_results}, "
                  f"fused={metrics.final_results}")
             for i, r in enumerate(results[:3], 1):
@@ -248,13 +246,13 @@ def test_hybrid_retriever(query: str, store, embeddings):
                 text  = getattr(r, "text", str(r))[:80]
                 info(f"  #{i} rrf_score={score:.4f}: \"{text}...\"")
         else:
-            fail(f"HybridRetriever: 0 Treffer (Zeit={retrieval_time:.0f}ms)")
-            info(f"Metriken: {metrics}")
+            fail(f"HybridRetriever: 0 hits (time={retrieval_time:.0f}ms)")
+            info(f"Metrics: {metrics}")
 
         return retriever
 
     except Exception as e:
-        fail(f"HybridRetriever fehlgeschlagen: {e}")
+        fail(f"HybridRetriever failed: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -265,7 +263,7 @@ def test_hybrid_retriever(query: str, store, embeddings):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_planner(query: str):
-    header("LAYER 5 — Planner / S_P (Query Decomposition, kein LLM)")
+    header("LAYER 5 — Planner / S_P (Query Decomposition, no LLM)")
 
     from src.logic_layer import create_planner
 
@@ -275,22 +273,22 @@ def test_planner(query: str):
         plan = planner.plan(query)
         plan_time = (time.time() - t0) * 1000
 
-        ok(f"Planner ausgeführt ({plan_time:.0f}ms)")
-        info(f"  Query-Typ:  {plan.query_type.value}")
-        info(f"  Strategie:  {plan.strategy.value}")
-        info(f"  Konfidenz:  {plan.confidence:.2f}")
+        ok(f"Planner executed ({plan_time:.0f}ms)")
+        info(f"  Query type:  {plan.query_type.value}")
+        info(f"  Strategy:    {plan.strategy.value}")
+        info(f"  Confidence:  {plan.confidence:.2f}")
 
         if hasattr(plan, 'hop_sequence') and plan.hop_sequence:
             info(f"  Sub-Queries ({len(plan.hop_sequence)}):")
             for hop in plan.hop_sequence:
                 info(f"    - \"{hop.sub_query}\"")
         else:
-            warn("  Keine Hop-Sequenz erzeugt → nur Original-Query wird verwendet")
+            warn("  No hop sequence produced → only original query will be used")
 
         return plan
 
     except Exception as e:
-        fail(f"Planner fehlgeschlagen: {e}")
+        fail(f"Planner failed: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -306,7 +304,7 @@ def test_navigator(query: str, plan, retriever):
     from src.logic_layer import Navigator, ControllerConfig
 
     if retriever is None:
-        fail("Kein HybridRetriever verfügbar — Layer 4 muss zuerst erfolgreich sein")
+        fail("No HybridRetriever available — Layer 4 must succeed first")
         return None
 
     try:
@@ -327,7 +325,7 @@ def test_navigator(query: str, plan, retriever):
         )
         navigator = Navigator(nav_config)
         navigator.set_retriever(retriever)
-        ok("Navigator initialisiert, Retriever gesetzt")
+        ok("Navigator initialised, retriever set")
 
         sub_queries = (
             [h.sub_query for h in plan.hop_sequence]
@@ -344,66 +342,65 @@ def test_navigator(query: str, plan, retriever):
         filtered_count = len(nav_result.filtered_context) if nav_result.filtered_context else 0
 
         if filtered_count > 0:
-            ok(f"Navigator: {raw_count} raw → {filtered_count} gefilterte Chunks ({nav_time:.0f}ms)")
+            ok(f"Navigator: {raw_count} raw → {filtered_count} filtered chunks ({nav_time:.0f}ms)")
             for i, chunk in enumerate(nav_result.filtered_context[:3], 1):
                 info(f"  Chunk #{i}: \"{chunk[:100]}...\"")
         else:
-            fail(f"Navigator: {raw_count} raw → {filtered_count} Chunks ({nav_time:.0f}ms)")
+            fail(f"Navigator: {raw_count} raw → {filtered_count} chunks ({nav_time:.0f}ms)")
             meta = nav_result.metadata or {}
-            info(f"  Pre-Filter:       {meta.get('pre_filter_count', '?')}")
-            info(f"  Nach Relevanz:    {meta.get('after_relevance_filter', '?')}")
-            info(f"  Nach Redundanz:   {meta.get('after_redundancy_filter', '?')}")
+            info(f"  Pre-filter:         {meta.get('pre_filter_count', '?')}")
+            info(f"  After relevance:    {meta.get('after_relevance_filter', '?')}")
+            info(f"  After redundancy:   {meta.get('after_redundancy_filter', '?')}")
             if meta.get("retrieval_errors"):
                 for err in meta["retrieval_errors"]:
-                    warn(f"  Retrieval-Fehler: {err}")
+                    warn(f"  Retrieval error: {err}")
 
         return nav_result
 
     except Exception as e:
-        fail(f"Navigator fehlgeschlagen: {e}")
+        fail(f"Navigator failed: {e}")
         import traceback
         traceback.print_exc()
         return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LAYER 7: VERIFIER / S_V (mit bekanntem Kontext)
+# LAYER 7: VERIFIER / S_V (with known context)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_verifier(query: str, gold_answer: str, context: list, skip_llm: bool):
-    header("LAYER 7 — Verifier / S_V (Antwortgenerierung)")
+    header("LAYER 7 — Verifier / S_V (Answer Generation)")
 
     if skip_llm:
-        warn("--skip-llm aktiv: Verifier-Test übersprungen")
+        warn("--skip-llm active: Verifier test skipped")
         return
 
     from src.logic_layer import create_verifier
 
-    # Wenn kein echtes Context vorhanden, nutze Dummy
     if not context:
-        warn("Kein Context von Navigator → nutze Dummy-Kontext")
+        warn("No context from Navigator → using dummy context")
         context = [
-            f"[DUMMY] Dieser Text ist ein Platzhalter weil der Navigator keinen Kontext gefunden hat.",
-            f"[DUMMY] Die Frage lautet: {query}"
+            f"[DUMMY] This text is a placeholder because the Navigator found no context.",
+            f"[DUMMY] The question is: {query}"
         ]
 
     try:
-        # Lädt alle Werte aus settings.yaml (max_docs, max_context_chars, timeout, …)
+        # Loads all values from settings.yaml (max_docs, max_context_chars, timeout, …)
         verifier = create_verifier(cfg=config)
-        ok("Verifier initialisiert")
+        ok("Verifier initialised")
 
-        info(f"Kontext-Chunks: {len(context)}")
-        info(f"Gold-Antwort:   \"{gold_answer}\"")
+        info(f"Context chunks: {len(context)}")
+        info(f"Gold answer:    \"{gold_answer}\"")
 
         t0 = time.time()
         gen_result = verifier.generate_and_verify(query=query, context=context)
         gen_time = (time.time() - t0) * 1000
 
-        ok(f"Verifier abgeschlossen ({gen_time:.0f}ms)")
-        info(f"  Antwort:     \"{gen_result.answer}\"")
-        info(f"  Konfidenz:   {gen_result.confidence.value}")
+        ok(f"Verifier completed ({gen_time:.0f}ms)")
+        info(f"  Answer:      \"{gen_result.answer}\"")
+        info(f"  Confidence:  {gen_result.confidence.value}")
 
-        # Manuelle EM + F1 Berechnung
+        # Manual EM + F1 calculation
         import re
         def norm(t):
             t = t.lower().strip()
@@ -430,7 +427,7 @@ def test_verifier(query: str, gold_answer: str, context: list, skip_llm: bool):
             info(f"  Gold (norm): \"{gold_n}\"")
 
     except Exception as e:
-        fail(f"Verifier fehlgeschlagen: {e}")
+        fail(f"Verifier failed: {e}")
         import traceback
         traceback.print_exc()
 
@@ -444,7 +441,7 @@ def test_full_pipeline(query: str, gold_answer: str, skip_llm: bool,
     header("LAYER 8 — Full Pipeline (End-to-End)")
 
     if skip_llm:
-        warn("--skip-llm aktiv: Full Pipeline übersprungen")
+        warn("--skip-llm active: Full Pipeline skipped")
         return
 
     from src.pipeline import create_full_pipeline
@@ -456,7 +453,7 @@ def test_full_pipeline(query: str, gold_answer: str, skip_llm: bool,
     vec_cfg = config.get("vector_store", {})
     rag_cfg = config.get("rag", {})
 
-    # Wiederverwendung aus früheren Layern verhindert KuzuDB-Lock-Konflikt
+    # Reusing objects from earlier layers avoids KuzuDB lock conflict
     if embeddings is None:
         cache_path = Path(f"./cache/{DATASET}_embeddings.db")
         embeddings = BatchedOllamaEmbeddings(
@@ -492,30 +489,29 @@ def test_full_pipeline(query: str, gold_answer: str, skip_llm: bool,
             graph_store=store.graph_store,
             config=config,
         )
-        ok("Pipeline erstellt")
+        ok("Pipeline created")
 
         t0 = time.time()
         result = pipeline.process(query)
         total_time = (time.time() - t0) * 1000
 
-        ok(f"Pipeline abgeschlossen ({total_time:.0f}ms)")
-        info(f"  Antwort:   \"{result.answer}\"")
-        info(f"  Gold:      \"{gold_answer}\"")
-        info(f"  Konfidenz: {result.confidence}")
+        ok(f"Pipeline completed ({total_time:.0f}ms)")
+        info(f"  Answer:     \"{result.answer}\"")
+        info(f"  Gold:       \"{gold_answer}\"")
+        info(f"  Confidence: {result.confidence}")
         info(f"  S_P: {result.planner_time_ms:.0f}ms | "
              f"S_N: {result.navigator_time_ms:.0f}ms | "
              f"S_V: {result.verifier_time_ms:.0f}ms")
 
-        # Coverage aus navigator_result
         nav = result.navigator_result or {}
         fc = nav.get("filtered_context", [])
-        info(f"  Kontext-Chunks: {len(fc)}")
+        info(f"  Context chunks: {len(fc)}")
         if len(fc) == 0:
-            warn("  → Coverage=0%! Navigator hat keinen Kontext gefunden.")
-            info(f"  Navigator-Metadata: {nav.get('metadata', {})}")
+            warn("  → Coverage=0%! Navigator found no context.")
+            info(f"  Navigator metadata: {nav.get('metadata', {})}")
 
     except Exception as e:
-        fail(f"Pipeline fehlgeschlagen: {e}")
+        fail(f"Pipeline failed: {e}")
         import traceback
         traceback.print_exc()
 
@@ -526,43 +522,42 @@ def test_full_pipeline(query: str, gold_answer: str, skip_llm: bool,
 
 def test_graph_quality(n_questions: int):
     """
-    Misst wie gut der Graph für N echte HotpotQA-Fragen arbeitet.
+    Measures how well the graph performs on N real HotpotQA questions.
 
-    Erweiterte Diagnose zeigt pro Frage:
-      - Welche Entität wurde tatsächlich gematcht? (Hub-Kontamination?)
-      - Enthält ein Graph-Chunk die Gold-Antwort? (Answer Coverage)
-      - Vergleich mit Vector-Search Answer Coverage
+    Extended diagnostics show per question:
+      - Which entity was actually matched? (hub contamination?)
+      - Does a graph chunk contain the gold answer? (answer coverage)
+      - Comparison with vector-search answer coverage
 
-    Erkennt das "False-Positive-Hit" Problem: Keyword trifft Hub-Entitäten
-    wie "He", "American", "United States" die für fast jede Frage matchen,
-    aber keine relevanten Chunks zurückgeben.
+    Detects the "false-positive-hit" problem: keyword matches hub entities
+    like "He", "American", "United States" that match almost every question
+    but return no relevant chunks.
     """
-    header(f"GRAPH QUALITY ANALYSE — {n_questions} Fragen")
+    header(f"GRAPH QUALITY ANALYSIS — {n_questions} questions")
 
     q_path = DATA_DIR / "questions.json"
     if not q_path.exists():
-        fail(f"questions.json nicht gefunden: {q_path}")
+        fail(f"questions.json not found: {q_path}")
         return
 
     with open(q_path, encoding="utf-8") as f:
         all_qs = json.load(f)
 
     n_questions = min(n_questions, len(all_qs))
-    info(f"Verfügbare Fragen: {len(all_qs)} — analysiere {n_questions}")
+    info(f"Available questions: {len(all_qs)} — analysing {n_questions}")
 
-    # Graph-Metadata anzeigen
     meta_path = DATA_DIR / "graph" / "extraction_metadata.json"
     if meta_path.exists():
         with open(meta_path) as f:
             meta = json.load(f)
         stats = meta.get("graph_stats", {})
-        ok(f"Graph-Stats: {stats.get('unique_entities', '?')} unique entities, "
+        ok(f"Graph stats: {stats.get('unique_entities', '?')} unique entities, "
            f"{stats.get('relations', '?')} relations, "
            f"{stats.get('document_chunks', '?')} chunks")
         gliner_model = meta.get("gliner_model", "?")
-        ok(f"Ingestion-Methode: GLiNER ({gliner_model})")
+        ok(f"Ingestion method: GLiNER ({gliner_model})")
     else:
-        warn("Keine extraction_metadata.json — Graph-Stats unbekannt")
+        warn("No extraction_metadata.json — graph stats unknown")
 
     from src.data_layer import HybridStore, StorageConfig
     from src.data_layer import BatchedOllamaEmbeddings
@@ -584,30 +579,30 @@ def test_graph_quality(n_questions: int):
             embedding_dim=emb_cfg.get("embedding_dim", 768),
             normalize_embeddings=vec_cfg.get("normalize_embeddings", True),
             distance_metric=vec_cfg.get("distance_metric", "cosine"),
-            similarity_threshold=0.0,   # Kein Filter – alle Treffer sehen
+            similarity_threshold=0.0,   # No filter — see all hits
         )
         store = HybridStore(config=storage_config, embeddings=embeddings)
     except Exception as e:
-        fail(f"Store-Init fehlgeschlagen: {e}")
+        fail(f"Store init failed: {e}")
         return
 
-    # GLiNER laden (optional)
+    # Load GLiNER (optional)
     gliner = None
     try:
         from gliner import GLiNER
         gliner = GLiNER.from_pretrained("urchade/gliner_small-v2.1")
-        ok("GLiNER geladen (urchade/gliner_small-v2.1)")
+        ok("GLiNER loaded (urchade/gliner_small-v2.1)")
     except Exception as e:
-        warn(f"GLiNER nicht ladbar: {e} — nur Keyword-Extraktion")
+        warn(f"GLiNER not loadable: {e} — keyword extraction only")
 
-    # ─── Hub-Erkennung ────────────────────────────────────────────────────────
-    # Entitäten die in fast jeder englischen Antwort vorkommen → Rauschen statt Signal
+    # ─── Hub detection ───────────────────────────────────────────────────────
+    # Entities that appear in almost every English answer → noise, not signal
     HUB_WORDS = {
-        # Pronomen (häufigster Fehler bei GLiNER/NER)
+        # Pronouns (most common GLiNER/NER false-positive class)
         "i", "he", "she", "it", "they", "we", "you",
         "his", "her", "their", "him", "them", "who", "that",
         "this", "these", "those", "its",
-        # Generische Terme (treffen zu viele Chunks)
+        # Generic terms (match too many chunks)
         "american", "united states", "us", "uk", "british",
         "country", "film", "movie", "people", "world", "city",
         "government", "man", "woman", "year", "time", "place",
@@ -616,17 +611,17 @@ def test_graph_quality(n_questions: int):
     }
 
     def is_hub(entity_name: str) -> bool:
-        """True wenn Entity ein Hub ist (nicht-spezifisch / zu generisch)."""
+        """True if entity is a hub (non-specific / too generic)."""
         if not entity_name:
             return False
         e = entity_name.strip().lower()
-        if len(e) <= 2:              # "I", "He", "US", Einzelbuchstaben
+        if len(e) <= 2:              # "I", "He", "US", single letters
             return True
         if e in HUB_WORDS:
             return True
         return False
 
-    # ─── Entity-Extraktion ───────────────────────────────────────────────────
+    # ─── Entity extraction ───────────────────────────────────────────────────
     import re
 
     def extract_keyword(query: str):
@@ -644,7 +639,7 @@ def test_graph_quality(n_questions: int):
         except Exception:
             return []
 
-    # ─── Answer Coverage Prüfung ─────────────────────────────────────────────
+    # ─── Answer coverage check ───────────────────────────────────────────────
     def norm_ans(t: str) -> str:
         t = t.lower().strip()
         t = re.sub(r'\b(a|an|the)\b', ' ', t)
@@ -652,7 +647,7 @@ def test_graph_quality(n_questions: int):
         return ' '.join(t.split())
 
     def answer_in_chunks(gold: str, chunks: list) -> bool:
-        """True wenn normalisierte Gold-Antwort in irgendeinem Chunk vorkommt."""
+        """True if the normalised gold answer appears in any chunk."""
         gold_n = norm_ans(gold)
         if not gold_n or len(gold_n) < 2:
             return False
@@ -662,19 +657,19 @@ def test_graph_quality(n_questions: int):
                 return True
         return False
 
-    # ─── Tabellen-Header ─────────────────────────────────────────────────────
+    # ─── Table header ────────────────────────────────────────────────────────
     print(f"\n  {'#':>3}  {'KW-H':>4}  {'Top-Entity (gematcht)':>22}  {'Hub':>3}  "
-          f"{'GrAns':>5}  {'VecH':>4}  {'VecAns':>6}  Frage")
+          f"{'GrAns':>5}  {'VecH':>4}  {'VecAns':>6}  Question")
     print(f"  {'─'*3}  {'─'*4}  {'─'*22}  {'─'*3}  {'─'*5}  {'─'*4}  {'─'*6}  {'─'*40}")
 
-    # ─── Zähler ──────────────────────────────────────────────────────────────
+    # ─── Counters ────────────────────────────────────────────────────────────
     kw_hits = kw_miss = 0
-    hub_contaminated   = 0   # Fragen wo alle KW-Treffer via Hub-Entity kamen
-    any_hub_hit        = 0   # Fragen wo mindestens ein Treffer via Hub war
-    graph_answer_hits  = 0   # Fragen wo Gold-Antwort in Graph-Chunks vorkommt
-    vec_answer_hits    = 0   # Fragen wo Gold-Antwort in Vector-Chunks vorkommt
+    hub_contaminated   = 0   # questions where all KW hits came via a hub entity
+    any_hub_hit        = 0   # questions where at least one hit came via a hub
+    graph_answer_hits  = 0   # questions where gold answer appears in graph chunks
+    vec_answer_hits    = 0   # questions where gold answer appears in vector chunks
 
-    gl_hits = gl_graph_answer_hits = 0  # GLiNER-Zähler (nur wenn verfügbar)
+    gl_hits = gl_graph_answer_hits = 0  # GLiNER counters (only when available)
 
     for i in range(n_questions):
         sample = all_qs[i]
@@ -686,7 +681,7 @@ def test_graph_quality(n_questions: int):
         try:
             res_kw = store.graph_search(entities=ents_kw if ents_kw else ["___"], top_k=5)
         except Exception as e:
-            warn(f"  [{i}] graph_search Fehler: {e}")
+            warn(f"  [{i}] graph_search error: {e}")
             continue
 
         n_kw = len(res_kw)
@@ -695,7 +690,7 @@ def test_graph_quality(n_questions: int):
         else:
             kw_miss += 1
 
-        # ─── Hub-Kontaminations-Diagnose ──────────────────────────────────
+        # ─── Hub contamination diagnostics ───────────────────────────────
         matched_entities = [r.get("matched_entity", "") for r in res_kw]
         top_entity = matched_entities[0] if matched_entities else "NONE"
         top_is_hub = is_hub(top_entity)
@@ -705,12 +700,12 @@ def test_graph_quality(n_questions: int):
         if res_kw and any(is_hub(e) for e in matched_entities):
             any_hub_hit += 1
 
-        # ─── Graph Answer Coverage ────────────────────────────────────────
+        # ─── Graph answer coverage ────────────────────────────────────────
         g_in_graph = answer_in_chunks(gold, res_kw) if gold else False
         if g_in_graph:
             graph_answer_hits += 1
 
-        # ─── Vector Search für Vergleich ──────────────────────────────────
+        # ─── Vector search for comparison ────────────────────────────────
         vec_ans = False
         n_vec = 0
         try:
@@ -723,7 +718,7 @@ def test_graph_quality(n_questions: int):
         except Exception:
             pass
 
-        # ─── Zeilenausgabe ────────────────────────────────────────────────
+        # ─── Row output ──────────────────────────────────────────────────
         kw_c   = GREEN if n_kw > 0 else RED
         hub_c  = RED   if top_is_hub else GREEN
         grn_c  = GREEN if g_in_graph else RED
@@ -741,12 +736,10 @@ def test_graph_quality(n_questions: int):
 
     total = kw_hits + kw_miss
     print(f"\n  {'─'*80}")
-    print(f"\n  {BOLD}Zusammenfassung ({total} Fragen):{RESET}")
+    print(f"\n  {BOLD}Summary ({total} questions):{RESET}")
 
-    # Graph-Hits
-    ok(f"Graph-Hits (KW):          {kw_hits:>3}/{total} ({100*kw_hits//max(total,1):>3}%)")
+    ok(f"Graph hits (KW):          {kw_hits:>3}/{total} ({100*kw_hits//max(total,1):>3}%)")
 
-    # Hub-Kontamination
     hub_all_rate = 100 * hub_contaminated // max(kw_hits, 1)
     hub_any_rate = 100 * any_hub_hit      // max(kw_hits, 1)
     if hub_all_rate >= 50:
@@ -755,7 +748,6 @@ def test_graph_quality(n_questions: int):
         warn(f"Hub contamination (all):  {hub_contaminated:>3}/{kw_hits} hits ({hub_all_rate:>3}%) ONLY via hub entity")
     warn(f"Hub contamination (any): {any_hub_hit:>4}/{kw_hits} hits ({hub_any_rate:>3}%) with >=1 hub entity")
 
-    # Answer Coverage
     ans_rate = 100 * graph_answer_hits // max(total, 1)
     vec_rate = 100 * vec_answer_hits   // max(total, 1)
     if ans_rate >= 50:
@@ -829,22 +821,22 @@ def test_graph_quality(n_questions: int):
 
 def test_multi_vector(n_questions: int):
     """
-    Testet Vector Search für N Fragen und zeigt Score-Verteilung.
-    Hilft schlechte Fragen (zu geringe Ähnlichkeit) von guten zu trennen.
-    Kein LLM nötig.
+    Tests vector search for N questions and shows score distribution.
+    Helps separate poor questions (low similarity) from good ones.
+    No LLM required.
     """
-    header(f"MULTI-VECTOR ANALYSE — {n_questions} Fragen (kein LLM)")
+    header(f"MULTI-VECTOR ANALYSIS — {n_questions} questions (no LLM)")
 
     q_path = DATA_DIR / "questions.json"
     if not q_path.exists():
-        fail(f"questions.json nicht gefunden: {q_path}")
+        fail(f"questions.json not found: {q_path}")
         return
 
     with open(q_path, encoding="utf-8") as f:
         all_qs = json.load(f)
 
     n_questions = min(n_questions, len(all_qs))
-    info(f"Verfügbare Fragen: {len(all_qs)} — teste {n_questions}")
+    info(f"Available questions: {len(all_qs)} — testing {n_questions}")
 
     from src.data_layer import BatchedOllamaEmbeddings
     from src.data_layer import HybridStore, StorageConfig
@@ -864,16 +856,16 @@ def test_multi_vector(n_questions: int):
             vector_db_path=DATA_DIR / "vector",
             graph_db_path=DATA_DIR / "graph",
             embedding_dim=emb_cfg.get("embedding_dim", 768),
-            similarity_threshold=0.0,          # Kein Filter – wir wollen alle Scores sehen
+            similarity_threshold=0.0,          # No filter — we want to see all scores
             normalize_embeddings=vec_cfg.get("normalize_embeddings", True),
             distance_metric=vec_cfg.get("distance_metric", "cosine"),
         )
         store = HybridStore(config=storage_config, embeddings=embeddings)
     except Exception as e:
-        fail(f"Init fehlgeschlagen: {e}")
+        fail(f"Init failed: {e}")
         return
 
-    # Frage-Typ-Kategorisierung (grob)
+    # Question type categorisation (coarse)
     def categorize(q: str) -> str:
         q_lower = q.lower()
         if q_lower.startswith(("were ", "was ", "is ", "are ", "did ", "do ", "does ", "has ", "have ")):
@@ -889,8 +881,8 @@ def test_multi_vector(n_questions: int):
     rows = []
     bad_idx = []
 
-    print(f"\n  {'#':>3}  {'Top-1 Score':>11}  {'Top-3 Ø':>8}  {'Typ':>8}  Frage (gekürzt)")
-    print(f"  {'─'*3}  {'─'*11}  {'─'*8}  {'─'*8}  {'─'*50}")
+    print(f"\n  {'#':>3}  {'Top-1 Score':>11}  {'Top-3 Avg':>9}  {'Type':>8}  Question (truncated)")
+    print(f"  {'─'*3}  {'─'*11}  {'─'*9}  {'─'*8}  {'─'*50}")
 
     for i in range(n_questions):
         sample = all_qs[i]
@@ -920,13 +912,12 @@ def test_multi_vector(n_questions: int):
 
             rows.append((i, top1, top3avg, qtype, query, answer))
             q_short = query[:50].ljust(50)
-            print(f"  {i:>3}  {color}{top1:>11.4f}{RESET}  {top3avg:>8.4f}  {qtype:>8}  {q_short}")
+            print(f"  {i:>3}  {color}{top1:>11.4f}{RESET}  {top3avg:>9.4f}  {qtype:>8}  {q_short}")
 
         except Exception as e:
             rows.append((i, -1, -1, qtype, query, answer))
-            print(f"  {i:>3}  {RED}  ERROR{RESET}  {'?':>8}  {'?':>8}  {query[:50]}")
+            print(f"  {i:>3}  {RED}  ERROR{RESET}  {'?':>9}  {'?':>8}  {query[:50]}")
 
-    # Zusammenfassung
     valid_rows = [(i, s1, s3, t, q, a) for (i, s1, s3, t, q, a) in rows if s1 >= 0]
     if valid_rows:
         avg_top1 = sum(r[1] for r in valid_rows) / len(valid_rows)
@@ -969,25 +960,24 @@ def main():
                         help="Skip LLM calls (Verifier + pipeline)")
     args = parser.parse_args()
 
-    # ─── Graph-Quality Modus ─────────────────────────────────────────────────
+    # ─── Graph-quality mode ──────────────────────────────────────────────────
     if args.graph_quality > 0:
-        print(f"\n{BOLD}{'═'*70}\n  EDGE-RAG DIAGNOSE — GRAPH QUALITY MODUS\n{'═'*70}{RESET}")
+        print(f"\n{BOLD}{'═'*70}\n  EDGE-RAG DIAGNOSE — GRAPH QUALITY MODE\n{'═'*70}{RESET}")
         test_graph_quality(args.graph_quality)
-        print(f"\n{BOLD}{'═'*70}\n  DIAGNOSE ABGESCHLOSSEN\n{'═'*70}{RESET}\n")
+        print(f"\n{BOLD}{'═'*70}\n  DIAGNOSIS COMPLETE\n{'═'*70}{RESET}\n")
         return
 
-    # ─── Multi-Vector Modus ──────────────────────────────────────────────────
+    # ─── Multi-vector mode ───────────────────────────────────────────────────
     if args.multi > 0:
-        print(f"\n{BOLD}{'═'*70}\n  EDGE-RAG DIAGNOSE — MULTI-VECTOR MODUS\n{'═'*70}{RESET}")
+        print(f"\n{BOLD}{'═'*70}\n  EDGE-RAG DIAGNOSE — MULTI-VECTOR MODE\n{'═'*70}{RESET}")
         test_multi_vector(args.multi)
-        print(f"\n{BOLD}{'═'*70}\n  DIAGNOSE ABGESCHLOSSEN\n{'═'*70}{RESET}\n")
+        print(f"\n{BOLD}{'═'*70}\n  DIAGNOSIS COMPLETE\n{'═'*70}{RESET}\n")
         return
 
-    # Lade Sample-Frage
     sample = load_sample_question(args.idx)
     if sample is None:
-        print(f"{RED}FEHLER: data/hotpotqa/questions.json nicht gefunden!{RESET}")
-        print("Zuerst ingestieren: python benchmark_datasets.py ingest --dataset hotpotqa --samples 50")
+        print(f"{RED}ERROR: data/hotpotqa/questions.json not found!{RESET}")
+        print("Ingest first: python benchmark_datasets.py ingest --dataset hotpotqa --samples 50")
         sys.exit(1)
 
     query       = args.question or sample.get("question", sample.get("q", ""))
@@ -996,8 +986,8 @@ def main():
     print(f"\n{BOLD}{'═'*70}")
     print(f"  EDGE-RAG DIAGNOSE")
     print(f"{'═'*70}{RESET}")
-    info(f"Frage ({args.idx}): \"{query}\"")
-    info(f"Gold-Antwort:   \"{gold_answer}\"")
+    info(f"Question ({args.idx}): \"{query}\"")
+    info(f"Gold answer:      \"{gold_answer}\"")
     print()
 
     run_all = args.layer == "all"
@@ -1053,11 +1043,11 @@ def main():
 
     # ─── Layer 8: Full Pipeline ───────────────────────────────────────────────
     if run_all or args.layer == "pipeline":
-        # store + embeddings weitergeben → verhindert KuzuDB-Lock-Konflikt
+        # pass store + embeddings through → avoids KuzuDB lock conflict
         test_full_pipeline(query, gold_answer, args.skip_llm,
                            store=store, embeddings=embeddings)
 
-    print(f"\n{BOLD}{'═'*70}\n  DIAGNOSE ABGESCHLOSSEN\n{'═'*70}{RESET}\n")
+    print(f"\n{BOLD}{'═'*70}\n  DIAGNOSIS COMPLETE\n{'═'*70}{RESET}\n")
 
 
 if __name__ == "__main__":

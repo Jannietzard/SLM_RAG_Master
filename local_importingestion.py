@@ -56,7 +56,7 @@ import sys
 import time
 import hashlib
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Set, Tuple
 from dataclasses import dataclass
 
 import yaml
@@ -191,6 +191,31 @@ def _canonical_entity_id(name: str, entity_type: str) -> str:
     canon = canonical_form(name)
     combined = f"{canon}:{entity_type or 'UNKNOWN'}"
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:24]
+
+
+# Relation-object surface forms that are *never* concept nodes even when they
+# fail to resolve to a named entity — single letters / digits ("R" for
+# Republican, "D" for Democrat), bare punctuation, the empty string. Keeping
+# these out of the graph prevents a "CONCEPT: r" hub that links every American
+# politician chunk. This is a structural filter (length / character class),
+# NOT a curated stop-list of seen values.
+def _is_plausible_concept(text: str) -> bool:
+    t = (text or "").strip()
+    if len(t) < 3:
+        return False
+    # Must contain at least one alphabetic character.
+    if not any(ch.isalpha() for ch in t):
+        return False
+    return True
+
+
+# Synthetic, lower-cased "concept" type for REBEL relation objects that are
+# attribute values rather than named entities ("genre -> punk rock",
+# "sport -> ice hockey", "occupation -> DJ"). Tagged distinctly from the
+# GLiNER entity types (PERSON, GPE, ...) so graph cleanup and retrieval can
+# treat them differently if needed. They still receive MENTIONS edges from
+# the chunk that produced the relation, so they are reachable.
+_CONCEPT_ENTITY_TYPE = "CONCEPT"
 
 class _HFEmbeddings:
     """Thin wrapper so SentenceTransformer has the same interface as BatchedOllamaEmbeddings."""
@@ -348,8 +373,8 @@ def ingest_vector_store(
     logger.info(f"PHASE 3a: VECTOR STORE INGESTION ({len(documents)} Chunks)")
     logger.info(f"{'─'*70}")
 
+    embedding_config = config.get("embeddings", {})
     if embeddings is None:
-        embedding_config = config.get("embeddings", {})
         perf_config = config.get("performance", {})
         cache_path = Path(f"./cache/{dataset_name}_embeddings.db")
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -408,6 +433,7 @@ def ingest_knowledge_graph(
     graph_path: Path,
     dataset_name: str,
     entity_confidence_threshold: float = 0.5,
+    capture_attribute_objects: bool = False,
 ) -> Tuple[Optional["KuzuGraphStore"], Dict[str, Any]]:
     """
     Importiere Entities und Relationen in KuzuDB Knowledge Graph.
@@ -418,7 +444,20 @@ def ingest_knowledge_graph(
         3. FROM_SOURCE + NEXT_CHUNK Relationen
         4. Entity nodes from extraction results
         5. MENTIONS Relationen (Chunk → Entity)
-        6. RELATED_TO Relationen (Entity → Entity)
+        6. RELATED_TO Relationen (Entity → Entity)  — second pass, after the
+           full `name_to_id` map is built, so a relation in chunk N can be
+           resolved against an entity first seen in chunk N+k.
+
+    Args:
+        capture_attribute_objects: When True, a REBEL relation whose object is
+            a free-text attribute value rather than a named entity
+            ("genre -> punk rock", "sport -> ice hockey") still produces a
+            graph edge — the object is materialised as a synthetic CONCEPT-typed
+            Entity node. Default False: such relations are dropped, keeping the
+            graph within the OntoNotes-5 entity-type taxonomy (PERSON, GPE,
+            ORGANIZATION, LOCATION, DATE, EVENT, WORK_OF_ART, PRODUCT) used by
+            GLiNER. Enable with --attribute-objects only after considering the
+            impact on co-occurrence edge quality and hub detection.
     """
     if not STORAGE_AVAILABLE:
         logger.error("Storage modules not available!")
@@ -440,6 +479,11 @@ def ingest_knowledge_graph(
         "unique_entities": 0,
         "mentions": 0,
         "relations": 0,
+        "rebel_duplicates_skipped": 0,
+        "rebel_unresolved_dropped": 0,
+        "attribute_relations": 0,
+        "concept_nodes": 0,
+        "rebel_confidence_is_constant": False,
     }
 
     # Index: chunk_id → extraction result
@@ -545,10 +589,14 @@ def ingest_knowledge_graph(
     # the fsync count by 200× and brings Phase 3b down to ~3-5 min.
     _PHASE3B_BATCH = 200   # chunks per transaction commit
 
+    # ── Pass A: Entity nodes + MENTIONS edges ────────────────────────────────
+    # Build the COMPLETE name_to_id map before touching relations. Relations
+    # are resolved in Pass B, so a relation in chunk N can reference an entity
+    # first extracted in chunk N+k (forward reference) — previously those were
+    # silently dropped because the map was only partially populated.
     for _batch_i, result in enumerate(
-        tqdm(extraction_results, desc="Entities & Relations", unit="chunk")
+        tqdm(extraction_results, desc="Entities & MENTIONS", unit="chunk")
     ):
-        # Open a new transaction at the start of each batch.
         if _batch_i % _PHASE3B_BATCH == 0:
             if _batch_i > 0:
                 try:
@@ -559,7 +607,6 @@ def ingest_knowledge_graph(
 
         chunk_id = str(result["chunk_id"])
 
-        # Step 4: Entity Nodes
         for ent in result.get("entities", []):
             entity_name = (ent.get("name") or "").strip()
             entity_type = ent.get("entity_type") or ent.get("type", "UNKNOWN")
@@ -590,7 +637,6 @@ def ingest_knowledge_graph(
 
             stats["entities"] += 1
 
-            # Step 5: MENTIONS Relation (Chunk -> Entity)
             try:
                 graph_store.add_mentions_relation(
                     chunk_id=chunk_id,
@@ -600,17 +646,80 @@ def ingest_knowledge_graph(
             except Exception as e:
                 logger.debug(f"    MENTIONS {chunk_id}->{entity_id}: {e}")
 
-        # Step 6: RELATED_TO Relations (Entity -> Entity)
-        # Lookup is strict on canonical_form; the previous substring fallback
-        # was lossy ("Local H" -> "Localeur") and is intentionally removed.
-        # Unresolved relations are dropped with a debug log.
-        # REBEL confidence and source chunks are persisted on the edge so
-        # downstream retrieval can filter low-confidence relations.
+    try:
+        graph_store.batch_commit()
+    except Exception:
+        pass
+
+    # ── Pass B: RELATED_TO edges (REBEL relations) ───────────────────────────
+    # Resolution is strict on canonical_form (no lossy substring fallback).
+    # Two-pass means `name_to_id` is now complete, so both endpoints can be a
+    # named entity from ANY chunk. A relation whose object resolves to no named
+    # entity is treated as a free-text attribute value and (when
+    # capture_attribute_objects=True) materialised as a CONCEPT node, so the
+    # genre/sport/occupation knowledge is not lost. Within-run triple
+    # deduplication keeps the relation count honest (REBEL beam search emits
+    # the same triple multiple times — KuzuDB MERGE collapses them, but the
+    # counter must not double-count).
+    seen_triples: Set[Tuple[str, str, str]] = set()
+    _rel_confs: Set[float] = set()
+    _concept_ids: Dict[str, str] = {}  # canonical_form(value) -> concept entity_id
+    _concept_mentions: Set[Tuple[str, str]] = set()  # (chunk_id, concept_id) already linked
+
+    def _ensure_concept_node(value: str, src_chunk: str) -> Optional[str]:
+        """MERGE a CONCEPT entity for a free-text relation object; link it from src_chunk."""
+        if not _is_plausible_concept(value):
+            return None
+        key = canonical_form(value)
+        cid = _concept_ids.get(key)
+        if cid is None:
+            cid = _canonical_entity_id(value, _CONCEPT_ENTITY_TYPE)
+            _concept_ids[key] = cid
+            try:
+                graph_store.add_entity(
+                    entity_id=cid,
+                    name=value,
+                    entity_type=_CONCEPT_ENTITY_TYPE,
+                    confidence=0.5,
+                )
+                stats["concept_nodes"] += 1
+            except Exception as e:
+                logger.debug(f"    CONCEPT node {value!r}: {e}")
+                return None
+        # Make the concept reachable: MENTIONS edge from the originating chunk
+        # (once per chunk/concept pair — KuzuDB MERGE is idempotent but the
+        # counter must not double-count repeated references in the same chunk).
+        mkey = (src_chunk, cid)
+        if mkey not in _concept_mentions:
+            _concept_mentions.add(mkey)
+            try:
+                graph_store.add_mentions_relation(chunk_id=src_chunk, entity_id=cid)
+                stats["mentions"] += 1
+            except Exception:
+                pass
+        # Keep it resolvable by later relations referencing the same value.
+        name_to_id.setdefault(key, cid)
+        return cid
+
+    _batch_i = 0
+    for result in tqdm(extraction_results, desc="RELATED_TO (REBEL)", unit="chunk"):
+        if _batch_i % _PHASE3B_BATCH == 0:
+            if _batch_i > 0:
+                try:
+                    graph_store.batch_commit()
+                except Exception:
+                    pass
+            graph_store.batch_begin()
+        _batch_i += 1
+
+        chunk_id = str(result["chunk_id"])
+
         for rel in result.get("relations", []):
             subject = (rel.get("subject_entity") or rel.get("subject") or "").strip()
             obj = (rel.get("object_entity") or rel.get("object") or "").strip()
             rel_type = rel.get("relation_type") or rel.get("relation") or "related_to"
             rel_conf = float(rel.get("confidence", 0.5))
+            _rel_confs.add(rel_conf)
             rel_sources = rel.get("source_chunk_ids") or rel.get("source_chunks") or [chunk_id]
             if isinstance(rel_sources, str):
                 rel_sources = [rel_sources]
@@ -618,35 +727,71 @@ def ingest_knowledge_graph(
                 continue
 
             subject_id = name_to_id.get(canonical_form(subject))
+            if not subject_id:
+                # A relation whose SUBJECT is not a named entity is almost
+                # always a parse artefact ("biographical -> ..."); drop it.
+                stats["rebel_unresolved_dropped"] += 1
+                continue
+
             object_id = name_to_id.get(canonical_form(obj))
+            is_attribute = False
+            if not object_id:
+                if capture_attribute_objects:
+                    object_id = _ensure_concept_node(obj, chunk_id)
+                    is_attribute = object_id is not None
+                if not object_id:
+                    stats["rebel_unresolved_dropped"] += 1
+                    continue
 
-            if subject_id and object_id and subject_id != object_id:
-                try:
-                    graph_store.add_related_to_relation(
-                        entity1_id=subject_id,
-                        entity2_id=object_id,
-                        relation_type=rel_type,
-                        confidence=rel_conf,
-                        source_chunks=[str(c) for c in rel_sources],
-                    )
-                    stats["relations"] += 1
-                except Exception as e:
-                    logger.debug(f"    RELATED_TO: {e}")
-            else:
-                logger.debug(
-                    "    RELATED_TO unresolved: subject=%r object=%r",
-                    subject, obj,
+            if subject_id == object_id:
+                continue
+
+            triple = (subject_id, rel_type, object_id)
+            if triple in seen_triples:
+                stats["rebel_duplicates_skipped"] += 1
+                continue
+            seen_triples.add(triple)
+
+            try:
+                graph_store.add_related_to_relation(
+                    entity1_id=subject_id,
+                    entity2_id=object_id,
+                    relation_type=rel_type,
+                    confidence=rel_conf,
+                    source_chunks=[str(c) for c in rel_sources],
                 )
+                stats["relations"] += 1
+                if is_attribute:
+                    stats["attribute_relations"] += 1
+            except Exception as e:
+                logger.debug(f"    RELATED_TO: {e}")
 
-    # Commit the final (potentially partial) batch.
     try:
         graph_store.batch_commit()
     except Exception:
         pass
 
+    # REBEL emits a constant 0.5 confidence for every triple (no per-triplet
+    # score from the seq2seq decoder). Surface this so downstream consumers
+    # don't mistake the value for a real ranking signal.
+    stats["rebel_confidence_is_constant"] = len(_rel_confs) <= 1
+    if stats["rebel_confidence_is_constant"] and _rel_confs:
+        logger.warning(
+            "    REBEL relation confidence is CONSTANT (%.2f for all %d edges) — "
+            "do not filter graph relations on this value; it carries no signal.",
+            next(iter(_rel_confs)), stats["relations"],
+        )
+
     logger.info(
-        "    OK %d entities, %d mentions, %d REBEL relations",
-        stats["unique_entities"], stats["mentions"], stats["relations"],
+        "    OK %d REBEL relations  (+%d attribute/CONCEPT, %d dup skipped, "
+        "%d unresolved dropped, %d concept nodes)",
+        stats["relations"], stats["attribute_relations"],
+        stats["rebel_duplicates_skipped"], stats["rebel_unresolved_dropped"],
+        stats["concept_nodes"],
+    )
+    logger.info(
+        "    OK %d entities, %d mentions",
+        stats["unique_entities"], stats["mentions"],
     )
 
     # ── SVO extraction: narrative relations from the SpaCy dependency parse ──
@@ -708,8 +853,10 @@ def run_full_import(
     hub_threshold_ratio: float = 0.03,
     enable_entity_linking: bool = True,
     linking_threshold: float = 0.92,
+    linking_max_type_size: int = 8000,
     resume: bool = False,
     embeddings_backend: str = "ollama",
+    capture_attribute_objects: bool = False,
 ) -> None:
     """
     Run the full Phase-3 import (vector store + knowledge graph + cleanup).
@@ -823,6 +970,7 @@ def run_full_import(
     print(f"  Cleanup:      {'off' if skip_cleanup else ('dry-run' if cleanup_dry_run else 'on')}")
     print(f"  Co-occur:     {'off' if skip_cooccurrence else 'on'} "
           f"(conf >= {cooccurrence_min_confidence})")
+    print(f"  Attr objects: {'CONCEPT nodes (--attribute-objects)' if capture_attribute_objects else 'dropped (default — OntoNotes-5 taxonomy)'}")
     print(f"  Embeddings:   {embeddings_backend}")
     print("═" * 70)
 
@@ -1054,6 +1202,7 @@ def run_full_import(
             graph_store, stats = ingest_knowledge_graph(
                 documents, extraction_results, graph_path, dataset_name,
                 entity_confidence_threshold=entity_conf,
+                capture_attribute_objects=capture_attribute_objects,
             )
             name_to_id = stats.pop("_name_to_id", {})
             # Persist name_to_id so --resume can reload it for Phase 3c.
@@ -1199,6 +1348,7 @@ def run_full_import(
                     graph_store=graph_store,
                     embedder=embedder,
                     similarity_threshold=linking_threshold,
+                    max_type_size=linking_max_type_size,
                     dry_run=cleanup_dry_run,
                 )
                 logger.info(
@@ -1250,14 +1400,21 @@ def run_full_import(
     print()
     print("  Ingestion stats:")
     for key, val in stats.items():
-        print(f"    {key:<22}: {val:>10,}")
-    print(f"    {'cooccurrence_edges':<22}: {cooccurrence_edges:>10,}")
-    print(f"    {'svo_relations':<22}: {stats.get('svo_relations', 0):>10,}")
-    print(f"    {'stoplist_dropped':<22}: {cleanup_ops['stoplist_dropped']:>10,}")
-    print(f"    {'orphans_dropped':<22}: {cleanup_ops['orphans_dropped']:>10,}")
-    print(f"    {'hubs_dropped':<22}: {cleanup_ops['hubs_dropped']:>10,}")
-    print(f"    {'duplicates_merged':<22}: {cleanup_ops['duplicates_merged']:>10,}")
-    print(f"    {'embedding_linked':<22}: {linked_count:>10,}")
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            continue
+        print(f"    {key:<26}: {val:>10,}")
+    print(f"    {'cooccurrence_edges':<26}: {cooccurrence_edges:>10,}")
+    print(f"    {'svo_relations':<26}: {stats.get('svo_relations', 0):>10,}")
+    print(f"    {'stoplist_dropped':<26}: {cleanup_ops['stoplist_dropped']:>10,}")
+    print(f"    {'orphans_dropped':<26}: {cleanup_ops['orphans_dropped']:>10,}")
+    print(f"    {'hubs_dropped':<26}: {cleanup_ops['hubs_dropped']:>10,}")
+    print(f"    {'duplicates_merged':<26}: {cleanup_ops['duplicates_merged']:>10,}")
+    print(f"    {'embedding_linked':<26}: {linked_count:>10,}")
+    if stats.get("rebel_confidence_is_constant"):
+        print()
+        print("    NOTE: REBEL relation confidence is constant (0.5) for all edges —")
+        print("          it is a decoder sentinel, not a ranking signal. Graph")
+        print("          retrieval must not filter RELATED_TO edges on confidence.")
     print()
     print("═" * 70)
     print("  Next steps:")
@@ -1409,6 +1566,14 @@ Examples:
              "(default: 0.92). Higher = stricter merging. Range [0.85, 0.97].",
     )
     parser.add_argument(
+        "--linking-max-type-size",
+        type=int,
+        default=8000,
+        help="Maximum entity-bucket size for embedding-based linking (default: 8000). "
+             "Buckets larger than this are skipped to avoid OOM (8000 entities = ~256 MB "
+             "float32 matrix). Raise to 50000+ only if you have sufficient RAM/VRAM.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Skip phases already recorded as complete in the checkpoint file "
@@ -1422,6 +1587,15 @@ Examples:
         help="Embedding backend: 'ollama' (default, requires Ollama running locally) "
              "or 'huggingface' (uses sentence-transformers, no Ollama needed — "
              "ideal for Colab/GPU environments).",
+    )
+    parser.add_argument(
+        "--attribute-objects",
+        action="store_true",
+        help="Opt-in: capture REBEL relations whose object is a free-text "
+             "attribute value ('genre -> punk rock', 'sport -> ice hockey') "
+             "as synthetic CONCEPT entity nodes. Default OFF — keeps the "
+             "graph within the OntoNotes-5 GLiNER taxonomy. Enable only for "
+             "exploratory runs or ablation studies.",
     )
 
     args = parser.parse_args()
@@ -1453,8 +1627,10 @@ Examples:
         hub_threshold_ratio=args.hub_threshold_ratio,
         enable_entity_linking=not args.no_entity_linking,
         linking_threshold=args.linking_threshold,
+        linking_max_type_size=args.linking_max_type_size,
         resume=args.resume,
         embeddings_backend=args.embeddings_backend,
+        capture_attribute_objects=args.attribute_objects,
     )
 
 

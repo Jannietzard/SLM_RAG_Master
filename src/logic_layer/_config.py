@@ -67,6 +67,7 @@ class ControllerConfig:
     max_chars_per_doc: int = 500              # settings.yaml: llm.max_chars_per_doc
     corroboration_source_weight: float = 0.1  # settings.yaml: navigator.corroboration_source_weight
     corroboration_query_weight: float = 0.05  # settings.yaml: navigator.corroboration_query_weight
+    enable_contradiction_filter: bool = False        # settings.yaml: navigator.enable_contradiction_filter
     contradiction_overlap_threshold: float = 0.3   # settings.yaml: navigator.contradiction_overlap_threshold
     contradiction_ratio_threshold: float = 2.0     # settings.yaml: navigator.contradiction_ratio_threshold
     contradiction_min_value: float = 100.0         # settings.yaml: navigator.contradiction_min_value
@@ -120,6 +121,7 @@ class ControllerConfig:
             max_chars_per_doc=llm.get("max_chars_per_doc", 500),
             corroboration_source_weight=nav.get("corroboration_source_weight", 0.1),
             corroboration_query_weight=nav.get("corroboration_query_weight", 0.05),
+            enable_contradiction_filter=nav.get("enable_contradiction_filter", False),
             contradiction_overlap_threshold=nav.get("contradiction_overlap_threshold", 0.3),
             contradiction_ratio_threshold=nav.get("contradiction_ratio_threshold", 2.0),
             contradiction_min_value=nav.get("contradiction_min_value", 100.0),

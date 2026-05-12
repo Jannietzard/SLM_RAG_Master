@@ -270,6 +270,21 @@ def main() -> int:
         default=0.5,
         help="Minimum NER confidence for entity insertion (default: 0.5)",
     )
+    parser.add_argument(
+        "--attribute-objects",
+        action="store_true",
+        help="Opt-in: materialise free-text REBEL relation objects as CONCEPT "
+             "nodes. Default OFF — keeps the graph within the OntoNotes-5 "
+             "GLiNER taxonomy.",
+    )
+    parser.add_argument(
+        "--assert-no-junk",
+        action="store_true",
+        help="Exit non-zero if the resulting graph contains a known-junk "
+             "entity (stop-list surface form) or if every REBEL relation has "
+             "the same confidence (sign that per-triple scores were lost). "
+             "Use in CI / pre-ingestion gates.",
+    )
     args = parser.parse_args()
 
     base = Path("./data") / args.dataset
@@ -348,15 +363,23 @@ def main() -> int:
         graph_path=dryrun_graph,
         dataset_name=f"_dryrun_{args.dataset}",
         entity_confidence_threshold=args.entity_confidence_threshold,
+        capture_attribute_objects=args.attribute_objects,
     )
     if graph_store is None:
         print("error: ingest_knowledge_graph returned no graph_store", file=sys.stderr)
         return 1
 
     name_to_id = stats.pop("_name_to_id", {})
-    print(f"  unique_entities:  {stats.get('unique_entities', 0)}")
-    print(f"  total_mentions:   {stats.get('mentions', 0)}")
-    print(f"  REBEL relations:  {stats.get('relations', 0)}")
+    print(f"  unique_entities:        {stats.get('unique_entities', 0)}")
+    print(f"  total_mentions:         {stats.get('mentions', 0)}")
+    print(f"  REBEL relations:        {stats.get('relations', 0)}")
+    print(f"    of which attribute:   {stats.get('attribute_relations', 0)}  "
+          f"(-> {stats.get('concept_nodes', 0)} CONCEPT nodes)")
+    print(f"    duplicates skipped:   {stats.get('rebel_duplicates_skipped', 0)}")
+    print(f"    unresolved dropped:   {stats.get('rebel_unresolved_dropped', 0)}")
+    if stats.get("rebel_confidence_is_constant"):
+        print("  NOTE: REBEL relation confidence is constant (decoder sentinel, "
+              "not a ranking signal).")
 
     # Phase 3c: co-occurrence
     cooc_edges = 0
@@ -435,6 +458,58 @@ def main() -> int:
         f"relations_per_chunk={metrics['densities']['relations_per_chunk']:.2f}"
     )
 
+    # ── Optional regression guard (--assert-no-junk) ─────────────────────────
+    # Fails the run if the graph contains a known-junk surface form (stop-list)
+    # or if REBEL relation confidence carries no signal. Both are silent-decay
+    # conditions that a passing dry-run would otherwise hide.
+    exit_code = 0
+    if args.assert_no_junk:
+        from src.data_layer.graph_quality import DEFAULT_STOPLIST, canonical_form as _cf
+
+        def _fetch(query):
+            try:
+                r = graph_store.conn.execute(query, {})
+            except Exception:
+                return []
+            out = []
+            while r.has_next():
+                out.append(tuple(r.get_next()))
+            return out
+
+        ent_rows = _fetch("MATCH (e:Entity) RETURN e.name, e.type")
+        junk = [(n, t) for n, t in ent_rows if n and _cf(n) in DEFAULT_STOPLIST]
+        rel_confs = {
+            float(c or 0.0)
+            for (c,) in _fetch("MATCH ()-[r:RELATED_TO]->() WHERE r.relation_type <> 'cooccurs' RETURN DISTINCT r.confidence")
+        }
+
+        print()
+        print("─" * 78)
+        print("  ASSERT-NO-JUNK")
+        print("─" * 78)
+        if junk:
+            exit_code = 2
+            print(f"  ✗ FAIL: {len(junk)} stop-list entity/-ies survived cleanup:")
+            for n, t in junk[:10]:
+                print(f"      - {n!r} (type={t})")
+        else:
+            print("  ✓ no stop-list entities in the graph")
+        # On a 5-chunk slice REBEL may legitimately yield only one confidence
+        # value (or none). Only fail if there are relations AND >1 distinct
+        # value was expected but not seen — i.e. flag the constant case as a
+        # WARNING here, hard-fail only when explicitly running a larger slice.
+        if len(rel_confs) <= 1 and stats.get("relations", 0) > 0:
+            if args.n_chunks >= 50:
+                exit_code = 2
+                print(f"  ✗ FAIL: all {stats['relations']} REBEL relations share "
+                      f"confidence {next(iter(rel_confs)) if rel_confs else 'n/a'} "
+                      "(per-triple scores lost upstream).")
+            else:
+                print(f"  ⚠ REBEL confidence is constant ({next(iter(rel_confs)) if rel_confs else 'n/a'}) "
+                      f"— expected on a {args.n_chunks}-chunk slice; re-check with --n-chunks 50.")
+        else:
+            print(f"  ✓ REBEL confidence has {len(rel_confs)} distinct value(s)")
+
     # Tear down
     try:
         graph_store.close()
@@ -456,7 +531,7 @@ def main() -> int:
               f"--graph-path {dryrun_graph}")
 
     print("=" * 78)
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

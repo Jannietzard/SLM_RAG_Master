@@ -168,14 +168,14 @@ rag:
 # ============================================================================
 llm:
   # Active model — must be pulled via: ollama pull <model_name>
-  model_name: "qwen2:1.5b"   # qwen2:1.5b: ~10-20s per query on CPU (safest for 60s timeout)
+  model_name: "llama3.2:3b"   # llama3.2:3b: ~35-55s per query on CPU (safest for 60s timeout)
 
   base_url: "http://localhost:11434"
   temperature: 0.0    # 0.0 = fully deterministic — required for reproducible thesis evaluation
   max_tokens: 200
   timeout: 60         # Ollama API timeout in seconds
                       # Comparison model latency on CPU (ablation study):
-                      # qwen2:1.5b ~10-20s, gemma2:2b ~20-35s,
+                      # qwen2.5:3b ~10-20s, gemma2:2b ~20-35s,
                       # llama3.2:3b ~35-55s, phi3 ~45-80s (ablation model, borderline at 60s).
 
   # Context budget for Verifier (S_V)
@@ -192,7 +192,7 @@ llm:
   #   900 -> 2500 (2026-05-04, §12.24): bridge chunks were truncated.
   #   2500 -> 3500, max_chars_per_doc 500 -> 800 (audit 2026-05-06):
   #   IFFHS-style answer sentences plus minimal bio context routinely span
-  #   600-700 chars; 500 truncated the answer. qwen2:1.5b has a 4096-token
+  #   600-700 chars; 500 truncated the answer. qwen2.5:3b has a 4096-token
   #   context window (~12 kB); the previous 2500-char cap used only ~20%.
   #   3500 chars uses ~30% and leaves headroom for the prompt template.
   # max_docs stays at 5 to preserve context-window discipline.
@@ -253,11 +253,11 @@ navigator:
   reranker_top_k: 10
 
   # Contradiction filter thresholds (numeric heuristic).
-  # Two chunks are flagged as contradictory when:
-  #   word_overlap > overlap_threshold AND
-  #   max(n1,n2)/min(n1,n2) > ratio_threshold AND min(n1,n2) > min_value
-  # min_value=100 prevents day-of-month values (1-31) from triggering false
-  # contradictions with year-scale numbers (see §12.25).
+  # Disabled by default (§12.33): the heuristic fires on population figures vs.
+  # years within topically related chunks, repeatedly deleting the answer chunk.
+  # The Verifier's NLI-based contradiction detection is the real guard.
+  # Enable only for ablation comparisons.
+  enable_contradiction_filter: true
   contradiction_overlap_threshold: 0.3
   contradiction_ratio_threshold: 2.0
   contradiction_min_value: 100.0

@@ -62,7 +62,22 @@
       "Bash(python -X utf8 -m pytest test_system/test_logic_layer.py test_system/test_navigator_semantic.py test_system/test_pipeline.py --tb=short -x)",
       "Bash(Select-String -Pattern \"passed|FAILED|ERROR\")",
       "Bash(Select-Object -Last 5)",
-      "Bash(python -X utf8 diagnose_verbose.py --idx 42 --skip-llm)"
+      "Bash(python -X utf8 diagnose_verbose.py --idx 42 --skip-llm)",
+      "Bash(python -X utf8 -c \"import ast; ast.parse\\(open\\('local_importingestion.py', encoding='utf-8'\\).read\\(\\)\\); print\\('local_importingestion.py: syntax OK'\\)\")",
+      "Bash(python -X utf8 -c \"import importlib.util; spec = importlib.util.spec_from_file_location\\('lii', 'local_importingestion.py'\\); m = importlib.util.module_from_spec\\(spec\\); spec.loader.exec_module\\(m\\); print\\('imports OK; ingest_knowledge_graph signature:', m.ingest_knowledge_graph.__defaults__\\)\")",
+      "Bash(python -X utf8 -c \"import ast; ast.parse\\(open\\('dryrun_ingestion.py', encoding='utf-8'\\).read\\(\\)\\); print\\('dryrun_ingestion.py: syntax OK'\\)\")",
+      "Bash(python -X utf8 dryrun_ingestion.py --n-chunks 5 --assert-no-junk)",
+      "Bash(python -X utf8 -m pytest test_system/ -q --no-header -x --ignore=test_system/test_graph_inspect.py -m \"not nightly and not llm and not integration\")",
+      "Bash(python -X utf8 -m pytest test_system/ -q --no-header --ignore=test_system/test_graph_inspect.py -m \"not nightly and not llm and not integration\")",
+      "Bash(python -X utf8 -m pytest test_system/ --no-header --ignore=test_system/test_graph_inspect.py -m \"not nightly and not llm and not integration\")",
+      "Bash(python -X utf8 dryrun_ingestion.py --n-chunks 50)",
+      "Bash(python -X utf8 -m pytest test_system/test_data_layer.py test_system/test_chunking.py test_system/test_embeddings.py -x --tb=short -q --ignore=test_system/test_graph_inspect.py -m \"not nightly and not llm and not integration\")",
+      "Bash(python -X utf8 -m pytest test_system/test_logic_layer.py test_system/test_pipeline.py test_system/test_missing_coverage.py test_system/test_config_robustness.py --tb=short -q -m \"not nightly and not llm and not integration\")",
+      "Bash(Select-String -Pattern \"passed|failed|error\")",
+      "Bash(Select-Object -Last 3)",
+      "Bash(python -X utf8 -m pytest test_system/test_planner_semantic.py test_system/test_logic_layer.py -x --tb=short -q)",
+      "Bash(Select-String -Pattern \"passed|failed|error|FAILED\")",
+      "Bash(python -c ' *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Jan Nietzard\\.claude\\projects\\c--Users-Jan-Nietzard-Documents-FOM-FOM-Masterarbeit-Masterarbeit-Edge-Entwicklungfolder\\memory"

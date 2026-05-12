@@ -354,7 +354,15 @@ class AgenticController:
         """
         Extract candidate bridge entity names from retrieved text chunks.
 
-        Two-pass heuristic (§12.28):
+        Three-pass heuristic (§12.32):
+
+        Pass 0 — Location-context extraction (highest priority):
+          Scans the top chunk for place names introduced by location prepositions
+          ("in the city of X", "capital of X", "in X", "of X").  A single
+          capitalised token found this way becomes the primary bridge entity and
+          short-circuits the remaining passes.  This recovers city/country names
+          (e.g. "Strasbourg") that are the natural bridge in geography questions
+          but are invisible to the person-name heuristics in Passes 1 and 2.
 
         Pass 1 — Surname-anchor search (higher precision):
           For each known entity (e.g. "Kasper Schmeichel"), look for its
@@ -373,17 +381,41 @@ class AgenticController:
         Previously this only looked at filtered_context[:2], which meant the
         bridge entity (typically in a later chunk) was never found.
         """
-        # Unicode-aware optional-middle-name pattern for surname anchoring.
-        # Captures "[FirstName] [OptionalMiddle] [Surname]" where Surname is
-        # supplied explicitly.  [^\s]+ matches any non-whitespace (handles
-        # special characters like ł, ñ, é).
-        _SURNAME_ANCHOR = re.compile(
-            r"\b([A-Z][^\s]{1,})\s+(?:[A-Z][^\s]+\s+)?({surname})\b"
+        # Matches a capitalised word that follows a location-preposition phrase.
+        # Covers patterns like:
+        #   "in the city of Strasbourg"
+        #   "the capital of France"
+        #   "formed in Strasbourg"
+        #   "born in Paris"
+        _LOCATION_CTX_RE = re.compile(
+            r"(?:in\s+the\s+(?:city|town|village|capital|region|province|district)\s+of"
+            r"|capital\s+of"
+            r"|(?:in|at|near|of)\s+)"
+            r"([A-Z][a-z]{2,}(?:[- ][A-Z][a-z]+)*)",
+            re.UNICODE,
         )
 
         exclude_lower = {e.lower() for e in exclude}
         seen: set = set()
         candidates: List[str] = []
+
+        # ── Pass 0: location-context extraction ──────────────────────────────
+        # Only scan the top-ranked chunk (index 0) — it is the most relevant
+        # and city names there are the intended bridge target.
+        if chunks:
+            for m in _LOCATION_CTX_RE.finditer(chunks[0]):
+                place = m.group(1).strip()
+                place_lower = place.lower()
+                if (
+                    place_lower not in exclude_lower
+                    and place_lower not in seen
+                    and len(place) >= 4
+                ):
+                    seen.add(place_lower)
+                    candidates.append(place)
+
+        if candidates:
+            return candidates[:3]
 
         # ── Pass 1: surname-anchor search ────────────────────────────────────
         for known in exclude:
@@ -557,6 +589,9 @@ class AgenticController:
             # Future work: accumulate nav_result.scores per step.
             "retrieval_scores": [],
             "retrieval_metadata": {"iterative_hints": current_hints, "hop_count": len(hops)},
+            # Propagate accumulated entity hints (original + bridge) so S_V uses
+            # the full entity set for credibility scoring and entity-path validation.
+            "entities": current_hints,
             "errors": errors,
             "stage_timings": {
                 **state.get("stage_timings", {}),
@@ -692,12 +727,25 @@ class AgenticController:
             plan_dict = state.get("retrieval_plan", {})
             hop_sequence = plan_dict.get("hop_sequence") if plan_dict else None
 
+            # Derive bridge entities: everything added to the entity list during
+            # iterative navigation that was not in the original planner output.
+            all_entities = state.get("entities", [])
+            original_entity_names = {
+                e.get("text", "") if isinstance(e, dict) else str(e)
+                for e in (plan_dict.get("entities") or [])
+            }
+            bridge_entities = [
+                e for e in all_entities
+                if e not in original_entity_names
+            ]
+
             result = self.verifier.generate_and_verify(
                 query=state["query"],
                 context=state["context"],
-                entities=state.get("entities", []),
+                entities=all_entities,
                 hop_sequence=hop_sequence,
                 query_type=plan_dict.get("query_type") if plan_dict else None,
+                bridge_entities=bridge_entities or None,
             )
 
             logger.info("[S_V] Iterations: %d", result.iterations)
@@ -811,6 +859,9 @@ class AgenticController:
             AgentState with answer and full pipeline metadata
         """
         logger.info("--- Pipeline start ---")
+        # Fix run-together tokens from noisy datasets (e.g. "in2014" → "in 2014").
+        query = re.sub(r"([a-zA-Z])(\d)", r"\1 \2", query)
+        query = re.sub(r"(\d)([a-zA-Z])", r"\1 \2", query)
         logger.info("Query: %s", query)
 
         start_time = time.time()

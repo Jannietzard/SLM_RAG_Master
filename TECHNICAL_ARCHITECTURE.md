@@ -34,6 +34,19 @@
 10. [Performance Characteristics](#10-performance-characteristics)
 11. [Non-Functional Requirements](#11-non-functional-requirements)
 12. [Design Decisions & Trade-offs](#12-design-decisions--trade-offs)
+    - 12.12 [Boolean Conjunction and Implicit Bridge Decomposition (Patterns I and J)](#1212-boolean-conjunction-and-implicit-bridge-decomposition-patterns-i-and-j)
+    - 12.13 [Top-K RRF Immunity in the Entity-Mention Filter](#1213-top-k-rrf-immunity-in-the-entity-mention-filter)
+    - 12.14 [SLM Model Selection: Cross-Architecture Evaluation](#1214-slm-model-selection-cross-architecture-evaluation)
+    - 12.15 [Keyword Entity Fallback and Dual Injection](#1215-keyword-entity-fallback-and-dual-injection-v410)
+    - 12.16 [Navigator Entity Hints Propagation Fix](#1216-navigator-entity-hints-propagation-fix-v410)
+    - 12.17 [Resource Cleanup: KuzuGraphStore.close() and HybridStore.close()](#1217-resource-cleanup-kuzugraphstoreclose-and-hybridstoreclose-v410)
+    - 12.18 [Contradiction Filter Calibration: min_value 10 → 100](#1218-contradiction-filter-calibration-min_value-10--100-v420)
+    - 12.19 [Planner Pattern E — Relational Anchor Bridge](#1219-planner-pattern-e--relational-anchor-bridge-v420)
+    - 12.20 [Own-Document Chunk Alias Annotation](#1220-own-document-chunk-alias-annotation-v420)
+    - 12.21 [Entity-Mention Filter Threshold and Bridge Extraction Fixes](#1221-entity-mention-filter-threshold-and-bridge-extraction-fixes-v440)
+    - 12.22 [BM25 as Third RRF Retrieval Path](#1222-bm25-as-third-rrf-retrieval-path-v450)
+    - 12.23 [Diagnostic Tooling: diagnose_verbose.py Gold-Tracking Per Stage](#1223-diagnostic-tooling-diagnose_verbosepy-gold-tracking-per-stage-v440v460)
+    - 12.24 [RELEVANT_ENTITY_TYPES Aligned to GLiNER Taxonomy](#1224-relevant_entity_types-aligned-to-gliner-taxonomy-v450)
 
 ---
 
@@ -1866,6 +1879,107 @@ Two coupled refinements address a failure mode where the answer-bearing chunk of
 **Chained-attribution decomposition (Planner Pattern H).** Existing bridge patterns each recognise a *single* pivot ("the X of Y", "the X in which Y…"). Some questions chain two pivots — "a [work] based on [Entity], is [created] by someone [attribute]?" links `Entity → work → agent → attribute`. The Planner detects this with a SpaCy dependency-parse signature (a passive ROOT with an `agent` `by`-phrase whose object is an indefinite pronoun, plus an `acl` attribution clause on the subject noun linking it to a named entity) and emits a three-hop sequence: resolve the work, resolve the agent, then answer the original question with both in context. The recogniser keys only on dependency *relation labels* and a closed inventory of English attribution-clause verbs — never on the work's vocabulary, the entity's name, or the question's phrasing — so a structurally identical question over unseen subject matter decomposes with no new code. The agent hop reuses the participle verbatim from the query ("illustrated", "written") rather than re-inflecting from a lemma, so the codebase carries no list of verbs the system has encountered. A parse-confidence gate (the full relation chain must be present and the anchor must overlap a detected entity) makes the recogniser fail safe: an ambiguous parse falls through to the existing patterns, never to a worse plan.
 
 **Classification–decomposition consistency.** A query classified multi-hop that matches no pattern and resists the connector split previously emitted the unsplit query as its sole sub-query — indistinguishable from a working single-hop plan. It now emits a deliberate two-hop fallback seeded on the detected entities, degrading to single-hop only when no anchor entity exists, and then with a logged warning so the gap is visible.
+
+### 12.12 Boolean Conjunction and Implicit Bridge Decomposition (Patterns I and J)
+
+Two new Planner decomposition patterns address systematic misclassification failures observed in HotpotQA bridge questions where the bridge entity is absent from the surface query.
+
+**Pattern I — Boolean conjunction ("Are X and Y both P?").** The question "Are Random House Tower and 888 7th Avenue both used for real estate?" is structurally a pair of independent yes/no checks, not a bridge chain. Prior to Pattern I, the entity-density heuristic in the classifier (Phase 3) boosted the MULTI_HOP score above COMPARISON, causing a bridge decomposition that produced a meaningless hop 0 ("Is Random House Tower the same as 888 7th Avenue?"). Pattern I is a Phase 0 pre-empt in `QueryClassifier.classify()`: a regex `^\s*(are|is|were|…)\b.+\band\b.+\bboth\b` fires before any scoring and returns COMPARISON immediately. Decomposition then calls `_decompose_boolean_conjunction()`, which splits the conjunction directly from the query surface (not via SpaCy NER — NER misclassified "888 7th Avenue" as MONEY) to produce two parallel independent `HopStep` objects with `depends_on=[]` and `is_bridge=False`. Each hop queries one subject independently; the Verifier synthesises the joint answer from the two result sets.
+
+**Pattern J — Implicit bridge ("another [noun] that …").** The question "Scott Parkin has been a vocal critic of Exxonmobil and another corporation that has operations in how many countries?" names only one of the two relevant entities. The AGGREGATE pattern `how many` fires and the question is classified as single-pass, leaving the answer-bearing Halliburton chunk nameless and therefore evicted by the entity-mention filter. Pattern J is a Phase 0.5 pre-empt: a regex `\banother\s+\w+\b` anywhere in the query short-circuits to MULTI_HOP before the AGGREGATE pattern can accumulate score. `_find_implicit_bridge()` locates the anchor entity (the named one, positionally before "another") and the bridge noun ("corporation"). `_decompose_implicit_bridge()` emits two hops: hop 0 resolves the unnamed entity ("What corporation besides Exxonmobil is Scott Parkin a critic of?"), hop 1 is the original query (answered once the bridge entity is materialised in context). Both patterns fire before Phase 1 regex scoring; patterns further down the classification stack are never reached for these query forms.
+
+### 12.13 Top-K RRF Immunity in the Entity-Mention Filter
+
+The entity-mention filter (§4.2.4, Filter 5) requires each retained chunk to mention at least one query entity by name. This is effective for removing topically irrelevant distractors but has a structural blind spot: when the answer-bearing chunk discusses an entity that was never named in the query (e.g. Halliburton in the idx 64 trace, or any implicit bridge target), the filter evicts it regardless of its RRF rank.
+
+The fix introduces a `_RRF_IMMUNE_TOP_K = 2` constant in `_entity_mention_filter()`. The top 2 chunks by RRF score after fusion are unconditionally retained; the entity-mention tier logic applies only to positions 3 and beyond. The rationale is that a three-path RRF (dense vector + BM25 sparse + graph) constitutes an independent relevance signal with no dependency on entity name matching: a chunk that ranks in the top 2 across all three retrieval paths is almost certainly topically relevant, even if the Planner's entity list does not enumerate its subject. In the idx 64 trace the Halliburton chunk ranked #2 (RRF 0.0164); with the immunity guard it is retained and the correct answer "more than 70 countries" reaches the Verifier. The guard is deliberately narrow (top 2 only) to preserve the filter's denoising effect on the remaining positions.
+
+### 12.14 SLM Model Selection: Cross-Architecture Evaluation
+
+An empirical prompt-level evaluation was conducted to determine whether the paraphrase-bridge failure class (where the LLM receives the answer in context but fails to follow a two-step coreference chain) is addressable by a larger model within the same architecture family, or requires a different architecture generation.
+
+**Setup.** Four models were given an identical extractive-QA prompt containing the answer (Roud index 821) in Chunk [1] and the paraphrase bridge ("the title of the episode is taken from the nursery rhyme 'What Are Little Boys Made Of?'") in Chunk [5]. The question asked for the index of the rhyme *inspiring* "What Are Little Girls Made Of?" — a two-hop coreference chain (Girls → Boys → 821).
+
+**Results.**
+
+| Model | Answer | Correct | Latency |
+|---|---|---|---|
+| `qwen2:1.5b` (baseline) | I don't know. | No | ~13 s |
+| `qwen2.5:3b` | I don't know. | No | ~43 s |
+| `qwen3:4b` | timed out¹ | — | >120 s |
+| `gemma3:4b` | 821 | **Yes** | ~118 s |
+
+¹ qwen3 has Chain-of-Thought (`<think>`) enabled by default; the internal reasoning stream exceeds the 120 s timeout. Disabling via `/no_think` suffix resolves the timeout.
+
+**Findings.**
+
+1. **Intra-family parameter scaling does not close the reasoning gap.** `qwen2.5:3b` (2× the parameters of the baseline) produced the identical failure — "I don't know." This indicates the failure is not a capacity ceiling addressable by scaling within the Qwen 2.x architecture family, but a qualitative difference in training regime or attention pattern between generations.
+
+2. **Architecture generation matters more than parameter count.** `gemma3:4b` (Google, released March 2025) correctly resolved the bridge at 4B parameters. `qwen2.5:3b` at the same scale failed. The relevant variable is training corpus composition and RLHF objective targeting reading comprehension, not raw parameter count.
+
+3. **Latency on CPU is prohibitive for gemma3:4b in production.** The 118 s response time reflects full CPU inference (no GPU offload). On a GPU-equipped edge device (e.g. NVIDIA Jetson Orin, RTX-class laptop), projected latency for gemma3:4b is 8–15 s — comparable to qwen2.5:3b on CPU and acceptable for the pipeline's S_V stage.
+
+4. **qwen3:4b requires `/no_think` for short-answer tasks.** The Chain-of-Thought mode generates 500–2000 internal reasoning tokens before producing the answer, which is appropriate for complex multi-step problems but pathological for extractive QA where the answer is a single number. Adding `/no_think` to the prompt disables the reasoning stream and reduces latency to the expected range (~15 s). This flag is an Ollama-level prompt directive (not a model parameter) and must be appended to the S_V prompt when `qwen3:*` models are active.
+
+**Implication for ablation study.** The recommended four-model ablation is: `qwen2:1.5b` (baseline) → `qwen2.5:3b` (intra-family scale) → `qwen3:4b` with `/no_think` (next-generation same vendor) → `gemma3:4b` (cross-architecture). This progression cleanly separates the parameter-scaling effect from the architecture-generation effect, producing a publishable curve rather than a monotone accuracy-vs-size plot.
+
+### 12.15 Keyword Entity Fallback and Dual Injection (v4.1.0)
+
+The `nomic-embed-text` model produces compressed cosine similarity scores for all text pairs in the range 0.739–0.786, making a vector similarity threshold of 0.3 effectively useless — every document pair is "similar." This means query-time vector retrieval alone cannot discriminate between a chunk about the named entity and a topically adjacent but irrelevant chunk. The workaround is a keyword entity fallback in `HybridRetriever`: when a detected entity name appears verbatim in a chunk's text, that chunk receives a direct score injection regardless of its cosine rank. The injection uses "dual injection" — both the entity's name and its longest token are used as search keys — to handle partial matches (e.g. "Schmeichel" matching "Peter Schmeichel"). This is documented as a known architectural limitation: a production system should use an embedding model with a wider score distribution (e.g. `bge-m3`).
+
+### 12.16 Navigator Entity Hints Propagation Fix (v4.1.0)
+
+When `AgenticController` reconstructs a `RetrievalPlan` from a serialised state dict (necessary for iterative multi-hop), the `retrieval_plan.entities` field is populated but `entity_names` (the list of plain strings) is `None`. The Navigator's entity-mention filter fell back to re-extracting entities from the plan, which silently failed when the plan was reconstructed without the full `EntityInfo` objects. The fix: in `Navigator.navigate()`, the entity-hints resolution priority is `entity_names` (explicit arg) → `retrieval_plan.entities` (read `.text` from each `EntityInfo`) → `None` (GLiNER re-runs). This ensures the entity-mention filter always has the correct entity strings regardless of whether the plan was freshly created or reconstructed.
+
+### 12.17 Resource Cleanup: `KuzuGraphStore.close()` and `HybridStore.close()` (v4.1.0)
+
+KuzuDB holds an exclusive file lock on its database directory. Without an explicit `.close()` call, the lock persists until the Python process exits. This caused `BlockingIOError` in test teardown when two test fixtures both opened the graph store in the same pytest session. Both `KuzuGraphStore` and `HybridStore` now implement a `close()` method that calls `self._conn.close()` and sets the connection reference to `None`. Test fixtures call `store.close()` in their `finally` block.
+
+### 12.18 Contradiction Filter Calibration: `min_value` 10 → 100 (v4.2.0)
+
+The contradiction filter evicts the lower-ranked of two chunks when they share high word overlap and contain numbers that differ by more than 2×. With `min_value = 10`, day-of-month integers (1–31) routinely paired with four-digit year values (e.g. "born on the 7th" vs. "born in 1974") and triggered false-positive evictions of biographical chunks. Raising `min_value` to 100 restricts the filter to numerically significant values — years, page counts, quantities above two digits — where a 2× ratio genuinely indicates factual conflict. Day-of-month values and small ordinals are no longer candidates. This was discovered via a `diagnose_verbose` trace where a correct birth-year chunk was evicted because the article also contained a street number (e.g. "7th Avenue") that paired with the year.
+
+### 12.19 Planner Pattern E — Relational Anchor Bridge (v4.2.0)
+
+Questions of the form "What was the [role] of [Entity] [verb phrase]?" ("What was the father of Kaspar Hauser found to be?") require a bridge step: first resolve who holds the role relative to the named entity, then answer the main question. Pattern E detects the structure `the [role] of [Entity]` using a regex `\bthe\s+(\w+)\s+of\b` and the presence of a named entity in the object position. When matched, the Planner emits a hop 0 bridge sub-query `"Who is the {role} of {Entity}?"` before the original query. The regex is anchored to the definite article to reduce false positives on phrases like "in spite of", "because of".
+
+### 12.20 Own-Document Chunk Alias Annotation (v4.2.0)
+
+When a chunk belongs to the source document *about* an entity but the entity's name does not appear verbatim in the chunk text (common for introductory sentences like "He was born in…"), the entity-mention filter would otherwise evict it. The ingestion pipeline annotates these chunks with an `[About: EntityName]` prefix at storage time: the chunk is stored as `"[About: Peter Schmeichel] He was born in…"`. At query time the entity-mention filter matches this prefix. A corresponding guard in the bridge entity extractor rejects tokens that contain `":"` in their first component to prevent artifacts like `"About"` or `"About: Schmeichel"` being extracted as entities.
+
+### 12.21 Entity-Mention Filter Threshold and Bridge Extraction Fixes (v4.4.0)
+
+Three targeted fixes to the entity-mention filter and bridge entity extraction, prompted by trace analysis of surname-disambiguation failures:
+
+**Fix A — Multi-word entity fallback threshold ≥5 → ≥8 chars.** The per-token fallback (when an exact multi-word phrase match fails, individual tokens are tried) previously accepted tokens ≥5 characters. Common first names ("James", "Peter", "Maria") are 5–6 characters and match irrelevant chunks — e.g. "Peter" matches any chunk mentioning any Peter. Raising to ≥8 characters preserves distinctive surnames ("Schmeichel", "Halliburton") while excluding short first names and common nouns.
+
+**Fix B — Bridge extraction surname-anchor pass.** When extracting bridge entities from retrieved chunks, the extractor first tries a full-name regex match (e.g. "Peter Schmeichel"), then falls back to the last token of the entity string as a surname anchor (e.g. "Schmeichel"). This recovers entities whose full name in the document includes middle names or diacritics not present in the query ("Peter Bolesław Schmeichel" → anchor on "Schmeichel").
+
+**Fix C — Bridge extraction rejects `[About: X]` annotation artifacts.** The `[About: EntityName]` prefix (§12.20) is present in stored chunk text. Without this guard, the bridge extractor would extract `"About"` or the full `"About: Schmeichel"` string as a bridge entity name, corrupting subsequent hop queries. The guard checks `":" not in first_token` before accepting any regex match.
+
+### 12.22 BM25 as Third RRF Retrieval Path (v4.5.0)
+
+Prior to v4.5.0 the RRF fusion ran over two result lists: dense vector retrieval and graph retrieval. A third path — BM25 sparse retrieval using the `rank_bm25` library — was added to the `HybridRetriever`. BM25 uses term-frequency/inverse-document-frequency weighting over the full chunk corpus and is complementary to dense retrieval: it excels at exact keyword matches (proper names, technical terms, rare words) where the dense model's score compression reduces discriminative power. The three-path fusion (dense + sparse + graph) increases the probability that a topically relevant chunk ranks in the top-2 across all three signals simultaneously — the condition required by the RRF immunity guard (§12.13). `rank_bm25` was added to `requirements.txt`.
+
+### 12.23 Diagnostic Tooling: `diagnose_verbose.py` Gold-Tracking Per Stage (v4.4.0–v4.6.0)
+
+`diagnose_verbose.py` was extended with a per-stage gold-paragraph tracking system. After each filter in the Navigator's pre-generative filter chain and at each Verifier stage, the tool checks whether the gold paragraphs (identified by source-doc title normalisation) are still present in the active context. The output markers are:
+
+- `OK GOLD` — all gold paragraphs present
+- `~ GOLD PARTIAL` — subset present, with a list of missing titles
+- `XX GOLD LOST` — all gold paragraphs evicted
+
+This makes it possible to identify precisely which filter evicted the answer-bearing chunk without manually diffing full context dumps. The model name is printed in the SUMMARY section (`Model: qwen2:1.5b`) to ensure traces are self-describing when compared across ablation runs.
+
+### 12.24 RELEVANT_ENTITY_TYPES Aligned to GLiNER Taxonomy (v4.5.0)
+
+The Planner's `EntityExtractor` uses SpaCy's OntoNotes-5 NER labels to identify named entities. The original `RELEVANT_ENTITY_TYPES` frozenset included `MONEY`, `QUANTITY`, `TIME`, `NORP`, and `LAW` — labels that have no equivalent in the GLiNER taxonomy used at ingestion time. This caused false-positive entities: "888 7th Avenue" was tagged as `MONEY`, producing a broken entity string that contaminated the entity-mention filter's search keys. The fix removes the five labels with no GLiNER counterpart:
+
+**Retained (GLiNER-aligned):** `PERSON`, `ORG`, `GPE`, `LOC`, `FAC`, `PRODUCT`, `EVENT`, `WORK_OF_ART`, `DATE`
+
+**Removed:** `MONEY`, `QUANTITY`, `TIME`, `NORP`, `LAW`
+
+A companion fix adds `_strip_leading_function_words()`, which removes sentence-initial auxiliary verbs that SpaCy absorbs into ORG spans (e.g. "Are Random House Tower" → "Random House Tower").
 
 ---
 

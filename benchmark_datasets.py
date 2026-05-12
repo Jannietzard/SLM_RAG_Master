@@ -1,38 +1,38 @@
 """
 benchmark_datasets.py - Multi-Dataset Benchmark System (UPDATED)
 
-Version: 4.1.0 - Angepasst an neue Projektstruktur
+Version: 4.1.0 - Adapted to new project structure
 Author: Edge-RAG Research Project
 Last Modified: 2026-01-30
 
-WICHTIG - Wissenschaftlich korrekte Evaluation:
+IMPORTANT - Scientifically correct evaluation:
 ═══════════════════════════════════════════════════════════════════════
-Jedes Dataset hat seinen EIGENEN Vector Store + Knowledge Graph.
-Bei Evaluation wird NUR der entsprechende Store verwendet.
-→ Kein Cross-Dataset Data Leakage!
+Each dataset has its OWN vector store + knowledge graph.
+During evaluation ONLY the corresponding store is used.
+→ No cross-dataset data leakage!
 ═══════════════════════════════════════════════════════════════════════
 
-ÄNDERUNGEN v4.1.0:
-- ✅ Entfernt: main_agentic.py (existiert nicht mehr)
-- ✅ Verwendet: src.pipeline.agent_pipeline.AgentPipeline
-- ✅ Verwendet: src.data_layer.chunking.SpacySentenceChunker
-- ✅ Verwendet: src.data_layer.ingestion.DocumentIngestionPipeline (fallback)
-- ✅ Korrekte Import-Pfade für alle Module
+Changes v4.1.0:
+- ✅ Removed: main_agentic.py (no longer exists)
+- ✅ Uses: src.pipeline.agent_pipeline.AgentPipeline
+- ✅ Uses: src.data_layer.chunking.SpacySentenceChunker
+- ✅ Uses: src.data_layer.ingestion.DocumentIngestionPipeline (fallback)
+- ✅ Correct import paths for all modules
 
 Usage:
-    # Ingest einzelnes Dataset
+    # Ingest single dataset
     python benchmark_datasets.py ingest --dataset hotpotqa --samples 500
-    
-    # Ingest alle Datasets (separate Stores)
+
+    # Ingest all datasets (separate stores)
     python benchmark_datasets.py ingest --dataset all --samples 500
-    
-    # Evaluate einzelnes Dataset
+
+    # Evaluate single dataset
     python benchmark_datasets.py evaluate --dataset hotpotqa --samples 100
-    
-    # Volle Ablation Study
+
+    # Full ablation study
     python benchmark_datasets.py ablation --samples 100
-    
-    # Self-Test
+
+    # Self-test
     python benchmark_datasets.py test
 """
 
@@ -73,7 +73,7 @@ except ImportError:
             pass
 
 # ============================================================================
-# IMPORTS MIT FALLBACK-LOGIK
+# IMPORTS WITH FALLBACK LOGIC
 # ============================================================================
 
 # LangChain (Core)
@@ -88,7 +88,7 @@ except ImportError:
         page_content: str
         metadata: Dict[str, Any] = field(default_factory=dict)
 
-# Chunking (SpacySentenceChunker ist primär)
+# Chunking (SpacySentenceChunker is primary)
 CHUNKING_AVAILABLE = False
 SpacySentenceChunker = None
 
@@ -98,7 +98,7 @@ try:
 except ImportError:
     pass
 
-# Ingestion Pipeline (optional fallback)
+# Ingestion Pipeline (optional fallback — used when primary path unavailable)
 INGESTION_PIPELINE_AVAILABLE = False
 DocumentIngestionPipeline = None
 IngestionConfig = None
@@ -119,7 +119,7 @@ try:
 except ImportError:
     pass
 
-# Pipeline (NEUE STRUKTUR)
+# Pipeline (new structure)
 PIPELINE_AVAILABLE = False
 AgentPipeline = None
 
@@ -129,7 +129,7 @@ try:
 except ImportError:
     pass
 
-# Ablation Study (optional)
+# Ablation Study module (optional)
 ABLATION_MODULE_AVAILABLE = False
 try:
     from src.evaluations.ablation_study import AblationStudy, AblationConfig
@@ -184,7 +184,7 @@ ABLATION_CONFIGS = [
 ]
 
 # Component ablation: (name, enable_planner, enable_verifier, max_iterations)
-# Verwendet mit --component-ablation Flag (Hybrid 50/50 Gewichte als Baseline)
+# Used with --component-ablation flag (hybrid 50/50 weights as baseline)
 COMPONENT_CONFIGS = [
     ("full",        True,  True,  1),
     ("no_planner",  False, True,  1),
@@ -485,13 +485,13 @@ LOADERS: Dict[str, DatasetLoader] = {
 # ============================================================================
 
 class StoreManager:
-    """Manages separate vector stores and graphs per dataset."""
+    """Manages separate vector stores and knowledge graphs per dataset."""
     
     def __init__(self, base_path: Path = Path("./data")):
         self.base_path = base_path
     
     def get_paths(self, dataset: str) -> Dict[str, Path]:
-        """Get all paths for a dataset."""
+        """Return all storage paths for a dataset."""
         ds_path = self.base_path / dataset
         return {
             "root": ds_path,
@@ -502,7 +502,7 @@ class StoreManager:
         }
     
     def ensure_dirs(self, dataset: str) -> None:
-        """Create directories for dataset."""
+        """Create directory structure for a dataset."""
         paths = self.get_paths(dataset)
         paths["root"].mkdir(parents=True, exist_ok=True)
     
@@ -511,14 +511,14 @@ class StoreManager:
         Clear data for a dataset.
 
         Two modes:
-          chunks_only=True:   delete ONLY chunks_export.json (Phase 1 output).
+          chunks_only=True:   Delete ONLY chunks_export.json (Phase 1 output).
                               Leaves vector/graph/extraction_results.json
-                              alone. Use when re-running Phase 1 and the
-                              KuzuDB graph might be locked by another
-                              process (Windows holds Kuzu file locks until
-                              the OS releases them).
+                              intact. Use when re-running Phase 1 while the
+                              KuzuDB graph may be locked by another process
+                              (Windows holds Kuzu file locks until the OS
+                              releases them).
 
-          chunks_only=False:  full reset. Rescues every .json file in the
+          chunks_only=False:  Full reset. Rescues every .json file in the
                               tree (chunks_export, questions, articles_info,
                               extraction_results — all expensive to
                               regenerate, especially the Colab output),
@@ -526,7 +526,7 @@ class StoreManager:
                               individual files (typically Kuzu .lock files
                               still held by the OS) is logged as a warning
                               and skipped — partial cleanup is acceptable
-                              because re-ingest will MERGE-overwrite.
+                              because re-ingestion will MERGE-overwrite.
         """
         paths = self.get_paths(dataset)
         root = paths["root"]
@@ -705,7 +705,7 @@ def create_langchain_documents(
         except Exception as e:
             logger.warning(f"SpaCy chunker failed: {e} - using fallback")
     
-    # Methode 2: Fallback (immer verfügbar)
+    # Method 2: Fallback (always available)
     logger.info("Using fallback sentence grouping")
     return _create_documents_fallback(articles, chunk_sentences)
 
@@ -808,7 +808,7 @@ def run_ingestion(
             logger.info(
                 f"  [{pct:5.1f}%] Batch {i // batch_size + 1}/{n_batches} "
                 f"| {batch_elapsed:.0f}s/batch "
-                f"| verbleibend ~{remaining/3600:.1f}h"
+                f"| remaining ~{remaining/3600:.1f}h"
             )
             pbar.set_postfix(batch=f"{i // batch_size + 1}/{n_batches}")
     
@@ -830,20 +830,44 @@ def normalize_answer(text: str) -> str:
     return text
 
 def compute_exact_match(prediction: str, gold: str) -> bool:
-    """Compute exact match (EM)."""
+    """Compute exact match (EM) following the official HotpotQA metric.
+
+    Rules (in order):
+    1. Exact string match after normalisation.
+    2. For multi-word gold answers (≥2 tokens): gold must appear as a
+       contiguous word-boundary-anchored substring of the prediction
+       (handles "the Eiffel Tower" inside "Eiffel Tower, Paris").
+    3. For yes/no: the gold token must appear as a standalone word in
+       the first 5 tokens of the prediction — NOT as a substring of a
+       longer word (prevents "no" matching inside "I don't know").
+
+    Deliberately NOT used: bare `gold in pred` substring check, which
+    causes "no" to match "I don't know." as a false positive.
+    """
     pred_norm = normalize_answer(prediction)
     gold_norm = normalize_answer(gold)
-    
+
+    if not gold_norm:
+        return False
+
+    # Rule 1: exact match
     if pred_norm == gold_norm:
         return True
-    
-    if gold_norm and gold_norm in pred_norm:
-        return True
-    
-    if gold_norm in ["yes", "no"]:
-        if gold_norm in pred_norm.split()[:5]:
+
+    # Rule 2: multi-word gold as contiguous phrase (word-boundary anchored)
+    gold_tokens = gold_norm.split()
+    if len(gold_tokens) >= 2:
+        import re as _re
+        pattern = r'\b' + _re.escape(gold_norm) + r'\b'
+        if _re.search(pattern, pred_norm):
             return True
-    
+
+    # Rule 3: yes/no — standalone word match only
+    if gold_norm in ("yes", "no"):
+        pred_words = pred_norm.split()[:5]
+        if gold_norm in pred_words:
+            return True
+
     return False
 
 def compute_f1(prediction: str, gold: str) -> float:
@@ -886,9 +910,9 @@ def create_pipeline(
     """
     Create pipeline for specific dataset.
     
-    NEUE IMPLEMENTIERUNG v4.1.0:
-    - Verwendet: src.pipeline.agent_pipeline.AgentPipeline
-    - Verwendet: create_full_pipeline factory
+    Implementation v4.1.0:
+    - Uses: src.pipeline.agent_pipeline.AgentPipeline
+    - Uses: create_full_pipeline factory
     """
     
     if not PIPELINE_AVAILABLE:
@@ -1143,8 +1167,8 @@ def cmd_ingest(args, config: Dict, store_manager: StoreManager):
                 with open(out_path, "w", encoding="utf-8") as f:
                     import json as _json
                     _json.dump(chunks_data, f, ensure_ascii=False, indent=2)
-                logger.info(f"  [chunks-only] Exportiert: {out_path}  ({out_path.stat().st_size/1024/1024:.1f} MB)")
-                logger.info(f"  [chunks-only] Naechster Schritt: Datei in Google Colab hochladen.")
+                logger.info(f"  [chunks-only] Exported: {out_path}  ({out_path.stat().st_size/1024/1024:.1f} MB)")
+                logger.info(f"  [chunks-only] Next step: upload file to Google Colab.")
                 continue
 
             paths = store_manager.get_paths(dataset)
@@ -1381,9 +1405,9 @@ def _compute_mur(ds_results: List) -> Dict[str, Optional[float]]:
     """
     MUR = ΔF1 / ΔLatency(s)  —  Marginal Utility Ratio.
 
-    Baseline = erster Eintrag (vector_only oder full).
-    Positiv = Verbesserung pro Sekunde Mehrlatenz.
-    None = Latenz-Unterschied zu klein für zuverlässige Messung.
+    Baseline = first entry (vector_only or full).
+    Positive = improvement per second of additional latency.
+    None = latency difference too small for reliable measurement.
     """
     if not ds_results:
         return {}
@@ -1392,11 +1416,11 @@ def _compute_mur(ds_results: List) -> Dict[str, Optional[float]]:
     for r in ds_results[1:]:
         delta_f1 = r.f1_score - baseline.f1_score
         delta_s = (r.avg_time_ms - baseline.avg_time_ms) / 1000.0
-        if abs(delta_s) < 0.001:          # < 1ms Unterschied → nicht messbar
+        if abs(delta_s) < 0.001:          # < 1ms difference → not measurable
             mur[r.config_name] = None
         elif delta_s > 0:
             mur[r.config_name] = delta_f1 / delta_s
-        else:                              # Schneller als Baseline
+        else:                              # Faster than baseline
             mur[r.config_name] = float("inf") if delta_f1 > 0 else delta_f1 / delta_s
     return mur
 
@@ -1624,22 +1648,22 @@ def main():
     eval_p.add_argument("--vector-weight", type=float, default=0.7)
     eval_p.add_argument("--graph-weight", type=float, default=0.3)
     eval_p.add_argument("--model", "-m", type=str, default=None,
-                        help="Modellname (z.B. phi3, llama3.2:3b). Default: aus settings.yaml")
+                        help="Model name (e.g. phi3, llama3.2:3b). Default: from settings.yaml")
     eval_p.add_argument("--no-planner", action="store_true",
-                        help="S_P überspringen (Ablation: kein Planner)")
+                        help="Skip S_P (ablation: no planner)")
     eval_p.add_argument("--no-verifier", action="store_true",
-                        help="S_V überspringen (Ablation: kein Verifier)")
+                        help="Skip S_V (ablation: no verifier)")
     eval_p.add_argument("--iterations", type=int, default=1,
-                        help="Anzahl Verifier-Iterationen (1/2/3). Default: 1")
+                        help="Number of verifier iterations (1/2/3). Default: 1")
 
     # ABLATION
     ablation_p = subparsers.add_parser("ablation", help="Run ablation study")
     ablation_p.add_argument("--dataset", "-d", type=str, default="all")
     ablation_p.add_argument("--samples", "-n", type=int, default=100)
     ablation_p.add_argument("--model", "-m", type=str, default=None,
-                            help="Modellname (z.B. phi3, llama3.2:3b). Default: aus settings.yaml")
+                            help="Model name (e.g. phi3, llama3.2:3b). Default: from settings.yaml")
     ablation_p.add_argument("--component-ablation", action="store_true",
-                            help="Zusätzlich Planner/Verifier/Iterations-Ablation durchführen")
+                            help="Also run planner/verifier/iterations component ablation")
     
     # STATUS
     subparsers.add_parser("status", help="Show ingestion status")

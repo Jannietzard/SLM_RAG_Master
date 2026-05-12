@@ -953,6 +953,15 @@ class PreGenerationValidator:
                         if chunk_has and other_has:
                             cred.cross_references += 1
 
+            # Self-relevance boost: if this chunk itself mentions a query entity
+            # it is directly on-topic regardless of what other chunks say.
+            # Without this, a bridge-target chunk (e.g. the Strasbourg article)
+            # always scores cross_references=0 because no other Hop-2 noise chunk
+            # mentions Strasbourg — and then falls below min_credibility_score.
+            if entity_tokens_lower and cred.cross_references == 0:
+                if any(t in chunk_lower for t in entity_tokens_lower):
+                    cred.cross_references = 1
+
             # Entity-frequency signal.
             if SPACY_AVAILABLE and NLP:
                 doc = NLP(chunk[: self.config.spacy_max_chars])
@@ -1010,10 +1019,29 @@ class Verifier:
     ANSWER_PROMPT = """You are a factual QA assistant. Answer based ONLY on the context below.
 
 Rules:
-- Give the shortest possible answer: a name, place, date, or yes/no.
+- Give the shortest possible answer: a name, place, date, number, or yes/no.
 - Do NOT explain or add sentences beyond the direct answer.
 - If the answer is a person, place, or thing: reply with just that name.
+- If the answer is a number or statistic (e.g. population, count, year): reply with just the number.
 - If the answer is yes/no: reply with just "yes" or "no".
+- If the context does not contain the answer: reply with "I don't know."
+
+Context:
+{context}
+
+Question: {query}
+
+Answer (as short as possible):"""
+
+    BRIDGE_PROMPT = """You are a factual QA assistant. Answer based ONLY on the context below.
+
+This is a multi-step question. Use the following reasoning chain to find the answer:
+{bridge_chain}
+
+Rules:
+- Give the shortest possible answer: a name, place, date, number, or yes/no.
+- Do NOT explain or add sentences beyond the direct answer.
+- If the answer is a number or statistic (e.g. population, count, year): reply with just the number.
 - If the context does not contain the answer: reply with "I don't know."
 
 Context:
@@ -1419,6 +1447,57 @@ Please provide a partial answer based on the available evidence, clearly indicat
 
         return False, "entities_not_found"
 
+    # ── Bridge Chain Builder ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_bridge_chain(
+        query: str,
+        entities: List[str],
+        bridge_entities: List[str],
+        hop_sequence: Optional[List[Dict[str, Any]]],
+    ) -> str:
+        """
+        Build a human-readable reasoning scaffold for multi-hop prompts.
+
+        Uses the hop_sequence sub-queries when available; falls back to a
+        generic "Step 1 → Step 2" description using entity names.
+
+        Example output:
+            Step 1: Find where 122nd SS-Standarte was formed → Strasbourg
+            Step 2: Find the inhabitants of Strasbourg in 2014 → answer needed
+        """
+        lines: List[str] = []
+
+        if hop_sequence:
+            hops = sorted(hop_sequence, key=lambda h: h.get("step_id", 0))
+            last_step_id = max(h.get("step_id", 0) for h in hops)
+            bridge_idx = 0
+            for hop in hops:
+                step = hop.get("step_id", 0) + 1
+                sub_q = hop.get("sub_query", "")
+                is_bridge = hop.get("is_bridge", False)
+                is_last = hop.get("step_id", 0) == last_step_id
+                if is_bridge and bridge_idx < len(bridge_entities):
+                    lines.append(
+                        "Step %d: %s → %s" % (step, sub_q, bridge_entities[bridge_idx])
+                    )
+                    bridge_idx += 1
+                elif is_last:
+                    lines.append("Step %d: %s → THIS IS THE ANSWER" % (step, sub_q))
+                else:
+                    lines.append("Step %d: %s → (intermediate result)" % (step, sub_q))
+        else:
+            # Fallback: generic chain from entity names + bridge entities
+            anchor = entities[0] if entities else "the subject"
+            for i, bridge in enumerate(bridge_entities, start=1):
+                lines.append("Step %d: find information about %s → %s" % (i, anchor, bridge))
+                anchor = bridge
+            lines.append(
+                "Step %d: find the final answer about %s" % (len(bridge_entities) + 1, anchor)
+            )
+
+        return "\n".join(lines)
+
     # ── Main Verification Loop ────────────────────────────────────────────────
 
     def generate_and_verify(
@@ -1428,6 +1507,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
         entities: Optional[List[str]] = None,
         hop_sequence: Optional[List[Dict[str, Any]]] = None,
         query_type: Optional[str] = None,
+        bridge_entities: Optional[List[str]] = None,
     ) -> VerificationResult:
         """
         Main entry point: pre-validation, generation, and self-correction.
@@ -1545,6 +1625,15 @@ Please provide a partial answer based on the available evidence, clearly indicat
                 elif query_type == "comparison":
                     prompt = self.COMPARISON_PROMPT.format(
                         context=formatted_context, query=query
+                    )
+                elif query_type in ("multi_hop", "bridge") and hop_sequence:
+                    bridge_chain = self._build_bridge_chain(
+                        query, entities or [], bridge_entities or [], hop_sequence
+                    )
+                    prompt = self.BRIDGE_PROMPT.format(
+                        bridge_chain=bridge_chain,
+                        context=formatted_context,
+                        query=query,
                     )
                 else:
                     prompt = self.ANSWER_PROMPT.format(
