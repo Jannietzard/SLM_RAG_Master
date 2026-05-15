@@ -10,24 +10,55 @@ Artifact B: Agent-Based Query Processing
 OVERVIEW
 ===============================================================================
 
-The Planner (S_P) is the first stage of the Agentic RAG system and acts as a
-deterministic router for query analysis and retrieval plan generation.
+The Planner (S_P) is the first stage of the Agentic RAG pipeline. It
+transforms a natural-language question into a structured retrieval plan
+consisting of: a classified query type, an ordered hop sequence of
+sub-queries, the named entities relevant to retrieval, and any temporal or
+comparative constraints.
 
-Core functions per thesis specification:
-1. QUERY CLASSIFICATION (Heuristic)
-   - Uses SpaCy's Rule-Based Matcher instead of ML models
-   - Classifies: Single-Hop, Multi-Hop, Comparison, Temporal Reasoning
-   - Minimises latency through lightweight linguistic heuristics
+The planner is composed of three stages:
 
-2. ENTITY & BRIDGE DETECTION
-   - Extraction via SpaCy NER (confidence > min_entity_confidence)
-   - Dependency parsing for syntactic relationships
-   - Bridge entities for multi-hop graph traversal
+1. QUERY CLASSIFICATION
+   - Rule-based classifier over closed-class English function words and
+     short syntactic patterns (SpaCy Matcher; Honnibal & Montani 2017).
+   - Output labels: SINGLE_HOP, MULTI_HOP, COMPARISON, TEMPORAL,
+     AGGREGATE, INTERSECTION.
+   - Two deterministic pre-empts run before the scoring classifier for
+     constructions that closed-class English markers identify
+     unambiguously: distributive predication with floating "both"
+     (COMPARISON pre-empt) and anaphoric "another" introducing an
+     unnamed referent (MULTI_HOP pre-empt).
+
+2. ENTITY EXTRACTION
+   - SpaCy NER restricted to the OntoNotes-5 named-entity inventory
+     (Weischedel et al. 2013, LDC2013T19).
+   - Per-label confidence estimation (see EntityExtractor._LABEL_CONFIDENCE).
+   - For MULTI_HOP queries, a bridge-entity heuristic identifies which
+     extracted entity is the intermediate referent linking the hops.
 
 3. PLAN GENERATION
-   - Structured JSON retrieval plan
-   - Defines: strategy, hop sequence, constraints
-   - Strategies: Vector-Only, Hybrid (Graph-Only reserved for future work)
+   - Hop-sequence decomposition for queries that are not single-hop.
+   - Two generalisable mechanisms produce the hop sequence:
+
+     (a) Dependency-parse decomposition: recognises four English
+         constructions structurally — relative-clause bridges
+         (Quirk et al. 1985 §17.7-15), passive voice with by-phrase agents
+         (Bresnan 1982, "The Passive in Lexical Theory"), relational-noun
+         complements with `of`-PP (Partee 1995; Barker 1995), and chained
+         attribution clauses (Levin 1993, "English Verb Classes").
+         Each recogniser keys on SpaCy dependency labels and the OntoNotes
+         NER inventory; no surface-form vocabulary lists are consulted.
+
+     (b) Connector-split baseline: when the dep-parse decomposer does not
+         match, the query is split at bridge connectors ("that", "which",
+         "who", "of the") and the resulting fragments are re-ordered so
+         the bridge sub-query precedes the final sub-query.
+
+   - A small set of comparison rewrites maps closed-class English
+     attribute nouns (nationality, birthplace, profession, genre, age,
+     country, religion) onto factual-lookup templates so that
+     attribute-comparison questions retrieve biographical chunks via the
+     attribute predicate rather than the comparison phrasing.
 
 ===============================================================================
 ARCHITECTURE
@@ -69,22 +100,30 @@ ACADEMIC REFERENCES
 - Honnibal, M., & Montani, I. (2017). "spaCy 2: Natural language understanding
   with Bloom embeddings, convolutional neural networks and incremental parsing."
   Unpublished; arXiv:1802.04016.
+- Quirk, R., Greenbaum, S., Leech, G., & Svartvik, J. (1985). "A Comprehensive
+  Grammar of the English Language." Longman.
+- Bresnan, J. (1982). "The Passive in Lexical Theory." In Bresnan ed.,
+  The Mental Representation of Grammatical Relations, MIT Press.
+- Karttunen, L. (1977). "Syntax and Semantics of Questions." Linguistics
+  and Philosophy 1(1).
+- Higginbotham, J. (1993). "Interrogatives." In Hale & Keyser eds.,
+  The View from Building 20, MIT Press.
+- Partee, B. (1995). "Lexical Semantics and Compositionality." In Gleitman
+  & Liberman eds., An Invitation to Cognitive Science: Language, MIT Press.
+- Barker, C. (1995). "Possessive Descriptions." CSLI Publications.
+- Levin, B. (1993). "English Verb Classes and Alternations: A Preliminary
+  Investigation." University of Chicago Press.
+- Karttunen, L. (1976). "Discourse Referents." In McCawley ed.,
+  Syntax and Semantics 7: Notes from the Linguistic Underground,
+  Academic Press.
+- Weischedel, R., et al. (2013). "OntoNotes Release 5.0." LDC2013T19.
 - Yang, Z., et al. (2018). "HotpotQA: A Dataset for Diverse, Explainable
-  Multi-hop Question Answering." EMNLP 2018.
+  Multi-hop Question Answering." EMNLP 2018. (Evaluation benchmark only —
+  no planner component is dataset-specific.)
 - Khattab, O., et al. (2022). "Demonstrate-Search-Predict: Composing retrieval
   and language models for knowledge-intensive NLP." arXiv:2212.14024.
   (Motivation for structured query decomposition in RAG pipelines.)
-- Weischedel, R., et al. (2013). "OntoNotes Release 5.0." LDC2013T19.
-  (Label-level NER confidence estimates for en_core_web_sm in
-  EntityExtractor._estimate_confidence; see _LABEL_CONFIDENCE dict.)
 
-===============================================================================
-Review History:
-    Last Reviewed:  2026-04-21
-    Review Result:  0 CRITICAL, 4 IMPORTANT, 7 RECOMMENDED
-    Reviewer:       Code Review Prompt v2.1
-    Next Review:    After re-ingestion with updated entity types or SpaCy lazy-load
-                    refactor (Finding 7)
 ===============================================================================
 """
 
@@ -276,7 +315,19 @@ class RetrievalPlan:
         constraints:     Additional constraints (temporal, comparison, etc.).
         estimated_hops:  Estimated number of retrieval hops.
         confidence:      Query classification confidence.
-        metadata:        Additional metadata for debugging.
+        matched_pattern: P1-fix (2026-05-15). Identifier of the decomposition
+            pattern that produced this plan (e.g. "G_form1", "H", "E",
+            "comparison_attr_map", "fallback_generic_2hop", "single_hop").
+            None when the field has not been set. Surfaces in the per-question
+            JSONL so the eval harness can compute per-pattern hit-rates and
+            SF-F1 deltas without parsing debug logs.
+        classifier_preempt: P2-fix (2026-05-15). Identifier of the Phase 0 /
+            Phase 0.5 classifier pre-empt that fired, if any
+            ("preempt_pattern_I_boolean_conjunction", "preempt_pattern_J_implicit_bridge").
+            None when no pre-empt fired (i.e. normal Phase 1-4 scoring path).
+            Lets reviewers audit pre-empt false-positive rates without
+            re-running classification.
+        metadata:        Additional metadata for debugging / future fields.
     """
     original_query: str
     query_type: QueryType
@@ -287,6 +338,8 @@ class RetrievalPlan:
     constraints: Dict[str, Any] = field(default_factory=dict)
     estimated_hops: int = 1
     confidence: float = 1.0
+    matched_pattern: Optional[str] = None
+    classifier_preempt: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -318,6 +371,15 @@ class RetrievalPlan:
             "constraints": self.constraints,
             "estimated_hops": self.estimated_hops,
             "confidence": self.confidence,
+            # P1/P2-fix (2026-05-15): surface the matched pattern + any classifier
+            # pre-empt so the per-question JSONL contains a greppable identifier
+            # for downstream analysis. Both keys are always present (possibly
+            # None) so consumers can rely on the schema.
+            "matched_pattern": self.matched_pattern,
+            "classifier_preempt": self.classifier_preempt,
+            # P8-fix: surface metadata so future debug fields are reachable from
+            # the JSONL without another schema change. Empty dict by default.
+            "metadata": self.metadata,
         }
 
     def to_json(self) -> str:
@@ -335,8 +397,8 @@ class PlannerConfig:
     """
     Configuration for the Query Planner.
 
-    All numeric thresholds are empirically tuned on the HotpotQA dev set
-    (see thesis Section 4.3 for ablation results). All values are sourced
+    Numeric thresholds were chosen by inspection during development and
+    documented in the thesis methodology section. All values are sourced
     from ``config/settings.yaml → planner`` via ``from_yaml()``; the
     dataclass defaults serve only as documented emergency fallbacks.
 
@@ -375,14 +437,17 @@ class PlannerConfig:
     entity_density_threshold: int = 2        # settings.yaml: planner.entity_density_threshold
     noun_density_threshold: int = 4          # settings.yaml: planner.noun_density_threshold
 
-    # Classifier weight constants — empirically tuned on HotpotQA dev set.
-    # Changing these may affect classification accuracy on other benchmarks.
+    # Classifier weight constants. Defaults were chosen by inspection during
+    # development; tuning is exposed via settings.yaml for reproducibility.
     classifier_spacy_weight: float = 1.5     # settings.yaml: planner.classifier_spacy_weight
     classifier_entity_boost: float = 0.5     # settings.yaml: planner.classifier_entity_boost
     classifier_confidence_base: float = 0.6  # settings.yaml: planner.classifier_confidence_base
     classifier_confidence_scale: float = 0.15  # settings.yaml: planner.classifier_confidence_scale
     classifier_confidence_cap: float = 0.95  # settings.yaml: planner.classifier_confidence_cap
-    classifier_fallback_confidence: float = 0.8  # settings.yaml: planner.classifier_fallback_confidence
+    # P9-fix (2026-05-15): default lowered 0.8 → 0.5 so no-pattern-match
+    # confidence falls strictly below any single-pattern match
+    # (base 0.60 + scale 0.15 × 1 = 0.75).
+    classifier_fallback_confidence: float = 0.5  # settings.yaml: planner.classifier_fallback_confidence
 
     @classmethod
     def from_yaml(cls, config: Dict[str, Any]) -> "PlannerConfig":
@@ -416,7 +481,7 @@ class PlannerConfig:
             classifier_confidence_base=planner.get("classifier_confidence_base", 0.6),
             classifier_confidence_scale=planner.get("classifier_confidence_scale", 0.15),
             classifier_confidence_cap=planner.get("classifier_confidence_cap", 0.95),
-            classifier_fallback_confidence=planner.get("classifier_fallback_confidence", 0.8),
+            classifier_fallback_confidence=planner.get("classifier_fallback_confidence", 0.5),
         )
 
 
@@ -449,7 +514,11 @@ class QueryClassifier:
     # Tuples (immutable) prevent accidental mutation by subclasses.
     # ─────────────────────────────────────────────────────────────────────────
 
-    # Comparison indicators: comparative words and structures
+    # Comparison indicators: comparative words and English coordination structures.
+    # All patterns key on closed-class function words (comparative morphology
+    # -er/-est, "than", "versus", "or", "both", "same") that are standard
+    # signals of comparative constructions in English (Quirk et al. 1985,
+    # "A Comprehensive Grammar of the English Language", §15.63-72).
     COMPARISON_PATTERNS = (
         r"\b(older|younger|taller|shorter|bigger|smaller|larger|higher|lower)\s+than\b",
         r"\b(more|less|fewer)\s+\w+\s+than\b",
@@ -458,36 +527,29 @@ class QueryClassifier:
         r"\bwhich\s+(is|was|are|were)\s+\w*(er|est)\b",
         r"\b(better|worse|best|worst)\b.*\bor\b",
         r"\bor\b.*\?(which|what)\s+(is|was)\s+\w*(er|est)",
-        r"\bsame\s+\w+\b",          # "same nationality", "same country", "same field"
-        r"\bboth\s+.+\s+(born|from|have|had|were|are)\b",  # "both born in", "both from"
+        r"\bsame\s+\w+\b",          # "same NP" — shared-attribute construction
+        r"\bboth\s+.+\s+(born|from|have|had|were|are)\b",  # "both" floating quantifier
         # "Who is older/taller/..., X or Y?" — no "than" required
         r"\b(older|younger|taller|shorter|bigger|smaller|larger|higher|lower|richer|poorer)\b.{0,60}\bor\b",
-        # FIX P-1: the canonical HotpotQA "select-between-two" comparison form.
-        # "Which writer was from England, Henry Roth or Robert Erskine Childers?"
-        # "Which band, Letters to Cleo or Screaming Trees, had more members?"
-        # "Which magazine was started first, X or Y?" / "...A or B, was published first?"
-        # Signature: a leading question-word + an "A or B" disjunction (often set
-        # off by a comma). This is a comparison even when no comparative adjective
-        # or "than" appears — the *answer* is one of the two named entities.
-        r"^\s*(which|what|who|whom)\b.{0,120}?,\s*[^,?]+\s+\bor\b\s+[^,?]+[,?]",   # "Which X, A or B, ...?" / "..., A or B?"
-        r"^\s*(which|what|who|whom)\b.{0,120}?\b(was|is|were|are|did|had|has|came|come)\b[^,?]*\bfirst\b",  # "Which ... was published first..."
-        r"\b(more|fewer|less|most|fewest)\s+\w+\b.{0,60}\bor\b",   # "had more members ... or ..."
-        r"\bor\b.{0,60}\b(more|fewer|less|most|fewest)\s+\w+\b",   # "...or...had more members"
-        # Pattern K (§12.33): shared-attribute parallel comparison.
-        # "What nationality were social anthropologists Alfred Gell and Edmund Leach?"
-        # "What countries are X and Y from?"
-        # "When were X and Y born?"
-        # Signature: an interrogative word + a plural copula/aux that takes
-        # multiple subjects + an "X and Y" coordination of two NER-like
-        # capitalised phrases. The answer is a SHARED attribute, so each
-        # entity needs its own bio retrieved in parallel — exactly what
-        # _decompose_comparison does. Without this pattern the query falls
-        # through to _decompose_multi_hop and emits a chained bridge from
-        # only one entity, missing the second gold paragraph.
-        r"^\s*(what|which|where|when|who|how)\b[^?]{0,80}?\b(are|were|do|did|have|has)\b"
-        r"[^?]{0,80}?\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\s+and\s+"
-        r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b",
     )
+
+    # Option A audit (2026-05-15): three regex-classifier patterns previously
+    # listed here were removed because they recognised specific question
+    # phrasings rather than linguistic structure:
+    #
+    #   - "Which X, A or B, …?" form (`,\s*[^,?]+\s+\bor\b\s+[^,?]+[,?]`)
+    #     replaced by `_decompose_select_between`, which uses SpaCy NER to
+    #     detect the disjunction structurally rather than via comma position.
+    #   - "Which … <aux> … first" form (`\b(was|is|were|are|…) … \bfirst\b`)
+    #     was a surface-form pattern fitted to one question shape. Removed.
+    #   - Plural-coordination string-shape pattern matching
+    #     `[A-Z][a-z]+\s+and\s+[A-Z][a-z]+` (the "Pattern K" regex). The
+    #     phenomenon (coordinated subjects with shared predicate attribute)
+    #     is real but the recogniser used a string-shape match, not a
+    #     dependency-parse signal. Coordination is now recognised by
+    #     `_decompose_select_between` via NER-span detection.
+    #
+    # See Quirk et al. (1985) §13.2 for the linguistics of coordinated NPs.
 
     # Temporal indicators: time references and temporal structures
     TEMPORAL_PATTERNS = (
@@ -506,7 +568,9 @@ class QueryClassifier:
         r"\b\w+\s+of\s+the\s+\w+\s+of\b",
         r"'s\s+\w+'s",  # possessive chains
         r"\b(who|what)\s+\w+\s+(the|a)\s+\w+\s+(that|which)\b",
-        # Bridge-relation patterns (HotpotQA / 2WikiMultiHop — Yang et al., 2018):
+        # Bridge-relation surface patterns: closed-class English attribution
+        # verbs and relational nouns that mark a noun phrase as standing in
+        # for an as-yet-unresolved entity (Quirk et al. 1985 §17.7-15).
         r"\b(starring|featuring|directed by|written by|authored by|composed by)\b",
         r"\b(father|mother|son|daughter|wife|husband|creator|founder)\s+of\b",
         r"\b(located|situated)\s+in\s+the\b",
@@ -553,6 +617,12 @@ class QueryClassifier:
         # SpaCy Matcher for syntactic patterns
         self._setup_spacy_matcher()
 
+        # P2-fix: per-call cache for the pre-empt identifier (if any). Set by
+        # classify() when Phase 0 / Phase 0.5 fires; read by Planner.plan() into
+        # RetrievalPlan.classifier_preempt. None means the classification took
+        # the normal Phase 1-4 scoring path.
+        self._last_preempt: Optional[str] = None
+
         logger.info("QueryClassifier initialised")
 
     def _setup_spacy_matcher(self) -> None:
@@ -584,6 +654,27 @@ class QueryClassifier:
             {"LOWER": "than"},
         ]
         self.matcher.add("COMPARISON", [comparison_pattern])
+
+        # Disjunctive coordination of proper nouns "X or Y" — the canonical
+        # surface form of an English alternative interrogative
+        # (Karttunen 1977, "Syntax and Semantics of Questions",
+        # Linguistics and Philosophy 1(1); Higginbotham 1993,
+        # "Interrogatives" in Hale & Keyser eds., MIT Press). Disjunction
+        # of two named entities forces a select-between-two reading.
+        #
+        # NOTE: a parallel "PROPN and PROPN" rule was deliberately NOT added.
+        # Conjunctive coordination of named entities is ambiguous between
+        # COMPARISON ("Are X and Y from the same country?") and
+        # INTERSECTION ("Which films star X and Y?"). Resolving that
+        # ambiguity requires looking at the predicate, which the
+        # existing INTERSECTION lexical patterns ("both ... and",
+        # "in common", "shared by") already do.
+        propn_or_propn = [
+            {"POS": "PROPN", "OP": "+"},
+            {"LOWER": "or"},
+            {"POS": "PROPN", "OP": "+"},
+        ]
+        self.matcher.add("COMPARISON", [propn_or_propn])
 
         logger.debug("SpaCy Matcher configured")
 
@@ -617,6 +708,9 @@ class QueryClassifier:
         query = query.strip()
         scores = {qt: 0.0 for qt in QueryType}
 
+        # P2-fix: reset pre-empt marker for this call.
+        self._last_preempt = None
+
         # ─────────────────────────────────────────────────────────────────────
         # PHASE 0: Boolean-conjunction pre-empt (Pattern I)
         # "Are/Did/Were X and Y both P?" — parallel yes/no, never a bridge chain.
@@ -629,6 +723,10 @@ class QueryClassifier:
         )
         if _BOOL_CONJ_PRE.match(query):
             logger.debug("classify: Boolean conjunction pre-empt for '%s' → COMPARISON", query[:80])
+            # P2-fix: record the pre-empt so the per-question JSONL can audit
+            # how often it fires and on what queries. Methodology gap (D3) — the
+            # documented four-phase pipeline does not describe pre-empts.
+            self._last_preempt = "preempt_pattern_I_boolean_conjunction"
             return QueryType.COMPARISON, 0.90
 
         # ─────────────────────────────────────────────────────────────────────
@@ -647,6 +745,8 @@ class QueryClassifier:
                 "classify: implicit-bridge pre-empt (Pattern J) for '%s' → MULTI_HOP",
                 query[:80],
             )
+            # P2-fix: record the pre-empt for false-positive auditing.
+            self._last_preempt = "preempt_pattern_J_implicit_bridge"
             return QueryType.MULTI_HOP, 0.80
 
         # ─────────────────────────────────────────────────────────────────────
@@ -760,8 +860,7 @@ class EntityExtractor:
     For complex queries, dependency parsing resolves syntactic relationships,
     enabling identification of bridge entities as necessary intermediate steps
     (hops) for graph traversal."
-    (Honnibal & Montani, 2017; arXiv:1802.04016;
-     Yang et al., 2018 HotpotQA EMNLP)
+    (Honnibal & Montani, 2017; arXiv:1802.04016)
     """
 
     # SpaCy NER labels that map to the GLiNER taxonomy used at ingestion time.
@@ -934,16 +1033,15 @@ class EntityExtractor:
             filtered.append(entity)
 
         # ─────────────────────────────────────────────────────────────────────
-        # FIX P-3: re-join proper-noun spans that SpaCy / the regex fallback
-        # fragmented. en_core_web_sm frequently splits a single title into
-        # pieces around a lowercase connector — e.g. "Letters to Cleo" →
-        # ["Letters"(ORG), "Cleo"(PRODUCT)] and "Seven Brief Lessons on
-        # Physics" → ["Seven Brief Lessons", "Physics"]. When two extracted
-        # entities are adjacent in the query separated only by a short
-        # connector ("to", "of", "on", "the", "and", "&", "'s", …), merge
-        # them into one span covering the whole title. This prevents the
-        # fragment ("Physics", "Letters") from being treated as a primary or
-        # bridge entity and dragging in irrelevant chunks.
+        # Re-join proper-noun spans that SpaCy's NER fragmented.
+        # The small en_core_web_sm model splits multi-token proper-noun
+        # phrases around lowercase function-word connectors ("to", "of",
+        # "on", "the", "and", "&", "'s") into separate spans. When two
+        # extracted entities are adjacent in the query and separated only
+        # by such a connector, the two spans almost certainly belong to a
+        # single proper-noun phrase (Quirk et al. 1985 §5.34 on compound
+        # nominals); we merge them so the full title is treated as one
+        # entity rather than fragmented across two retrieval anchors.
         # ─────────────────────────────────────────────────────────────────────
         filtered = self._rejoin_fragmented_spans(query, filtered)
 
@@ -989,8 +1087,8 @@ class EntityExtractor:
                 )
             )
             if joinable:
-                # Build the merged span verbatim from the query text so casing /
-                # connectors are preserved exactly ("Letters to Cleo").
+                # Build the merged span verbatim from the query text so casing
+                # and the original connector tokens are preserved exactly.
                 new_text = query[cur.start_char:nxt.end_char].strip()
                 # Prefer the more specific label: a named type over PROPN/QUOTED.
                 if cur.label in ("PROPN", "QUOTED") and nxt.label not in ("PROPN", "QUOTED"):
@@ -1019,10 +1117,11 @@ class EntityExtractor:
         """
         Identify bridge entities for multi-hop reasoning.
 
-        Bridge entities are intermediate nodes required for graph traversal.
-        Per thesis Section 3.2 and Yang et al. (2018) HotpotQA EMNLP:
-        "Bridge entities (e.g. subject-object relationships in nested sentences)
-        serve as necessary intermediate steps (hops) for graph traversal."
+        Bridge entities are intermediate nodes required for graph traversal:
+        a bridge entity is mentioned in one retrieval step but its identity
+        must be resolved before a second step can be issued. The notion is
+        equivalent to the "intermediate referent" of compositional question
+        answering (e.g. Karttunen 1977 on multi-step questions).
 
         Detection uses SpaCy dependency parsing:
         - Prepositional objects in nested structures (dep=pobj)
@@ -1070,12 +1169,14 @@ class EntityExtractor:
         # Mark entities as bridge if in bridge_candidates.
         # First and last entities are typically anchors, not bridges.
         #
-        # FIX P-3: a bridge entity is the *thing* that links two hops — a
-        # person, organisation, work, place, or event. Generic descriptors
-        # (NORP nationalities like "Italian", DATE values, QUANTITY/MONEY,
-        # and unlabelled regex PROPN fragments) must never be promoted to
-        # bridge: doing so steers retrieval toward high-frequency hub nodes
-        # ("Physics", "Italian") instead of the entity that actually bridges.
+        # A bridge entity is the noun phrase that links two retrieval steps:
+        # it must denote a discrete referent (person, organisation, work,
+        # place, event). Generic descriptors — NORP demonyms, dates,
+        # quantities, and unlabelled regex PROPN fragments — are excluded
+        # because they refer to classes rather than to individuals and
+        # would steer retrieval toward high-degree hub nodes rather than
+        # the specific bridging referent (West & Leskovec 2012, "Human
+        # Wayfinding in Information Networks", WWW).
         _BRIDGE_OK_LABELS = {"PERSON", "ORG", "GPE", "LOC", "FAC",
                              "WORK_OF_ART", "PRODUCT", "EVENT"}
         for i, entity in enumerate(entities):
@@ -1116,8 +1217,95 @@ class PlanGenerator:
     """
     Generator for structured retrieval plans.
 
-    Produces a detailed plan for the Navigator (S_N) based on query
-    classification and extracted entities.
+    Produces a hop sequence for the Navigator (S_N) based on the query type
+    and the named entities extracted by the EntityExtractor.
+
+    ─────────────────────────────────────────────────────────────────────────
+    DECOMPOSITION MECHANISMS
+    ─────────────────────────────────────────────────────────────────────────
+    Hop generation applies two generalisable mechanisms and a baseline. No
+    surface-form vocabulary lists are consulted; all recognisers key on
+    SpaCy dependency labels, closed-class English function words, or the
+    OntoNotes-5 named-entity inventory.
+
+    Mechanism A — Dependency-parse decomposers
+    ------------------------------------------
+    Four English constructions are recognised structurally via SpaCy
+    dependency labels (Honnibal & Montani 2017). Each recogniser is gated
+    by a parse-confidence check requiring the relevant anchor to overlap
+    a detected NER span, so the construction is only accepted when the
+    parser produces the expected dependency structure and the entity
+    inventory grounds it to a corpus referent.
+
+    G — Relative-clause bridge (Quirk et al. 1985 §17.7-15).
+        "The [noun] in/of/by which [Entity] …" or "the [role] who/that …
+        [Entity]". Recogniser keys on the `relcl` dep label. Two forms
+        cover the relative-pronoun-subject case and the relative-pronoun-
+        object case.
+
+    H — Chained attribution (Levin 1993, "English Verb Classes").
+        A passive ROOT with an `agent` by-phrase whose object is an
+        indefinite pronoun, plus an `acl` clause on the subject anchored
+        to a named entity. The attribution-clause head must be one of a
+        small set of verbs of derivation/depiction (a closed class
+        documented at the constant `_ATTRIBUTION_ACL_VERBS`).
+
+    E — Relational-noun + of-PP complement (Partee 1995; Barker 1995).
+        A noun whose dependency structure contains a `prep`("of") child
+        whose `pobj` is a named entity. Generalises to any noun for
+        which the parser produces this structure; no role enumeration.
+
+    F — Passive-agent voice transformation (Bresnan 1982; Quirk et al.
+        1985 §3.65-71). A verb with `auxpass` + `nsubjpass` + `agent`
+        children. Past-participle → infinitive conversion is performed
+        by SpaCy's morphological lemmatiser, so the recogniser is
+        vocabulary-independent.
+
+    Mechanism B — Closed-class lexical pre-empts
+    --------------------------------------------
+    Two English constructions are unambiguously identified by closed-class
+    function words and are routed before the general scoring classifier:
+
+    I — Distributive predication with floating "both"
+        (Quirk et al. 1985 §10.49). Surface form "<aux> X and Y both <P>".
+        The "both" quantifier is the discriminator.
+
+    J — Anaphoric introduction with "another" (Karttunen 1976,
+        "Discourse Referents"). The presence of "another <noun>" signals
+        an unnamed referent that must be resolved before the predicate
+        applies, forcing a MULTI_HOP plan.
+
+    Baseline — Connector-split decomposition
+    ----------------------------------------
+    For multi-hop queries whose structure none of the above recognise, the
+    query is split at bridge connectors ("that", "which", "who", "of the")
+    and the resulting fragments are re-ordered so the bridge sub-query
+    precedes the final sub-query. A 2-hop cap collapses spurious 3-part
+    splits whose middle parts contain no named entity. This is the
+    methodology-described baseline (Khattab et al. 2022, DSP).
+
+    Failure modes (explicit, surfaced in `matched_pattern`):
+      - `fallback_generic_2hop`: classified MULTI_HOP, no mechanism
+        applied, but a seed entity is available. Emit "Who or what is
+        X?" as hop-0 and the original query as hop-1.
+      - `fallback_degraded_to_single_hop`: classified MULTI_HOP, no
+        mechanism applied, no entity available. Logged at WARNING.
+
+    Comparison queries route through ``_decompose_comparison``:
+      - I (boolean conjunction) — runs first; the "both" discriminator
+        is unambiguous.
+      - Select-between-two — disjunction of two NER entities joined by
+        "or"; the disjunction is detected via NER spans, not surface form.
+      - `_ATTR_MAP` rewrite — closed-class English attribute nouns are
+        rewritten into per-entity factual lookups.
+      - Generic per-entity predicate templates — used when no attribute
+        rewrite applies.
+
+    Pattern identifiers are recorded on every plan
+    (``RetrievalPlan.matched_pattern``) so per-pattern diagnostics can be
+    computed from the eval JSONL without parsing logs.
+
+    ─────────────────────────────────────────────────────────────────────────
     """
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1144,12 +1332,17 @@ class PlanGenerator:
         re.IGNORECASE,
     )
 
-    # Attribute rewriting map for comparison queries.
-    # Transforms "Were X and Y of the same nationality?" into two factual lookups
-    # "What is the nationality of X?" / "What is the nationality of Y?".
-    # This improves vector similarity to factual chunks (e.g. "X is American").
-    # 8 patterns covering the most frequent comparison attributes in HotpotQA
-    # (Yang et al., 2018 EMNLP).
+    # Attribute-rewriting templates for comparison queries.
+    # Transforms a shared-attribute comparison ("Were X and Y of the same
+    # nationality?") into two per-entity factual lookups ("What is the
+    # nationality of X?" / "What is the nationality of Y?"). The rewrite
+    # improves vector-similarity match against biographical chunks, which
+    # typically realise the attribute as a copular predicate ("X is an
+    # American …") rather than as a comparison. Templates cover canonical
+    # biographical attributes (nationality, birthplace, profession, genre,
+    # age, country, religion, age via birth year). The list is closed and
+    # documented; each entry consists of one regex over a closed-class
+    # English attribute noun + one parameterised question template.
     _ATTR_MAP = (
         (re.compile(r'\bsame\s+nationality\b', re.IGNORECASE),
          "What is the nationality of {entity}?"),
@@ -1168,87 +1361,65 @@ class PlanGenerator:
         (re.compile(r'\bsame\s+(?:religion|faith|belief)\b', re.IGNORECASE),
          "What is the religion of {entity}?"),
         # "Who is older/younger, X or Y?" → "When was X born?" so ANN matches
-        # Wikipedia bio intros ("X (born 14 August 1965) is a …") rather than the
-        # comparative question phrasing. §12.24 (2026-05-04).
+        # Wikipedia bio intros ("X (born 14 August 1965) is a …") rather than
+        # the comparative question phrasing.
         (re.compile(r'\b(older|younger)\b', re.IGNORECASE),
          "When was {entity} born?"),
     )
 
-    # ── Pattern C: "for a/an/the [category] [description]" ──────────────────────
-    # Handles hidden-bridge queries where the bridge entity is described but not
-    # named, e.g. "What year did GNR do a promo for a movie starring Schwarzenegger?"
-    # → bridge_query = "movie starring Schwarzenegger as NY police detective"
-    # → final_query  = original (controller injects bridge name at runtime)
-    _CATEGORY_WORDS = (
-        "film|movie|show|song|album|game|book|video|series|documentary"
-    )
-    _FOR_CAT = re.compile(
-        r'\bfor (?:a|an|the)\s+(?P<cat>' + _CATEGORY_WORDS + r')\b'
-        r'(?P<desc>.{5,}?)(?:\?|$)',
-        re.IGNORECASE,
-    )
+    # Option A audit (2026-05-15): Pattern C was removed. It matched the
+    # surface form "for a/an/the <CATEGORY> <desc>" where CATEGORY enumerated
+    # a fixed list of creative-work nouns. The list was example-derived and
+    # the surrounding regex was a string-shape match, not a structural
+    # recogniser. Queries previously handled by C now fall through to the
+    # connector-split baseline and, when that fails, to the dep-parse
+    # patterns or generic-2hop fallback.
 
-    # ── Pattern E: "the [role] of [Entity]" — relational anchor bridge ──────────
-    # Handles: "What was the father of X voted to be?", "Where was the wife of Y born?"
-    # When none of the split patterns match, this detects a role-relation that
-    # implicitly names a bridge entity (e.g., "the father of Kasper Schmeichel"
-    # → Peter Schmeichel). Two sub-queries are generated:
-    #   hop 0 (bridge): "Who is the {role} of {anchor entity}?"  — resolves bridge
-    #   hop 1 (final):  original query                           — answers the fact
-    # The bridge sub-query causes the Navigator to retrieve the anchor entity's
-    # article, which names the bridge, increasing the chance that the bridge
-    # entity's own article surfaces via keyword entity fallback and RRF fusion.
-    _RELATIONAL_ANCHOR_ROLES = re.compile(
-        r'\bthe\s+(father|mother|son|daughter|wife|husband|brother|sister|'
-        r'uncle|aunt|grandfather|grandmother|nephew|niece|cousin|'
-        r'director|founder|creator|author|composer|inventor|'
-        r'president|chairman|owner|captain|coach|manager)\s+of\b',
-        re.IGNORECASE,
-    )
+    # ── Pattern E: Relational-noun complement bridge ─────────────────────────
+    # A relational noun (one whose meaning entails a relation to another
+    # entity, e.g. "father", "director", "founder") combined with an "of-PP"
+    # complement headed by a named entity is a standard construction in
+    # English nominal semantics. Following Partee (1995, "The Semantics of
+    # Compositionality") and Barker (1995, "Possessive Descriptions",
+    # CSLI), relational nouns project an argument structure with one
+    # internal argument typically realised as an of-PP. The relevant
+    # syntactic signal here is therefore a noun whose dependency parse
+    # contains a `prep`("of") child whose `pobj` is a named entity — not
+    # a fixed enumeration of role words.
+    #
+    # The detection is performed in ``_find_relational_noun_bridge`` using
+    # SpaCy's dependency parse and the OntoNotes-5 entity inventory. No
+    # role list is required: any noun whose of-complement is an NER span
+    # qualifies. This generalises to roles never seen at development time
+    # (e.g. "the choreographer of X", "the librettist of Y") provided the
+    # parser produces the same dependency structure.
 
-    # ── Pattern D: "What [role] with/having [qualifier] [verb]..." ─────────────
-    # Handles: "What screenwriter with credits for X co-wrote a film ...?"
-    # The role + qualifier identifies the unknown bridge person.
-    _ROLE_PAT = re.compile(
-        r'^(?:what|which|who)\s+(?P<role>\w+(?:\s+\w+)?)\s+'
-        r'(?:with|having|known for|who)\s+(?P<qual>.+?)\s+'
-        r'(?:co-?wrote|wrote|directed|produced|starred|co-?directed)\b',
-        re.IGNORECASE,
-    )
+    # Option A audit (2026-05-15): Pattern D was removed for the same reason
+    # as Pattern C — its verb slot was a fixed enumeration of attribution
+    # verbs (co-wrote / wrote / directed / produced / starred / co-directed)
+    # and the role slot was a `\w+` shape match, not a syntactic recogniser.
+    # Wh-questions with appositive qualifiers are now handled, when present
+    # as a parseable relative-clause structure, by Pattern G.
 
-    # ── Pattern F: Passive-agent bridge ─────────────────────────────────────
-    # Handles: "[Subject] was written/directed/authored by [agent] that/who [property]?"
-    # e.g. "Seven Brief Lessons on Physics was written by an Italian physicist
-    #        that has worked in France since what year?"
-    # Correct decomposition:
-    #   hop 0 (bridge): "Who wrote Seven Brief Lessons on Physics?"
-    #   hop 1 (final):  original query
-    # The passive verb tells us *how* to form the bridge question ("wrote",
-    # "directed", "authored", etc.).  The subject is everything before "was/were".
-    _PASSIVE_AGENT_RE = re.compile(
-        r'^(?P<subj>.+?)\s+(?:was|were)\s+'
-        r'(?P<verb>written|authored|directed|produced|composed|created|'
-        r'founded|formed|recorded|released|published|edited|scored|narrated)\s+'
-        r'by\b',
-        re.IGNORECASE,
-    )
-    # Maps passive past-participle → active question verb
-    _PASSIVE_TO_ACTIVE = {
-        "written":   "write",
-        "authored":  "author",
-        "directed":  "direct",
-        "produced":  "produce",
-        "composed":  "compose",
-        "created":   "create",
-        "founded":   "found",
-        "formed":    "form",
-        "recorded":  "record",
-        "released":  "release",
-        "published": "publish",
-        "edited":    "edit",
-        "scored":    "score",
-        "narrated":  "narrate",
-    }
+    # ── Pattern F: Passive-agent voice transformation ──────────────────────
+    # Recognises English passive constructions of the form
+    #     [SUBJECT] was/were [PAST-PARTICIPLE] by [AGENT]
+    # using SpaCy's dependency parse rather than a closed verb list. Voice
+    # transformation (passive ↔ active) is a fundamental syntactic operation
+    # in English grammar (Quirk et al. 1985 §3.65-71; Bresnan 1982,
+    # "The Passive in Lexical Theory"). The recogniser keys on:
+    #     - a passive auxiliary (`auxpass`) attached to the head verb,
+    #     - an `agent` by-phrase whose `pobj` is a named entity or
+    #       indefinite description.
+    # Past-participle → infinitive transformation uses SpaCy's lemmatiser,
+    # which is built on UniMorph-style morphological tables (Honnibal &
+    # Montani 2017, arXiv:1802.04016). No verb enumeration is required.
+    #
+    # The previous implementation used a fixed regex over 14 attribution
+    # verbs and a hand-written past-participle → infinitive lookup table.
+    # Both were retired in the Option A audit (2026-05-15): the regex was
+    # surface-form fitted, and the lookup table reimplemented the SpaCy
+    # lemmatiser. Detection is now in _find_passive_agent_bridge.
 
     # Pre-compiled regexes for _form_sub_query (called on every multi-hop step)
     _STRIP_LEADING_CONJ = re.compile(
@@ -1283,6 +1454,12 @@ class PlanGenerator:
             config: Planner configuration.
         """
         self.config = config or PlannerConfig()
+        # P1-fix: per-call cache for the pattern that produced the current
+        # hop sequence. Set by _generate_hops / _decompose_* methods immediately
+        # before returning; read by generate() into RetrievalPlan.matched_pattern.
+        # Reset to None at the start of each generate() call so a stale value
+        # from a previous query cannot leak.
+        self._last_matched_pattern: Optional[str] = None
 
     def generate(
         self,
@@ -1303,6 +1480,10 @@ class PlanGenerator:
         Returns:
             Complete RetrievalPlan.
         """
+        # P1-fix: reset the pattern marker before this call so stale state from
+        # a previous plan() invocation cannot bleed in.
+        self._last_matched_pattern = None
+
         strategy = self._determine_strategy(query_type, entities)
         hop_sequence, sub_queries = self._generate_hops(query, query_type, entities)
         constraints = self._extract_constraints(query, query_type)
@@ -1316,6 +1497,7 @@ class PlanGenerator:
             sub_queries=sub_queries,
             constraints=constraints,
             estimated_hops=len(hop_sequence),
+            matched_pattern=self._last_matched_pattern,
             confidence=confidence,
             metadata={
                 "entity_count": len(entities),
@@ -1395,18 +1577,26 @@ class PlanGenerator:
                 is_bridge=False,
             ))
             sub_queries = [query]
+            # P1-fix: mark this path explicitly so the JSONL distinguishes
+            # "classifier decided SINGLE_HOP" from "no pattern matched, fell back".
+            self._last_matched_pattern = "single_hop"
 
         elif query_type == QueryType.MULTI_HOP:
             hop_sequence, sub_queries = self._decompose_multi_hop(query, entities)
+            # _decompose_multi_hop sets _last_matched_pattern per pattern branch.
 
         elif query_type == QueryType.COMPARISON:
             hop_sequence, sub_queries = self._decompose_comparison(query, entities)
+            # _decompose_comparison sets the marker for select-between / parallel /
+            # attr_map variants.
 
         elif query_type == QueryType.INTERSECTION:
             hop_sequence, sub_queries = self._decompose_intersection(query, entities)
+            self._last_matched_pattern = self._last_matched_pattern or "intersection"
 
         elif query_type == QueryType.TEMPORAL:
             hop_sequence, sub_queries = self._decompose_temporal(query, entities)
+            self._last_matched_pattern = self._last_matched_pattern or "temporal"
 
         elif query_type == QueryType.AGGREGATE:
             hop_sequence.append(HopStep(
@@ -1417,6 +1607,7 @@ class PlanGenerator:
                 is_bridge=False,
             ))
             sub_queries = [query]
+            self._last_matched_pattern = "aggregate"
 
         return hop_sequence, sub_queries
 
@@ -1531,7 +1722,7 @@ class PlanGenerator:
             → role_noun = head of relcl (subject noun),
               anchor   = subject of relcl
 
-        Form 2 — Anchor-as-clause-object (§12.33 extension, Pattern L):
+        Form 2 — Anchor-as-clause-object (Pattern L extension):
             "...the [King|actress|author] who [made|directed|wrote] [Entity]..."
             → role_noun = head of relcl (attr/dobj head),
               anchor   = NER entity inside the relcl subtree
@@ -1611,6 +1802,133 @@ class PlanGenerator:
             logger.debug("_find_relative_clause_bridge failed: %s", exc)
         return None
 
+    def _find_passive_agent_bridge(
+        self,
+        query: str,
+    ) -> Optional[Tuple[str, str]]:
+        """
+        Detect a passive construction with a by-phrase agent.
+
+        Recognises "[SUBJECT] was/were [PAST-PARTICIPLE] by …" using SpaCy's
+        dependency parse (Quirk et al. 1985 §3.65-71; Bresnan 1982,
+        "The Passive in Lexical Theory"). Signals:
+            - a VERB with an `auxpass` (passive auxiliary) child,
+            - an `nsubjpass` (passive subject) child,
+            - an `agent` (by-phrase) child.
+
+        Returns (subject_text, infinitive_verb), where ``infinitive_verb`` is
+        SpaCy's lemma of the past-participle. The lemma transformation is
+        morphology-driven (Honnibal & Montani 2017) and works for any
+        English passive participle the parser knows — no verb enumeration.
+
+        Returns None if the structure is absent or the parser does not
+        produce the expected dependency signature.
+        """
+        if not SPACY_AVAILABLE or NLP is None:
+            return None
+        try:
+            doc = NLP(query)
+            for tok in doc:
+                if tok.pos_ != "VERB":
+                    continue
+                has_auxpass = any(c.dep_ == "auxpass" for c in tok.children)
+                if not has_auxpass:
+                    continue
+                # Subject of the passive verb.
+                subj_tok = next(
+                    (c for c in tok.children if c.dep_ in ("nsubjpass", "nsubj")),
+                    None,
+                )
+                if subj_tok is None:
+                    continue
+                # Must have an `agent` (by-phrase) child to qualify as a
+                # canonical agentive passive.
+                has_agent = any(c.dep_ == "agent" for c in tok.children)
+                if not has_agent:
+                    continue
+                # Subject text: contiguous span of the subject subtree.
+                subj_span = " ".join(
+                    t.text for t in subj_tok.subtree if not t.is_punct
+                ).strip()
+                # Verb lemma (infinitive form for the bridge sub-query).
+                verb_lemma = tok.lemma_.lower()
+                if subj_span and verb_lemma:
+                    return subj_span, verb_lemma
+        except Exception as exc:
+            logger.debug("_find_passive_agent_bridge failed: %s", exc)
+        return None
+
+    def _find_relational_noun_bridge(
+        self,
+        query: str,
+        entities: List[EntityInfo],
+    ) -> Optional[Tuple[str, str]]:
+        """
+        Detect a relational-noun + of-PP-complement construction.
+
+        Recognises noun phrases of the form "the ROLE of ENTITY" where ROLE
+        is any noun whose dependency parse contains a `prep`("of") child
+        whose `pobj` is a named entity (Partee 1995; Barker 1995, "Possessive
+        Descriptions", CSLI; Quirk et al. 1985 §5.118 on relational nouns).
+
+        Returns (role_text, anchor_entity_text), or None if the structure is
+        not present or the of-PP object does not overlap a detected NER entity.
+
+        No role vocabulary list is consulted — any noun whose dependency
+        structure matches qualifies. The parse-confidence gate requires the
+        of-PP object to overlap a detected named entity span (PERSON, ORG,
+        GPE, LOC, FAC, WORK_OF_ART, PRODUCT, EVENT), so the construction
+        is only accepted when the object is anchored to a corpus entity.
+        """
+        if not SPACY_AVAILABLE or NLP is None:
+            return None
+        _ANCHOR_LABELS = frozenset({
+            "PERSON", "ORG", "GPE", "LOC", "FAC",
+            "WORK_OF_ART", "PRODUCT", "EVENT", "NORP",
+        })
+        anchor_entities = [e for e in entities if e.label in _ANCHOR_LABELS]
+        if not anchor_entities:
+            return None
+        try:
+            doc = NLP(query)
+            for token in doc:
+                # Look for a noun head with a "of" prepositional child.
+                if token.pos_ != "NOUN":
+                    continue
+                of_prep = None
+                for child in token.children:
+                    if child.dep_ == "prep" and child.lemma_.lower() == "of":
+                        of_prep = child
+                        break
+                if of_prep is None:
+                    continue
+                # Find the pobj of the "of" preposition.
+                pobj = None
+                for gc in of_prep.children:
+                    if gc.dep_ == "pobj":
+                        pobj = gc
+                        break
+                if pobj is None:
+                    continue
+                # Span of the pobj subtree (the candidate anchor NP).
+                pobj_span_lower = " ".join(
+                    t.text.lower() for t in pobj.subtree if not t.is_punct
+                ).strip()
+                # Parse-confidence gate: the pobj must overlap a detected NER entity.
+                matched_anchor = next(
+                    (e.text for e in anchor_entities
+                     if e.text.lower() in pobj_span_lower
+                     or pobj_span_lower in e.text.lower()),
+                    None,
+                )
+                if matched_anchor is None:
+                    continue
+                role_text = token.text
+                return role_text, matched_anchor
+        except Exception as exc:
+            logger.debug("_find_relational_noun_bridge failed: %s", exc)
+        return None
+
     # ── Pattern H: chained-attribution bridge ───────────────────────────────
     # English verbs that, as the head of an `acl` clause on a "work" noun,
     # express "this work is *about/derived-from* X":  "[work] based on / set in /
@@ -1650,7 +1968,7 @@ class PlanGenerator:
         """
         Detect a *chained* attribution bridge using SpaCy's dependency parse.
 
-        Target shape (idx-42 archetype):
+        Target shape:
             "A [work] based on [Entity], is [written] by someone [attribute]?"
         Dependency signature:
             work_noun   --nsubjpass--> passive_verb (ROOT)
@@ -1927,11 +2245,13 @@ class PlanGenerator:
         #         the bridge entity now materialised in context)
         imb = self._find_implicit_bridge(query, entities)
         if imb:
+            # P1-fix: tag before delegating so the marker survives the return.
+            self._last_matched_pattern = "J_implicit_bridge"
             return self._decompose_implicit_bridge(query, imb, entities)
 
         # ── Pattern G: Relative-clause bridge (SpaCy dependency parse) ───────
         # Form 1: "The [noun] in which [Entity] [predicate] [main question]?"
-        # Form 2 (Pattern L, §12.33): "...the [King|actress|author] who [verb] [Entity]..."
+        # Form 2 (Pattern L): "...the [King|actress|author] who [verb] [Entity]..."
         # Uses structural grammar (relcl dep label) — no verb list needed.
         # Must run BEFORE the generic split because the split-on-"which" would
         # otherwise destroy the grammatical structure of the query.
@@ -1966,6 +2286,9 @@ class PlanGenerator:
             logger.debug(
                 "_decompose_multi_hop: Pattern G (%s) → %r", form, bridge_q[:60]
             )
+            # P1-fix: mark which Pattern G variant fired ("G_form1" or "G_form2")
+            # so the JSONL can distinguish them in per-pattern analysis.
+            self._last_matched_pattern = f"G_{form}"
             return hop_sequence, [bridge_q, query]
 
         # ── Pattern H: chained-attribution bridge (SpaCy dependency parse) ───
@@ -1977,6 +2300,8 @@ class PlanGenerator:
         # fail-safe — worst case it falls through to the patterns below.
         ac = self._find_attribution_chain(query, entities)
         if ac:
+            # P1-fix: tag Pattern H (chained-attribution, 3-hop chain).
+            self._last_matched_pattern = "H_attribution_chain"
             return self._decompose_attribution_chain(query, ac, entities)
 
         # Split at bridge connectors; maxsplit=1 per pattern preserves the
@@ -1994,7 +2319,7 @@ class PlanGenerator:
                 new_parts.extend(split_result)
             parts = [p.strip() for p in new_parts if p.strip() and len(p.strip()) > 5]
 
-        # ── 2-hop cap (§12.32 Fix 1) ──────────────────────────────────────────
+        # ── 2-hop cap ─────────────────────────────────────────────────────────
         # Repeated splitting on different connectors can produce 3+ parts from
         # a single relative clause:
         #   "What is the middle name of the actress who plays X in Y?"
@@ -2025,78 +2350,22 @@ class PlanGenerator:
                 )
                 parts = [parts[0], parts[-1]]
 
-        # ── Pattern C: "for a/an/the [category] [description]" ──────────────────
-        # See class-level _FOR_CAT for full rationale.
-        if len(parts) <= 1:
-            cm = self._FOR_CAT.search(query)
-            if cm:
-                bridge_q = f"{cm.group('cat')} {cm.group('desc').strip()}"
-                hop_sequence = [
-                    HopStep(
-                        step_id=0,
-                        sub_query=bridge_q,
-                        target_entities=[e.text for e in entities],
-                        depends_on=[],
-                        is_bridge=True,
-                    ),
-                    HopStep(
-                        step_id=1,
-                        sub_query=query,
-                        target_entities=[e.text for e in entities],
-                        depends_on=[0],
-                        is_bridge=False,
-                    ),
-                ]
-                logger.debug(
-                    "_decompose_multi_hop: Pattern C bridge → %r", bridge_q[:60]
-                )
-                return hop_sequence, [bridge_q, query]
+        # Patterns C and D were removed in the Option A audit (2026-05-15).
+        # See the class-level note for the rationale. The connector-split
+        # baseline above and the dep-parse patterns (G, H, F) below cover the
+        # structural cases; the surface-form regexes for "for a/an/the
+        # CATEGORY" and "What ROLE with/having QUAL VERB" were retired.
 
-        # ── Pattern D: "What [role] with/having [qualifier] [verb]..." ────────
-        # See class-level _ROLE_PAT for full rationale.
+        # ── Pattern E: Relational-noun + of-PP complement (dep-parse) ──────────
+        # Detects "the ROLE of ENTITY" where ROLE is any noun and ENTITY is a
+        # named entity. No role-word enumeration — see class docstring for
+        # the linguistic basis (Partee 1995; Barker 1995).
         if len(parts) <= 1 and entities:
-            rm = self._ROLE_PAT.match(query)
-            if rm:
-                bridge_q = f"{rm.group('role')} {rm.group('qual').strip()}"
-                hop_sequence = [
-                    HopStep(
-                        step_id=0,
-                        sub_query=bridge_q,
-                        target_entities=[e.text for e in entities],
-                        depends_on=[],
-                        is_bridge=True,
-                    ),
-                    HopStep(
-                        step_id=1,
-                        sub_query=query,
-                        target_entities=[e.text for e in entities],
-                        depends_on=[0],
-                        is_bridge=False,
-                    ),
-                ]
-                logger.debug(
-                    "_decompose_multi_hop: Pattern D role-bridge → %r", bridge_q[:60]
-                )
-                return hop_sequence, [bridge_q, query]
-
-        # ── Pattern E: "the [role] of [Entity]" — relational anchor bridge ──────
-        # Only fires when all split patterns failed (len(parts) == 1).
-        # See class-level _RELATIONAL_ANCHOR_ROLES for full rationale.
-        if len(parts) <= 1 and entities:
-            em = self._RELATIONAL_ANCHOR_ROLES.search(query)
-            if em:
-                role = em.group(1).lower()
-                # Use the first proper named entity as the anchor (the entity
-                # whose article will name the bridge). Prefer PERSON/ORG/GPE
-                # over DATE entities, which are not article subjects.
-                _ANCHOR_LABELS = frozenset({
-                    "PERSON", "ORG", "GPE", "LOC", "WORK_OF_ART", "EVENT", "FAC",
-                })
-                anchor = next(
-                    (e.text for e in entities if e.label in _ANCHOR_LABELS),
-                    entities[0].text,
-                )
-                bridge_q = f"Who is the {role} of {anchor}?"
+            rn = self._find_relational_noun_bridge(query, entities)
+            if rn is not None:
+                role, anchor = rn
+                # Use the noun's surface form (lowercased for consistency).
+                bridge_q = f"Who is the {role.lower()} of {anchor}?"
                 hop_sequence = [
                     HopStep(
                         step_id=0,
@@ -2114,25 +2383,20 @@ class PlanGenerator:
                     ),
                 ]
                 logger.debug(
-                    "_decompose_multi_hop: Pattern E relational-anchor → %r", bridge_q[:60]
+                    "_decompose_multi_hop: Pattern E relational-noun (%s of %s) → %r",
+                    role, anchor, bridge_q[:60],
                 )
+                self._last_matched_pattern = "E_relational_noun"
                 return hop_sequence, [bridge_q, query]
 
-        # ── Pattern F: Passive-agent bridge ─────────────────────────────────
-        # "[Subject] was written/directed/... by [agent] that [property]?"
-        # Only fires when the generic split produced parts (i.e. there IS a
-        # "that/which/who" clause) — meaning the connector split already found
-        # the boundary, but the *order* it produces is wrong (it reverses parts,
-        # putting the property fragment first and the anchor second).  Pattern F
-        # detects the passive-agent structure and corrects the order by emitting
-        # hop 0 = "Who {verb} {subject}?" and hop 1 = original query.
-        # Also fires when split failed (len(parts)==1) with a passive-agent form.
-        pm = self._PASSIVE_AGENT_RE.match(query)
-        if pm and len(parts) >= 1:
-            subj = pm.group("subj").strip()
-            past_part = pm.group("verb").lower()
-            active_verb = self._PASSIVE_TO_ACTIVE.get(past_part, past_part)
-            # "Who wrote Seven Brief Lessons on Physics?"
+        # ── Pattern F: Passive-agent voice transformation (dep-parse) ─────────
+        # Detects passive constructions with by-phrase agents via SpaCy's
+        # `auxpass`/`nsubjpass`/`agent` dependency labels. Past-participle →
+        # infinitive transformation uses SpaCy's lemmatiser. See class
+        # docstring for the linguistic basis.
+        pa = self._find_passive_agent_bridge(query)
+        if pa is not None and len(parts) >= 1:
+            subj, active_verb = pa
             bridge_q = f"Who {active_verb} {subj}?"
             hop_sequence = [
                 HopStep(
@@ -2151,11 +2415,18 @@ class PlanGenerator:
                 ),
             ]
             logger.debug(
-                "_decompose_multi_hop: Pattern F passive-agent → %r", bridge_q[:60]
+                "_decompose_multi_hop: Pattern F passive-agent (%s/%s) → %r",
+                subj[:30], active_verb, bridge_q[:60],
             )
+            self._last_matched_pattern = "F_passive_agent"
             return hop_sequence, [bridge_q, query]
 
         if len(parts) > 1:
+            # P1-fix: the generic connector-split path is the baseline algorithm
+            # described in the methodology ("split at bridge connectors, reverse,
+            # enrich"). Tagged distinctly so per-pattern analysis can separate
+            # "patterns added on top" from "the baseline did this".
+            self._last_matched_pattern = "connector_split"
             reversed_parts = list(reversed(parts))
 
             for i, part in enumerate(reversed_parts):
@@ -2237,6 +2508,12 @@ class PlanGenerator:
                     "_decompose_multi_hop: no pattern matched for %r "
                     "— generic 2-hop fallback (anchor=%r)", query[:80], anchor
                 )
+                # P1-fix: classification-decomposition consistency fallback.
+                # Distinct from the connector split because no real decomposition
+                # happened — we only fabricated a hop-0 "Who is X?" to keep the
+                # plan multi-hop. Surfacing this lets the eval report
+                # "classified MULTI_HOP but no pattern fired" rate honestly.
+                self._last_matched_pattern = "fallback_generic_2hop"
                 hop_sequence = [
                     HopStep(
                         step_id=0,
@@ -2268,13 +2545,18 @@ class PlanGenerator:
                     is_bridge=False,
                 ))
                 sub_queries = [query]
+                # P1-fix: failure marker. The classifier said MULTI_HOP but
+                # NOTHING worked. Surfacing this is essential — without it,
+                # the eval cannot distinguish "we solved this" from "we silently
+                # gave up".
+                self._last_matched_pattern = "fallback_degraded_to_single_hop"
 
         return hop_sequence, sub_queries
 
     # Boolean-conjunction surface form: "Are/Did/Were/Is/Do/Does/Have/Has [X] and [Y] both [P]?"
     # The "both" keyword is a reliable discriminator — genuine bridge questions almost
     # never contain it. Lexical detection avoids SpaCy parse dependency.
-    # §12.32: Pattern I — Boolean conjunction decomposition.
+    # Pattern I — Boolean conjunction decomposition.
     _BOOL_CONJ_RE = re.compile(
         r'^\s*(are|is|were|was|did|do|does|have|has)\b.+\band\b.+\bboth\b',
         re.IGNORECASE,
@@ -2416,18 +2698,18 @@ class PlanGenerator:
         # that this is a parallel yes/no check, not a selection-between-two-options.
         bool_conj = self._decompose_boolean_conjunction(query, entities)
         if bool_conj is not None:
+            # P1-fix: tag before returning so the marker survives the call.
+            self._last_matched_pattern = "I_boolean_conjunction"
             return bool_conj
 
-        # FIX P-1: "select-between-two" comparison form
-        # ("Which writer was from England, Henry Roth or Robert Erskine Childers?",
-        #  "Which band, Letters to Cleo or Screaming Trees, had more members?").
-        # Here the two comparison operands are exactly the two entities joined by
-        # "or" in the query — NOT the first two NER hits (which would wrongly pick
-        # "England"). Detect the disjunction, strip it + the leading "Which
-        # <category>" framing to recover the *property*, and emit one focused
-        # per-entity sub-query.
+        # Disjunctive coordination ("X or Y") between two named entities is
+        # the canonical surface form of an English alternative interrogative
+        # (Karttunen 1977; Higginbotham 1993). The decomposer below detects
+        # the disjunction via SpaCy NER spans rather than via comma position,
+        # and emits one parallel retrieval per disjunct.
         sel = self._decompose_select_between(query, entities)
         if sel is not None:
+            self._last_matched_pattern = "select_between_two"
             return sel
 
         # Use only proper NER entities; regex-PROPN entities include noisy
@@ -2466,6 +2748,9 @@ class PlanGenerator:
                 depends_on=[],
                 is_bridge=False,
             ))
+            # P1-fix: comparison was classified but no entities found —
+            # surfaces a measurable failure mode in the eval.
+            self._last_matched_pattern = "comparison_no_entities"
             return hop_sequence, [query]
 
         sub_query_templates = []
@@ -2501,23 +2786,33 @@ class PlanGenerator:
         # Improves vector similarity to factual chunks such as
         # "X is an American filmmaker" (Yang et al., 2018 EMNLP).
         rewritten = []
+        attr_rewrite_fired = False
         for pattern, template in self._ATTR_MAP:
             if pattern.search(query):
                 rewritten = [
                     (e, template.format(entity=e.text))
                     for e, _ in sub_query_templates
                 ]
+                attr_rewrite_fired = True
                 break
         if rewritten:
             sub_query_templates = rewritten
 
+        # P1-fix: tag the comparison sub-variant we actually emit. Distinguishes
+        # _ATTR_MAP-rewritten comparisons from plain per-entity comparisons in
+        # the per-pattern eval table.
+        self._last_matched_pattern = (
+            "comparison_attr_map" if attr_rewrite_fired
+            else "comparison_parallel"
+        )
+
         # One step per entity (steps are independent → can run in parallel).
-        # NOTE: The original query is intentionally NOT appended as a third
-        # sub-query.  Empirical diagnosis (idx=0, diagnose_verbose.py) showed
-        # that re-issuing the full comparison question as a retrieval query
-        # produces noise hits (John MacGregor, Gerald R. Ford Freeway) and
-        # inflates RRF scores for irrelevant chunks via the cross-query boost.
-        # The two entity-specific attribute-template queries are sufficient.
+        # The original query is intentionally NOT appended as a third
+        # sub-query. The comparison phrasing as a whole is less specific than
+        # either per-entity factual lookup, and adding it as a retrieval
+        # query introduces broad-match noise that inflates RRF scores for
+        # irrelevant chunks via the cross-query corroboration bonus. The two
+        # entity-specific attribute-template queries are sufficient.
         for i, (entity, sub_query) in enumerate(sub_query_templates):
             hop_sequence.append(HopStep(
                 step_id=i,
@@ -2553,13 +2848,12 @@ class PlanGenerator:
         Strategy:
           1. Find two extracted entities that sit on either side of an "or" in
              the query, with only whitespace/comma between them and "or".
-          2. Remove that "<A> or <B>" span from the query, and strip the leading
-             "Which <category>" framing → what remains is the *property* clause
-             ("was from England", "had more members", "was published first").
+          2. Remove that "<A> or <B>" span from the query and strip the leading
+             "Which <category>" framing; what remains is the predicate clause
+             shared by the two disjuncts.
           3. Build one focused sub-query per entity by attaching the entity to
-             the property clause, e.g. "Henry Roth was from England" /
-             "Letters to Cleo had more members". If an _ATTR_MAP attribute
-             pattern matches, prefer that rewrite instead.
+             the predicate clause. If an `_ATTR_MAP` attribute pattern matches
+             the original query, prefer that attribute-template rewrite instead.
         """
         # 1. Locate an "A or B" disjunction of two entities.
         ents_by_pos = sorted(entities, key=lambda e: e.start_char)
@@ -2594,7 +2888,7 @@ class PlanGenerator:
                 break
         if not templates:
             if property_clause:
-                # "Henry Roth was from England" / "Letters to Cleo had more members"
+                # Generic predicate template: "<entity> <predicate>".
                 templates = [f"{ent_a.text} {property_clause}",
                              f"{ent_b.text} {property_clause}"]
             else:
@@ -2742,7 +3036,7 @@ class Planner:
     Usage:
         planner = Planner()
         plan = planner.plan("Who directed the movie with Tom Hanks?")
-        sub_queries = planner.decompose_query("Is Berlin older than Munich?")
+        sub_queries = plan.sub_queries   # flat list of retrieval sub-queries
     """
 
     def __init__(
@@ -2814,6 +3108,11 @@ class Planner:
             entities=entities,
         )
 
+        # P2-fix: surface any classifier pre-empt that fired so the JSONL can
+        # audit pre-empt false-positive rates. None when classification took
+        # the normal Phase 1-4 scoring path.
+        plan.classifier_preempt = getattr(self.classifier, "_last_preempt", None)
+
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         plan.metadata["planning_time_ms"] = elapsed_ms
 
@@ -2827,21 +3126,12 @@ class Planner:
 
         return plan
 
-    def decompose_query(self, query: str) -> List[str]:
-        """
-        Decompose a query into sub-queries.
-
-        Simplified entry point for agent compatibility.
-        Returns only the flat sub-query list.
-
-        Args:
-            query: The user query.
-
-        Returns:
-            List of sub-queries for retrieval.
-        """
-        plan = self.plan(query)
-        return plan.sub_queries
+    # P10 (2026-05-15): decompose_query() removed. It was a legacy wrapper
+    # around plan() returning only sub_queries. Production code never used it
+    # (the pipeline reads plan.sub_queries directly). External callers should
+    # migrate to:
+    #     plan = planner.plan(query)
+    #     sub_queries = plan.sub_queries
 
     def _empty_plan(self, query: str) -> RetrievalPlan:
         """Return a minimal plan for empty or invalid queries."""

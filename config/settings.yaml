@@ -108,6 +108,19 @@ graph:
   top_k_entities: 10             # Number of graph results
   expand_context: true           # Include surrounding chunks (KuzuDB only)
 
+  # I-2 (publication-recommended): enable the 2-bridge Hop-3 traversal.
+  # Off by default — adds 200-1000 ms per query and rarely improves HotpotQA
+  # recall (hop-2 already captures bridge entities). Toggle true for
+  # multi-hop-heavy ablations or 2WikiMultiHopQA evaluation.
+  enable_hop3: false
+
+  # I-3 (publication-recommended): mention-degree above which an entity is
+  # excluded as a bridge target (hub suppression). 280 = ~3% of 9412 HotpotQA
+  # chunks; matches the hub_threshold_ratio=0.03 used at ingestion-time
+  # cleanup. Computed once per process, cached per cap value.
+  # Refs: West & Leskovec (2012) WWW; GraphRAG (Edge et al., 2024).
+  hub_mention_cap: 280
+
   # Entity extraction method during ingestion
   # "keyword" - Simple keyword-based (fast, basic)
   # "spacy"   - spaCy NER (requires: pip install spacy)
@@ -293,8 +306,13 @@ planner:
   classifier_confidence_scale: 0.15
   # Upper cap on returned classification confidence
   classifier_confidence_cap: 0.95
-  # Confidence returned when no pattern matches (SINGLE_HOP fallback)
-  classifier_fallback_confidence: 0.8
+  # Confidence returned when no pattern matches (SINGLE_HOP fallback).
+  # P9-fix (2026-05-15): lowered 0.8 → 0.5. Pre-fix, a no-pattern-match
+  # produced HIGHER confidence (0.80) than a single-pattern-match
+  # (base 0.60 + scale 0.15 × 1 = 0.75), which contradicted the
+  # 'confidence reflects classifier certainty' docstring. 0.5 places the
+  # fallback strictly below any actual match.
+  classifier_fallback_confidence: 0.5
 
   # ---------------------------------------------------------------------------
   # ENTITY DENSITY THRESHOLDS (Phase 3 of classify())
@@ -427,20 +445,12 @@ benchmark:
   # Default number of samples per dataset
   default_samples: 500
 
-  # Ablation study configurations
-  ablation_configs:
-    - name: "vector_only"
-      vector_weight: 1.0
-      graph_weight: 0.0
-    - name: "graph_only"
-      vector_weight: 0.0
-      graph_weight: 1.0
-    - name: "hybrid_70_30"
-      vector_weight: 0.7
-      graph_weight: 0.3
-    - name: "hybrid_50_50"
-      vector_weight: 0.5
-      graph_weight: 0.5
+  # ablation_configs removed (audit 2026-05-15): the vector_weight /
+  # graph_weight knobs they referenced were never read by production code
+  # (see comment under `rag:` ablation-mode section). Run ablations by
+  # setting `rag.retrieval_mode` to "vector", "graph", or "hybrid" — those
+  # three values are the only retrieval-path toggles the production code
+  # actually honors.
 
 # ============================================================================
 # VERIFIER (S_V) — Pre-Validation and Self-Correction
@@ -476,6 +486,24 @@ verifier:
   # Credibility scoring normalisation constants.
   credibility_cross_ref_max: 3.0        # Divisor for cross-reference count
   credibility_provenance_baseline: 0.5  # Score for vector-only (non-graph) chunks
+
+  # B8 (audit 2026-05-15): magic numbers surfaced from VerifierConfig defaults.
+  # All three were already read by VerifierConfig.from_yaml(); only the YAML
+  # entries were missing, which obscured them from reproducibility audits.
+
+  # Numeric-divergence threshold for offline (heuristic) contradiction
+  # detection. Pairs of chunks where the same entity is assigned numeric
+  # values whose relative difference exceeds this fraction are flagged.
+  # Only used when transformers/NLI is unavailable.
+  heuristic_contradiction_threshold: 0.5
+
+  # Entity-frequency normalisation divisors used in credibility scoring.
+  # A chunk with N entities scores min(1.0, N / normalizer) on the
+  # entity-density signal. SpaCy NER is more precise than regex proper-noun
+  # matching, so it uses a lower divisor (fewer false positives → fewer
+  # entities expected per chunk).
+  credibility_entity_freq_normalizer_spacy: 5.0
+  credibility_entity_freq_normalizer_regex: 10.0
 
   # SpaCy processing limit inside credibility scoring (edge CPU budget).
   spacy_max_chars: 500

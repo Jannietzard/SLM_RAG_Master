@@ -818,7 +818,12 @@ def patch_verifier(verifier) -> None:
     # ── generate_and_verify ───────────────────────────────────────────────────
     orig_gen = verifier.generate_and_verify
 
-    def _wrap_generate(query, context, entities=None, hop_sequence=None, query_type=None, bridge_entities=None):
+    def _wrap_generate(query, context, entities=None, hop_sequence=None,
+                       query_type=None, bridge_entities=None,
+                       chunk_is_graph_based=None, **_kw):
+        # B2 (verifier audit, 2026-05-15) added chunk_is_graph_based; **_kw
+        # absorbs any future kwargs so diagnose_verbose.py is forward-
+        # compatible with verifier-signature additions.
         section("S_V — VERIFIER")
         field("Query",       query)
         field("Chunks in",   len(context))
@@ -832,6 +837,7 @@ def patch_verifier(verifier) -> None:
             pre_val = verifier.pre_validator.validate(
                 context=context, query=query,
                 entities=entities, hop_sequence=hop_sequence,
+                chunk_is_graph_based=chunk_is_graph_based,
             )
             print(f"    {bold('Status:')}          {pre_val.status.value}")
             print(f"    {bold('entity_path_valid:')} {pre_val.entity_path_valid}")
@@ -863,7 +869,13 @@ def patch_verifier(verifier) -> None:
         for i, c in enumerate(context):
             chunk_block(i, c)
 
-        result = orig_gen(query, context, entities, hop_sequence, query_type=query_type, bridge_entities=bridge_entities)
+        result = orig_gen(
+            query, context, entities, hop_sequence,
+            query_type=query_type,
+            bridge_entities=bridge_entities,
+            chunk_is_graph_based=chunk_is_graph_based,
+            **_kw,
+        )
 
         subsection("VERIFIER RESULT")
         field("Answer",       result.answer)
@@ -906,20 +918,25 @@ def load_question(idx: int) -> dict:
 # CONTROLLER HOOK — make bridge-entity extraction visible
 # =============================================================================
 
-def patch_controller_bridge(controller) -> None:
+def patch_controller_bridge(_pipeline_unused=None) -> None:
     """
     Patch AgenticController._extract_bridge_entities so that every detection
-    of bridge entities appears in the output. This shows whether the
-    iterative multi-hop is actually running and which entities it discovers.
+    of bridge entities appears in the output. After the B7 cleanup
+    AgenticController is a static-helper container; the patch swaps the
+    classmethod at class level so every caller (currently only
+    AgentPipeline._iterative_navigate) sees the wrapped version.
+
+    The argument is accepted for backward compatibility with older callsites
+    that passed an instance — it is no longer used.
     """
     from src.logic_layer.controller import AgenticController as _AC
-    orig_extract = _AC._extract_bridge_entities  # raw function via class
+    orig_extract = _AC._extract_bridge_entities  # unbound staticmethod
 
     def _wrapped_extract(chunks, exclude, *args, **kwargs):
         # *args/**kwargs forward any new parameters added to the underlying
-        # _extract_bridge_entities signature (e.g. §12.32 added `query=...`
-        # for relevance-ranked extraction). Without this, every signature
-        # change to the controller method would crash diagnose_verbose.py.
+        # _extract_bridge_entities signature (e.g. the `query=...` kwarg
+        # added for relevance-ranked extraction). Without this, every
+        # signature change would crash diagnose_verbose.py.
         result = orig_extract(chunks, exclude, *args, **kwargs)
         bar = "  " + "·" * 60
         print(f"\n{bar}")
@@ -936,16 +953,27 @@ def patch_controller_bridge(controller) -> None:
         print(f"{bar}\n")
         return result
 
-    # Instance-dict patch: Python looks in self.__dict__ first -> overrides class staticmethod
-    controller._extract_bridge_entities = _wrapped_extract
+    # Class-level patch (replaces the staticmethod). AgenticController has no
+    # instances post-B7 — it's a static-helper container — so we override the
+    # attribute on the class itself.
+    _AC._extract_bridge_entities = staticmethod(_wrapped_extract)
 
 
 def build_pipeline(cfg: dict):
-    import yaml
+    """Construct the production AgentPipeline + sub-agents for diagnostics.
+
+    After the B7 cleanup (2026-05-15) the orchestrator class
+    ``AgenticController`` was reduced to a static-helper container; the
+    production entry point is now ``src.pipeline.AgentPipeline``. This
+    builder mirrors ``create_full_pipeline`` but returns the individual
+    agents alongside the pipeline so the diagnostic hooks
+    (patch_planner/patch_navigator/patch_verifier) can attach to each one.
+    """
     from src.data_layer.embeddings import BatchedOllamaEmbeddings
     from src.data_layer.hybrid_retriever import HybridRetriever, RetrievalConfig, RetrievalMode
     from src.data_layer.storage import HybridStore, StorageConfig
-    from src.logic_layer import AgenticController, ControllerConfig, create_planner, create_verifier
+    from src.logic_layer import create_planner, create_verifier
+    from src.pipeline.agent_pipeline import AgentPipeline
 
     vector_path = PROJECT_ROOT / "data" / "hotpotqa" / "vector"
     graph_path  = PROJECT_ROOT / "data" / "hotpotqa" / "graph"
@@ -975,20 +1003,24 @@ def build_pipeline(cfg: dict):
         config=ret_cfg,
     )
 
-    ctrl_cfg = ControllerConfig.from_yaml(cfg)
     planner  = create_planner(cfg)
     verifier = create_verifier(cfg=cfg)
     verifier.set_graph_store(store.graph_store)
 
-    controller = AgenticController(
-        config=ctrl_cfg,
+    # AgentPipeline lazy-initialises its Navigator using `cfg`. Construct
+    # explicitly here so the diagnostic hooks can attach before .process().
+    pipeline = AgentPipeline(
         planner=planner,
         verifier=verifier,
-        full_cfg=cfg,
+        hybrid_retriever=retriever,
+        graph_store=store.graph_store,
+        config=cfg,
     )
-    controller.set_retriever(retriever)
+    # Force agent construction now (otherwise `pipeline.navigator` is None
+    # until the first .process() call).
+    pipeline._lazy_init_agents()
 
-    return controller, planner, verifier, store, retriever
+    return pipeline, planner, verifier, store, retriever
 
 
 # =============================================================================
@@ -1075,19 +1107,21 @@ def main():
     # ── Build pipeline ────────────────────────────────────────────────────────
     print(f"\n{dim('Loading pipeline...')} ", end="", flush=True)
     t0 = time.time()
-    controller, planner, verifier, store, retriever = build_pipeline(cfg)
+    pipeline, planner, verifier, store, retriever = build_pipeline(cfg)
     print(f"{green('OK')}  {dim(f'({(time.time()-t0)*1000:.0f} ms)')}")
 
     # ── Install hooks ─────────────────────────────────────────────────────────
     patch_planner(planner)
     patch_retriever(retriever)
-    patch_navigator(controller.navigator)
-    patch_controller_bridge(controller)
+    patch_navigator(pipeline.navigator)
+    patch_controller_bridge()  # class-level patch — no instance needed post-B7
 
     if not args.skip_llm:
         patch_verifier(verifier)
     else:
-        def _skip_verifier(query, context, entities=None, hop_sequence=None, query_type=None, bridge_entities=None):
+        def _skip_verifier(query, context, entities=None, hop_sequence=None,
+                            query_type=None, bridge_entities=None,
+                            chunk_is_graph_based=None, **_kw):
             from src.logic_layer import VerificationResult
             section("S_V — VERIFIER  (skipped via --skip-llm)")
             field("Context chunks", len(context))
@@ -1141,8 +1175,11 @@ def main():
         verifier.generate_and_verify = _skip_verifier
 
     # ── Run pipeline ─────────────────────────────────────────────────────────
+    # B7 (2026-05-15): orchestration moved from AgenticController.run() to
+    # AgentPipeline.process(). The PipelineResult dataclass replaces the
+    # AgentState dict — both expose 'answer', but timing/error fields differ.
     t_start = time.time()
-    final_state = controller.run(q_text)
+    pipeline_result = pipeline.process(q_text)
     total_ms = (time.time() - t_start) * 1000
 
     # ── Disable sys.settrace ─────────────────────────────────────────────────
@@ -1152,19 +1189,18 @@ def main():
 
     # ── Summary ──────────────────────────────────────────────────────────────
     section("SUMMARY")
-    pred = final_state.get("answer", "")
+    pred = pipeline_result.answer or ""
     field("Question",   q_text)
     field("Gold",       gold)
     field("Prediction", pred)
-    ctrl_cfg = getattr(controller, "config", None)
-    field("Model",      ctrl_cfg.model_name if ctrl_cfg else "(unknown)")
+    vcfg = getattr(verifier, "config", None)
+    field("Model",      vcfg.model_name if vcfg else "(unknown)")
     field("Total time", f"{total_ms:.0f} ms")
 
-    timings = final_state.get("stage_timings", {})
-    if timings:
-        field("S_P", f"{timings.get('planner_ms', 0):.0f} ms")
-        field("S_N", f"{timings.get('navigator_ms', 0):.0f} ms")
-        field("S_V", f"{timings.get('verifier_ms', 0):.0f} ms")
+    # PipelineResult exposes per-stage timing as top-level fields.
+    field("S_P", f"{pipeline_result.planner_time_ms:.0f} ms")
+    field("S_N", f"{pipeline_result.navigator_time_ms:.0f} ms")
+    field("S_V", f"{pipeline_result.verifier_time_ms:.0f} ms")
 
     # EM-Check
     import re
@@ -1179,12 +1215,6 @@ def main():
         gold_n and bool(re.search(r'\b' + re.escape(gold_n) + r'\b', pred_n))
     )
     print(f"\n  Result: {bold(green('OK CORRECT') if em else red('XX WRONG'))}")
-
-    errors = final_state.get("errors", [])
-    if errors:
-        print(f"\n  {red('Pipeline errors:')}")
-        for e in errors:
-            print(f"    {red('!')} {dim(e)}")
 
     print(f"\n{bold('═' * 72)}\n")
 

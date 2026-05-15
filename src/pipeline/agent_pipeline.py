@@ -667,11 +667,41 @@ class AgentPipeline:
                 )
                 plan_hop_sequence = plan.hop_sequence if plan.hop_sequence else None
 
+                # B1-fix: forward query_type and bridge_entities so the Verifier
+                # actually selects BRIDGE_PROMPT for multi-hop and COMPARISON_PROMPT
+                # for comparison queries (instead of falling through to ANSWER_PROMPT
+                # for every query). query_type is sourced from the Planner; bridge
+                # entities are sourced from the iterative-navigate metadata when the
+                # plan had dependent hops, falling back to an empty list otherwise.
+                plan_query_type: Optional[str] = None
+                if hasattr(plan, "query_type") and plan.query_type is not None:
+                    try:
+                        plan_query_type = plan.query_type.value  # Enum -> str
+                    except AttributeError:
+                        plan_query_type = str(plan.query_type)
+
+                bridge_entities_for_verifier: List[str] = []
+                chunk_is_graph_based: Optional[List[bool]] = None
+                nav_metadata = getattr(nav_result, "metadata", None) or {}
+                if isinstance(nav_metadata, dict):
+                    bridge_entities_for_verifier = (
+                        nav_metadata.get("resolved_bridges", []) or []
+                    )
+                    # B2-fix: forward per-chunk graph-provenance from the
+                    # Navigator so the Verifier credibility scorer uses a real
+                    # signal instead of a constant baseline.
+                    flags = nav_metadata.get("chunk_is_graph_based")
+                    if isinstance(flags, list) and len(flags) == len(nav_result.filtered_context):
+                        chunk_is_graph_based = [bool(f) for f in flags]
+
                 gen_result = self.verifier.generate_and_verify(
                     query=query,
                     context=nav_result.filtered_context,
                     entities=plan_entities,
                     hop_sequence=plan_hop_sequence,
+                    query_type=plan_query_type,
+                    bridge_entities=bridge_entities_for_verifier or None,
+                    chunk_is_graph_based=chunk_is_graph_based,
                 )
                 # asdict() deep-copies the dataclass but converts Enum fields to raw
                 # Enum objects, not .value strings. Override every Enum field explicitly

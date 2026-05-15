@@ -1190,6 +1190,17 @@ def create_hybrid_retriever(
         bm25_weight=rag_cfg.get("bm25_weight", 1.0),
         enable_hop3=graph_cfg.get("enable_hop3", False),
     )
+
+    # I-3: propagate the hub-mention cap from settings.yaml into the live
+    # graph store (no class-wide mutation; only this store instance).
+    # Falls back to the class default if the key is absent.
+    _hub_cap = graph_cfg.get("hub_mention_cap")
+    if _hub_cap is not None:
+        try:
+            hybrid_store.graph_store.HUB_MENTION_CAP = int(_hub_cap)
+        except (AttributeError, ValueError, TypeError):
+            logger.debug("hub_mention_cap override failed; using class default")
+
     return HybridRetriever(hybrid_store, embeddings, config)
 
 

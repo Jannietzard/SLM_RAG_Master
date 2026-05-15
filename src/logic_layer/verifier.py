@@ -15,28 +15,32 @@ The Verifier (S_V) is the final stage of the three-agent RAG pipeline
 (S_P → S_N → S_V) and implements a dual-stage approach:
 
 1. PRE-GENERATION VALIDATION
-   Three checks are applied before generation:
+   The Verifier defaults to TWO checks before generation. A third check
+   exists as an ablation-only toggle.
 
-   a) Entity-Path Validation (multi-hop queries)
+   a) Entity-Path Validation (multi-hop queries) — DEFAULT ON
       Verifies that retrieved chunks cover the query entities.  When a
       KuzuDB graph store is available, ``find_chunks_by_entity_multihop``
       is used; otherwise falls back to substring matching.
 
-   b) Contradiction Detection
-      NLI-based pairwise detection on adjacent chunk pairs.  Only
-      consecutive pairs are checked (O(n)) to stay within edge CPU budget;
-      non-adjacent contradictions are not detected.  Disabled by default
-      to avoid the ~270 MB NLI model download; a numeric-divergence
-      heuristic serves as the offline fallback.
-      Reference: Bowman et al. (2015). arXiv:1508.05326 (NLI task);
-      Reimers & Gurevych (2019). arXiv:1908.10084 (cross-encoder model)..
-
-   c) Source Credibility Scoring
+   b) Source Credibility Scoring — DEFAULT ON
       Weighted combination (40 % cross-references, 30 % entity-mention
-      frequency, 30 % retrieval provenance).  Weights were chosen
-      empirically on a HotpotQA dev-set sample.  The provenance signal
-      is currently always False because Navigator does not forward
-      retrieval-source metadata to S_V (known limitation).
+      frequency, 30 % retrieval provenance — see SourceCredibility for
+      the per-weight defense). Graph-vs-vector provenance is now a real
+      signal from the Navigator (B2 fix); pre-B2 it was a constant
+      baseline because Navigator did not forward retrieval-source metadata.
+
+   c) Contradiction Detection — DEFAULT OFF (ablation-only, B6)
+      NLI-based pairwise detection on adjacent chunk pairs requires a
+      ~270 MB cross-encoder download (Reimers & Gurevych, 2019;
+      arXiv:1908.10084) and contradicts the edge-deployment constraint of
+      the thesis. The Navigator already runs a numeric-divergence
+      heuristic filter (``enable_contradiction_filter`` in settings.yaml)
+      which removes obviously contradictory chunks before they reach the
+      Verifier. The Verifier-side check is therefore retained only as a
+      research-mode toggle for ablation studies — set
+      ``enable_contradiction_detection: true`` to enable. The thesis
+      methodology paragraph describes the system with this off.
 
 2. GENERATION WITH A QUANTISED SLM
    Phi-3-Mini (or any Ollama-hosted model) is prompted with a compact
@@ -229,14 +233,35 @@ class SourceCredibility:
     - ``entity_frequency``: named-entity mention density as a proxy for
       information richness (weight: ``credibility_weight_entity_freq``,
       default 30 %).
-    - ``retrieval_provenance``: graph-based retrieval receives a higher score
-      than vector-only retrieval (weight: ``credibility_weight_provenance``,
-      default 30 %).  Currently always False because Navigator does not
-      forward retrieval-source metadata to S_V (known limitation).
+    - ``retrieval_provenance``: graph-retrieved chunks score higher than
+      vector/BM25-only chunks (weight: ``credibility_weight_provenance``,
+      default 30 %). Real provenance is supplied via
+      ``chunk_is_graph_based`` from the Navigator (B2-fix); when absent the
+      historical constant baseline (0.5) is applied so the term degenerates
+      to a uniform offset rather than crashing.
 
-    Weights are empirically chosen on a HotpotQA dev-set sample.  Their
-    individual contribution is modest relative to entity-path filtering, so
-    they are a first approximation rather than an optimised calibration.
+    B5 note — defense of the 40 / 30 / 30 weights:
+        The weights are documented as a deliberate inspection-time choice
+        rather than the output of a grid-search calibration.  Cross-reference
+        corroboration receives the largest share because two independent
+        chunks agreeing on a fact is a stronger correctness signal than
+        either signal in isolation (Knowledge-Vault style multi-source
+        fusion, Dong et al., 2014, KDD).  Entity-frequency and
+        retrieval-provenance are weighted equally because they measure
+        independent dimensions (information density vs. retrieval-path
+        quality) and the thesis does not claim one dominates the other.
+
+        The total contribution of the credibility filter is bounded above
+        by the chunk-eviction rate at ``min_credibility_score``; on the
+        thesis HotpotQA evaluation this filter evicts < 10 % of chunks,
+        so the weights' individual influence on final EM/F1 is small.
+        The thesis reports a single ablation row ("Verifier w/o credibility
+        filter") rather than a weight-sweep, which is methodologically
+        sufficient at this scale.
+
+    The provenance term used to be a constant baseline because the Navigator
+    did not forward retrieval-source metadata.  This is fixed in B2 — see
+    ``PreGenerationValidator.validate``'s ``chunk_is_graph_based`` parameter.
     """
 
     text: str
@@ -559,22 +584,26 @@ class PreGenerationValidator:
     """
     Pre-generation validation stage for S_V.
 
-    Implements three sequential checks before answer generation:
+    DEFAULT pipeline (two checks):
 
     1. **Entity-Path Validation** — verifies that retrieved chunks cover all
        query entities.  Uses ``find_chunks_by_entity_multihop`` when a
        KuzuDB graph store is available; falls back to substring matching.
 
-    2. **Contradiction Detection** — pairwise NLI check on adjacent chunk
-       pairs (O(n); non-adjacent pairs are not checked).
-       Reference: Bowman et al. (2015). arXiv:1508.05326;
-       Reimers & Gurevych (2019). arXiv:1908.10084.
-       Disabled by default; numeric-divergence heuristic as fallback.
-
-    3. **Source Credibility Scoring** — weighted combination of
+    2. **Source Credibility Scoring** — weighted combination of
        cross-reference corroboration, entity-mention density, and retrieval
        provenance.  Chunks below ``min_credibility_score`` are filtered;
        at least one chunk is always retained.
+
+    ABLATION-ONLY check (default OFF, B6):
+
+    3. **Contradiction Detection** — pairwise NLI check on adjacent chunk
+       pairs (O(n); non-adjacent pairs are not checked).
+       Reference: Bowman et al. (2015). arXiv:1508.05326;
+       Reimers & Gurevych (2019). arXiv:1908.10084.
+       The Navigator already runs a numeric-divergence contradiction filter
+       on the same context; this Verifier-side check is research-mode only.
+       Enable via ``enable_contradiction_detection: true``.
     """
 
     # Compiled at class level — reused across all instances.
@@ -621,6 +650,7 @@ class PreGenerationValidator:
         query: str,
         entities: Optional[List[str]] = None,
         hop_sequence: Optional[List[Dict[str, Any]]] = None,
+        chunk_is_graph_based: Optional[List[bool]] = None,
     ) -> PreValidationResult:
         """
         Run all three pre-generation validation checks sequentially.
@@ -636,6 +666,12 @@ class PreGenerationValidator:
         hop_sequence :
             Hop plan from the Planner.  Reserved for future graph-path
             planning; not used in the current implementation.
+        chunk_is_graph_based :
+            B2-fix: per-chunk retrieval-provenance flag (parallel to ``context``).
+            True for chunks retrieved via the KuzuDB graph path. Used by the
+            credibility scorer to give graph-corroborated chunks a higher
+            provenance score. None disables the provenance signal (falls back
+            to the constant baseline used pre-B2).
 
         Returns
         -------
@@ -683,23 +719,45 @@ class PreGenerationValidator:
 
         # ── Check 3: Source Credibility Scoring ───────────────────────────────
         if self.config.enable_credibility_scoring:
+            # B2-fix: remap the provenance flag onto the (possibly trimmed)
+            # filtered_context by exact-text lookup against the original
+            # context. None entries fall back to the constant baseline inside
+            # _compute_credibility so older callers that pass no provenance
+            # see no behavior change.
+            filtered_graph_flags: Optional[List[bool]] = None
+            if chunk_is_graph_based is not None and len(chunk_is_graph_based) == len(context):
+                _by_text = {c: g for c, g in zip(context, chunk_is_graph_based)}
+                filtered_graph_flags = [
+                    _by_text.get(c, False) for c in result.filtered_context
+                ]
+
             credibility_scores = self._compute_credibility(
-                result.filtered_context, context, entities=entities
+                result.filtered_context, context, entities=entities,
+                chunk_is_graph_based=filtered_graph_flags,
             )
             result.credibility_scores = credibility_scores
-            high_cred = [
-                chunk
-                for chunk, score in zip(result.filtered_context, credibility_scores)
+            # Track which chunks survive credibility filtering so the high-cred
+            # subset stays aligned with filtered_graph_flags for downstream use.
+            keep_indices = [
+                i for i, score in enumerate(credibility_scores)
                 if score >= self.config.min_credibility_score
             ]
-            if high_cred:
-                result.filtered_context = high_cred
+            if keep_indices:
+                result.filtered_context = [result.filtered_context[i] for i in keep_indices]
+                if filtered_graph_flags is not None:
+                    filtered_graph_flags = [filtered_graph_flags[i] for i in keep_indices]
             elif credibility_scores:
                 # Always retain the highest-credibility chunk so the
                 # generator is never given an empty context.
                 best_idx = credibility_scores.index(max(credibility_scores))
                 result.filtered_context = [result.filtered_context[best_idx]]
+                if filtered_graph_flags is not None:
+                    filtered_graph_flags = [filtered_graph_flags[best_idx]]
                 result.status = ValidationStatus.LOW_CREDIBILITY
+            # Expose the final per-chunk provenance flags for callers that want
+            # to log retrieval-source statistics (e.g. ablation diagnostics).
+            if filtered_graph_flags is not None:
+                result.details["chunk_is_graph_based"] = filtered_graph_flags
 
         result.validation_time_ms = (time.time() - start_time) * 1000
         logger.info(
@@ -898,6 +956,7 @@ class PreGenerationValidator:
         filtered_context: List[str],
         original_context: List[str],
         entities: Optional[List[str]] = None,
+        chunk_is_graph_based: Optional[List[bool]] = None,
     ) -> List[float]:
         """
         Compute credibility scores for each chunk in ``filtered_context``.
@@ -907,10 +966,12 @@ class PreGenerationValidator:
            (corroboration proxy).
         2. Entity frequency: SpaCy NER density as an information-richness
            proxy.  Regex proper-noun count as fallback.
-        3. Retrieval provenance: currently always False because Navigator
-           does not forward retrieval-source metadata (known limitation).
-           The provenance weight is applied uniformly at the
-           ``credibility_provenance_baseline`` level (0.5).
+        3. Retrieval provenance (B2-fix): graph-retrieved chunks get the full
+           weight (1.0); vector/BM25-only chunks get ``credibility_provenance_baseline``.
+           Before B2, ``is_graph_based`` was always False — see the docstring
+           addendum in compute_score(). Pass ``chunk_is_graph_based`` (parallel
+           to ``filtered_context``) to enable the real signal; None falls back
+           to the constant baseline for callers that haven't been updated.
 
         ``entities`` adds token-level cross-reference matching: if a word
         (≥4 chars) from an entity name appears in both this chunk and another
@@ -930,8 +991,19 @@ class PreGenerationValidator:
                         entity_tokens_lower.append(tok_l)
                         seen_tokens.add(tok_l)
 
+        # B2-fix: align the provenance flag with filtered_context. None means
+        # the caller didn't supply provenance, so we keep the historic baseline
+        # behavior (every chunk is treated as non-graph).
+        if chunk_is_graph_based is not None and len(chunk_is_graph_based) != len(filtered_context):
+            logger.warning(
+                "chunk_is_graph_based length mismatch (%d vs %d filtered chunks); "
+                "ignoring provenance signal.",
+                len(chunk_is_graph_based), len(filtered_context),
+            )
+            chunk_is_graph_based = None
+
         scores: List[float] = []
-        for chunk in filtered_context:
+        for chunk_idx, chunk in enumerate(filtered_context):
             cred = SourceCredibility(text=chunk)
             key_phrases = self._extract_key_phrases(chunk)
             chunk_lower = chunk.lower()
@@ -970,8 +1042,13 @@ class PreGenerationValidator:
                 proper_count = len(self._PROPER_NOUN_PATTERN.findall(chunk))
                 cred.entity_frequency = min(1.0, proper_count / self.config.credibility_entity_freq_normalizer_regex)
 
-            # Provenance: always False (see docstring).
-            cred.is_graph_based = False
+            # B2-fix: use real retrieval-provenance when supplied. Falls back
+            # to the historical False/baseline path for callers (older tests,
+            # AgenticController direct path) that don't pass provenance.
+            if chunk_is_graph_based is not None:
+                cred.is_graph_based = bool(chunk_is_graph_based[chunk_idx])
+            else:
+                cred.is_graph_based = False
 
             scores.append(
                 cred.compute_score(
@@ -1113,6 +1190,40 @@ Please provide a partial answer based on the available evidence, clearly indicat
         "American", "British", "European", "Australian", "Canadian",
         "Yes", "No",
     })
+
+    # B4-fix: stopwords excluded from the token-grounding check for short /
+    # numeric claims with no proper noun. Articles, auxiliaries, and copulas
+    # add no factual content, so demanding their literal presence in the
+    # context would over-violate paraphrases. Lowercase — matched against
+    # tokenized claim text.
+    _CLAIM_VERIFY_STOPWORDS: frozenset = frozenset({
+        "the", "a", "an", "of", "in", "on", "at", "to", "for", "by", "with",
+        "is", "was", "are", "were", "be", "been", "being", "has", "have", "had",
+        "do", "does", "did", "and", "or", "but", "if", "so",
+        "it", "its", "this", "that", "these", "those",
+    })
+
+    # B10-fix: per-string truncation budget for iteration_history entries.
+    # Across 500 questions × 2 iterations × ~400-char answers + claim lists,
+    # the raw history balloons the per-question JSONL by several MB and
+    # slows down jq/pandas analysis. 200 chars per string is enough to
+    # diagnose failures (LLM error sentinels, hallucination first line) while
+    # keeping the file flat-text grep-friendly.
+    _HISTORY_STR_TRUNCATE_CHARS: int = 200
+
+    @classmethod
+    def _truncate_history_str(cls, s: str) -> str:
+        """Truncate a string for storage in iteration_history (B10)."""
+        if not isinstance(s, str):
+            return s
+        if len(s) <= cls._HISTORY_STR_TRUNCATE_CHARS:
+            return s
+        return s[: cls._HISTORY_STR_TRUNCATE_CHARS] + "...[truncated]"
+
+    @classmethod
+    def _truncate_history_list(cls, items: List[str]) -> List[str]:
+        """Truncate every string in a list for iteration_history storage (B10)."""
+        return [cls._truncate_history_str(x) for x in items]
 
     # Epistemic-disclaimer phrases that signal the LLM did NOT answer.
     # When an answer matches any of these, it must not be reported as
@@ -1410,7 +1521,55 @@ Please provide a partial answer based on the available evidence, clearly indicat
         entities.extend(self._SINGLE_PROPER_NOUN_RE.findall(claim))
         entities.extend(self._QUOTED_RE.findall(claim))
         entities = [e for e in entities if e not in self._CLAIM_STOPWORDS]
+
         if not entities:
+            # B4-fix: claims with no extractable proper nouns previously
+            # auto-verified, which inflated all_verified=True for short factual
+            # answers like "1995", "9 million inhabitants", "ice hockey" — the
+            # exact answer shape HotpotQA produces for "how many" / "in what
+            # year" / "what sport" questions. We now check the claim against
+            # the retrieved context whenever it contains a numeric token OR is
+            # very short (<= 6 tokens). If the claim isn't grounded in context,
+            # treat it as a violation rather than auto-verified. Multi-clause
+            # narrative sentences with no proper noun still auto-verify (the
+            # historical behavior) because no falsifiable anchor exists.
+            claim_lower = claim.lower().strip()
+            tokens = claim_lower.split()
+            has_number = bool(re.search(r"\d", claim_lower))
+            is_short = len(tokens) <= 6
+
+            if (has_number or is_short) and context:
+                # Token-level grounding check: every non-stopword content token
+                # of the claim must appear somewhere in the joined context.
+                # Stopwords/articles/auxiliary verbs are ignored so phrasing
+                # differences ("was founded in 1995" vs "founded 1995") don't
+                # falsely violate.
+                #
+                # B4-fix: numeric tokens are KEPT regardless of length because
+                # they are the falsifiable signal the check exists to catch
+                # (e.g. "9 million inhabitants" vs "1.5 million inhabitants" —
+                # without keeping the digit, "million" and "inhabitants" both
+                # match and the hallucination would slip through). Strip
+                # trailing punctuation so "1995." still matches "1995" in
+                # the context.
+                context_text = " ".join(context).lower()
+                content_tokens = []
+                for raw in tokens:
+                    t = raw.strip(".,;:!?\"'()[]")
+                    if not t:
+                        continue
+                    if t in self._CLAIM_VERIFY_STOPWORDS:
+                        continue
+                    is_numeric_token = any(ch.isdigit() for ch in t)
+                    if is_numeric_token or len(t) >= 2:
+                        content_tokens.append(t)
+                if not content_tokens:
+                    return True, "no_content_tokens_to_verify"
+                grounded = all(t in context_text for t in content_tokens)
+                if grounded:
+                    return True, "context_token_grounded"
+                return False, "no_entities_and_tokens_ungrounded"
+
             return True, "no_entities_to_verify"
 
         # ── Graph store verification ──────────────────────────────────────────
@@ -1540,6 +1699,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
         hop_sequence: Optional[List[Dict[str, Any]]] = None,
         query_type: Optional[str] = None,
         bridge_entities: Optional[List[str]] = None,
+        chunk_is_graph_based: Optional[List[bool]] = None,
     ) -> VerificationResult:
         """
         Main entry point: pre-validation, generation, and self-correction.
@@ -1583,12 +1743,32 @@ Please provide a partial answer based on the available evidence, clearly indicat
         logger.info("[Verifier] query='%s'", query[:60])
         logger.info("[Verifier] context docs: %d", len(context))
 
+        # B1-followup (2026-05-15): the signature documents hop_sequence as
+        # List[Dict[str, Any]], but AgentPipeline.process() passes the
+        # Planner's List[HopStep] dataclasses directly. The bridge-chain
+        # builder uses .get() on each entry, which works on dicts but not on
+        # dataclasses. Normalise at the boundary so both call paths work:
+        # dataclass → dict via dataclasses.asdict(); dicts pass through.
+        if hop_sequence:
+            try:
+                from dataclasses import asdict, is_dataclass
+                hop_sequence = [
+                    asdict(h) if is_dataclass(h) else h
+                    for h in hop_sequence
+                ]
+            except Exception as exc:  # defensive — never break the eval over this
+                logger.debug(
+                    "hop_sequence normalisation skipped (%s); leaving as-is.",
+                    exc,
+                )
+
         # ── Pre-generation validation ─────────────────────────────────────────
         pre_validation = self.pre_validator.validate(
             context=context,
             query=query,
             entities=entities,
             hop_sequence=hop_sequence,
+            chunk_is_graph_based=chunk_is_graph_based,
         )
         working_context = pre_validation.filtered_context
         logger.info(
@@ -1691,7 +1871,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
                 )
                 iteration_history.append({
                     "iteration": iteration,
-                    "answer": answer,
+                    "answer": self._truncate_history_str(answer),
                     "claims": [],
                     "verified": [],
                     "violated": [],
@@ -1706,7 +1886,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
                 logger.warning("[Verifier] LLM error: %s", answer)
                 iteration_history.append({
                     "iteration": iteration,
-                    "answer": answer,
+                    "answer": self._truncate_history_str(answer),
                     "claims": [],
                     "verified": [],
                     "violated": [],
@@ -1755,12 +1935,15 @@ Please provide a partial answer based on the available evidence, clearly indicat
             )
 
             iter_time = (time.time() - iter_start) * 1000
+            # B10-fix: truncate stored strings (answer + claim/verified/violated
+            # lists) to 200 chars each. Keeps the per-question JSONL flat-text
+            # grep-friendly across 500-question runs.
             iteration_history.append({
                 "iteration": iteration,
-                "answer": answer,
-                "claims": claims,
-                "verified": verified_claims,
-                "violated": violated_claims,
+                "answer": self._truncate_history_str(answer),
+                "claims": self._truncate_history_list(claims),
+                "verified": self._truncate_history_list(verified_claims),
+                "violated": self._truncate_history_list(violated_claims),
                 "llm_latency_ms": llm_latency,
                 "total_time_ms": iter_time,
                 "error": False,
@@ -1822,6 +2005,8 @@ Please provide a partial answer based on the available evidence, clearly indicat
         entities: Optional[List[str]] = None,
         hop_sequence: Optional[List[Dict[str, Any]]] = None,
         query_type: Optional[str] = None,
+        bridge_entities: Optional[List[str]] = None,
+        chunk_is_graph_based: Optional[List[bool]] = None,
     ) -> VerificationResult:
         """Callable interface — forwards all arguments to generate_and_verify."""
         return self.generate_and_verify(
@@ -1830,6 +2015,8 @@ Please provide a partial answer based on the available evidence, clearly indicat
             entities=entities,
             hop_sequence=hop_sequence,
             query_type=query_type,
+            bridge_entities=bridge_entities,
+            chunk_is_graph_based=chunk_is_graph_based,
         )
 
 

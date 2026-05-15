@@ -205,15 +205,24 @@ class TestPlanner:
         plan = planner.plan("Who invented the telephone?")
         assert 0.0 <= plan.confidence <= 1.0
 
-    def test_decompose_query_returns_list(self) -> None:
-        """decompose_query() returns a non-empty list."""
+    def test_plan_sub_queries_returns_list(self) -> None:
+        """P10 (2026-05-15): replaces test_decompose_query_returns_list.
+        decompose_query() was removed as legacy; callers read plan.sub_queries
+        directly.
+        """
         from src.logic_layer.planner import create_planner
         planner = create_planner()
-        sub_queries = planner.decompose_query(
-            "Who directed Inception and when was it released?"
+        plan = planner.plan("Who directed Inception and when was it released?")
+        assert isinstance(plan.sub_queries, list)
+        assert len(plan.sub_queries) >= 1
+
+    def test_decompose_query_method_removed(self) -> None:
+        """P10: confirm decompose_query is gone — guards against accidental
+        re-introduction by future contributors."""
+        from src.logic_layer.planner import Planner
+        assert not hasattr(Planner, "decompose_query"), (
+            "P10 cleanup: decompose_query should be removed from Planner"
         )
-        assert isinstance(sub_queries, list)
-        assert len(sub_queries) >= 1
 
     def test_empty_query_no_crash(self) -> None:
         """Empty string returns a RetrievalPlan with a valid QueryType and empty sub_queries."""
@@ -1605,151 +1614,57 @@ class TestVerifier:
 
 
 # =============================================================================
-# 4. AGENTIC CONTROLLER TESTS
+# 4. AGENTIC CONTROLLER — STATIC HELPERS (B7 cleanup, 2026-05-15)
 # =============================================================================
+# The full orchestrator (run/__call__/LangGraph/_run_simple_pipeline/AgentState)
+# was removed in B7. AgenticController is now a static-helper container for
+# bridge-entity extraction and hop-query rewriting, consumed by
+# AgentPipeline._iterative_navigate. Tests below cover the surviving static
+# surface; the orchestration is now tested via TestAgentPipeline (further down).
 
 
-class TestAgenticController:
-    """Tests for AgenticController: full S_P → S_N → S_V pipeline."""
+class TestAgenticControllerStaticHelpers:
+    """Tests for AgenticController's surviving static helpers."""
 
-    @pytest.fixture
-    def controller(self):
-        """Single-iteration controller for fast unit tests.
-
-        model_name='phi3' and max_iterations=1 are explicit unit-test scope
-        choices; the production default (settings.yaml llm.model_name and
-        agent.max_verification_iterations) may differ.
-        """
-        from src.logic_layer.controller import create_controller
-        return create_controller(model_name="phi3", max_iterations=1)
-
-    def test_initialization(self, controller) -> None:
-        """Controller exposes all three agent instances."""
-        assert controller.planner is not None
-        assert controller.navigator is not None
-        assert controller.verifier is not None
-
-    def test_navigator_starts_without_retriever(self, controller) -> None:
-        """Navigator has no retriever at construction time."""
-        assert controller.navigator.retriever is None
-
-    def test_set_retriever(self, controller) -> None:
-        """set_retriever() delegates to Navigator."""
-        mock_retriever = Mock()
-        controller.set_retriever(mock_retriever)
-        assert controller.navigator.retriever is mock_retriever
-
-    def test_set_graph_store(self, controller) -> None:
-        """set_graph_store() delegates to Verifier."""
-        mock_store = Mock()
-        controller.set_graph_store(mock_store)
-        assert controller.verifier.graph_store is mock_store
-
-    def test_planner_classifies_query_type(self, controller) -> None:
-        """Planner inside the controller returns a valid QueryType."""
-        from src.logic_layer.planner import QueryType
-        plan = controller.planner.plan("What is machine learning?")
-        assert plan.query_type in list(QueryType)
-
-    def test_run_returns_dict_with_answer_key(self, controller) -> None:
-        """run() returns an AgentState dict containing an 'answer' key."""
-        with patch.object(
-            controller.verifier, "_call_llm",
-            return_value=("Mocked answer.", 0.05),
-        ):
-            state = controller.run("What is machine learning?")
-        assert isinstance(state, dict)
-        assert "answer" in state
-
-    def test_run_without_retriever_no_crash(self, controller) -> None:
-        """run() without a retriever completes and returns an answer string."""
-        with patch.object(
-            controller.verifier, "_call_llm",
-            return_value=("No information available.", 0.05),
-        ):
-            state = controller.run("What is the capital of France?")
-        assert isinstance(state, dict)
-        assert isinstance(state.get("answer", ""), str)
-
-    def test_call_shortcut_returns_string(self, controller) -> None:
-        """__call__() returns the answer directly as a string."""
-        with patch.object(
-            controller.verifier, "_call_llm",
-            return_value=("Test answer.", 0.05),
-        ):
-            answer = controller("What is 2+2?")
-        assert isinstance(answer, str)
-
-    def test_full_pipeline_with_mock_retriever_and_llm(self, controller) -> None:
-        """Full S_P → S_N → S_V flow using the rule-based LLM stub.
-
-        Uses _rule_based_llm_stub instead of a fixed canned answer so that
-        the test verifies the prompt-formatting code path: if _format_context()
-        or ANSWER_PROMPT.format() produces a malformed prompt, the stub returns
-        'I don't know.' and the answer assertion fails.
-        """
-        mock_retriever = Mock()
-        mock_retriever.retrieve.return_value = (
-            [MockResult("Paris is the capital of France.", 0.9)],
-            {"latency_ms": 5},
+    def test_module_does_not_export_create_controller(self) -> None:
+        """B7: create_controller and AgentState are gone from the public API."""
+        from src.logic_layer import controller as controller_module
+        assert not hasattr(controller_module, "create_controller"), (
+            "B7 cleanup: create_controller should be removed"
         )
-        controller.set_retriever(mock_retriever)
-        with patch.object(
-            controller.verifier, "_call_llm",
-            side_effect=_rule_based_llm_stub,
-        ):
-            state = controller.run("What is the capital of France?")
-        assert state["answer"] != "", "Rule-based stub must produce a non-empty answer"
-        assert "Paris" in state["answer"] or "capital" in state["answer"].lower(), (
-            f"Rule-based stub should echo context content; got: {state['answer']!r}"
-        )
-        assert "context" in state
-        assert "iterations" in state
-
-    def test_planner_entities_reach_navigator_filter(self, controller) -> None:
-        """E2E: entities extracted by S_P are forwarded into Navigator's
-        entity-mention filter — they must not be silently dropped.
-
-        A mock retriever returns one chunk mentioning "Einstein" and one
-        that does not.  After the entity-mention filter, only the Einstein
-        chunk must remain (or both if Safety Fallback fires — but at least
-        the Einstein chunk must be present).
-        """
-        mock_retriever = Mock()
-        mock_retriever.retrieve.return_value = (
-            [
-                MockResult("Einstein was born in Ulm, Germany in 1879.", 0.9),
-                MockResult("The weather in Berlin is cold in winter.", 0.3),
-            ],
-            {"latency_ms": 5},
-        )
-        controller.set_retriever(mock_retriever)
-        with patch.object(
-            controller.verifier, "_call_llm",
-            return_value=("Einstein was born in Ulm.", 0.05),
-        ):
-            state = controller.run("Where was Albert Einstein born?")
-
-        context = state.get("context", [])
-        # At least one context chunk must mention Einstein — confirming that
-        # Planner entities reached the Navigator entity-mention filter and the
-        # relevant chunk was not dropped.
-        assert any("Einstein" in c for c in context), (
-            f"Einstein chunk must survive entity-mention filter; context={context}"
+        assert not hasattr(controller_module, "AgentState"), (
+            "B7 cleanup: AgentState should be removed"
         )
 
-    def test_state_has_all_required_keys(self, controller) -> None:
-        """AgentState contains the seven keys consumed by the evaluation harness."""
-        with patch.object(
-            controller.verifier, "_call_llm",
-            return_value=("Test.", 0.05),
-        ):
-            state = controller.run("test query")
-        required_keys = {
-            "query", "answer", "context", "iterations",
-            "all_verified", "verified_claims", "violated_claims",
-        }
-        assert required_keys.issubset(set(state.keys()))
+    def test_static_helpers_are_callable(self) -> None:
+        """All four static helpers used by AgentPipeline survived B7."""
+        from src.logic_layer.controller import AgenticController
+        assert callable(AgenticController._extract_bridge_entities)
+        assert callable(AgenticController._rewrite_hop_query_with_bridges)
+        assert callable(AgenticController._score_bridge_candidate)
+        assert callable(AgenticController._detect_expected_type)
+
+    def test_detect_expected_type_person_for_who(self) -> None:
+        from src.logic_layer.controller import AgenticController
+        assert AgenticController._detect_expected_type("Who directed Inception?") == "PERSON"
+
+    def test_detect_expected_type_gpe_for_where(self) -> None:
+        from src.logic_layer.controller import AgenticController
+        assert AgenticController._detect_expected_type("Where was Einstein born?") == "GPE"
+
+    def test_rewrite_hop_query_appends_bridges(self) -> None:
+        from src.logic_layer.controller import AgenticController
+        rewritten = AgenticController._rewrite_hop_query_with_bridges(
+            "What is the population?", ["Strasbourg"]
+        )
+        assert "Strasbourg" in rewritten
+
+    def test_rewrite_hop_query_no_double_injection(self) -> None:
+        """If the bridge is already in the sub-query, leave it alone."""
+        from src.logic_layer.controller import AgenticController
+        sq = "What is the population of Strasbourg?"
+        out = AgenticController._rewrite_hop_query_with_bridges(sq, ["Strasbourg"])
+        assert out == sq
 
 
 # =============================================================================
@@ -1868,16 +1783,23 @@ class TestThesisCompliance:
         config = VerifierConfig()
         assert config.max_iterations >= 1
 
-    def test_agent_state_has_required_fields(self) -> None:
-        """AgentState TypedDict contains all keys consumed by the evaluation harness."""
-        from src.logic_layer.controller import AgentState
-        annotations = AgentState.__annotations__
+    def test_pipeline_result_has_required_fields(self) -> None:
+        """PipelineResult contains all fields consumed by the evaluation harness.
+
+        Replaces the pre-B7 test_agent_state_has_required_fields, which
+        inspected AgenticController.AgentState. AgentState was removed in
+        B7; the production result type is now PipelineResult.
+        """
+        from src.pipeline.agent_pipeline import PipelineResult
+        from dataclasses import fields
+        field_names = {f.name for f in fields(PipelineResult)}
         required = {
-            "query", "answer", "context", "iterations",
-            "all_verified", "verified_claims", "violated_claims",
-            "retrieval_plan", "errors",
+            "query", "answer", "planner_result", "navigator_result",
+            "verifier_result", "total_time_ms",
         }
-        assert required.issubset(set(annotations.keys()))
+        assert required.issubset(field_names), (
+            f"PipelineResult missing required fields: {required - field_names}"
+        )
 
     def test_navigator_relevance_threshold_default(self) -> None:
         """ControllerConfig default relevance_threshold_factor matches settings.yaml value 0.85."""

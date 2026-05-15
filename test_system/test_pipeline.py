@@ -309,6 +309,30 @@ class TestAgentPipeline:
         gamma_key = pipeline._get_cache_key("Gamma?")
         assert gamma_key in pipeline._cache
 
+    def test_b1_pipeline_forwards_query_type_to_verifier(self, pipeline):
+        """B1: AgentPipeline must forward query_type to generate_and_verify.
+
+        Pre-fix, the eval used ANSWER_PROMPT for every query because the
+        pipeline never passed query_type/bridge_entities. This test captures
+        the actual kwargs the pipeline forwards.
+        """
+        captured = {}
+        original_generate = pipeline.verifier.generate_and_verify
+
+        def capturing_generate(*args, **kwargs):
+            captured.update(kwargs)
+            return original_generate(*args, **kwargs)
+
+        with patch.object(pipeline.verifier, "_call_llm", return_value=("Berlin.", 0.05)), \
+             patch.object(pipeline.verifier, "generate_and_verify", side_effect=capturing_generate):
+            pipeline.process("Is Berlin older than Munich?")
+
+        assert "query_type" in captured, "B1: query_type missing from verifier call"
+        # The query is a comparison; the planner should classify it as such,
+        # but even if it falls back to single_hop the *kwarg* must be present.
+        assert captured["query_type"] is not None
+        assert "bridge_entities" in captured  # may be None, but key exists
+
 
 # ============================================================================
 # TestBatchProcessor

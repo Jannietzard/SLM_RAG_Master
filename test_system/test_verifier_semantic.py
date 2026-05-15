@@ -528,6 +528,330 @@ class TestQuestionRelevanceReorder:
         assert reordered[1] == context[1]
 
 
+# ---------------------------------------------------------------------------
+# B1: query_type + bridge_entities forwarded by AgentPipeline
+# ---------------------------------------------------------------------------
+
+class TestB1QueryTypePlumbing:
+    """B1: the BRIDGE_PROMPT / COMPARISON_PROMPT must actually be selectable.
+
+    Pre-fix, AgentPipeline called generate_and_verify() without query_type or
+    bridge_entities. The verifier's prompt-selection code at L1657-1670 only
+    fires when both are supplied, so every eval query used ANSWER_PROMPT.
+    These tests assert the verifier's selection picks BRIDGE/COMPARISON when
+    given the proper kwargs, and that the pipeline actually forwards them.
+    """
+
+    def test_comparison_query_type_selects_comparison_prompt(self, minimal_cfg, monkeypatch):
+        v = create_verifier(cfg=minimal_cfg, enable_pre_validation=False)
+        captured = {}
+
+        def fake_llm(self, prompt):
+            captured["prompt"] = prompt
+            return "Berlin", 1.0
+
+        monkeypatch.setattr(Verifier, "_call_llm", fake_llm)
+        v.generate_and_verify(
+            query="Is Berlin older than Munich?",
+            context=["Berlin founded 1237.", "Munich founded 1158."],
+            entities=["Berlin", "Munich"],
+            query_type="comparison",
+        )
+        # COMPARISON_PROMPT has a unique signature: numbered steps "1. Find ... 2. Find ... 3. Compare"
+        assert "1. Find the relevant fact for the FIRST" in captured["prompt"]
+        assert "2. Find the relevant fact for the SECOND" in captured["prompt"]
+
+    def test_multi_hop_with_hop_sequence_selects_bridge_prompt(self, minimal_cfg, monkeypatch):
+        v = create_verifier(cfg=minimal_cfg, enable_pre_validation=False)
+        captured = {}
+
+        def fake_llm(self, prompt):
+            captured["prompt"] = prompt
+            return "Inception", 1.0
+
+        monkeypatch.setattr(Verifier, "_call_llm", fake_llm)
+        v.generate_and_verify(
+            query="Who directed the film starring Leonardo DiCaprio about dreams?",
+            context=["Inception is a 2010 film directed by Christopher Nolan."],
+            entities=["Leonardo DiCaprio"],
+            hop_sequence=[
+                {"step_id": 0, "sub_query": "Find the film", "is_bridge": True},
+                {"step_id": 1, "sub_query": "Find the director", "is_bridge": False},
+            ],
+            query_type="multi_hop",
+            bridge_entities=["Inception"],
+        )
+        # BRIDGE_PROMPT has the unique substring "Use the following reasoning chain"
+        assert "reasoning chain" in captured["prompt"]
+        assert "Step" in captured["prompt"]  # _build_bridge_chain produces "Step N:" lines
+
+    def test_hop_sequence_accepts_HopStep_dataclasses(self, minimal_cfg, monkeypatch):
+        """B1-followup regression guard (2026-05-15).
+
+        AgentPipeline.process() passes the Planner's List[HopStep] dataclasses
+        directly to generate_and_verify, while the signature documents
+        List[Dict]. The verifier must normalise both forms — otherwise
+        _build_bridge_chain crashes with `'HopStep' object has no attribute
+        'get'` before any LLM call is made.
+        """
+        from src.logic_layer.planner import HopStep
+        v = create_verifier(cfg=minimal_cfg, enable_pre_validation=False)
+        captured = {}
+
+        def fake_llm(self, prompt):
+            captured["prompt"] = prompt
+            return "Inception", 1.0
+
+        monkeypatch.setattr(Verifier, "_call_llm", fake_llm)
+        # Pass dataclasses (production pipeline path), not dicts (controller path).
+        v.generate_and_verify(
+            query="Who directed the film starring Leonardo DiCaprio?",
+            context=["Inception was directed by Christopher Nolan."],
+            entities=["Leonardo DiCaprio"],
+            hop_sequence=[
+                HopStep(step_id=0, sub_query="Find the film",
+                        target_entities=["Leonardo DiCaprio"],
+                        depends_on=[], is_bridge=True),
+                HopStep(step_id=1, sub_query="Find the director",
+                        target_entities=[], depends_on=[0], is_bridge=False),
+            ],
+            query_type="multi_hop",
+            bridge_entities=["Inception"],
+        )
+        # Must reach the LLM — the crash this guards against happened before
+        # _call_llm was invoked.
+        assert "prompt" in captured, (
+            "B1-followup: HopStep dataclasses crashed _build_bridge_chain "
+            "before the LLM was called"
+        )
+        assert "reasoning chain" in captured["prompt"]
+
+    def test_no_query_type_falls_back_to_answer_prompt(self, minimal_cfg, monkeypatch):
+        v = create_verifier(cfg=minimal_cfg, enable_pre_validation=False)
+        captured = {}
+
+        def fake_llm(self, prompt):
+            captured["prompt"] = prompt
+            return "Paris", 1.0
+
+        monkeypatch.setattr(Verifier, "_call_llm", fake_llm)
+        v.generate_and_verify(
+            query="What is the capital of France?",
+            context=["France's capital is Paris."],
+            entities=["France"],
+        )
+        # ANSWER_PROMPT has the unique line "Give the shortest possible answer"
+        assert "Give the shortest possible answer" in captured["prompt"]
+        # Neither BRIDGE nor COMPARISON markers should be present.
+        assert "reasoning chain" not in captured["prompt"]
+        assert "1. Find the relevant fact for the FIRST" not in captured["prompt"]
+
+    def test_call_wrapper_forwards_bridge_entities(self, minimal_cfg, monkeypatch):
+        """B9: Verifier.__call__ must forward bridge_entities (regression guard for B1)."""
+        v = create_verifier(cfg=minimal_cfg, enable_pre_validation=False)
+        seen = {}
+
+        def fake_gen(self, query, context, entities=None, hop_sequence=None,
+                     query_type=None, bridge_entities=None, chunk_is_graph_based=None):
+            seen["bridge_entities"] = bridge_entities
+            seen["query_type"] = query_type
+            return VerificationResult(answer="x", iterations=1)
+
+        monkeypatch.setattr(Verifier, "generate_and_verify", fake_gen)
+        v(query="q", context=["c"], query_type="multi_hop", bridge_entities=["E"])
+        assert seen["bridge_entities"] == ["E"]
+        assert seen["query_type"] == "multi_hop"
+
+
+# ---------------------------------------------------------------------------
+# B2: retrieval-provenance signal in credibility scoring
+# ---------------------------------------------------------------------------
+
+class TestB2ProvenanceSignal:
+    """B2: pre-fix, ``cred.is_graph_based`` was hard-coded False — the
+    provenance term contributed a constant baseline (0.5) regardless of
+    retrieval method. Now, callers can pass per-chunk graph-provenance flags
+    and graph chunks score strictly higher than vector-only chunks.
+    """
+
+    def test_graph_chunk_scores_higher_than_vector_chunk(self, minimal_cfg):
+        validator = PreGenerationValidator(VerifierConfig.from_yaml(minimal_cfg))
+        # Two near-identical chunks, only difference is graph-vs-vector provenance.
+        chunk = "Albert Einstein was a German-born theoretical physicist."
+        # Use two unique chunks to avoid filter collapse on duplicate text.
+        ctx = [
+            chunk,
+            "Einstein developed the theory of relativity in 1915.",
+        ]
+        # Provenance: chunk 0 graph-retrieved, chunk 1 vector-only.
+        flags = [True, False]
+        result = validator.validate(
+            ctx, "What did Einstein develop?",
+            entities=["Einstein"],
+            chunk_is_graph_based=flags,
+        )
+        assert len(result.credibility_scores) == 2
+        # Graph-retrieved chunk should score >= vector chunk (the provenance
+        # term contributes weight*1.0 vs weight*baseline).
+        # Both chunks have the same entity-frequency / cross-references, so
+        # the only systematic difference is provenance.
+        # B2-fix: graph chunk gets full provenance credit (weight × 1.0),
+        # vector chunk gets baseline (weight × 0.5). Score delta should be
+        # provenance_weight × (1.0 - baseline) = 0.3 × 0.5 = 0.15.
+        score_graph, score_vector = result.credibility_scores[0], result.credibility_scores[1]
+        assert score_graph > score_vector, (
+            f"Graph chunk ({score_graph:.3f}) should outscore vector chunk "
+            f"({score_vector:.3f}) after B2-fix"
+        )
+
+    def test_missing_provenance_falls_back_to_baseline(self, minimal_cfg):
+        """When chunk_is_graph_based is None, behavior is identical to pre-B2."""
+        validator = PreGenerationValidator(VerifierConfig.from_yaml(minimal_cfg))
+        ctx = ["Einstein was a physicist.", "Einstein developed relativity."]
+        result_no_provenance = validator.validate(
+            ctx, "What did Einstein develop?", entities=["Einstein"],
+        )
+        result_explicit_none = validator.validate(
+            ctx, "What did Einstein develop?", entities=["Einstein"],
+            chunk_is_graph_based=None,
+        )
+        # Same input → same scores when provenance is absent (baseline applied).
+        assert result_no_provenance.credibility_scores == result_explicit_none.credibility_scores
+
+    def test_provenance_flag_length_mismatch_ignored(self, minimal_cfg, caplog):
+        """A length-mismatched provenance list should be ignored, not crash."""
+        import logging
+        caplog.set_level(logging.WARNING)
+        validator = PreGenerationValidator(VerifierConfig.from_yaml(minimal_cfg))
+        ctx = ["chunk one", "chunk two", "chunk three"]
+        result = validator.validate(
+            ctx, "query", entities=[],
+            chunk_is_graph_based=[True],  # wrong length: 1 vs 3
+        )
+        assert len(result.credibility_scores) >= 1
+
+
+# ---------------------------------------------------------------------------
+# B4: claim verification — no auto-verify for short / numeric claims
+# ---------------------------------------------------------------------------
+
+class TestB4NumericClaimVerification:
+    """B4: pre-fix, a claim with no proper noun returned (True, 'no_entities_to_verify')
+    immediately — so an LLM hallucinating "9 million inhabitants" or "1995"
+    auto-verified regardless of context. The fix grounds short / numeric
+    claims by token presence in the context."""
+
+    def test_numeric_claim_grounded_in_context_verified(self, verifier):
+        ok, reason = verifier._verify_claim(
+            "founded in 1995",
+            context=["The company was founded in 1995 in Cupertino."],
+        )
+        assert ok is True
+        assert reason == "context_token_grounded"
+
+    def test_numeric_claim_not_in_context_violated(self, verifier):
+        """The hallucination case B4 is designed to catch."""
+        ok, reason = verifier._verify_claim(
+            "9 million inhabitants",
+            context=["Munich has roughly 1.5 million inhabitants."],
+        )
+        assert ok is False
+        assert reason == "no_entities_and_tokens_ungrounded"
+
+    def test_short_phrase_not_in_context_violated(self, verifier):
+        ok, reason = verifier._verify_claim(
+            "ice hockey",
+            context=["The athlete played football professionally."],
+        )
+        assert ok is False
+        assert reason == "no_entities_and_tokens_ungrounded"
+
+    def test_short_phrase_in_context_verified(self, verifier):
+        ok, reason = verifier._verify_claim(
+            "ice hockey",
+            context=["He played ice hockey for the national team."],
+        )
+        assert ok is True
+        assert reason == "context_token_grounded"
+
+    def test_long_narrative_no_proper_noun_still_auto_verifies(self, verifier):
+        """Long sentences with no proper noun keep the historical auto-verify
+        behavior — no falsifiable anchor to check against."""
+        ok, reason = verifier._verify_claim(
+            "This is a long sentence that contains no proper noun and is more than six tokens.",
+            context=["something else entirely"],
+        )
+        assert ok is True
+        assert reason == "no_entities_to_verify"
+
+    def test_empty_context_short_claim_still_auto_verifies(self, verifier):
+        """No context means no falsifiable anchor — keep historical behavior."""
+        ok, reason = verifier._verify_claim("Yes.", context=[])
+        assert ok is True
+        assert reason == "no_entities_to_verify"
+
+
+# ---------------------------------------------------------------------------
+# B10: iteration_history string-truncation budget
+# ---------------------------------------------------------------------------
+
+class TestB10HistoryTruncation:
+    """B10: per-string truncation budget for iteration_history entries.
+
+    Pre-fix, the verifier stored full answers + full claim lists in
+    iteration_history. Across 500 questions × 2 iterations × ~400-char
+    answers, the per-question JSONL bloated by several MB. Strings are
+    now truncated to 200 chars + a "...[truncated]" marker.
+    """
+
+    def test_short_string_unchanged(self):
+        assert Verifier._truncate_history_str("Hello world.") == "Hello world."
+
+    def test_long_string_truncated_with_marker(self):
+        s = "x" * 500
+        out = Verifier._truncate_history_str(s)
+        assert out.endswith("...[truncated]")
+        # 200 content chars + truncation marker
+        assert len(out) == 200 + len("...[truncated]")
+        assert out.startswith("x" * 200)
+
+    def test_non_string_passed_through(self):
+        # Non-string inputs should not crash (defensive default).
+        assert Verifier._truncate_history_str(None) is None
+        assert Verifier._truncate_history_str(42) == 42
+
+    def test_truncate_list_applies_per_element(self):
+        items = ["short", "x" * 300, "y" * 50]
+        out = Verifier._truncate_history_list(items)
+        assert out[0] == "short"
+        assert out[1].endswith("...[truncated]")
+        assert out[2] == "y" * 50
+
+    def test_iteration_history_truncated_on_long_llm_answer(self, minimal_cfg, monkeypatch):
+        """Full integration: a 500-char LLM answer is truncated in history."""
+        v = create_verifier(cfg=minimal_cfg, enable_pre_validation=False)
+        long_answer = "Albert Einstein was born in Ulm. " + ("filler text. " * 50)
+        assert len(long_answer) > 200
+
+        monkeypatch.setattr(
+            Verifier, "_call_llm",
+            lambda self, prompt: (long_answer, 1.0),
+        )
+        result = v.generate_and_verify(
+            query="Where was Einstein born?",
+            context=["Einstein was born in Ulm."],
+            entities=["Einstein"],
+        )
+        assert result.iteration_history, "Expected at least one iteration in history"
+        stored_answer = result.iteration_history[0]["answer"]
+        assert len(stored_answer) <= 200 + len("...[truncated]"), (
+            f"B10: history answer too long ({len(stored_answer)} chars)"
+        )
+        assert stored_answer.endswith("...[truncated]"), (
+            "B10: truncated answers must carry the truncation marker"
+        )
+
+
 if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.WARNING)

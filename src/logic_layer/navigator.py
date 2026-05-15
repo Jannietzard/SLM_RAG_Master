@@ -261,6 +261,15 @@ class Navigator:
                         else 1.0
                     )
 
+                    # B2-fix: capture the retrieval method ("vector"/"graph"/
+                    # "bm25"/"hybrid") separately from source_doc so the Verifier
+                    # credibility score can use real graph-provenance signal
+                    # instead of a constant baseline.
+                    retrieval_method = (
+                        res.retrieval_method
+                        if hasattr(res, "retrieval_method")
+                        else "unknown"
+                    )
                     all_results.append({
                         "text": text,
                         "score": score,
@@ -269,6 +278,7 @@ class Navigator:
                             else res.source if hasattr(res, "source")
                             else "unknown"
                         ),
+                        "retrieval_method": retrieval_method,
                         "sub_query": sub_query,
                     })
 
@@ -383,6 +393,19 @@ class Navigator:
         result.filtered_context = [r["text"] for r in shrunk_results]
         result.scores = [r["rrf_score"] for r in shrunk_results]
 
+        # B2-fix: surface retrieval provenance per filtered chunk so the
+        # Verifier's credibility scorer can use a real graph-based signal
+        # (was always False/baseline before; see verifier._compute_credibility).
+        # A chunk is "graph-based" if at least one of the retrieval paths that
+        # produced it was the graph path.
+        result.metadata["chunk_retrieval_methods"] = [
+            list(r.get("retrieval_methods", [])) for r in shrunk_results
+        ]
+        result.metadata["chunk_is_graph_based"] = [
+            "graph" in (r.get("retrieval_methods", []) or [])
+            for r in shrunk_results
+        ]
+
         result.metadata["filter_time_ms"] = (time.time() - filter_start) * 1000
         result.metadata["total_time_ms"] = (time.time() - start_time) * 1000
 
@@ -436,10 +459,17 @@ class Navigator:
                     "scores": [],
                     "sources": set(),
                     "sub_queries": set(),
+                    # B2-fix: track the retrieval methods that produced this
+                    # chunk (vector/graph/bm25). Used by the Verifier to set
+                    # is_graph_based for credibility scoring.
+                    "retrieval_methods": set(),
                 }
             text_groups[text]["scores"].append(r["score"])
             text_groups[text]["sources"].add(r["source"])
             text_groups[text]["sub_queries"].add(r["sub_query"])
+            method = r.get("retrieval_method", "unknown")
+            if method and method != "unknown":
+                text_groups[text]["retrieval_methods"].add(method)
 
         # Build per-sub-query rankings and accumulate RRF contributions
         sub_query_rankings: Dict[str, List[Any]] = {}
@@ -489,6 +519,9 @@ class Navigator:
                 # reranker so bridge chunks are scored against the hop that retrieved
                 # them, not the surface query (§12.30).
                 "_best_sub_query": group.get("_best_sub_query", ""),
+                # B2-fix: propagate retrieval-method provenance so the Verifier
+                # can flag graph-retrieved chunks as more credible.
+                "retrieval_methods": list(group.get("retrieval_methods", set())),
             })
 
         # Sort descending by RRF score

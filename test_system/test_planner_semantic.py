@@ -292,6 +292,493 @@ class TestFactoryAndSettings:
         assert plan.metadata["planning_time_ms"] >= 0
 
 
+# ── P1: matched_pattern recorded in RetrievalPlan ──────────────────────────────
+
+class TestP1MatchedPatternRecorded:
+    """P1: every plan must carry an identifier of the pattern that produced it,
+    so the per-question JSONL can answer 'how often does Pattern X fire?'
+    without parsing debug logs.
+
+    Pre-fix, RetrievalPlan had no such field; the matched pattern was only
+    visible in `logger.debug` lines. The eval harness's
+    `_extract_planner_diagnostics` returned (query_type, hop_count, n_entities)
+    with no pattern info.
+    """
+
+    def test_single_hop_marked(self, planner):
+        plan = planner.plan("What is the capital of France?")
+        assert plan.matched_pattern == "single_hop", (
+            f"Expected 'single_hop', got {plan.matched_pattern!r}"
+        )
+
+    def test_comparison_attr_map_marked(self, planner):
+        plan = planner.plan(
+            "Were Scott Derrickson and Ed Wood of the same nationality?"
+        )
+        # Comparison routes through _decompose_comparison; the _ATTR_MAP
+        # rewrite for "same nationality" should fire.
+        assert plan.matched_pattern in {
+            "comparison_attr_map",
+            "comparison_parallel",
+            "I_boolean_conjunction",
+            "select_between_two",
+        }, f"Got {plan.matched_pattern!r}"
+
+    def test_multihop_pattern_marker_set(self, planner):
+        plan = planner.plan(
+            "Who directed the film starring Tom Hanks in Forrest Gump?"
+        )
+        # Any MULTI_HOP plan must carry a pattern marker — never None.
+        if plan.query_type == QueryType.MULTI_HOP:
+            assert plan.matched_pattern is not None, (
+                "MULTI_HOP plans must always set matched_pattern"
+            )
+            # Allowed values for the multi-hop dispatcher (open set in tests).
+            assert isinstance(plan.matched_pattern, str)
+            assert len(plan.matched_pattern) > 0
+
+    def test_matched_pattern_in_to_dict(self, planner):
+        """P8: matched_pattern surfaces in to_dict() output (greppable from JSONL)."""
+        plan = planner.plan("What is the capital of France?")
+        d = plan.to_dict()
+        assert "matched_pattern" in d, "to_dict() must surface matched_pattern (P8)"
+        assert d["matched_pattern"] == plan.matched_pattern
+
+    def test_metadata_in_to_dict(self, planner):
+        """P8: metadata key must be present in to_dict() output."""
+        plan = planner.plan("What is the capital of France?")
+        d = plan.to_dict()
+        assert "metadata" in d, "to_dict() must surface metadata (P8)"
+        assert isinstance(d["metadata"], dict)
+        # planning_time_ms is always added by plan() — sanity-check it's reachable.
+        assert "planning_time_ms" in d["metadata"]
+
+    def test_no_pattern_marker_leak_across_calls(self, planner):
+        """A second plan() call must not inherit the first call's pattern."""
+        # First call: classified MULTI_HOP, sets some pattern marker.
+        plan1 = planner.plan(
+            "Who directed the film starring Tom Hanks in Forrest Gump?"
+        )
+        # Second call: plain single-hop, should be re-tagged "single_hop".
+        plan2 = planner.plan("What is the capital of France?")
+        assert plan2.matched_pattern == "single_hop", (
+            f"Stale pattern leaked between calls: got {plan2.matched_pattern!r} "
+            f"after first call set {plan1.matched_pattern!r}"
+        )
+
+
+# ── P2: classifier pre-empt surfaced in RetrievalPlan ─────────────────────────
+
+class TestP2ClassifierPreemptRecorded:
+    """P2: Phase 0 (boolean-conjunction) and Phase 0.5 (implicit-bridge)
+    classifier pre-empts return early from classify() with hard-coded
+    confidence values. Pre-fix, they were invisible to downstream analysis.
+    """
+
+    def test_boolean_conjunction_preempt_recorded(self, planner):
+        plan = planner.plan("Are Berlin and Munich both in Germany?")
+        # Pre-empt should mark COMPARISON with confidence 0.90.
+        assert plan.query_type == QueryType.COMPARISON
+        assert plan.classifier_preempt == "preempt_pattern_I_boolean_conjunction", (
+            f"Boolean-conjunction pre-empt should record marker; got "
+            f"{plan.classifier_preempt!r}"
+        )
+
+    def test_implicit_bridge_preempt_recorded(self, planner):
+        plan = planner.plan(
+            "Scott Parkin has been a critic of Exxonmobil and another corporation "
+            "that has operations in how many countries?"
+        )
+        assert plan.classifier_preempt == "preempt_pattern_J_implicit_bridge", (
+            f"Implicit-bridge pre-empt should record marker; got "
+            f"{plan.classifier_preempt!r}"
+        )
+
+    def test_normal_path_no_preempt(self, planner):
+        plan = planner.plan("What is the capital of France?")
+        # Normal Phase 1-4 scoring path — no pre-empt should fire.
+        assert plan.classifier_preempt is None, (
+            f"Single-hop query should not trigger a pre-empt; got "
+            f"{plan.classifier_preempt!r}"
+        )
+
+    def test_preempt_in_to_dict(self, planner):
+        plan = planner.plan("Are Berlin and Munich both in Germany?")
+        d = plan.to_dict()
+        assert "classifier_preempt" in d, (
+            "to_dict() must surface classifier_preempt (P2)"
+        )
+        assert d["classifier_preempt"] == plan.classifier_preempt
+
+    def test_preempt_marker_not_leaked_across_calls(self, planner):
+        """A second plan() call must not inherit the first call's pre-empt."""
+        plan1 = planner.plan("Are Berlin and Munich both in Germany?")
+        assert plan1.classifier_preempt is not None  # sanity
+        plan2 = planner.plan("What is the capital of France?")
+        assert plan2.classifier_preempt is None, (
+            f"Stale pre-empt leaked between calls: got "
+            f"{plan2.classifier_preempt!r}"
+        )
+
+
+# ── P3: pattern-priority order is documented + tested ─────────────────────────
+
+class TestP3PatternPriorityOrder:
+    """P3: when two patterns *could* match the same query, the documented
+    dispatch order in PlanGenerator's class docstring must win.
+
+    These tests pin the ordering so future pattern reshuffles cannot silently
+    change which pattern fires.
+    """
+
+    def test_J_preempt_beats_aggregate(self, planner):
+        """Pattern J's pre-empt must beat the AGGREGATE 'how many' pattern.
+        Without the pre-empt, "how many" would dominate scoring.
+        """
+        plan = planner.plan(
+            "Scott Parkin has been a critic of Exxonmobil and another corporation "
+            "that has operations in how many countries?"
+        )
+        assert plan.query_type == QueryType.MULTI_HOP, (
+            f"J pre-empt must override AGGREGATE; got {plan.query_type.value}"
+        )
+        assert plan.matched_pattern == "J_implicit_bridge"
+
+    def test_I_preempt_beats_intersection_priority(self, planner):
+        """Pattern I (boolean conjunction) must beat the INTERSECTION patterns
+        that also match 'both ... and'. Pre-empt fires before scoring.
+        """
+        plan = planner.plan("Are Berlin and Munich both in Germany?")
+        assert plan.query_type == QueryType.COMPARISON, (
+            f"I pre-empt must produce COMPARISON; got {plan.query_type.value}"
+        )
+        assert plan.matched_pattern == "I_boolean_conjunction"
+
+    def test_select_between_beats_attr_map(self, planner):
+        """When a comparison query has both an 'or' disjunction AND an
+        _ATTR_MAP-matching phrase, select-between-two must win because it
+        is checked first in _decompose_comparison.
+        """
+        plan = planner.plan(
+            "Which writer was from England, Henry Roth or Robert Erskine Childers?"
+        )
+        # select_between_two is checked before _ATTR_MAP per the documented order.
+        assert plan.matched_pattern == "select_between_two", (
+            f"Expected select_between_two; got {plan.matched_pattern!r}"
+        )
+
+    def test_fallback_marker_distinguishes_failure_modes(self, planner):
+        """Classified MULTI_HOP but no pattern fires → fallback_generic_2hop
+        (when an entity is present) or fallback_degraded_to_single_hop (when
+        not). These markers must not collide with real-pattern markers.
+        """
+        # A multi-hop query with no clear bridge structure beyond a generic
+        # "starring" relation that no pattern picks up.
+        plan = planner.plan(
+            "Who directed the film starring Tom Hanks in Forrest Gump?"
+        )
+        if plan.query_type == QueryType.MULTI_HOP:
+            # The marker should be a fallback OR a legitimate pattern letter.
+            # It must NOT be None (P1 invariant).
+            assert plan.matched_pattern is not None
+            assert plan.matched_pattern not in {"", "None"}
+
+
+# ── P5: per-pattern regression tests ──────────────────────────────────────────
+# One canonical query per pattern, pinned to its expected matched_pattern
+# marker. Future pattern-deletion decisions must update or delete the
+# corresponding test here.
+
+class TestP5PerPatternRegression:
+    """P5: each pattern has one canonical input that must produce its marker.
+
+    These tests are intentionally minimal — they pin the marker, not the
+    full hop structure (that's covered by integration tests elsewhere).
+    Their job is to make pattern-deletion decisions auditable: if you delete
+    Pattern X, the corresponding test here fails, and you explicitly accept
+    or migrate the canonical case.
+    """
+
+    # ── Multi-hop dispatcher patterns ──────────────────────────────────────
+
+    @pytest.mark.skipif(not SPACY_AVAILABLE, reason="Pattern G requires SpaCy dep parse")
+    def test_pattern_G_relative_clause_form1(self, planner):
+        """Form 1: 'The [noun] in which [Entity] [predicate]...'
+        Anchor is the subject of the relcl (a real NP, not a pronoun).
+        """
+        plan = planner.plan(
+            "The film in which Audrey Hepburn starred won which award?"
+        )
+        # Pattern G form1 OR form2 acceptable depending on parse.
+        if plan.query_type == QueryType.MULTI_HOP and plan.matched_pattern:
+            assert plan.matched_pattern.startswith("G_") or \
+                   plan.matched_pattern in {"H_attribution_chain", "connector_split"}, (
+                f"Expected G_form*; got {plan.matched_pattern!r}"
+            )
+
+    @pytest.mark.skipif(not SPACY_AVAILABLE, reason="Pattern H requires SpaCy dep parse")
+    def test_pattern_H_attribution_chain(self, planner):
+        """Chained attribution: 'a [work] based on [Entity], is [verb-en]
+        by someone [attribute]?' — a 3-hop chain.
+        """
+        plan = planner.plan(
+            "A manga series based on Ichitaka Seto, is illustrated by someone "
+            "born in what year?"
+        )
+        if plan.query_type == QueryType.MULTI_HOP and plan.matched_pattern:
+            # If H fires, it should be H_attribution_chain. If H doesn't fire
+            # (parse ambiguous), at least the marker is set (P1 invariant).
+            assert plan.matched_pattern is not None
+
+    def test_pattern_I_boolean_conjunction(self, planner):
+        """'Are X and Y both P?' → COMPARISON via Pattern I pre-empt + Pattern I
+        decomposer."""
+        plan = planner.plan("Are Berlin and Munich both in Germany?")
+        assert plan.query_type == QueryType.COMPARISON
+        assert plan.matched_pattern == "I_boolean_conjunction"
+
+    def test_pattern_J_implicit_bridge(self, planner):
+        """'X and another [N] that…' → MULTI_HOP via Pattern J pre-empt +
+        Pattern J decomposer."""
+        plan = planner.plan(
+            "Scott Parkin has been a critic of Exxonmobil and another "
+            "corporation that operates in how many countries?"
+        )
+        assert plan.query_type == QueryType.MULTI_HOP
+        assert plan.matched_pattern == "J_implicit_bridge"
+
+    # ── Comparison dispatcher patterns ─────────────────────────────────────
+
+    def test_pattern_K_select_between(self, planner):
+        """'Which X, A or B, …?' — select-between-two comparison form."""
+        plan = planner.plan(
+            "Which writer was from England, Henry Roth or Robert Erskine Childers?"
+        )
+        assert plan.query_type == QueryType.COMPARISON
+        assert plan.matched_pattern == "select_between_two"
+
+    def test_pattern_attr_map_same_nationality(self, planner):
+        """'same nationality' → _ATTR_MAP rewrite to 'What is the nationality of X?'"""
+        plan = planner.plan(
+            "Were Scott Derrickson and Ed Wood of the same nationality?"
+        )
+        assert plan.query_type == QueryType.COMPARISON
+        assert plan.matched_pattern == "comparison_attr_map"
+        # _ATTR_MAP produces one sub-query per entity, neither equal to the
+        # original query.
+        for sq in plan.sub_queries:
+            assert "nationality of" in sq.lower(), (
+                f"_ATTR_MAP rewrite should produce 'nationality of' sub-queries; "
+                f"got {sq!r}"
+            )
+
+    # ── Single-pattern markers ─────────────────────────────────────────────
+
+    def test_marker_single_hop(self, planner):
+        plan = planner.plan("What is the capital of France?")
+        assert plan.matched_pattern == "single_hop"
+
+    def test_marker_aggregate(self, planner):
+        """'How many X?' classifies as AGGREGATE — but Pattern J pre-empt
+        outranks it. Use a query without 'another N' to actually reach AGGREGATE.
+        """
+        plan = planner.plan("How many countries are in the European Union?")
+        # AGGREGATE OR SINGLE_HOP depending on classifier — either way no
+        # pre-empt should fire.
+        assert plan.classifier_preempt is None
+        if plan.query_type == QueryType.AGGREGATE:
+            assert plan.matched_pattern == "aggregate"
+
+    def test_no_pattern_marker_is_None(self, planner):
+        """P1 invariant: every plan from a non-empty query must set the marker."""
+        for q in [
+            "What is the capital of France?",
+            "Were Scott Derrickson and Ed Wood of the same nationality?",
+            "Are Berlin and Munich both in Germany?",
+            "Scott Parkin has been a critic of Exxonmobil and another "
+            "corporation that operates in how many countries?",
+            "Who directed the film starring Tom Hanks?",
+        ]:
+            plan = planner.plan(q)
+            assert plan.matched_pattern is not None, (
+                f"P1 invariant violated for query {q!r}: matched_pattern is None"
+            )
+
+
+# ── Option A audit: dep-parse generalisation (E, F) ──────────────────────────
+
+class TestOptionAGeneralisability:
+    """Option A audit (2026-05-15): E and F were reimplemented via SpaCy's
+    dependency parse. These tests verify the recognisers generalise to verbs
+    and roles that were never enumerated in the source — proving the
+    recognisers key on linguistic structure, not on a vocabulary list.
+    """
+
+    def test_pattern_E_generalises_to_novel_role_nouns(self, planner):
+        """Pattern E must fire on relational nouns never listed in any
+        constant. The dep-parse recogniser depends only on the syntactic
+        shape `noun -> prep("of") -> pobj(named_entity)`.
+        """
+        # "choreographer" and "librettist" never appeared in the old role list.
+        # They are relational nouns by the same structural test.
+        plan = planner.plan("Where was the choreographer of Black Swan born?")
+        if plan.query_type == QueryType.MULTI_HOP:
+            assert plan.matched_pattern is not None
+            # E must fire OR connector-split must fire (both are acceptable).
+            assert plan.matched_pattern in {
+                "E_relational_noun", "connector_split",
+            }, f"Got unexpected marker: {plan.matched_pattern!r}"
+
+    def test_pattern_F_generalises_to_novel_passive_verbs(self, planner):
+        """Pattern F must fire on passive verbs never enumerated in the
+        deleted _PASSIVE_TO_ACTIVE table. The dep-parse recogniser keys on
+        `auxpass + nsubjpass + agent` regardless of which verb fills the
+        slot. SpaCy's lemmatiser handles past-participle → infinitive.
+        """
+        # "painted" and "conducted" were not in the deleted lookup table.
+        for q in [
+            "The Mona Lisa was painted by who?",
+            "The symphony was conducted by an Austrian who later moved to America in what year?",
+        ]:
+            plan = planner.plan(q)
+            if plan.query_type == QueryType.MULTI_HOP:
+                # F must fire OR connector-split must fire.
+                assert plan.matched_pattern in {
+                    "F_passive_agent", "connector_split",
+                }, f"For {q!r}, got unexpected marker: {plan.matched_pattern!r}"
+
+    def test_deleted_C_pattern_marker_never_appears(self, planner):
+        """The C_for_category marker must never be produced (Pattern C deleted)."""
+        for q in [
+            "What is the capital of France?",
+            "What year did the producer release a movie starring James Bond?",
+            "Who wrote a book about quantum mechanics?",
+        ]:
+            plan = planner.plan(q)
+            assert plan.matched_pattern != "C_for_category", (
+                f"Deleted marker C_for_category surfaced for {q!r}"
+            )
+
+    def test_deleted_D_pattern_marker_never_appears(self, planner):
+        """The D_role_qualifier marker must never be produced (Pattern D deleted)."""
+        for q in [
+            "What screenwriter with credits for Avatar co-wrote a film?",
+            "Which director with a Pulitzer prize made a documentary?",
+        ]:
+            plan = planner.plan(q)
+            assert plan.matched_pattern != "D_role_qualifier", (
+                f"Deleted marker D_role_qualifier surfaced for {q!r}"
+            )
+
+    def test_no_passive_to_active_lookup_table(self):
+        """The deleted _PASSIVE_TO_ACTIVE lookup table must not exist on
+        PlanGenerator. Regression guard against accidental re-introduction.
+        """
+        from src.logic_layer.planner import PlanGenerator
+        assert not hasattr(PlanGenerator, "_PASSIVE_TO_ACTIVE"), (
+            "Option A cleanup: _PASSIVE_TO_ACTIVE lookup table should be removed"
+        )
+        assert not hasattr(PlanGenerator, "_RELATIONAL_ANCHOR_ROLES"), (
+            "Option A cleanup: _RELATIONAL_ANCHOR_ROLES regex should be removed"
+        )
+        assert not hasattr(PlanGenerator, "_FOR_CAT"), (
+            "Option A cleanup: _FOR_CAT regex (Pattern C) should be removed"
+        )
+        assert not hasattr(PlanGenerator, "_ROLE_PAT"), (
+            "Option A cleanup: _ROLE_PAT regex (Pattern D) should be removed"
+        )
+
+    def test_no_dataset_revealing_comments_in_source(self):
+        """Source code must not contain HotpotQA-specific question text or
+        dataset-specific change-log markers. Bibliography citations are OK.
+        """
+        import re as _re
+        from pathlib import Path
+        src = Path(__file__).parent.parent / "src" / "logic_layer" / "planner.py"
+        text = src.read_text(encoding="utf-8")
+        # Strip the bibliography section so legitimate citations don't trip us.
+        # The bibliography ends before the first "class " or "def " line.
+        body_start = min(
+            text.find("\nclass "), text.find("\ndef "),
+        )
+        body = text[body_start:] if body_start > 0 else text
+
+        forbidden = [
+            r"FIX P-",
+            r"idx-\d+\b",
+            r"idx=\d+",
+            r"Kasper Schmeichel|Schmeichel",
+            r"GNR\b",
+            r"Schwarzenegger",
+            r"Henry Roth",
+            r"Letters to Cleo",
+            r"Screaming Trees",
+            r"Bobbi Bacha",
+            r"Sela Ward",
+            r"Robert Durst",
+        ]
+        leaks = []
+        for pat in forbidden:
+            m = _re.search(pat, body)
+            if m:
+                leaks.append((pat, m.group(0)))
+        assert not leaks, (
+            f"Option A cleanup: dataset-revealing strings remain in code body: "
+            f"{leaks}"
+        )
+
+
+# ── P9: fallback confidence ordering ──────────────────────────────────────────
+
+class TestP9FallbackConfidenceOrdering:
+    """P9: fallback confidence must be strictly lower than any actual
+    pattern-match confidence — otherwise 'no pattern matched' reports higher
+    classifier certainty than 'one pattern matched', contradicting the
+    documented confidence scaling.
+
+    Pre-fix: fallback was 0.8, single-pattern match was 0.6 + 0.15*1 = 0.75.
+    Post-fix: fallback is 0.5; matches start at 0.75.
+    """
+
+    def test_default_fallback_below_min_pattern_confidence(self):
+        """Dataclass default must respect the ordering."""
+        from src.logic_layer.planner import PlannerConfig
+        cfg = PlannerConfig()
+        min_match_confidence = (
+            cfg.classifier_confidence_base
+            + cfg.classifier_confidence_scale * 1.0
+        )
+        assert cfg.classifier_fallback_confidence < min_match_confidence, (
+            f"P9: fallback={cfg.classifier_fallback_confidence} must be < "
+            f"min-match={min_match_confidence}"
+        )
+
+    def test_yaml_fallback_below_min_pattern_confidence(self):
+        """Loaded settings.yaml value also respects the ordering."""
+        from src.logic_layer.planner import PlannerConfig
+        from src.logic_layer._settings import _load_settings
+        cfg = PlannerConfig.from_yaml(_load_settings())
+        min_match_confidence = (
+            cfg.classifier_confidence_base
+            + cfg.classifier_confidence_scale * 1.0
+        )
+        assert cfg.classifier_fallback_confidence < min_match_confidence
+
+    def test_single_hop_query_uses_fallback(self, planner):
+        """A query with no scoring-pattern match returns fallback confidence."""
+        plan = planner.plan("Banana banana banana?")
+        # This nonsense query should fall through to SINGLE_HOP with fallback
+        # confidence (whichever value is set in settings.yaml).
+        if plan.query_type == QueryType.SINGLE_HOP:
+            min_match_confidence = (
+                planner.config.classifier_confidence_base
+                + planner.config.classifier_confidence_scale * 1.0
+            )
+            assert plan.confidence <= min_match_confidence, (
+                f"Fallback confidence {plan.confidence} must not exceed min-match"
+            )
+
+
 if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.WARNING)

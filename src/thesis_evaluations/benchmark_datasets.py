@@ -254,6 +254,12 @@ class EvalResult:
     planner_query_type: str = ""
     hop_count: int = 0
     n_entities: int = 0
+    # P1/P2-fix (2026-05-15): identifies which pattern produced the plan, and
+    # whether a classifier pre-empt fired. Surfaces in the per-question JSONL
+    # so the eval can compute per-pattern hit-rates and SF-F1 deltas without
+    # parsing debug logs. None when the field is unset (e.g. mocked tests).
+    matched_pattern: Optional[str] = None
+    classifier_preempt: Optional[str] = None
 
     # Verifier diagnostics
     verifier_iterations: int = 0
@@ -1232,14 +1238,23 @@ def _classify_llm_error(answer: str) -> Tuple[bool, str]:
     return True, "other"
 
 
-def _extract_planner_diagnostics(planner_result: Dict[str, Any]) -> Tuple[str, int, int]:
-    """(query_type, hop_count, n_entities) from PlannerResult.to_dict()."""
+def _extract_planner_diagnostics(
+    planner_result: Dict[str, Any],
+) -> Tuple[str, int, int, Optional[str], Optional[str]]:
+    """Extract (query_type, hop_count, n_entities, matched_pattern, classifier_preempt)
+    from PlannerResult.to_dict().
+
+    P1/P2-fix (2026-05-15): added matched_pattern and classifier_preempt to the
+    return tuple so per-question JSONL can be filtered/aggregated by pattern.
+    """
     if not isinstance(planner_result, dict):
-        return "", 0, 0
+        return "", 0, 0, None, None
     qt = planner_result.get("query_type", "") or ""
     hops = planner_result.get("hop_sequence", []) or []
     entities = planner_result.get("entities", []) or []
-    return qt, len(hops), len(entities)
+    matched_pattern = planner_result.get("matched_pattern")
+    classifier_preempt = planner_result.get("classifier_preempt")
+    return qt, len(hops), len(entities), matched_pattern, classifier_preempt
 
 
 def _extract_verifier_diagnostics(verifier_result: Dict[str, Any]) -> Tuple[int, bool, str]:
@@ -1324,8 +1339,12 @@ def evaluate_dataset(
                 pipeline_ok_llm_failed = bool(all_gold and llm_err)
 
                 # ── Planner / Verifier diagnostics ───────────────────────
-                p_qtype, hop_count, n_ents = _extract_planner_diagnostics(
-                    getattr(result, "planner_result", {}) or {}
+                # P1/P2-fix: pull matched_pattern + classifier_preempt for
+                # per-pattern aggregation downstream.
+                p_qtype, hop_count, n_ents, p_pattern, p_preempt = (
+                    _extract_planner_diagnostics(
+                        getattr(result, "planner_result", {}) or {}
+                    )
                 )
                 v_iters, v_verified, v_conf = _extract_verifier_diagnostics(
                     getattr(result, "verifier_result", {}) or {}
@@ -1354,6 +1373,8 @@ def evaluate_dataset(
                     planner_query_type=p_qtype,
                     hop_count=hop_count,
                     n_entities=n_ents,
+                    matched_pattern=p_pattern,
+                    classifier_preempt=p_preempt,
                     verifier_iterations=v_iters,
                     all_verified=v_verified,
                     confidence=v_conf,

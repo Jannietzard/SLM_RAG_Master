@@ -592,6 +592,13 @@ class KuzuGraphStore:
     # to share the same parent without confusing KuzuDB.
     KUZU_DIR_NAME = "graph_KuzuDB"
 
+    # I-3: retrieval-time hub-mention cap. Class attribute (not local constant)
+    # so the hybrid_retriever factory can override it from settings.yaml
+    # (`graph.hub_mention_cap`). Default 280 = 3% of 9412 HotpotQA chunks;
+    # matches the cleanup-time hub_threshold_ratio=0.03. Entities with more
+    # mentions than this are excluded as bridge targets.
+    HUB_MENTION_CAP: int = 280
+
     def __init__(self, db_path: Path) -> None:
         """
         Initialise KuzuDB graph store.
@@ -1413,24 +1420,10 @@ class KuzuGraphStore:
         # signal anyway, so we only ever expand from the first few matches.
         _HUB_FANOUT_CAP = 5
         # P-3 (publication-blocker): reject bridges through high-degree hub
-        # entities. "United States" is mentioned in 4404 chunks (47% of the
-        # corpus) and any graph traversal through it creates spurious
-        # cross-topic bridges. The cap is the same hub-threshold used at
-        # ingestion time (hub_threshold_ratio=0.03 × 9412 ≈ 280); entities
-        # with more mentions than this are treated as non-bridging hubs.
-        # The check happens at retrieval time so the underlying graph
-        # remains unchanged — this is reversible and tunable per query.
-        #
-        # Refs:
-        #   - Hub-suppression in graph IR: West & Leskovec (2012), WWW,
-        #     "Human Wayfinding in Information Networks" — high-degree nodes
-        #     are noisy bridges; users prune them.
-        #   - 3 % threshold derivation parallels TF-IDF's IDF cap (Salton &
-        #     Buckley, 1988, IPM 24(5)): a term/entity in >3 % of documents
-        #     loses discriminative power.
-        #   - GraphRAG (Edge et al., 2024, MSR, arXiv:2404.16130) drops high-
-        #     centrality nodes during community detection for the same reason.
-        _HUB_MENTION_CAP = 280
+        # entities. Read from the class attribute so the hybrid_retriever
+        # factory can override it from settings.yaml (`graph.hub_mention_cap`).
+        # See KuzuGraphStore.HUB_MENTION_CAP for the rationale and refs.
+        _HUB_MENTION_CAP = self.HUB_MENTION_CAP
 
         try:
             # Hop 0: direct MENTIONS — try name variants until we get a hit.
