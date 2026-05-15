@@ -947,3 +947,236 @@ def _redirect_entity_edges(graph_store, old_id: str, new_id: str) -> None:
             )
         except Exception as exc:
             logger.debug("redirect RELATED_TO in failed: %s", exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUBSUMPTIVE CO-OCCURRENCE CLEANUP
+# ─────────────────────────────────────────────────────────────────────────────
+# Background: build_cooccurrence_edges() writes a RELATED_TO{cooccurs} edge for
+# every entity pair sharing a chunk. Some of those pairs also have a SEMANTIC
+# RELATED_TO edge from REBEL/SVO. For those, the cooccurs edge is redundant
+# information (semantic relation entails co-occurrence) and dominates the graph
+# numerically (~8:1 cooccurs:semantic on HotpotQA). At retrieval time we
+# already down-weight cooccurs (§12.36), but it still pollutes:
+#   - the published edge count ("we have 300k edges" sounds impressive until
+#     reviewers learn 85% are cooccurs)
+#   - the visualisation
+#   - any future ablation that compares semantic-only vs full
+#
+# Subsumption rule: if entity-pair (a, b) has BOTH a semantic relation AND a
+# cooccurs edge in either direction, delete the cooccurs edges. The semantic
+# edge already encodes the relationship. Pairs with only cooccurs are kept
+# (they carry the only signal we have for that pair).
+#
+# Refs:
+#   - Galárraga et al. (2014) "Canonicalizing Open Knowledge Bases", CIKM:
+#     redundant edge canonicalisation in OpenIE graphs.
+#   - Knowledge Vault (Dong et al., 2014, KDD): edge-confidence subsumption
+#     when multiple extractors agree on a fact.
+
+def drop_subsumed_cooccurrence_edges(
+    graph_store,
+    cooccurs_relation_type: str = "cooccurs",
+    dry_run: bool = False,
+    batch_size: int = 2000,
+) -> int:
+    """
+    Delete cooccurs edges between pairs that also have a semantic edge.
+
+    Semantic = any relation_type other than `cooccurs_relation_type`.
+
+    Implementation note (KuzuDB): Kuzu does not support subquery EXISTS inside
+    DELETE, so we do this in two passes:
+      1. Materialise the set of (a_id, b_id) pairs that have BOTH a semantic
+         edge and a cooccurs edge (in either direction).
+      2. Delete cooccurs edges between those pairs in batches.
+
+    Args:
+        graph_store:           KuzuGraphStore-compatible.
+        cooccurs_relation_type: The relation_type value for the redundant
+                                edge family. Defaults to "cooccurs" (must
+                                match `build_cooccurrence_edges` argument).
+        dry_run:               If True, return the count of edges that
+                                WOULD be deleted; do not mutate.
+        batch_size:            Pairs per delete batch.
+
+    Returns:
+        Number of cooccurs edges deleted (or that would be deleted).
+    """
+    pairs: Set[Tuple[str, str]] = set()
+    for a_id, b_id in _fetch_all(
+        graph_store,
+        """
+        MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity)
+        WHERE r.relation_type IS NOT NULL
+          AND r.relation_type <> $cooccurs
+        RETURN DISTINCT a.entity_id, b.entity_id
+        """,
+        {"cooccurs": cooccurs_relation_type},
+    ):
+        # Canonical unordered pair so an A->B semantic edge subsumes a B->A
+        # cooccurs edge as well.
+        lo, hi = (a_id, b_id) if a_id <= b_id else (b_id, a_id)
+        pairs.add((lo, hi))
+
+    if not pairs:
+        logger.info("Subsumptive cooccurs cleanup: no semantic pairs found; nothing to do.")
+        return 0
+
+    # Find which of these pairs ALSO have a cooccurs edge (in either direction).
+    pairs_list = list(pairs)
+    to_delete: List[Tuple[str, str]] = []
+
+    # Kuzu does not handle IN over lists of TUPLES well — explode to per-row
+    # ANY-direction query and rely on the small selectivity of the semantic set.
+    for i in range(0, len(pairs_list), batch_size):
+        batch = pairs_list[i : i + batch_size]
+        # Flatten so a single Cypher pass can match both directions.
+        a_ids = [p[0] for p in batch]
+        b_ids = [p[1] for p in batch]
+        # Direction 1: a -> b
+        try:
+            result = graph_store.conn.execute(
+                """
+                MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity)
+                WHERE r.relation_type = $cooccurs
+                  AND a.entity_id IN $a_ids AND b.entity_id IN $b_ids
+                RETURN a.entity_id, b.entity_id
+                """,
+                {"cooccurs": cooccurs_relation_type, "a_ids": a_ids, "b_ids": b_ids},
+            )
+            while result.has_next():
+                row = tuple(result.get_next())
+                to_delete.append((row[0], row[1]))
+        except Exception as exc:
+            logger.debug("subsumed-pair lookup (forward) failed: %s", exc)
+        # Direction 2: b -> a
+        try:
+            result = graph_store.conn.execute(
+                """
+                MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity)
+                WHERE r.relation_type = $cooccurs
+                  AND a.entity_id IN $b_ids AND b.entity_id IN $a_ids
+                RETURN a.entity_id, b.entity_id
+                """,
+                {"cooccurs": cooccurs_relation_type, "a_ids": a_ids, "b_ids": b_ids},
+            )
+            while result.has_next():
+                row = tuple(result.get_next())
+                to_delete.append((row[0], row[1]))
+        except Exception as exc:
+            logger.debug("subsumed-pair lookup (reverse) failed: %s", exc)
+
+    if dry_run:
+        logger.info(
+            "Subsumptive cooccurs cleanup (dry-run): would delete %d cooccurs edges "
+            "across %d semantic pairs.",
+            len(to_delete), len(pairs),
+        )
+        return len(to_delete)
+
+    deleted = 0
+    for i in range(0, len(to_delete), batch_size):
+        batch = to_delete[i : i + batch_size]
+        a_ids = [p[0] for p in batch]
+        b_ids = [p[1] for p in batch]
+        try:
+            graph_store.conn.execute(
+                """
+                MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity)
+                WHERE r.relation_type = $cooccurs
+                  AND a.entity_id IN $a_ids AND b.entity_id IN $b_ids
+                DELETE r
+                """,
+                {"cooccurs": cooccurs_relation_type, "a_ids": a_ids, "b_ids": b_ids},
+            )
+            deleted += len(batch)
+        except Exception as exc:
+            logger.warning("subsumed-pair delete batch %d failed: %s", i // batch_size, exc)
+
+    logger.info(
+        "Subsumptive cooccurs cleanup: deleted %d redundant cooccurs edges "
+        "(semantic-pair count = %d).",
+        deleted, len(pairs),
+    )
+    return deleted
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ISOLATED-ENTITY DROP (post-linking)
+# ─────────────────────────────────────────────────────────────────────────────
+# Background: After Phase 3d.5 (`link_entities_by_embedding`), some Entity
+# nodes end up with MENTIONS edges but ZERO RELATED_TO edges in either
+# direction. They are reachable from chunks but contribute nothing to graph
+# traversal — every hop-1 / hop-2 / hop-3 search on them returns the empty
+# set. The §3e baseline reports `isolated_rate=27.5%`, which exceeds the 5%
+# invariant.
+#
+# Why does this happen?
+#   - The entity was never the subject or object of any REBEL/SVO triple.
+#   - All its co-occurrence partners were merged INTO this entity during 3d.5,
+#     so the edges that previously connected the cluster collapsed to self-
+#     loops and were filtered out.
+#   - GLiNER recall is wider than REBEL coverage; many extracted entities
+#     simply have no extracted relation in the corpus.
+#
+# Action: After 3d.5, remove entities with zero RELATED_TO edges. Their
+# chunks remain in the graph and are still retrievable via vector search;
+# only the dead leaf nodes are pruned. This DOES change retrieval (an
+# entity-driven path that previously hit the dead node now returns no
+# graph-supported chunk for that entity), but the alternative is to keep
+# 27% of the graph as dead weight.
+#
+# Refs:
+#   - HippoRAG (Gutiérrez et al., 2024, NeurIPS): degree-pruning of
+#     dangling entity nodes before PageRank.
+#   - GraphRAG (Edge et al., 2024, Microsoft): community filtering excludes
+#     singleton entities from cluster summaries.
+
+def drop_isolated_entities(
+    graph_store,
+    dry_run: bool = False,
+    delete_mentions: bool = True,
+) -> int:
+    """
+    Delete Entity nodes with zero RELATED_TO edges in either direction.
+
+    Args:
+        graph_store:      KuzuGraphStore-compatible.
+        dry_run:          Count operations without mutating the graph.
+        delete_mentions:  If True (default), also delete the MENTIONS edges
+                          that point at the isolated entity. Kuzu requires
+                          edges-before-node for a successful node delete.
+
+    Returns:
+        Number of entities deleted.
+    """
+    all_ids: Set[str] = {row[0] for row in _fetch_all(
+        graph_store, "MATCH (e:Entity) RETURN e.entity_id"
+    )}
+    if not all_ids:
+        return 0
+    connected: Set[str] = set()
+    for a, b in _fetch_all(
+        graph_store,
+        "MATCH (a:Entity)-[:RELATED_TO]->(b:Entity) RETURN a.entity_id, b.entity_id",
+    ):
+        connected.add(a)
+        connected.add(b)
+    isolated = all_ids - connected
+    if dry_run:
+        logger.info(
+            "Drop-isolated (dry-run): %d / %d entities have zero RELATED_TO edges.",
+            len(isolated), len(all_ids),
+        )
+        return len(isolated)
+    if not isolated:
+        logger.info("Drop-isolated: no isolated entities (rate=0%%).")
+        return 0
+    for eid in isolated:
+        _delete_entity_safely(graph_store, eid)
+    logger.info(
+        "Drop-isolated: removed %d entities with zero RELATED_TO edges (%.1f%% of total).",
+        len(isolated), 100.0 * len(isolated) / max(1, len(all_ids)),
+    )
+    return len(isolated)

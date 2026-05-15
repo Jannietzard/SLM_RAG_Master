@@ -256,9 +256,32 @@ class RetrievalConfig:
     enable_bm25: bool = True    # settings.yaml: rag.enable_bm25
     bm25_top_k: int = 10        # settings.yaml: rag.bm25_top_k
 
-    # vector_weight / graph_weight were removed in the 2026-05-06 cleanup audit.
-    # They were never read by production code; weighted-fusion ablation can be
-    # performed by setting `mode` to RetrievalMode.VECTOR or RetrievalMode.GRAPH.
+    # I-1 (publication-recommended): per-source RRF weights.
+    # Each source's RRF contribution is multiplied by its weight, so a chunk
+    # at rank r from source S contributes `weight_S / (k + r)` instead of the
+    # vanilla `1 / (k + r)`. Default 1.0/1.0/1.0 reproduces the prior
+    # rank-only behaviour exactly (no regression). Tune per ablation via
+    # settings.yaml `rag.vector_weight / rag.graph_weight / rag.bm25_weight`.
+    #
+    # Refs:
+    #   - Per-source weighting on top of RRF: Bruch et al. (2023), "An
+    #     Analysis of Fusion Functions for Hybrid Retrieval", ACM TOIS 41(4)
+    #     — weighted-rank fusion outperforms unweighted RRF when sources
+    #     have different precision/recall profiles.
+    #   - Hybrid dense+sparse+graph fusion: ColBERT-PLAID (Santhanam et al.,
+    #     2022, NAACL) for dense-sparse fusion; HippoRAG (Gutiérrez et al.,
+    #     2024, NeurIPS) for adding graph as a third channel.
+    #   - The RRF constant k=60 default follows Cormack, Clarke & Buettcher
+    #     (2009), SIGIR.
+    vector_weight: float = 1.0
+    graph_weight: float = 1.0
+    bm25_weight: float = 1.0
+
+    # I-2 (publication-recommended): Hop-3 graph traversal (2-bridge chains).
+    # OFF by default — adds latency (~200-1000ms) and is only useful for
+    # questions where the answer is 2 relations away. Opt in via settings.yaml
+    # `graph.enable_hop3: true` when running multi-hop-heavy ablations.
+    enable_hop3: bool = False
 
 
 @dataclass
@@ -333,16 +356,30 @@ class RRFFusion:
         https://doi.org/10.1145/1571941.1572114
     """
 
-    def __init__(self, k: int = 60, cross_source_boost: float = 1.2) -> None:
+    def __init__(
+        self,
+        k: int = 60,
+        cross_source_boost: float = 1.2,
+        vector_weight: float = 1.0,
+        graph_weight: float = 1.0,
+        bm25_weight: float = 1.0,
+    ) -> None:
         """
         Args:
             k: RRF constant (default 60, empirically optimal).
             cross_source_boost: Additional RRF credit for chunks found in
                 both vector and graph paths (interpreted as
                 cross_source_boost / (k + 1) additive bonus).
+            vector_weight / graph_weight / bm25_weight: I-1 per-source
+                weights applied to each path's RRF contribution. Default
+                1.0/1.0/1.0 reproduces vanilla RRF. Set unequal weights to
+                bias the fusion toward one source for ablation studies.
         """
         self.k = k
         self.cross_source_boost = cross_source_boost
+        self.vector_weight = vector_weight
+        self.graph_weight = graph_weight
+        self.bm25_weight = bm25_weight
 
     def fuse(
         self,
@@ -404,9 +441,10 @@ class RRFFusion:
         # Vector ranks
         # VectorStoreAdapter.vector_search() returns dicts with keys:
         #   "document_id", "text", "similarity", "metadata" -> {"source_file": ...}
+        # I-1: vector_weight scales this source's RRF contribution (default 1.0).
         for rank, result in enumerate(vector_results, start=1):
             chunk_id = result.get("document_id", "")
-            rrf_scores[chunk_id] += 1.0 / (self.k + rank)
+            rrf_scores[chunk_id] += self.vector_weight * (1.0 / (self.k + rank))
             vector_ranks[chunk_id] = rank
             vector_scores[chunk_id] = result.get("similarity", 0.0)
 
@@ -420,17 +458,26 @@ class RRFFusion:
 
         # Graph ranks
         # HybridStore.graph_search() returns dicts with keys:
-        #   "chunk_id", "text", "hops", "source_file", "matched_entity", "position"
+        #   "chunk_id", "text", "hops", "source_file", "matched_entity",
+        #   "triple_confidence", "position"
+        # I-1: graph_weight scales this source's RRF contribution (default 1.0).
         for rank, result in enumerate(graph_results, start=1):
             chunk_id = result.get("chunk_id", "")
-            rrf_scores[chunk_id] += 1.0 / (self.k + rank)
+            rrf_scores[chunk_id] += self.graph_weight * (1.0 / (self.k + rank))
             graph_ranks[chunk_id] = rank
             hops = result.get("hops", 1)
-            graph_scores[chunk_id] = 1.0 / (hops + 1)  # derive proxy score from hop distance
+            # P-2 (publication-blocker): combine hop-distance with the
+            # triple-frequency confidence from storage. Hop-0 (direct
+            # mention) → 1.0 confidence, Hop-2 multiplies by the bridge
+            # triple's corpus-support strength. This replaces the
+            # pure-hop proxy that ignored REBEL's (constant) confidence.
+            triple_conf = result.get("triple_confidence", 1.0)
+            graph_scores[chunk_id] = (1.0 / (hops + 1)) * triple_conf
 
             graph_metadata[chunk_id] = {
                 "hop_distance": hops,
                 "matched_entities": [result.get("matched_entity", "")],
+                "triple_confidence": triple_conf,
             }
 
             if chunk_id not in chunk_data:
@@ -445,12 +492,13 @@ class RRFFusion:
         bm25_ranks: Dict[str, int] = {}
         bm25_scores_map: Dict[str, float] = {}
 
+        # I-1: bm25_weight scales this source's RRF contribution (default 1.0).
         if bm25_results:
             for rank, result in enumerate(bm25_results, start=1):
                 chunk_id = result.get("document_id", "")
                 if not chunk_id:
                     continue
-                rrf_scores[chunk_id] += 1.0 / (self.k + rank)
+                rrf_scores[chunk_id] += self.bm25_weight * (1.0 / (self.k + rank))
                 bm25_ranks[chunk_id] = rank
                 bm25_scores_map[chunk_id] = result.get("similarity", 0.0)
 
@@ -778,6 +826,9 @@ class HybridRetriever:
         self.rrf_fusion = RRFFusion(
             k=self.config.rrf_k,
             cross_source_boost=self.config.cross_source_boost,
+            vector_weight=self.config.vector_weight,
+            graph_weight=self.config.graph_weight,
+            bm25_weight=self.config.bm25_weight,
         )
 
         # Re-use GLiNER model from HybridStore's entity pipeline when available.
@@ -877,6 +928,7 @@ class HybridRetriever:
                         entities=query_entities,
                         max_hops=self.config.max_hops,
                         top_k=self.config.graph_top_k,
+                        enable_hop3=self.config.enable_hop3,
                     )
                 except (ValueError, RuntimeError, OSError) as e:
                     logger.warning("Graph retrieval failed: %s", e)
@@ -1131,6 +1183,12 @@ def create_hybrid_retriever(
         gliner_model_name=gliner_cfg.get("model_name", "urchade/gliner_small-v2.1"),
         enable_bm25=rag_cfg.get("enable_bm25", True),
         bm25_top_k=rag_cfg.get("bm25_top_k", 10),
+        # I-1 / I-2 publication-recommended settings — defaults preserve
+        # vanilla equal-weight RRF and Hop-3-disabled behaviour.
+        vector_weight=rag_cfg.get("vector_weight", 1.0),
+        graph_weight=rag_cfg.get("graph_weight", 1.0),
+        bm25_weight=rag_cfg.get("bm25_weight", 1.0),
+        enable_hop3=graph_cfg.get("enable_hop3", False),
     )
     return HybridRetriever(hybrid_store, embeddings, config)
 

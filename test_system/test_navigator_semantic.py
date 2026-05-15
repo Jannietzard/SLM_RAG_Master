@@ -294,23 +294,36 @@ class TestEntityMentionFilter:
         return {"text": text, "rrf_score": score}
 
     def test_chunks_without_entity_dropped(self, nav):
-        """Chunk not mentioning 'Einstein' is removed when Einstein is the query entity."""
+        """Chunk not mentioning 'Einstein' is removed when Einstein is the query entity.
+
+        §12.33 added top-2 RRF immunity to prevent the filter from dropping
+        a high-ranked answer chunk when its entity happens to be an implicit
+        bridge target. This test now uses 3 chunks so the Paris distractor
+        is ranked #3 (outside the immunity window) and the filter still
+        drops it.
+        """
         results = [
-            self._r("Albert Einstein was born in Ulm."),
-            self._r("Paris is the capital of France."),
+            self._r("Albert Einstein was born in Ulm.", score=0.9),
+            self._r("Albert Einstein worked at ETH Zürich.", score=0.8),
+            self._r("Paris is the capital of France.", score=0.4),
         ]
         filtered = nav._entity_mention_filter(results, ["Einstein"])
         assert all("einstein" in r["text"].lower() for r in filtered)
 
     def test_multi_word_entity_full_phrase_match(self, nav):
-        """Multi-word entity 'Ed Wood' matched by full-phrase lookup."""
+        """Multi-word entity 'Ed Wood' matched by full-phrase lookup.
+
+        §12.33: 3 chunks so the Tim Burton distractor is at index 2,
+        outside the top-2 RRF-immunity window.
+        """
         results = [
-            self._r("Ed Wood directed Plan 9 from Outer Space."),
-            self._r("Tim Burton produced several quirky films."),
+            self._r("Ed Wood directed Plan 9 from Outer Space.", score=0.9),
+            self._r("Ed Wood made several B-movies.", score=0.7),
+            self._r("Tim Burton produced several quirky films.", score=0.4),
         ]
         filtered = nav._entity_mention_filter(results, ["Ed Wood"])
-        assert len(filtered) == 1
-        assert "Ed Wood" in filtered[0]["text"]
+        assert all("Ed Wood" in r["text"] for r in filtered)
+        assert not any("Tim Burton" in r["text"] for r in filtered)
 
     def test_short_single_token_entity_skipped(self, nav):
         """Single token shorter than 5 chars ('Were') is not checked as entity."""
@@ -415,10 +428,15 @@ class TestNavigateFull:
         assert isinstance(result.metadata, dict)
 
     def test_navigate_entity_mention_filter_active(self, nav):
-        """Chunks not mentioning the query entity are filtered out."""
+        """Chunks not mentioning the query entity are filtered out.
+
+        §12.33: 3+ chunks needed so the Paris distractor sits outside the
+        top-2 RRF-immunity window and is correctly dropped.
+        """
         nav.set_retriever(self._MockRetriever([
             self._MockResult("Albert Einstein was born in Ulm.", 0.9),
-            self._MockResult("Paris is a city in France, known for the Eiffel Tower.", 0.7),
+            self._MockResult("Albert Einstein later moved to Princeton.", 0.8),
+            self._MockResult("Paris is a city in France, known for the Eiffel Tower.", 0.4),
         ]))
         result = nav.navigate(
             retrieval_plan=None,

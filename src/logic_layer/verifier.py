@@ -1455,45 +1455,77 @@ Please provide a partial answer based on the available evidence, clearly indicat
         entities: List[str],
         bridge_entities: List[str],
         hop_sequence: Optional[List[Dict[str, Any]]],
+        context: Optional[List[str]] = None,
     ) -> str:
         """
         Build a human-readable reasoning scaffold for multi-hop prompts.
 
-        Uses the hop_sequence sub-queries when available; falls back to a
-        generic "Step 1 → Step 2" description using entity names.
-
-        Example output:
-            Step 1: Find where 122nd SS-Standarte was formed → Strasbourg
-            Step 2: Find the inhabitants of Strasbourg in 2014 → answer needed
+        Safety guarantees (§12.32):
+        1. Never emits a literal sentinel like "THIS IS THE ANSWER" — small
+           quantized models echo such strings verbatim. The final step uses
+           a directive verb ("→ derive the final answer") instead.
+        2. Only injects a bridge entity into a hop's substitution if the
+           entity is actually present in the retrieved context. Prevents
+           propagation of spurious/distractor bridge entities into the
+           reasoning chain (e.g. "New York" appearing because the gold
+           chunk had a tangential clause about Robert Durst).
+        3. If no bridge entity passes the grounding check, the hop is
+           rendered as a directive ("→ identify the intermediate result")
+           rather than left blank or pre-filled with a wrong value.
         """
         lines: List[str] = []
+        # Lowercased context for cheap substring grounding-check.
+        context_blob = " ".join(context or []).lower()
+
+        def _grounded(entity: str) -> bool:
+            """Entity is grounded if it appears in the retrieved context.
+
+            Empty context → trust the upstream extractor (cannot ground-
+            check, but emitting nothing is worse than emitting unverified)."""
+            if not context_blob:
+                return True
+            return entity.lower() in context_blob
 
         if hop_sequence:
             hops = sorted(hop_sequence, key=lambda h: h.get("step_id", 0))
             last_step_id = max(h.get("step_id", 0) for h in hops)
+            # Filter bridge entities to those actually grounded in context.
+            # Preserves order; first grounded entity goes to first bridge hop.
+            grounded_bridges = [e for e in bridge_entities if _grounded(e)]
             bridge_idx = 0
             for hop in hops:
                 step = hop.get("step_id", 0) + 1
                 sub_q = hop.get("sub_query", "")
                 is_bridge = hop.get("is_bridge", False)
                 is_last = hop.get("step_id", 0) == last_step_id
-                if is_bridge and bridge_idx < len(bridge_entities):
+                if is_last:
+                    # Directive verb form — NOT a literal placeholder string
+                    # the LLM could mistake for an answer.
                     lines.append(
-                        "Step %d: %s → %s" % (step, sub_q, bridge_entities[bridge_idx])
+                        "Step %d: %s → derive the final answer" % (step, sub_q)
+                    )
+                elif is_bridge and bridge_idx < len(grounded_bridges):
+                    lines.append(
+                        "Step %d: %s → %s" % (step, sub_q, grounded_bridges[bridge_idx])
                     )
                     bridge_idx += 1
-                elif is_last:
-                    lines.append("Step %d: %s → THIS IS THE ANSWER" % (step, sub_q))
                 else:
-                    lines.append("Step %d: %s → (intermediate result)" % (step, sub_q))
+                    # Bridge entity unavailable or not grounded — leave
+                    # the resolution open instead of pre-filling a wrong value.
+                    lines.append(
+                        "Step %d: %s → identify the intermediate result"
+                        % (step, sub_q)
+                    )
         else:
-            # Fallback: generic chain from entity names + bridge entities
+            # Fallback: generic chain from entity names + (grounded) bridges.
+            grounded_bridges = [e for e in bridge_entities if _grounded(e)]
             anchor = entities[0] if entities else "the subject"
-            for i, bridge in enumerate(bridge_entities, start=1):
+            for i, bridge in enumerate(grounded_bridges, start=1):
                 lines.append("Step %d: find information about %s → %s" % (i, anchor, bridge))
                 anchor = bridge
             lines.append(
-                "Step %d: find the final answer about %s" % (len(bridge_entities) + 1, anchor)
+                "Step %d: derive the final answer about %s"
+                % (len(grounded_bridges) + 1, anchor)
             )
 
         return "\n".join(lines)
@@ -1628,7 +1660,8 @@ Please provide a partial answer based on the available evidence, clearly indicat
                     )
                 elif query_type in ("multi_hop", "bridge") and hop_sequence:
                     bridge_chain = self._build_bridge_chain(
-                        query, entities or [], bridge_entities or [], hop_sequence
+                        query, entities or [], bridge_entities or [],
+                        hop_sequence, context=context,
                     )
                     prompt = self.BRIDGE_PROMPT.format(
                         bridge_chain=bridge_chain,

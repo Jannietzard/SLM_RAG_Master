@@ -404,6 +404,115 @@ class AgentPipeline:
             )
             logger.info("Verifier (S_V) lazy-initialised")
 
+    def _iterative_navigate(self, plan: Any, original_query: str) -> Any:
+        """
+        §12.37: iterative multi-hop navigation with bridge-entity propagation.
+
+        Executes each hop sequentially:
+          1. Run Navigator.navigate() for the hop's sub-query.
+          2. Extract bridge entities from the retrieved chunks (via
+             AgenticController._extract_bridge_entities — relevance-ranked,
+             query-aware).
+          3. Rewrite the NEXT hop's sub-query by appending the resolved
+             bridges (via _rewrite_hop_query_with_bridges).
+          4. Accumulate raw_context + filtered_context across all hops.
+
+        Returns a merged NavigatorResult.
+
+        Refs:
+          - IRCoT (Trivedi et al., 2023, ACL, arXiv:2212.10509): iterative
+            retrieval-with-reasoning, feeds back retrieved entities.
+          - HippoRAG (Gutiérrez et al., 2024, NeurIPS): personalized-PageRank
+            seeding from hop-1.
+        """
+        from ..logic_layer.controller import AgenticController
+        from ..logic_layer.navigator import NavigatorResult
+
+        # Sort hops by step_id so dependencies resolve in order.
+        hops = sorted(
+            plan.hop_sequence, key=lambda h: h.step_id
+        )
+
+        # Initial entity hints come from the planner's NER pass.
+        initial_entities = [e.text for e in (plan.entities or [])]
+        current_hints: List[str] = list(initial_entities)
+        resolved_bridges: List[str] = []
+
+        accumulated_raw: List[str] = []
+        accumulated_filtered: List[str] = []
+        seen_raw: set = set()
+        seen_filtered: set = set()
+        merged_scores: List[float] = []
+        merged_metadata: Dict[str, Any] = {}
+        last_result: Optional[NavigatorResult] = None
+
+        for hop in hops:
+            sub_query = hop.sub_query
+
+            # §12.37 Fix F: inject resolved bridge entities into this hop's
+            # sub_query before retrieval. Only fires when the hop depends
+            # on earlier bridges AND those bridges weren't already in the
+            # planner-generated sub_query.
+            if resolved_bridges and hop.depends_on:
+                sub_query = AgenticController._rewrite_hop_query_with_bridges(
+                    sub_query, resolved_bridges
+                )
+
+            try:
+                nav_result = self.navigator.navigate(
+                    retrieval_plan=plan,
+                    sub_queries=[sub_query],
+                    entity_names=current_hints,
+                )
+            except Exception as exc:
+                logger.warning("[AgentPipeline iterative] hop %d failed: %s",
+                               hop.step_id, exc)
+                continue
+
+            last_result = nav_result
+
+            for chunk in nav_result.raw_context:
+                if chunk not in seen_raw:
+                    accumulated_raw.append(chunk)
+                    seen_raw.add(chunk)
+            for chunk, score in zip(nav_result.filtered_context,
+                                     nav_result.scores or [0.0] * len(nav_result.filtered_context)):
+                if chunk not in seen_filtered:
+                    accumulated_filtered.append(chunk)
+                    seen_filtered.add(chunk)
+                    merged_scores.append(score)
+
+            # After a bridge hop: extract bridges and remember them.
+            if hop.is_bridge and nav_result.filtered_context:
+                bridges = AgenticController._extract_bridge_entities(
+                    nav_result.filtered_context,
+                    exclude=current_hints,
+                    query=original_query,
+                )
+                if bridges:
+                    logger.info(
+                        "[AgentPipeline iterative] hop %d bridges: %s",
+                        hop.step_id, bridges,
+                    )
+                    current_hints = current_hints + bridges
+                    resolved_bridges = resolved_bridges + bridges
+
+        if last_result is None:
+            return NavigatorResult(
+                filtered_context=[], raw_context=[], scores=[], metadata={},
+            )
+
+        return NavigatorResult(
+            filtered_context=accumulated_filtered,
+            raw_context=accumulated_raw,
+            scores=merged_scores,
+            metadata={
+                **(last_result.metadata or {}),
+                "iterative_hops": len(hops),
+                "resolved_bridges": resolved_bridges,
+            },
+        )
+
     def process(self, query: str) -> PipelineResult:
         """
         Process a single query through the full S_P → S_N → S_V pipeline.
@@ -500,8 +609,33 @@ class AgentPipeline:
                     "as single sub-query."
                 )
 
+            # §12.37: route through iterative multi-hop when the plan has
+            # dependent steps. Previously AgentPipeline ran ALL sub-queries
+            # in parallel via a single Navigator.navigate() call, which meant
+            # the Hop-2 sub-query never received the bridge entity resolved in
+            # Hop-1 — this is the dominant retrieval-failure mode for bridge
+            # questions (29% gold-recall in the 20-question retrieval-only
+            # baseline). The iterative path delegates to AgenticController so
+            # the bridge-entity propagation logic (Fix F query rewriting) and
+            # Navigator entity-hints filter both fire.
+            #
+            # Refs:
+            #   - IRCoT iterative retrieval-with-reasoning: Trivedi et al.
+            #     (2023), ACL, arXiv:2212.10509.
+            #   - HippoRAG bridge-aware multi-hop: Gutiérrez et al. (2024),
+            #     NeurIPS, arXiv:2405.14831.
+            has_bridge_deps = (
+                self.enable_planner
+                and plan.hop_sequence
+                and len(plan.hop_sequence) > 1
+                and any(h.depends_on for h in plan.hop_sequence)
+            )
+
             navigator_start = time.time()
-            nav_result = self.navigator.navigate(plan, sub_queries)
+            if has_bridge_deps:
+                nav_result = self._iterative_navigate(plan, query)
+            else:
+                nav_result = self.navigator.navigate(plan, sub_queries)
             navigator_time = (time.time() - navigator_start) * 1000
 
             # asdict() performs a deep copy and recursively converts nested

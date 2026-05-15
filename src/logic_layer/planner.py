@@ -473,6 +473,20 @@ class QueryClassifier:
         r"^\s*(which|what|who|whom)\b.{0,120}?\b(was|is|were|are|did|had|has|came|come)\b[^,?]*\bfirst\b",  # "Which ... was published first..."
         r"\b(more|fewer|less|most|fewest)\s+\w+\b.{0,60}\bor\b",   # "had more members ... or ..."
         r"\bor\b.{0,60}\b(more|fewer|less|most|fewest)\s+\w+\b",   # "...or...had more members"
+        # Pattern K (§12.33): shared-attribute parallel comparison.
+        # "What nationality were social anthropologists Alfred Gell and Edmund Leach?"
+        # "What countries are X and Y from?"
+        # "When were X and Y born?"
+        # Signature: an interrogative word + a plural copula/aux that takes
+        # multiple subjects + an "X and Y" coordination of two NER-like
+        # capitalised phrases. The answer is a SHARED attribute, so each
+        # entity needs its own bio retrieved in parallel — exactly what
+        # _decompose_comparison does. Without this pattern the query falls
+        # through to _decompose_multi_hop and emits a chained bridge from
+        # only one entity, missing the second gold paragraph.
+        r"^\s*(what|which|where|when|who|how)\b[^?]{0,80}?\b(are|were|do|did|have|has)\b"
+        r"[^?]{0,80}?\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\s+and\s+"
+        r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b",
     )
 
     # Temporal indicators: time references and temporal structures
@@ -1505,40 +1519,94 @@ class PlanGenerator:
     def _find_relative_clause_bridge(
         self,
         query: str,
-    ) -> Optional[Tuple[str, str]]:
+    ) -> Optional[Tuple[str, str, str]]:
         """
-        Detect "The [noun] in which [Entity] [predicate]..." queries using
-        SpaCy's dependency parse and return (noun, entity_text), or None.
+        Detect bridge queries with a relative-clause structure using SpaCy's
+        dependency parse and return (role_noun, anchor_entity), or None.
 
-        Works by finding a token whose dependency label is 'relcl' (relative
-        clause) that modifies a subject noun.  The subject of the relative
-        clause is the bridging entity; the head noun is the bridging category.
+        Two structural forms are supported:
 
-        No verb list is needed — the structural signal (relcl dep label) is
-        sufficient for any verb the language model might produce.
+        Form 1 — Anchor-inside-clause:
+            "The [noun] in which [Entity] [predicate]..."
+            → role_noun = head of relcl (subject noun),
+              anchor   = subject of relcl
+
+        Form 2 — Anchor-as-clause-object (§12.33 extension, Pattern L):
+            "...the [King|actress|author] who [made|directed|wrote] [Entity]..."
+            → role_noun = head of relcl (attr/dobj head),
+              anchor   = NER entity inside the relcl subtree
+            When the relcl subject is a relative pronoun (who/that/which),
+            the actual bridge anchor is the NER entity in the predicate.
+
+        Form 2 covers "In which year was the King who made the 1925 Birthday
+        Honours born?" — Pattern G v1 rejected it because `King.dep_ == "attr"`
+        and because the relcl subject was the pronoun "who", not a named entity.
+
+        No verb list is needed — the structural signal (relcl dep label +
+        an NER entity reachable from the relcl) is sufficient for any verb
+        the language model might produce.
         """
         if not SPACY_AVAILABLE or NLP is None:
             return None
+        # Relative-pronoun set: when the relcl subject is one of these, the
+        # real anchor sits inside the predicate as an object/oblique NP.
+        _REL_PRONOUNS = {"who", "whom", "which", "that"}
         try:
             doc = NLP(query)
             for token in doc:
-                if token.dep_ == "relcl":
-                    head = token.head
-                    if head.dep_ in ("nsubj", "nsubjpass", "ROOT"):
-                        # Subject of the relative clause = bridging entity
-                        rel_subjects = [
-                            c for c in token.children if c.dep_ == "nsubj"
-                        ]
-                        if rel_subjects:
-                            # Expand to the full noun phrase of the subject
-                            subj_span = rel_subjects[0]
-                            entity_text = " ".join(
-                                t.text for t in subj_span.subtree
-                                if not t.is_punct
-                            ).strip()
-                            noun_text = head.text
-                            if entity_text and noun_text:
-                                return noun_text, entity_text
+                if token.dep_ != "relcl":
+                    continue
+                head = token.head
+                # Accept attr (predicate-nominal: "X was the King who...")
+                # in addition to nsubj/nsubjpass/ROOT.
+                if head.dep_ not in ("nsubj", "nsubjpass", "ROOT", "attr"):
+                    continue
+
+                # ── Form 1: relcl subject is a real NP (not a pronoun) ──
+                rel_subjects = [
+                    c for c in token.children if c.dep_ == "nsubj"
+                ]
+                if rel_subjects:
+                    subj_tok = rel_subjects[0]
+                    if subj_tok.text.lower() not in _REL_PRONOUNS:
+                        entity_text = " ".join(
+                            t.text for t in subj_tok.subtree
+                            if not t.is_punct
+                        ).strip()
+                        noun_text = head.text
+                        if entity_text and noun_text:
+                            return noun_text, entity_text, "form1"
+
+                # ── Form 2 (Pattern L): relcl subject is a relative pronoun;
+                # anchor is the NER entity inside the relcl subtree. ──────
+                # We need entities that sit INSIDE the relative clause
+                # (so we can use them as graph-search anchors), not the
+                # head NP itself. The head's `subtree` INCLUDES the relcl,
+                # so we cannot use `head.subtree` as the exclusion set —
+                # it would mask the entire relcl. Instead, restrict to
+                # tokens whose ancestor chain passes through the relcl
+                # token but NOT directly through the head as a noun-phrase
+                # modifier (det/compound/amod).
+                relcl_token_indices = {t.i for t in token.subtree}
+                # Tokens that are part of the head's OWN noun phrase (det,
+                # compound, amod, nmod attached directly to head). These
+                # must be excluded — they belong to the role NP, not the
+                # anchor inside the relcl predicate.
+                head_np_indices = {head.i}
+                for child in head.children:
+                    if child.dep_ in ("det", "compound", "amod", "nmod", "poss"):
+                        head_np_indices.update(t.i for t in child.subtree)
+                candidate_ents = [
+                    ent for ent in doc.ents
+                    if any(t.i in relcl_token_indices for t in ent)
+                    and not any(t.i in head_np_indices for t in ent)
+                ]
+                if candidate_ents:
+                    # Longest entity span = most specific anchor.
+                    anchor = max(candidate_ents, key=lambda e: len(e.text))
+                    noun_text = head.text
+                    if anchor.text and noun_text:
+                        return noun_text, anchor.text, "form2"
         except Exception as exc:
             logger.debug("_find_relative_clause_bridge failed: %s", exc)
         return None
@@ -1862,14 +1930,23 @@ class PlanGenerator:
             return self._decompose_implicit_bridge(query, imb, entities)
 
         # ── Pattern G: Relative-clause bridge (SpaCy dependency parse) ───────
-        # Detects "The [noun] in which [Entity] [predicate] [main question]?"
-        # using structural grammar (relcl dep label) — no verb list needed.
+        # Form 1: "The [noun] in which [Entity] [predicate] [main question]?"
+        # Form 2 (Pattern L, §12.33): "...the [King|actress|author] who [verb] [Entity]..."
+        # Uses structural grammar (relcl dep label) — no verb list needed.
         # Must run BEFORE the generic split because the split-on-"which" would
         # otherwise destroy the grammatical structure of the query.
         rc = self._find_relative_clause_bridge(query)
         if rc:
-            noun, entity_text = rc
-            bridge_q = f"In which {noun} did {entity_text}?"
+            noun, entity_text, form = rc
+            if form == "form2":
+                # Form 2: the bridge entity is the unknown role-NP; the anchor
+                # is the NER entity inside the relative clause. The bridge
+                # sub-query asks "which {role} is associated with {anchor}"
+                # so retrieval pulls the anchor's article (which names the role).
+                bridge_q = f"Who is the {noun} associated with {entity_text}?"
+            else:
+                # Form 1 (original): the entity is the subject of the relcl.
+                bridge_q = f"In which {noun} did {entity_text}?"
             hop_sequence = [
                 HopStep(
                     step_id=0,
@@ -1887,7 +1964,7 @@ class PlanGenerator:
                 ),
             ]
             logger.debug(
-                "_decompose_multi_hop: Pattern G relative-clause → %r", bridge_q[:60]
+                "_decompose_multi_hop: Pattern G (%s) → %r", form, bridge_q[:60]
             )
             return hop_sequence, [bridge_q, query]
 
@@ -1916,6 +1993,37 @@ class PlanGenerator:
                 split_result = re.split(pattern, part, maxsplit=1, flags=re.IGNORECASE)
                 new_parts.extend(split_result)
             parts = [p.strip() for p in new_parts if p.strip() and len(p.strip()) > 5]
+
+        # ── 2-hop cap (§12.32 Fix 1) ──────────────────────────────────────────
+        # Repeated splitting on different connectors can produce 3+ parts from
+        # a single relative clause:
+        #   "What is the middle name of the actress who plays X in Y?"
+        #   → ["middle name", "actress", "plays X in Y"]   (3 parts → 3 hops)
+        # But semantically this is still a 2-hop bridge: resolve the actress,
+        # then answer the attribute. The middle parts ("actress") become
+        # nonsensical sub-queries ("What is actress?") that retrieve random
+        # actresses as distractors and propagate spurious bridge entities.
+        #
+        # Heuristic: keep the first part (final attribute) and the last part
+        # (bridge resolver), drop everything in between. The dropped fragments
+        # carry no named entity — they were just clause connectors picked up by
+        # the over-eager split.
+        #
+        # The cap is conservative: it only collapses when the middle parts have
+        # NO named entity. If any middle part has an entity, we keep all parts
+        # so genuine 3-hop chains (Pattern H attribution) survive.
+        if len(parts) > 2:
+            middle_has_entity = any(
+                any(e.text.lower() in mid.lower() for e in entities)
+                for mid in parts[1:-1]
+            )
+            if not middle_has_entity:
+                logger.debug(
+                    "_decompose_multi_hop: collapsing %d-part split → 2-hop "
+                    "(no entity in middle parts: %r)",
+                    len(parts), parts[1:-1],
+                )
+                parts = [parts[0], parts[-1]]
 
         # ── Pattern C: "for a/an/the [category] [description]" ──────────────────
         # See class-level _FOR_CAT for full rationale.

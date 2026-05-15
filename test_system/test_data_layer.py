@@ -415,6 +415,54 @@ class TestKuzuGraphStore:
             "1-hop related chunk mh_c2 must be found via Einstein→Curie RELATED_TO edge"
         )
 
+    def test_max_hops_one_disables_bridge_expansion(self, temp_dir: Path) -> None:
+        """max_hops=1 must return only direct mentions, no bridge chunks.
+
+        Validates that the max_hops parameter on find_chunks_by_entity_multihop
+        actually gates the hop-2 traversal — needed for the graph-only ablation
+        that isolates the bridge-expansion contribution.
+        """
+        from src.data_layer.storage import KuzuGraphStore
+
+        db_path = temp_dir / "graph_maxhops"
+        store = KuzuGraphStore(db_path)
+
+        store.add_document_chunk("mh1_direct", "Einstein paper", 1, 0, "p.txt")
+        store.add_document_chunk("mh1_bridge", "Curie biography", 1, 0, "b.txt")
+        store.add_entity("e_einstein", "Einstein", entity_type="person", confidence=0.9)
+        store.add_entity("e_curie", "Curie", entity_type="person", confidence=0.9)
+        store.add_mentions_relation("mh1_direct", "e_einstein")
+        store.add_mentions_relation("mh1_bridge", "e_curie")
+        store.add_related_to_relation("e_einstein", "e_curie", relation_type="colleague")
+
+        # max_hops=1: only the direct mention chunk should come back.
+        results = store.find_chunks_by_entity_multihop("Einstein", max_results=10, max_hops=1)
+        chunk_ids = {r["chunk_id"] for r in results}
+        assert "mh1_direct" in chunk_ids
+        assert "mh1_bridge" not in chunk_ids, (
+            "max_hops=1 must not include bridge-expansion (hop-2) chunks"
+        )
+
+    def test_classified_weight_origin_discrimination(self) -> None:
+        """_classified_weight must rank REBEL > SVO > cooccurs by relation_type shape.
+
+        - "cooccurs" (literal sentinel)          -> 0.25
+        - "date_of_birth" (REBEL, underscored)   -> 1.0
+        - "place of birth" (REBEL, whitespaced)  -> 1.0
+        - "direct" (SVO, single verb lemma)      -> 0.6
+        - "" / None                              -> 1.0 (default, never down-rank unknown)
+        """
+        from src.data_layer.storage import KuzuGraphStore
+
+        # _classified_weight is a classmethod — no instance needed.
+        assert KuzuGraphStore._classified_weight("cooccurs") == 0.25
+        assert KuzuGraphStore._classified_weight("date_of_birth") == 1.0
+        assert KuzuGraphStore._classified_weight("place of birth") == 1.0
+        assert KuzuGraphStore._classified_weight("direct") == 0.6
+        assert KuzuGraphStore._classified_weight("win") == 0.6
+        assert KuzuGraphStore._classified_weight(None) == 1.0
+        assert KuzuGraphStore._classified_weight("") == 1.0
+
 
 class TestHybridStore:
     """Tests for the combined Vector + Graph store facade."""

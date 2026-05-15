@@ -28,48 +28,56 @@ import urllib.request
 import urllib.error
 
 # ── The exact prompt from the failing trace ────────────────────────────────
-PROMPT = """You are a factual QA assistant. Answer based ONLY on the context below.
+PROMPT = """  You are a factual QA assistant. Answer based ONLY on the context below.
+  
+  This is a multi-step question. Use the following reasoning chain to find the answer:
+  Step 1: Netherlands wear during Oranjegekte or to celebrate the national holiday
+  Koningsdag? → Orange-Nassau
+  Step 2: What color clothing do people? → THIS IS THE ANSWER
   
   Rules:
-  - Give the shortest possible answer: a name, place, date, or yes/no.
+  - Give the shortest possible answer: a name, place, date, number, or yes/no.
   - Do NOT explain or add sentences beyond the direct answer.
-  - If the answer is a person, place, or thing: reply with just that name.
-  - If the answer is yes/no: reply with just "yes" or "no".
+  - If the answer is a number or statistic (e.g. population, count, year): reply with
+  just the number.
   - If the context does not contain the answer: reply with "I don't know."
   
   Context:
-  [1] The 122nd SS-Standarte was a regimental command of the Allgemeine-SS that was
-  formed in the city of Strasbourg during World War II. The Standarte was activated on
-  November 12, 1940, and reached battalion strength by the end of the year. The command
-  was a successor to the previously disbanded 121st SS-Standarte, also situated in
-  Strasbourg.
+  [1] Oranjegekte (Orange craze) or Oranjekoorts (Orange fever) is a phenomenon in the
+  Netherlands that occurs during major sporting events, especially international
+  football championships, and during Koningsdag, an annual holiday celebrating the
+  king's birthday. It manifests itself in the wearing of orange clothing such as
+  T-shirts, caps and scarfs; lavish attention for sports and sports fans in the media;
+  and the decoration of cars, rooms, houses, shops, and even entire streets in orange,
+  the traditional color of the Dutch royal family, the House of Orange-Nassau.
   
-  [2] The 122nd Division (第122師団 , Dai-hyakunijūni Shidan ) was an infantry division of
-  the Imperial Japanese Army. Its call sign was the Maizuru Division (舞鶴兵団 , Maizuru
-  Heidan ) . It was formed 16 January in Mudanjiang as a triangular division.
+  [2] Koningsdag (] ) or King's Day is a national holiday in the Kingdom of the
+  Netherlands. Celebrated on 27 April (26 April if the 27th is a Sunday), the date marks
+  the birth of King Willem-Alexander.
   
-  [3] Strasbourg ( , ] ; Alsatian: "Strossburi"; German: "Straßburg" ] ) is the capital
-  and largest city of the Grand Est region of France and is the official seat of the
-  European Parliament. Located close to the border with Germany in the historic region
-  of Alsace, it is the capital of the Bas-Rhin département. In 2014, the city proper had
-  276,170 inhabitants and both the Eurométropole de Strasbourg (Greater Strasbourg) and
-  the Arrondissement of Strasbourg had 484,157 inhabitants.
+  [3] The casera outfits are normally dark blue, but can come in many colors. They wear
+  caseras because that is what the people of the mountain wear and the holiday used to
+  celebrate the peasants who sold their goods in town and came on Santo Tomas to pay
+  rent to landlords in the city.
   
-  [4] In zoology, an inquiline (from Latin "inquilinus", "lodger" or "tenant") is an
-  animal that lives commensally in the nest, burrow, or dwelling place of an animal of
-  another species. For example, some organisms such as insects may live in the homes of
-  gophers and feed on debris, fungi, roots, etc. The most widely distributed types of
-  inquiline are those found in association with the nests of social insects, especially
-  ants and termites – a single colony may support dozens of different inquiline species.
+  [4] Queen's Day or "Koninginnedag" is the former name of a national holiday in the
+  Netherlands, the Netherlands Antilles and Aruba from 1890 to 2013. It has since been
+  renamed King's Day or "Koningsdag" to honor the birthday of King Willem-Alexander.
   
-  Question: What is the inhabitant of the city where  122nd SS-Standarte was formed
-  in2014
+  [5] It was recognized as a public holiday in the southern districts of Belize in 1943,
+  and declared a national holiday in 1977. The holiday celebrates the settlement of the
+  Garifuna people in Belize after being exiled from the Grenadines by the British army.
+  The major festivities for the holiday occur in the town of Dangriga, including
+  parades, street music, and traditional dancing.
+  
+  Question: What color clothing do people of the Netherlands wear during Oranjegekte or
+  to celebrate the national holiday Koningsdag?
   
   Answer (as short as possible):"""
 
-# Testet: idx: 63,65,71
+# Testet: idx: 63,65,71,79
 
-GOLD_ANSWER = "276,170"
+GOLD_ANSWER = "orange"
 
 DEFAULT_MODELS = [
     # timed out 90sec

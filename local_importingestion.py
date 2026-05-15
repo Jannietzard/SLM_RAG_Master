@@ -33,6 +33,62 @@ Usage:
         --dataset hotpotqa \\
         --graph-only
 
+    # Resume after crash — skip phases already done in checkpoint
+    python local_importingestion.py \\
+        --chunks data/hotpotqa/chunks_export.json \\
+        --extractions data/hotpotqa/graph/extraction_results.json \\
+        --dataset hotpotqa \\
+        --graph-only --resume
+
+    # Re-run only Phase 3d.5 (entity linking) after clearing the 3d5 checkpoint entry,
+    # with a raised max-type-size to process large buckets (e.g. PERSON):
+    python local_importingestion.py \\
+        --chunks data/hotpotqa/chunks_export.json \\
+        --extractions data/hotpotqa/graph/extraction_results.json \\
+        --dataset hotpotqa \\
+        --graph-only --resume --no-cooccurrence --no-cleanup \\
+        --linking-max-type-size 20000
+
+Available flags:
+    REQUIRED
+      --chunks PATH               Path to chunks_export.json (Phase 1 output)
+      --extractions PATH          Path to extraction_results.json (Phase 2 output)
+      --dataset / -d NAME         Dataset name (e.g. hotpotqa)
+
+    OPTIONAL
+      --config PATH               Path to settings.yaml (default: config/settings.yaml)
+      --graph-only                Skip vector store (LanceDB); import KG only
+      --clear                     Delete existing stores before import (full re-run)
+      --resume                    Skip phases already marked done in checkpoint;
+                                  mutually exclusive with --clear
+
+    CLEANUP / CO-OCCURRENCE
+      --no-cleanup                Disable orphan/hub/duplicate cleanup pass (Phase 3d)
+      --no-cooccurrence           Disable RELATED_TO co-occurrence edges (Phase 3c)
+      --no-subsumptive-cleanup    Disable Phase 3c.5 — keep cooccurs edges even
+                                  when a semantic edge already covers the pair
+      --no-isolated-drop          Disable Phase 3f — keep entities with zero
+                                  RELATED_TO edges after Phase 3d.5 linking
+      --cleanup-dry-run           Dry-run cleanup — print mutations but do not apply
+      --cooccurrence-min-confidence FLOAT
+                                  Minimum confidence for co-occurrence edges (default: 0.5)
+      --hub-threshold-ratio FLOAT Hub suppression ratio (default: 0.03)
+
+    ENTITY LINKING (Phase 3d.5)
+      --no-entity-linking         Disable embedding-based alias resolution entirely
+      --linking-threshold FLOAT   Cosine similarity for alias merging (default: 0.92)
+      --linking-max-type-size INT Max entity-bucket size before the bucket is skipped
+                                  to avoid OOM (default: 8000; raise to 20000+ for
+                                  large types like PERSON — requires ~1.6 GB RAM)
+
+    EMBEDDINGS
+      --embeddings-backend {ollama,huggingface}
+                                  Embedding backend (default: ollama)
+
+    MISC
+      --attribute-objects         Capture REBEL attribute values as CONCEPT nodes
+                                  (default off — keeps OntoNotes-5 taxonomy)
+
 Graph-quality post-processing (always applied unless --no-cleanup):
     1. Canonical entity IDs           — deduplicate at MERGE time using
                                         canonical surface form (parentheticals,
@@ -104,6 +160,8 @@ try:
         canonical_form,
         cleanup_graph,
         compute_graph_baseline,
+        drop_isolated_entities,
+        drop_subsumed_cooccurrence_edges,
         format_baseline_report,
         link_entities_by_embedding,
     )
@@ -848,6 +906,8 @@ def run_full_import(
     clear: bool = False,
     skip_cleanup: bool = False,
     skip_cooccurrence: bool = False,
+    skip_subsumptive_cleanup: bool = False,
+    skip_isolated_drop: bool = False,
     cleanup_dry_run: bool = False,
     cooccurrence_min_confidence: float = 0.5,
     hub_threshold_ratio: float = 0.03,
@@ -930,6 +990,11 @@ def run_full_import(
         clear:                        Delete existing stores before import.
         skip_cleanup:                 Disable Phase 3d cleanup pass.
         skip_cooccurrence:            Disable Phase 3c co-occurrence edges.
+        skip_subsumptive_cleanup:     Disable Phase 3c.5 (delete cooccurs
+                                      edges where a semantic edge already
+                                      covers the same pair).
+        skip_isolated_drop:           Disable Phase 3f (drop entities with
+                                      zero RELATED_TO edges after linking).
         cleanup_dry_run:              Cleanup pass counts only, no DB writes.
         cooccurrence_min_confidence:  Min NER confidence for co-occurrence.
         hub_threshold_ratio:          Hub cutoff: ratio × total_chunks.
@@ -1254,6 +1319,53 @@ def run_full_import(
                 logger.error("Co-occurrence edge construction failed: %s", e)
 
     # ══════════════════════════════════════════════════════════════════════
+    # PHASE 3c.5 — SUBSUMPTIVE CO-OCCURRENCE CLEANUP (semantic wins)
+    # ══════════════════════════════════════════════════════════════════════
+    # For every entity-pair that has BOTH a REBEL/SVO semantic edge AND a
+    # cooccurs edge, delete the cooccurs edge. The semantic relation already
+    # entails co-occurrence, so the cooccurs row is redundant — keeping it
+    # only inflates edge counts (~8:1 cooccurs:semantic on HotpotQA) and
+    # pollutes visualisation and ablation metrics. Pairs whose ONLY signal
+    # is co-occurrence are kept (still the only edge we have for them).
+    # See §12.36 retrieval-time weighting (kept as a belt-and-braces).
+    #
+    # Typical removal: ~30 000 of the ~290 000 cooccurs on HotpotQA. The
+    # remaining cooccurs edges are between pairs that REBEL never connected
+    # — exactly where co-occurrence is the only available bridge signal.
+    # ══════════════════════════════════════════════════════════════════════
+    _t0 = time.time()
+    subsumed_dropped = 0
+    if (
+        graph_store is not None
+        and not skip_cooccurrence
+        and not skip_subsumptive_cleanup
+    ):
+        if _phase_done(checkpoint, "3c5"):
+            logger.info("  Phase 3c.5 (subsumptive cleanup): SKIPPED — already in checkpoint")
+            subsumed_dropped = checkpoint["3c5"].get("dropped", 0)
+        else:
+            logger.info(f"\n{'─'*70}")
+            logger.info(
+                "PHASE 3c.5: SUBSUMPTIVE CO-OCCURRENCE CLEANUP%s",
+                " (DRY RUN)" if cleanup_dry_run else "",
+            )
+            logger.info(f"{'─'*70}")
+            try:
+                subsumed_dropped = drop_subsumed_cooccurrence_edges(
+                    graph_store=graph_store,
+                    cooccurs_relation_type="cooccurs",
+                    dry_run=cleanup_dry_run,
+                )
+                logger.info(
+                    "  Subsumed cooccurs deleted: %d (semantic relation already exists)",
+                    subsumed_dropped,
+                )
+                _save_checkpoint(graph_path, "3c5", {"dropped": subsumed_dropped})
+                logger.info(_phase_eta("3c.5 subsumptive cleanup", time.time() - _t0))
+            except Exception as e:
+                logger.error("Subsumptive cleanup failed: %s", e)
+
+    # ══════════════════════════════════════════════════════════════════════
     # PHASE 3d — GRAPH CLEANUP
     # ══════════════════════════════════════════════════════════════════════
     # Four-pass cleanup to improve graph quality:
@@ -1321,10 +1433,24 @@ def run_full_import(
     # ══════════════════════════════════════════════════════════════════════
     _t0 = time.time()
     linked_count = 0
-    if graph_store is not None and enable_entity_linking and not skip_cleanup:
+    if graph_store is not None and enable_entity_linking:
         if _phase_done(checkpoint, "3d5"):
+            prev_3d5 = checkpoint["3d5"]
+            prev_note = prev_3d5.get("note", "")
+            prev_max_type_size = prev_3d5.get("max_type_size", 0)
             logger.info("  Phase 3d.5 (entity linking): SKIPPED — already in checkpoint")
-            linked_count = checkpoint["3d5"].get("linked", 0)
+            linked_count = prev_3d5.get("linked", 0)
+            if "partial" in prev_note.lower() or (
+                prev_max_type_size and linking_max_type_size > prev_max_type_size
+            ):
+                logger.warning(
+                    "  Phase 3d.5 prior run was PARTIAL (note='%s', max_type_size=%d) "
+                    "but current --linking-max-type-size=%d is larger. "
+                    "Delete the '3d5' entry from .import_checkpoint.json and re-run "
+                    "with --resume to process the previously-skipped type buckets "
+                    "(typically PERSON, ORG).",
+                    prev_note, prev_max_type_size, linking_max_type_size,
+                )
         else:
             logger.info(f"\n{'─'*70}")
             logger.info("PHASE 3d.5: EMBEDDING-BASED ENTITY LINKING")
@@ -1355,10 +1481,62 @@ def run_full_import(
                     "  Embedding-linked entities merged: %d (threshold=%.2f)",
                     linked_count, linking_threshold,
                 )
-                _save_checkpoint(graph_path, "3d5", {"linked": linked_count})
+                _save_checkpoint(
+                    graph_path,
+                    "3d5",
+                    {
+                        "linked": linked_count,
+                        "max_type_size": linking_max_type_size,
+                        "threshold": linking_threshold,
+                    },
+                )
                 logger.info(_phase_eta("3d.5 entity linking", time.time() - _t0))
             except Exception as exc:
                 logger.error("Entity linking failed: %s", exc)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PHASE 3f — POST-LINK ISOLATED-ENTITY DROP
+    # ══════════════════════════════════════════════════════════════════════
+    # After Phase 3d.5 (alias resolution) some entities end up with MENTIONS
+    # edges but ZERO RELATED_TO edges (their cluster-mates absorbed the
+    # connectivity during the merge, or REBEL/SVO never produced a triple
+    # for them). These dead-leaf nodes inflate the graph and cause the
+    # baseline `isolated_rate` invariant to fail (~27% on HotpotQA before
+    # this phase). They contribute nothing to graph traversal — every
+    # multi-hop search rooted on them returns the empty set.
+    #
+    # We drop them here so the §3e baseline reports the correctly-pruned
+    # state and the published "we cleaned the graph" claim is truthful.
+    # ══════════════════════════════════════════════════════════════════════
+    _t0 = time.time()
+    isolated_dropped = 0
+    if (
+        graph_store is not None
+        and not skip_isolated_drop
+    ):
+        if _phase_done(checkpoint, "3f"):
+            logger.info("  Phase 3f (drop-isolated): SKIPPED — already in checkpoint")
+            isolated_dropped = checkpoint["3f"].get("dropped", 0)
+        else:
+            logger.info(f"\n{'─'*70}")
+            logger.info(
+                "PHASE 3f: POST-LINK ISOLATED-ENTITY DROP%s",
+                " (DRY RUN)" if cleanup_dry_run else "",
+            )
+            logger.info(f"{'─'*70}")
+            try:
+                isolated_dropped = drop_isolated_entities(
+                    graph_store=graph_store,
+                    dry_run=cleanup_dry_run,
+                )
+                logger.info(
+                    "  Isolated entities dropped: %d (zero RELATED_TO edges)",
+                    isolated_dropped,
+                )
+                _save_checkpoint(graph_path, "3f", {"dropped": isolated_dropped})
+                logger.info(_phase_eta("3f drop-isolated", time.time() - _t0))
+            except Exception as exc:
+                logger.error("Drop-isolated failed: %s", exc)
 
     # ══════════════════════════════════════════════════════════════════════
     # PHASE 3e — BASELINE METRICS
@@ -1404,12 +1582,14 @@ def run_full_import(
             continue
         print(f"    {key:<26}: {val:>10,}")
     print(f"    {'cooccurrence_edges':<26}: {cooccurrence_edges:>10,}")
+    print(f"    {'cooccurs_subsumed':<26}: {subsumed_dropped:>10,}")
     print(f"    {'svo_relations':<26}: {stats.get('svo_relations', 0):>10,}")
     print(f"    {'stoplist_dropped':<26}: {cleanup_ops['stoplist_dropped']:>10,}")
     print(f"    {'orphans_dropped':<26}: {cleanup_ops['orphans_dropped']:>10,}")
     print(f"    {'hubs_dropped':<26}: {cleanup_ops['hubs_dropped']:>10,}")
     print(f"    {'duplicates_merged':<26}: {cleanup_ops['duplicates_merged']:>10,}")
     print(f"    {'embedding_linked':<26}: {linked_count:>10,}")
+    print(f"    {'post_link_isolated':<26}: {isolated_dropped:>10,}")
     if stats.get("rebel_confidence_is_constant"):
         print()
         print("    NOTE: REBEL relation confidence is constant (0.5) for all edges —")
@@ -1430,6 +1610,8 @@ def run_full_import(
     meta["graph_stats"] = stats
     meta["cleanup_ops"] = cleanup_ops
     meta["cooccurrence_edges"] = cooccurrence_edges
+    meta["cooccurs_subsumed_dropped"] = subsumed_dropped
+    meta["post_link_isolated_dropped"] = isolated_dropped
     if baseline:
         # Strip top_clusters because they hold raw entity_id/name tuples that
         # bloat the metadata file. Keep the summary numbers.
@@ -1532,6 +1714,23 @@ Examples:
         help="Disable co-occurrence edge construction (RELATED_TO {cooccurs})",
     )
     parser.add_argument(
+        "--no-subsumptive-cleanup",
+        action="store_true",
+        help="Disable Phase 3c.5 — keep cooccurs edges even when a semantic "
+             "edge already covers the same entity-pair. Default is ON: any "
+             "cooccurs edge that has a paired semantic edge in either "
+             "direction is deleted as redundant.",
+    )
+    parser.add_argument(
+        "--no-isolated-drop",
+        action="store_true",
+        help="Disable Phase 3f — keep entities with zero RELATED_TO edges "
+             "after entity linking. Default is ON: dead-leaf entities "
+             "(MENTIONS present but RELATED_TO empty in both directions) "
+             "are removed so the §3e baseline reports the correctly-"
+             "pruned state.",
+    )
+    parser.add_argument(
         "--cleanup-dry-run",
         action="store_true",
         help="Run the cleanup pass in dry-run mode (count operations, no mutation)",
@@ -1622,6 +1821,8 @@ Examples:
         clear=args.clear,
         skip_cleanup=args.no_cleanup,
         skip_cooccurrence=args.no_cooccurrence,
+        skip_subsumptive_cleanup=args.no_subsumptive_cleanup,
+        skip_isolated_drop=args.no_isolated_drop,
         cleanup_dry_run=args.cleanup_dry_run,
         cooccurrence_min_confidence=args.cooccurrence_min_confidence,
         hub_threshold_ratio=args.hub_threshold_ratio,

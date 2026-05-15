@@ -915,8 +915,12 @@ def patch_controller_bridge(controller) -> None:
     from src.logic_layer.controller import AgenticController as _AC
     orig_extract = _AC._extract_bridge_entities  # raw function via class
 
-    def _wrapped_extract(chunks, exclude):
-        result = orig_extract(chunks, exclude)
+    def _wrapped_extract(chunks, exclude, *args, **kwargs):
+        # *args/**kwargs forward any new parameters added to the underlying
+        # _extract_bridge_entities signature (e.g. §12.32 added `query=...`
+        # for relevance-ranked extraction). Without this, every signature
+        # change to the controller method would crash diagnose_verbose.py.
+        result = orig_extract(chunks, exclude, *args, **kwargs)
         bar = "  " + "·" * 60
         print(f"\n{bar}")
         if result:

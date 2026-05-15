@@ -219,7 +219,13 @@ class Article:
 
 @dataclass
 class EvalResult:
-    """Single question evaluation result."""
+    """Single question evaluation result.
+
+    Separates pipeline correctness (retrieval) from model correctness (LLM
+    answer) so the thesis can argue: "of N questions where retrieval found
+    all gold paragraphs, X% were also answered correctly — the remaining
+    gap is model capacity, not pipeline architecture."
+    """
     question_id: str
     question: str
     gold_answer: str
@@ -230,6 +236,29 @@ class EvalResult:
     time_ms: float
     dataset: str
     question_type: str
+
+    # Retrieval quality (independent of LLM)
+    gold_titles: List[str] = field(default_factory=list)
+    retrieved_titles: List[str] = field(default_factory=list)
+    retrieval_recall: float = 0.0
+    retrieval_precision: float = 0.0
+    sf_f1: float = 0.0
+    all_gold_retrieved: bool = False
+
+    # Failure-mode separation
+    llm_error: bool = False
+    llm_error_type: str = ""
+    pipeline_succeeded_llm_failed: bool = False
+
+    # Planner diagnostics
+    planner_query_type: str = ""
+    hop_count: int = 0
+    n_entities: int = 0
+
+    # Verifier diagnostics
+    verifier_iterations: int = 0
+    all_verified: bool = False
+    confidence: str = ""
 
 @dataclass
 class ConfigResult:
@@ -244,6 +273,16 @@ class ConfigResult:
     avg_time_ms: float
     coverage: float
     by_type: Dict[str, Dict] = field(default_factory=dict)
+
+    # Retrieval-level aggregates (pipeline correctness)
+    avg_sf_f1: float = 0.0
+    sf_recall_rate: float = 0.0          # fraction of Qs where all gold retrieved
+    retrieval_only_em: float = 0.0       # EM among Qs where all gold retrieved
+    llm_error_rate: float = 0.0
+    pipeline_failed_rate: float = 0.0    # gold not fully retrieved
+    pipeline_ok_llm_failed_rate: float = 0.0
+    pipeline_ok_llm_wrong_rate: float = 0.0
+    pipeline_ok_llm_ok_rate: float = 0.0
 
 @dataclass
 class AblationResults:
@@ -1013,6 +1052,207 @@ def create_pipeline(
     return pipeline
 
 # ============================================================================
+# EVALUATION RUNNER — pipeline vs. LLM failure separation
+# ============================================================================
+#
+# The benchmark must answer two independent questions:
+#   1. Did the pipeline (S_P + S_N) retrieve the correct supporting facts?
+#      Measured by supporting-fact F1 against HotpotQA gold paragraphs.
+#   2. Did the LLM (S_V) produce the correct answer GIVEN those facts?
+#      Measured by EM/F1 restricted to questions where retrieval succeeded.
+#
+# These can fail independently. A timeout on the SLM is a model failure, not
+# a pipeline failure. A missing gold paragraph is a pipeline failure, no
+# matter how good the LLM is. The thesis argument depends on distinguishing
+# the two.
+
+# Module-level text→title index. Populated by the retriever monkey-patch
+# below; consulted by _retrieved_titles_for_chunks() to look up the source
+# title of a Navigator-filtered chunk. Keyed by the first 200 chars of chunk
+# text (case-folded) so we tolerate downstream truncation.
+_TEXT_TO_TITLE: Dict[str, str] = {}
+
+
+def _text_key(text: str) -> str:
+    return (text or "").strip()[:200].lower()
+
+
+def _norm_title(title: str) -> str:
+    """Lowercase, strip a leading 'hotpotqa_'/'2wiki_'/etc. dataset prefix,
+    collapse whitespace. Mirrors the diagnose_verbose.py logic so SF
+    comparison uses the same key space."""
+    t = (title or "").strip().lower()
+    if "_" in t:
+        prefix, _, rest = t.partition("_")
+        if prefix and " " not in prefix and rest:
+            t = rest
+    return " ".join(t.split())
+
+
+def _gold_titles_from_supporting_facts(supporting_facts: List) -> List[str]:
+    """HotpotQA/2WikiMHQA supporting_facts → set of normalised gold titles.
+
+    supporting_facts is a list of (title, sent_id) tuples (see
+    load_hotpotqa). We only need the unique titles."""
+    seen, out = set(), []
+    for entry in supporting_facts or []:
+        title = entry[0] if isinstance(entry, (list, tuple)) and entry else str(entry)
+        norm = _norm_title(title)
+        if norm and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
+def _install_retriever_title_capture(pipeline) -> Optional[callable]:
+    """Monkey-patch HybridRetriever.retrieve() on the live pipeline so every
+    raw RetrievalResult registers its (text→source_doc) mapping in
+    _TEXT_TO_TITLE.
+
+    Returns the original retrieve() so the caller can restore it after the
+    benchmark run. None if no retriever is reachable from the pipeline.
+
+    This is the inline alternative to threading source_doc through the
+    Navigator/Verifier — the navigator strips chunks to text-only, so we
+    rebuild the title lookup at the retriever boundary."""
+    # Locate the HybridRetriever on the live pipeline. AgentPipeline exposes
+    # it as `hybrid_retriever` (the canonical attribute used in
+    # src/pipeline/agent_pipeline.py); older paths used `retriever`. The
+    # Navigator stores it as `retriever` after set_retriever() is called.
+    # Without this fallback chain matching ALL possible attribute names,
+    # the patch silently no-ops and SF-F1 = 0.0 across every question —
+    # which is exactly what was observed before this fix.
+    retriever = None
+    for attr in ("hybrid_retriever", "retriever", "_retriever"):
+        candidate = getattr(pipeline, attr, None)
+        if candidate is not None and hasattr(candidate, "retrieve"):
+            retriever = candidate
+            break
+    if retriever is None:
+        nav = getattr(pipeline, "navigator", None) or getattr(pipeline, "_navigator", None)
+        if nav is not None:
+            retriever = getattr(nav, "retriever", None) or getattr(nav, "_retriever", None)
+    if retriever is None or not hasattr(retriever, "retrieve"):
+        logger.warning(
+            "Could not locate HybridRetriever on pipeline (tried "
+            "hybrid_retriever / retriever / _retriever / navigator.retriever) "
+            "— SF metrics will be 0. Pipeline attrs available: %s",
+            [a for a in dir(pipeline) if not a.startswith('_')][:20],
+        )
+        return None
+    logger.info("SF-title capture installed on %s.%s",
+                type(pipeline).__name__,
+                "hybrid_retriever" if retriever is getattr(pipeline, "hybrid_retriever", None)
+                else "retriever")
+
+    original = retriever.retrieve
+
+    def _wrapped(*args, **kwargs):
+        ret = original(*args, **kwargs)
+        # HybridRetriever.retrieve() returns Tuple[List[RetrievalResult],
+        # RetrievalMetrics]. Previous version of this patch iterated the
+        # tuple directly and produced (RetrievalResult, RetrievalMetrics)
+        # pairs — the metrics object has no .text / .source_doc, so every
+        # capture silently fell through and SF-F1 was 0.0 across all
+        # questions. The unpacking below is the actual fix.
+        if isinstance(ret, tuple) and len(ret) >= 1:
+            results_iter = ret[0]
+        else:
+            results_iter = ret
+        try:
+            for r in (results_iter or []):
+                txt = (r.text if hasattr(r, "text")
+                       else r.get("text", "") if isinstance(r, dict)
+                       else "")
+                src = (r.source_doc if hasattr(r, "source_doc")
+                       else r.get("source_doc", "") if isinstance(r, dict)
+                       else "")
+                if txt and src:
+                    _TEXT_TO_TITLE.setdefault(_text_key(txt), src)
+        except Exception as exc:
+            logger.debug("title-capture failed (non-fatal): %s", exc)
+        return ret
+
+    retriever.retrieve = _wrapped
+    return original
+
+
+def _retrieved_titles_for_chunks(chunks: List[str]) -> List[str]:
+    """Map filtered-context chunks back to their source-doc titles using
+    the text→title index built by the retriever monkey-patch."""
+    out: List[str] = []
+    seen: set = set()
+    for c in chunks or []:
+        title = _TEXT_TO_TITLE.get(_text_key(c)) or _TEXT_TO_TITLE.get(_text_key(c[:200]))
+        if not title:
+            continue
+        norm = _norm_title(title)
+        if norm and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
+def _compute_sf_metrics(retrieved: List[str], gold: List[str]) -> Tuple[float, float, float, bool]:
+    """Supporting-fact precision, recall, F1, and 'all_gold_retrieved' flag.
+
+    HotpotQA-style: titles only, set-based (sent_id ignored — at chunk
+    granularity we cannot resolve sentence-level supporting facts)."""
+    gold_set = set(gold or [])
+    retrieved_set = set(retrieved or [])
+    if not gold_set:
+        return 0.0, 0.0, 0.0, False
+    if not retrieved_set:
+        return 0.0, 0.0, 0.0, False
+    tp = len(gold_set & retrieved_set)
+    precision = tp / len(retrieved_set) if retrieved_set else 0.0
+    recall = tp / len(gold_set) if gold_set else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+    all_gold = gold_set.issubset(retrieved_set)
+    return precision, recall, f1, all_gold
+
+
+def _classify_llm_error(answer: str) -> Tuple[bool, str]:
+    """Detect Verifier error sentinels.
+
+    Verifier emits answers prefixed with '[Error:' on LLM-side failures
+    (timeout, API error, no valid answer). Anything else is a real model
+    response, even if substantively wrong."""
+    if not answer or not answer.startswith("[Error:"):
+        return False, ""
+    low = answer.lower()
+    if "timeout" in low:
+        return True, "timeout"
+    if "connect" in low or "ollama" in low:
+        return True, "connection"
+    if "api returned" in low:
+        return True, "api"
+    if "no valid answer" in low:
+        return True, "no_answer"
+    return True, "other"
+
+
+def _extract_planner_diagnostics(planner_result: Dict[str, Any]) -> Tuple[str, int, int]:
+    """(query_type, hop_count, n_entities) from PlannerResult.to_dict()."""
+    if not isinstance(planner_result, dict):
+        return "", 0, 0
+    qt = planner_result.get("query_type", "") or ""
+    hops = planner_result.get("hop_sequence", []) or []
+    entities = planner_result.get("entities", []) or []
+    return qt, len(hops), len(entities)
+
+
+def _extract_verifier_diagnostics(verifier_result: Dict[str, Any]) -> Tuple[int, bool, str]:
+    """(iterations, all_verified, confidence) from Verifier output."""
+    if not isinstance(verifier_result, dict):
+        return 0, False, ""
+    iters = int(verifier_result.get("iterations", 0) or 0)
+    allv = bool(verifier_result.get("all_verified", False))
+    conf = str(verifier_result.get("confidence", "") or "")
+    return iters, allv, conf
+
+
+# ============================================================================
 # EVALUATION RUNNER
 # ============================================================================
 
@@ -1023,72 +1263,201 @@ def evaluate_dataset(
     config_name: str,
     vector_weight: float,
     graph_weight: float,
+    jsonl_out: Optional[Path] = None,
+    retrieval_only: bool = False,
 ) -> ConfigResult:
-    """Evaluate dataset with given configuration."""
-    
-    results = []
+    """Evaluate dataset with given configuration.
 
-    for q in tqdm(questions, desc=f"Evaluating {dataset} [{config_name}]", unit="q"):
-        try:
-            start = time.time()
-            result = pipeline.process(q.question)
-            elapsed = (time.time() - start) * 1000
-            
-            em = compute_exact_match(result.answer, q.answer)
-            f1 = compute_f1(result.answer, q.answer)
-            
-            retrieval_count = 0
-            if hasattr(result, 'navigator_result'):
-                nav_result = result.navigator_result
-                if isinstance(nav_result, dict):
-                    retrieval_count = len(nav_result.get('filtered_context', []))
-            
-            results.append(EvalResult(
-                question_id=q.id,
-                question=q.question,
-                gold_answer=q.answer,
-                predicted_answer=result.answer,
-                exact_match=em,
-                f1_score=f1,
-                retrieval_count=retrieval_count,
-                time_ms=elapsed,
-                dataset=q.dataset,
-                question_type=q.question_type,
-            ))
-            
-        except Exception as e:
-            logger.warning(f"    Error on Q{q.id}: {str(e)[:50]}")
-    
+    Args:
+        jsonl_out: If given, append one JSON line per question to this file
+            with the full EvalResult — for thesis analysis.
+        retrieval_only: If True, skip the LLM (verifier) entirely and only
+            measure pipeline retrieval quality. EM/F1 are forced to 0 in
+            this mode; SF-F1/recall are the meaningful metrics.
+    """
+
+    results: List[EvalResult] = []
+
+    # Reset text→title cache for this run and install retriever hook.
+    _TEXT_TO_TITLE.clear()
+    original_retrieve = _install_retriever_title_capture(pipeline)
+
+    # Optional: disable verifier for retrieval-only evaluation.
+    saved_enable_verifier = None
+    if retrieval_only and hasattr(pipeline, "enable_verifier"):
+        saved_enable_verifier = pipeline.enable_verifier
+        pipeline.enable_verifier = False
+
+    desc = f"Evaluating {dataset} [{config_name}]" + (" [retrieval-only]" if retrieval_only else "")
+
+    try:
+        for q in tqdm(questions, desc=desc, unit="q"):
+            try:
+                start = time.time()
+                result = pipeline.process(q.question)
+                elapsed = (time.time() - start) * 1000
+
+                # ── Answer-level metrics (LLM correctness) ───────────────
+                if retrieval_only:
+                    em, f1 = False, 0.0
+                    predicted = ""
+                else:
+                    em = compute_exact_match(result.answer, q.answer)
+                    f1 = compute_f1(result.answer, q.answer)
+                    predicted = result.answer
+
+                # ── Retrieval-level metrics (pipeline correctness) ───────
+                filtered_chunks: List[str] = []
+                if hasattr(result, 'navigator_result'):
+                    nav = result.navigator_result
+                    if isinstance(nav, dict):
+                        filtered_chunks = nav.get('filtered_context', []) or []
+                retrieval_count = len(filtered_chunks)
+
+                gold_titles = _gold_titles_from_supporting_facts(q.supporting_facts)
+                retrieved_titles = _retrieved_titles_for_chunks(filtered_chunks)
+                sf_p, sf_r, sf_f1, all_gold = _compute_sf_metrics(retrieved_titles, gold_titles)
+
+                # ── Failure-mode separation ──────────────────────────────
+                llm_err, llm_err_type = (False, "") if retrieval_only else _classify_llm_error(predicted)
+                # Pipeline OK + LLM failed = retrieval was complete but model errored.
+                pipeline_ok_llm_failed = bool(all_gold and llm_err)
+
+                # ── Planner / Verifier diagnostics ───────────────────────
+                p_qtype, hop_count, n_ents = _extract_planner_diagnostics(
+                    getattr(result, "planner_result", {}) or {}
+                )
+                v_iters, v_verified, v_conf = _extract_verifier_diagnostics(
+                    getattr(result, "verifier_result", {}) or {}
+                )
+
+                eval_result = EvalResult(
+                    question_id=q.id,
+                    question=q.question,
+                    gold_answer=q.answer,
+                    predicted_answer=predicted,
+                    exact_match=em,
+                    f1_score=f1,
+                    retrieval_count=retrieval_count,
+                    time_ms=elapsed,
+                    dataset=q.dataset,
+                    question_type=q.question_type,
+                    gold_titles=gold_titles,
+                    retrieved_titles=retrieved_titles,
+                    retrieval_recall=sf_r,
+                    retrieval_precision=sf_p,
+                    sf_f1=sf_f1,
+                    all_gold_retrieved=all_gold,
+                    llm_error=llm_err,
+                    llm_error_type=llm_err_type,
+                    pipeline_succeeded_llm_failed=pipeline_ok_llm_failed,
+                    planner_query_type=p_qtype,
+                    hop_count=hop_count,
+                    n_entities=n_ents,
+                    verifier_iterations=v_iters,
+                    all_verified=v_verified,
+                    confidence=v_conf,
+                )
+                results.append(eval_result)
+
+                # Per-question JSONL (one line per question) for thesis analysis.
+                if jsonl_out is not None:
+                    try:
+                        jsonl_out.parent.mkdir(parents=True, exist_ok=True)
+                        with open(jsonl_out, "a", encoding="utf-8") as fh:
+                            fh.write(json.dumps(asdict(eval_result), ensure_ascii=False) + "\n")
+                    except Exception as exc:
+                        logger.warning("JSONL write failed: %s", exc)
+
+            except Exception as e:
+                logger.warning(f"    Error on Q{q.id}: {str(e)[:80]}")
+    finally:
+        # Restore patched retriever and verifier flag so the pipeline isn't
+        # permanently mutated (matters for ablation: same pipeline runs
+        # multiple configurations).
+        if original_retrieve is not None:
+            for attr in ("hybrid_retriever", "retriever", "_retriever"):
+                cand = getattr(pipeline, attr, None)
+                if cand is not None and hasattr(cand, "retrieve"):
+                    cand.retrieve = original_retrieve
+                    break
+            else:
+                nav = getattr(pipeline, "navigator", None) or getattr(pipeline, "_navigator", None)
+                if nav is not None:
+                    inner = getattr(nav, "retriever", None) or getattr(nav, "_retriever", None)
+                    if inner is not None:
+                        inner.retrieve = original_retrieve
+        if saved_enable_verifier is not None:
+            pipeline.enable_verifier = saved_enable_verifier
+
     if not results:
         return None
-    
-    # Aggregate metrics
-    em_rate = sum(1 for r in results if r.exact_match) / len(results)
-    avg_f1 = sum(r.f1_score for r in results) / len(results)
-    avg_time = sum(r.time_ms for r in results) / len(results)
-    coverage = sum(1 for r in results if r.retrieval_count > 0) / len(results)
-    
+
+    # ── Aggregate metrics ────────────────────────────────────────────────
+    n = len(results)
+    em_rate = sum(1 for r in results if r.exact_match) / n
+    avg_f1 = sum(r.f1_score for r in results) / n
+    avg_time = sum(r.time_ms for r in results) / n
+    coverage = sum(1 for r in results if r.retrieval_count > 0) / n
+
+    # Retrieval-level aggregates
+    avg_sf_f1 = sum(r.sf_f1 for r in results) / n
+    n_all_gold = sum(1 for r in results if r.all_gold_retrieved)
+    sf_recall_rate = n_all_gold / n
+    retrieval_only_em = (
+        sum(1 for r in results if r.all_gold_retrieved and r.exact_match) / n_all_gold
+        if n_all_gold > 0 else 0.0
+    )
+    llm_error_rate = sum(1 for r in results if r.llm_error) / n
+
+    # Failure decomposition (mutually exclusive buckets, sum to 1.0):
+    #   pipeline_failed       : not all_gold_retrieved
+    #   pipeline_ok_llm_failed : all_gold AND llm error (timeout/etc.)
+    #   pipeline_ok_llm_wrong  : all_gold AND no llm error AND not EM
+    #   pipeline_ok_llm_ok     : all_gold AND EM
+    pipeline_failed = sum(1 for r in results if not r.all_gold_retrieved) / n
+    ok_llm_failed = sum(1 for r in results if r.all_gold_retrieved and r.llm_error) / n
+    ok_llm_wrong = sum(
+        1 for r in results
+        if r.all_gold_retrieved and not r.llm_error and not r.exact_match
+    ) / n
+    ok_llm_ok = sum(
+        1 for r in results if r.all_gold_retrieved and r.exact_match
+    ) / n
+
     # By question type
-    by_type = {}
+    by_type: Dict[str, Dict] = {}
     for qtype in set(r.question_type for r in results):
         type_results = [r for r in results if r.question_type == qtype]
+        tn = len(type_results)
         by_type[qtype] = {
-            "count": len(type_results),
-            "exact_match": sum(1 for r in type_results if r.exact_match) / len(type_results),
-            "f1": sum(r.f1_score for r in type_results) / len(type_results),
+            "count": tn,
+            "exact_match": sum(1 for r in type_results if r.exact_match) / tn,
+            "f1": sum(r.f1_score for r in type_results) / tn,
+            "sf_f1": sum(r.sf_f1 for r in type_results) / tn,
+            "sf_recall_rate": sum(1 for r in type_results if r.all_gold_retrieved) / tn,
+            "llm_error_rate": sum(1 for r in type_results if r.llm_error) / tn,
         }
-    
+
     return ConfigResult(
         dataset=dataset,
         config_name=config_name,
         vector_weight=vector_weight,
         graph_weight=graph_weight,
-        n_questions=len(results),
+        n_questions=n,
         exact_match=em_rate,
         f1_score=avg_f1,
         avg_time_ms=avg_time,
         coverage=coverage,
         by_type=by_type,
+        avg_sf_f1=avg_sf_f1,
+        sf_recall_rate=sf_recall_rate,
+        retrieval_only_em=retrieval_only_em,
+        llm_error_rate=llm_error_rate,
+        pipeline_failed_rate=pipeline_failed,
+        pipeline_ok_llm_failed_rate=ok_llm_failed,
+        pipeline_ok_llm_wrong_rate=ok_llm_wrong,
+        pipeline_ok_llm_ok_rate=ok_llm_ok,
     )
 
 # ============================================================================
@@ -1234,27 +1603,60 @@ def cmd_evaluate(args, config: Dict, store_manager: StoreManager):
 
     try:
         config_name = f"v{args.vector_weight}_g{args.graph_weight}_{model_name}"
+
+        retrieval_only = getattr(args, "retrieval_only", False)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        jsonl_dir = Path("./evaluation_results")
+        jsonl_path = jsonl_dir / f"{dataset}_{model_name.replace(':','-')}_{ts}.jsonl"
+        # Truncate any prior partial file with the same name.
+        if jsonl_path.exists():
+            jsonl_path.unlink()
+
         result = evaluate_dataset(
             dataset, questions, pipeline,
             config_name, args.vector_weight, args.graph_weight,
+            jsonl_out=jsonl_path,
+            retrieval_only=retrieval_only,
         )
-        
+
         # Print results
         logger.info(f"\n{'─'*70}")
-        logger.info("RESULTS")
+        logger.info("RESULTS" + (" [retrieval-only]" if retrieval_only else ""))
         logger.info(f"{'─'*70}")
-        logger.info(f"  Exact Match:  {result.exact_match:.2%}")
-        logger.info(f"  F1 Score:     {result.f1_score:.3f}")
-        logger.info(f"  Coverage:     {result.coverage:.2%}")
-        logger.info(f"  Avg Time:     {result.avg_time_ms:.0f}ms")
-        
+        logger.info(f"  Exact Match:           {result.exact_match:.2%}")
+        logger.info(f"  F1 Score:              {result.f1_score:.3f}")
+        logger.info(f"  Coverage:              {result.coverage:.2%}")
+        logger.info(f"  Avg Time:              {result.avg_time_ms:.0f}ms")
+        logger.info("")
+        logger.info("  Pipeline (S_P + S_N) — retrieval quality:")
+        logger.info(f"    Supporting-fact F1:  {result.avg_sf_f1:.3f}")
+        logger.info(f"    All gold retrieved:  {result.sf_recall_rate:.2%}")
+        if not retrieval_only:
+            logger.info("")
+            logger.info("  Failure decomposition (sum to 100%):")
+            logger.info(f"    Pipeline failed:           {result.pipeline_failed_rate:.2%}  (gold not fully retrieved)")
+            logger.info(f"    Pipeline ok, LLM failed:   {result.pipeline_ok_llm_failed_rate:.2%}  (timeout/api error)")
+            logger.info(f"    Pipeline ok, LLM wrong:    {result.pipeline_ok_llm_wrong_rate:.2%}")
+            logger.info(f"    Pipeline ok, LLM ok (EM):  {result.pipeline_ok_llm_ok_rate:.2%}")
+            logger.info("")
+            logger.info(f"  LLM error rate:        {result.llm_error_rate:.2%}")
+            logger.info(f"  EM | all-gold-retrieved: {result.retrieval_only_em:.2%}  "
+                        f"(model accuracy when retrieval succeeds)")
+
         if result.by_type:
             logger.info(f"\n  By Question Type:")
             for qtype, stats in result.by_type.items():
-                logger.info(f"    {qtype}: EM={stats['exact_match']:.2%}, F1={stats['f1']:.3f}")
-        
+                logger.info(
+                    f"    {qtype}: EM={stats['exact_match']:.2%} F1={stats['f1']:.3f} "
+                    f"SF-F1={stats.get('sf_f1', 0.0):.3f} "
+                    f"SF-Recall={stats.get('sf_recall_rate', 0.0):.2%} "
+                    f"LLM-err={stats.get('llm_error_rate', 0.0):.2%}"
+                )
+
+        logger.info("")
+        logger.info(f"  Per-question results: {jsonl_path}")
         logger.info("="*70)
-        
+
     finally:
         # Cleanup
         del pipeline
@@ -1307,6 +1709,10 @@ def cmd_ablation(args, config: Dict, store_manager: StoreManager):
 
         dataset_results = []
 
+        retrieval_only = getattr(args, "retrieval_only", False)
+        run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        jsonl_dir = Path("./evaluation_results")
+
         # ── Retrieval-weight ablation ──────────────────────────────────────
         for cfg_name, vector_weight, graph_weight in ABLATION_CONFIGS:
             run_name = f"{cfg_name}_{model_name}"
@@ -1320,17 +1726,30 @@ def cmd_ablation(args, config: Dict, store_manager: StoreManager):
                     model_name=model_name,
                 )
 
+                jsonl_path = jsonl_dir / (
+                    f"{dataset}_{model_name.replace(':','-')}_{run_name}_{run_ts}.jsonl"
+                )
+                if jsonl_path.exists():
+                    jsonl_path.unlink()
+
                 result = evaluate_dataset(
                     dataset, questions, pipeline,
                     run_name, vector_weight, graph_weight,
+                    jsonl_out=jsonl_path,
+                    retrieval_only=retrieval_only,
                 )
 
                 if result:
                     dataset_results.append(result)
                     if run_name not in used_run_names:
                         used_run_names.append(run_name)
-                    logger.info(f"    EM: {result.exact_match:.2%}, F1: {result.f1_score:.3f}, "
-                                f"Latency: {result.avg_time_ms:.0f}ms")
+                    logger.info(
+                        f"    EM: {result.exact_match:.2%}, F1: {result.f1_score:.3f}, "
+                        f"SF-F1: {result.avg_sf_f1:.3f}, "
+                        f"SF-Recall: {result.sf_recall_rate:.2%}, "
+                        f"LLM-err: {result.llm_error_rate:.2%}, "
+                        f"Latency: {result.avg_time_ms:.0f}ms"
+                    )
 
                 del pipeline
                 import gc
@@ -1359,17 +1778,30 @@ def cmd_ablation(args, config: Dict, store_manager: StoreManager):
                         max_iterations=max_iter,
                     )
 
+                    jsonl_path = jsonl_dir / (
+                        f"{dataset}_{model_name.replace(':','-')}_{run_name}_{run_ts}.jsonl"
+                    )
+                    if jsonl_path.exists():
+                        jsonl_path.unlink()
+
                     result = evaluate_dataset(
                         dataset, questions, pipeline,
                         run_name, 0.5, 0.5,
+                        jsonl_out=jsonl_path,
+                        retrieval_only=retrieval_only,
                     )
 
                     if result:
                         dataset_results.append(result)
                         if run_name not in used_run_names:
                             used_run_names.append(run_name)
-                        logger.info(f"    EM: {result.exact_match:.2%}, F1: {result.f1_score:.3f}, "
-                                    f"Latency: {result.avg_time_ms:.0f}ms")
+                        logger.info(
+                            f"    EM: {result.exact_match:.2%}, F1: {result.f1_score:.3f}, "
+                            f"SF-F1: {result.avg_sf_f1:.3f}, "
+                            f"SF-Recall: {result.sf_recall_rate:.2%}, "
+                            f"LLM-err: {result.llm_error_rate:.2%}, "
+                            f"Latency: {result.avg_time_ms:.0f}ms"
+                        )
 
                     del pipeline
                     gc.collect()
@@ -1467,6 +1899,34 @@ def print_ablation_table(results: AblationResults):
             row += f"{r.f1_score:>{col_w}.3f}" if r else f"{'':>{col_w}}"
         print(row)
 
+        # SF-F1 row (pipeline retrieval quality)
+        row = f"{'  (SF-F1)':<16}"
+        for cfg_name in results.configs:
+            r = next((r for r in ds_results if r.config_name == cfg_name), None)
+            row += f"{r.avg_sf_f1:>{col_w}.3f}" if r else f"{'':>{col_w}}"
+        print(row)
+
+        # SF-Recall (all-gold-retrieved rate)
+        row = f"{'  (SF-Recall)':<16}"
+        for cfg_name in results.configs:
+            r = next((r for r in ds_results if r.config_name == cfg_name), None)
+            row += f"{r.sf_recall_rate:>{col_w}.1%}" if r else f"{'':>{col_w}}"
+        print(row)
+
+        # EM | all-gold-retrieved  (model accuracy when retrieval is correct)
+        row = f"{'  (EM|retr.ok)':<16}"
+        for cfg_name in results.configs:
+            r = next((r for r in ds_results if r.config_name == cfg_name), None)
+            row += f"{r.retrieval_only_em:>{col_w}.1%}" if r else f"{'':>{col_w}}"
+        print(row)
+
+        # LLM error rate
+        row = f"{'  (LLM-err)':<16}"
+        for cfg_name in results.configs:
+            r = next((r for r in ds_results if r.config_name == cfg_name), None)
+            row += f"{r.llm_error_rate:>{col_w}.1%}" if r else f"{'':>{col_w}}"
+        print(row)
+
         # Latency row
         row = f"{'  (ms)':<16}"
         for cfg_name in results.configs:
@@ -1499,8 +1959,16 @@ def print_ablation_table(results: AblationResults):
             print(f"  {dataset:<15}: {best.config_name}  (F1={best.f1_score:.3f}{mur_str})")
 
     print("="*total_w + "\n")
-    print("MUR = ΔF1 / ΔLatency(s) vs. baseline (first config).")
-    print("Higher MUR = better accuracy-per-second trade-off.\n")
+    print("Legend:")
+    print("  EM/F1        = final answer correctness vs. gold (LLM output).")
+    print("  SF-F1        = supporting-fact F1: did the pipeline retrieve the right paragraphs?")
+    print("  SF-Recall    = % of questions where ALL gold supporting paragraphs were retrieved.")
+    print("  EM|retr.ok   = EM among questions where retrieval succeeded (model accuracy")
+    print("                 conditioned on correct retrieval — isolates LLM capability).")
+    print("  LLM-err      = % of questions where the LLM returned a [Error:...] sentinel")
+    print("                 (timeout/connection/api). Distinguishes pipeline failure from model failure.")
+    print("  MUR          = ΔF1 / ΔLatency(s) vs. baseline (first config). Higher = better trade-off.")
+    print()
 
 def cmd_status(args, config: Dict, store_manager: StoreManager):
     """Show status command."""
@@ -1655,6 +2123,10 @@ def main():
                         help="Skip S_V (ablation: no verifier)")
     eval_p.add_argument("--iterations", type=int, default=1,
                         help="Number of verifier iterations (1/2/3). Default: 1")
+    eval_p.add_argument("--retrieval-only", action="store_true",
+                        help="Skip the LLM entirely; only measure pipeline retrieval (SF-F1). "
+                             "EM/F1 are forced to 0 in this mode. Useful for isolating "
+                             "Planner/Navigator quality without LLM latency cost.")
 
     # ABLATION
     ablation_p = subparsers.add_parser("ablation", help="Run ablation study")
@@ -1664,6 +2136,11 @@ def main():
                             help="Model name (e.g. phi3, llama3.2:3b). Default: from settings.yaml")
     ablation_p.add_argument("--component-ablation", action="store_true",
                             help="Also run planner/verifier/iterations component ablation")
+    ablation_p.add_argument("--retrieval-only", action="store_true",
+                            help="Skip the LLM entirely across all ablation configs. Only "
+                                 "supporting-fact metrics (SF-F1, SF-Recall) are meaningful. "
+                                 "Much faster — useful for tuning retrieval-side config without "
+                                 "paying LLM latency on every config.")
     
     # STATUS
     subparsers.add_parser("status", help="Show ingestion status")

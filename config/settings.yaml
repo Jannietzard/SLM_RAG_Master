@@ -168,14 +168,14 @@ rag:
 # ============================================================================
 llm:
   # Active model — must be pulled via: ollama pull <model_name>
-  model_name: "llama3.2:3b"   # llama3.2:3b: ~35-55s per query on CPU (safest for 60s timeout)
+  model_name: "qwen2:1.5b"    # PRIMARY thesis baseline — ~5-10s/query, never times out on CPU
 
   base_url: "http://localhost:11434"
   temperature: 0.0    # 0.0 = fully deterministic — required for reproducible thesis evaluation
   max_tokens: 200
   timeout: 60         # Ollama API timeout in seconds
                       # Comparison model latency on CPU (ablation study):
-                      # qwen2.5:3b ~10-20s, gemma2:2b ~20-35s,
+                      # qwen2:1.5b ~5-10s, qwen2.5:3b ~10-20s, gemma2:2b ~20-35s,
                       # llama3.2:3b ~35-55s, phi3 ~45-80s (ablation model, borderline at 60s).
 
   # Context budget for Verifier (S_V)

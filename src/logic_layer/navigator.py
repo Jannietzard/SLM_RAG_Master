@@ -305,7 +305,9 @@ class Navigator:
             if retrieval_plan and hasattr(retrieval_plan, "original_query")
             else (sub_queries[0] if sub_queries else "")
         )
-        fused_results = self._reranker_filter(fused_results, original_query)
+        fused_results = self._reranker_filter(
+            fused_results, original_query, entity_hints=entity_names,
+        )
         result.metadata["reranker_applied"] = self.config.enable_reranker
 
         # ─────────────────────────────────────────────────────────────────────
@@ -597,13 +599,60 @@ class Navigator:
         ratio_threshold = self.config.contradiction_ratio_threshold
         min_value = self.config.contradiction_min_value
 
-        def extract_numbers(text: str) -> List[float]:
-            return [float(n) for n in re.findall(r"\b\d{4}\b|\b\d+(?:\.\d+)?\b", text)]
+        # Year-context words: when a number appears near one of these, treat
+        # it as a year regardless of magnitude. Handles "year 3000".
+        _YEAR_CONTEXT_WORDS = (
+            "year", "born", "founded", "established", "released",
+            "published", "elected", "incorporated", "ad ", "bc ", "ce ",
+        )
+        # Count-context words: when a number appears near one of these,
+        # treat it as a count/population even if it falls inside the year
+        # range [1000, 2100]. Handles "Population 1000 versus target."
+        # where 1000 is a plain count, not a year. Context words take
+        # priority over the magnitude heuristic to disambiguate ambiguous
+        # 4-digit numbers ("Population 2014" should be a count, not a year).
+        _COUNT_CONTEXT_WORDS = (
+            "population", "people", "inhabitants", "residents",
+            "members", "employees", "users", "subscribers",
+            "votes", "voters", "seats", "kilometers", "km",
+            "miles", "dollars", "euros", "pounds",
+            "versus", "vs",
+        )
 
-        def _is_year(n: float) -> bool:
-            return 1000.0 <= n <= 2100.0 and n == int(n)
+        def _extract_numbers_with_context(text: str) -> List[Tuple[float, bool]]:
+            """Return (number, is_year_in_context) for each number found.
 
-        all_numbers: List[List[float]] = [extract_numbers(r["text"]) for r in results]
+            Disambiguation strategy:
+              1. If a count-context word appears near the number → count.
+              2. Else, if a year-context word appears near → year.
+              3. Else, fall back to the magnitude heuristic [1000, 2100].
+            Context (1) overrides (3) so "Population 1000" is a count.
+            """
+            text_lower = text.lower()
+            out: List[Tuple[float, bool]] = []
+            for m in re.finditer(r"\b\d{4}\b|\b\d+(?:\.\d+)?\b", text):
+                val = float(m.group(0))
+                pos = m.start()
+                # Look in a ±25-char window around the number for context.
+                start = max(0, pos - 25)
+                end = min(len(text_lower), pos + len(m.group(0)) + 25)
+                window = text_lower[start:end]
+                near_count = any(w in window for w in _COUNT_CONTEXT_WORDS)
+                near_year = any(w in window for w in _YEAR_CONTEXT_WORDS)
+                in_range = 1000.0 <= val <= 2100.0 and val == int(val)
+                # Count context wins; year context next; magnitude last.
+                if near_count and not near_year:
+                    is_year = False
+                elif near_year:
+                    is_year = True
+                else:
+                    is_year = in_range
+                out.append((val, is_year))
+            return out
+
+        all_numbers: List[List[Tuple[float, bool]]] = [
+            _extract_numbers_with_context(r["text"]) for r in results
+        ]
         all_words: List[set] = [set(r["text"].lower().split()) for r in results]
 
         contradicting: set = set()
@@ -627,9 +676,9 @@ class Navigator:
                         # same kind (both years, or both counts/populations).
                         # A year paired with a population figure (e.g. 1940 vs
                         # 276170) measures different things and is not a conflict.
-                        and _is_year(n1) == _is_year(n2)
-                        for n1 in nums_i
-                        for n2 in nums_j
+                        and is_year_1 == is_year_2
+                        for (n1, is_year_1) in nums_i
+                        for (n2, is_year_2) in nums_j
                     )
                     if found:
                         lower_idx = (
@@ -875,6 +924,7 @@ class Navigator:
         self,
         results: List[Dict[str, Any]],
         query: str,
+        entity_hints: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Optional cross-encoder reranking after RRF fusion (§12.29).
@@ -883,12 +933,28 @@ class Navigator:
         encoder and sorts them by cross-encoder score.  The remaining chunks
         (beyond top_k) keep their RRF order and are appended unchanged.
 
+        §12.37 Fix E: when `entity_hints` is provided (Planner-extracted
+        entities + bridge entities resolved in earlier hops), the entity
+        names are appended to the query side of the (query, chunk) pair as
+        a soft hint: "<query> [ENTITIES: A, B, C]". The cross-encoder
+        learns to up-rank chunks that lexically contain the hinted entities.
+        On bridge questions this means the answer chunk (which mentions the
+        bridge entity) is up-ranked over distractor chunks that mention only
+        the surface query keywords.
+
+        Refs:
+          - Annotated re-ranking with entity hints: ColBERTv2 (Santhanam et
+            al., 2022, NAACL).
+          - Cross-encoder bi-text reranking: Reimers & Gurevych (2019),
+            arXiv:1908.10084.
+          - Entity-grounded reranking: HippoRAG (Gutiérrez et al., 2024,
+            NeurIPS, arXiv:2405.14831).
+
         Disabled when config.enable_reranker is False (default).
         self._reranker is set to False after the first failed load attempt
         so subsequent calls skip the model-load overhead.
 
         Model: cross-encoder/ms-marco-MiniLM-L-6-v2 (22 MB, CPU, ~30 ms/pair).
-        Reference: Reimers & Gurevych (2019). arXiv:1908.10084.
         """
         if not self.config.enable_reranker or not results:
             return results
@@ -924,7 +990,26 @@ class Navigator:
         # is no regression. For bridge/multi-hop queries this ensures that a
         # second-hop answer chunk (e.g. author bio) is scored against the hop
         # sub-query that retrieved it, not the surface question.
-        pairs = [(r.get("_best_sub_query") or query, r["text"]) for r in candidates]
+        #
+        # §12.37 Fix E: append entity hints to the query side. Cross-encoder
+        # treats this as "query talks about these entities", up-ranking chunks
+        # that lexically contain them. Capped at top-5 entity hints to keep
+        # the query short (cross-encoder context window).
+        def _query_with_hints(base_q: str) -> str:
+            if not entity_hints:
+                return base_q
+            useful = [
+                e for e in entity_hints[:5]
+                if e and len(e) >= 3 and e.lower() not in base_q.lower()
+            ]
+            if not useful:
+                return base_q
+            return f"{base_q} [ENTITIES: {', '.join(useful)}]"
+
+        pairs = [
+            (_query_with_hints(r.get("_best_sub_query") or query), r["text"])
+            for r in candidates
+        ]
         try:
             scores = self._reranker.predict(pairs)
             for r, s in zip(candidates, scores):

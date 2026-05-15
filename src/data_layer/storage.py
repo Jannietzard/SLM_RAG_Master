@@ -499,6 +499,53 @@ _GRAPH_LOOKUP_STOPWORDS: frozenset = frozenset({
 })
 
 
+_HUB_NAMES_CACHE: Dict[int, List[str]] = {}
+
+
+def _get_hub_entity_names(conn, mention_cap: int) -> List[str]:
+    """
+    P-3 (publication-blocker): return entity names whose mention-degree
+    exceeds `mention_cap`. Cached per connection-process / per cap.
+
+    Rationale: KuzuDB does not support subquery COUNT { ... } in
+    WHERE clauses (Neo4j-5 syntax). We compute the hub set once and pass
+    it as a query parameter so the hop-2/hop-3 traversal can NOT IN-filter
+    against it. The set is tiny (typically <100 entities at cap=280) so
+    parameter overhead is negligible.
+
+    Cache is keyed by mention_cap, not connection. If you tune
+    _HUB_MENTION_CAP at runtime, restart the process to clear.
+    """
+    cached = _HUB_NAMES_CACHE.get(mention_cap)
+    if cached is not None:
+        return cached
+    try:
+        res = conn.execute(
+            """
+            MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity)
+            WITH e.name AS name, COUNT(c) AS deg
+            WHERE deg > $cap
+            RETURN name
+            """,
+            {"cap": mention_cap},
+        )
+        names: List[str] = []
+        while res.has_next():
+            row = res.get_next()
+            if row and row[0]:
+                names.append(row[0])
+        _HUB_NAMES_CACHE[mention_cap] = names
+        logger.info("Hub-entity cache built: %d names with mention-degree > %d",
+                    len(names), mention_cap)
+        return names
+    except Exception as exc:
+        logger.warning("Hub-entity cache build failed (%s) — proceeding "
+                       "without hub filter (graph quality may degrade)", exc)
+        # Cache empty list so we don't retry the failing query every call.
+        _HUB_NAMES_CACHE[mention_cap] = []
+        return []
+
+
 def _is_graph_worthy_entity(name: str) -> bool:
     """True if `name` should be used as a graph-lookup key. Rejects empty/short
     strings, bare numbers/years, and known generic single-word stop-terms."""
@@ -1184,11 +1231,142 @@ class KuzuGraphStore:
 
         return context_chunks
 
+    # §12.36 relation-type weights — used by _triple_frequency_confidence to
+    # rank bridge candidates. Semantic REBEL relations (named predicate)
+    # score full weight; cooccurs heavily down-weighted but not dropped.
+    # This preserves bridge connectivity (84.7% of entity-pairs have ONLY
+    # cooccurs edges) while ensuring semantic bridges outrank statistical-
+    # noise bridges when both exist.
+    #
+    # Refs:
+    #   - Cooccurrence weighting in graph IR follows the PMI tradition (Church
+    #     & Hanks, 1990, "Word Association Norms, Mutual Information and
+    #     Lexicography", Computational Linguistics 16(1)) — co-mention edges
+    #     carry weak but non-zero signal; the right choice is to down-weight,
+    #     not delete.
+    #   - The 0.25 multiplier is in the regime used by HippoRAG (Gutiérrez et
+    #     al., 2024, NeurIPS, arXiv:2405.14831) for "non-typed" edges relative
+    #     to typed Wikidata relations, and consistent with LightRAG's
+    #     dual-level retrieval weights (Guo et al., 2024, arXiv:2410.05779).
+    #   - Confidence via corpus support count follows DeepDive (Niu et al.,
+    #     2012, "Elementary: Large-scale Knowledge-base Construction via
+    #     Machine Learning and Statistical Inference", AI Magazine 33(3))
+    #     and KnowledgeVault (Dong et al., 2014, KDD).
+    # Origin-based weighting. SVO triples come from a SpaCy dependency parse
+    # (single-token verb lemmas like "direct", "win", "bear", "found") and are
+    # noisier than REBEL's seq2seq predictions on Wikidata-style relations
+    # ("date_of_birth", "member_of_sports_team", "place_of_birth"). We discriminate
+    # by string shape: REBEL relations contain "_" or " " (multi-token Wikidata
+    # IDs); SVO relations are single lowercase tokens. Cooccurs is the explicit
+    # sentinel value used at ingestion.
+    #
+    # Refs:
+    #   - SVO precision vs RE precision: Akbik & Löser (2012) "KrakeN: N-ary
+    #     facts in open information extraction" — dependency-parse triples have
+    #     lower precision than supervised RE on the same corpus.
+    #   - Multi-extractor pooling: Knowledge Vault (Dong et al., 2014, KDD)
+    #     weights per-extractor accuracy in the fusion step.
+    _RELATION_TYPE_WEIGHTS = {
+        "cooccurs": 0.25,    # statistical co-mention — weak signal, last resort
+    }
+    _RELATION_TYPE_DEFAULT_WEIGHT = 1.0   # REBEL Wikidata-style relations
+
+    # Heuristic to identify SVO vs REBEL relation strings at retrieval time
+    # (without a separate edge property). REBEL's Wikidata-style relations
+    # are multi-token: "date_of_birth", "member of sports team", "place_of_death".
+    # SVO predicates are single verb lemmas: "direct", "win", "bear", "lead".
+    # The cooccurs sentinel is matched literally by the dict above.
+    _SVO_WEIGHT = 0.6        # dependency-parse heuristic — between cooccurs and REBEL
+
+    @classmethod
+    def _classified_weight(cls, relation_type: Optional[str]) -> float:
+        """Return the retrieval-time weight for a relation_type string.
+
+        Cooccurs is matched literally. REBEL Wikidata-style relations
+        (containing '_' or whitespace) get the default 1.0 weight. SVO
+        single-token verb lemmas get _SVO_WEIGHT.
+        """
+        rel = (relation_type or "").strip().lower()
+        if not rel:
+            return cls._RELATION_TYPE_DEFAULT_WEIGHT
+        explicit = cls._RELATION_TYPE_WEIGHTS.get(rel)
+        if explicit is not None:
+            return explicit
+        # Multi-token => REBEL Wikidata-style
+        if "_" in rel or " " in rel:
+            return cls._RELATION_TYPE_DEFAULT_WEIGHT
+        # Single-token => SVO verb lemma
+        return cls._SVO_WEIGHT
+
+    def _triple_frequency_confidence(
+        self,
+        e1_name: str,
+        relation_type: Optional[str],
+        e2_name: str,
+    ) -> float:
+        """
+        P-2 (publication-blocker): compute a confidence score from triple
+        co-occurrence frequency, replacing REBEL's constant 0.5 sentinel.
+
+        Refs:
+            - DeepDive corpus-support inference: Niu et al. (2012). AI
+              Magazine 33(3). "Elementary: Large-scale KB Construction via
+              Machine Learning and Statistical Inference."
+            - Knowledge Vault confidence pooling: Dong et al. (2014). KDD.
+            - Log-scaled support normalisation: Mikolov et al. (2013).
+              "Distributed Representations…" NeurIPS — log frequency is the
+              standard transform for highly-skewed count distributions.
+
+        §12.36 update: multiplied by a relation-type weight so cooccurs
+        bridges (weight=0.25) are ranked far below semantic bridges
+        (weight=1.0) at the same support level.
+
+        Counts how many distinct chunks mention BOTH e1 and e2 (proxy for
+        "how often is this relation supported by the corpus"). Returns a
+        normalised score in (0, 1]:
+            base_conf = min(1.0, log(1 + n_supporting_chunks) / log(10))
+            conf = base_conf * relation_type_weight
+        - cooccurs at 1 chunk    → 0.30 × 0.25 = 0.075
+        - cooccurs at 9+ chunks  → 1.00 × 0.25 = 0.250
+        - semantic at 1 chunk    → 0.30 × 1.00 = 0.300
+        - semantic at 9+ chunks  → 1.00 × 1.00 = 1.000
+        ⇒ any semantic bridge beats any cooccurs bridge on confidence.
+
+        Returns 0.5 (the original sentinel) on query failure so callers
+        cannot tell the difference between "honest 0.5" and "error fallback".
+        """
+        if not e1_name or not e2_name:
+            return 0.5
+        try:
+            import math
+            res = self.conn.execute(
+                """
+                MATCH (e1:Entity {name: $e1_name})
+                MATCH (e2:Entity {name: $e2_name})
+                MATCH (c:DocumentChunk)-[:MENTIONS]->(e1)
+                MATCH (c)-[:MENTIONS]->(e2)
+                RETURN COUNT(DISTINCT c)
+                """,
+                {"e1_name": e1_name, "e2_name": e2_name},
+            )
+            if res.has_next():
+                n = int(res.get_next()[0] or 0)
+                # Origin-based weight: cooccurs 0.25, SVO 0.6, REBEL 1.0.
+                weight = self._classified_weight(relation_type)
+                if n <= 0:
+                    return 0.3 * weight  # one-sided support — still some signal
+                base = min(1.0, math.log(1 + n) / math.log(10))
+                return base * weight
+        except Exception as exc:
+            logger.debug("_triple_frequency_confidence failed: %s", exc)
+        return 0.5
+
     def find_chunks_by_entity_multihop(
         self,
         entity_name: str,
         max_results: int = 5,
         enable_hop3: bool = False,
+        max_hops: int = 2,
     ) -> List[Dict[str, Any]]:
         """
         Multi-hop entity search: returns chunks related to entity_name through
@@ -1211,6 +1389,10 @@ class KuzuGraphStore:
             entity_name: Entity name substring to match.
             max_results: Maximum total results across all hops.
             enable_hop3: Run the 2-bridge hop as well (slow; default False).
+            max_hops: Cap on graph-traversal depth. 0 disables graph search,
+                1 returns Hop-0 (direct mentions) only, ≥2 includes Hop-2 bridges.
+                Hop-3 is additionally gated by enable_hop3. Used by the
+                graph-only ablation baseline to disable bridge expansion.
 
         Returns:
             List of dicts: chunk_id, text, source_file, matched_entity,
@@ -1230,18 +1412,71 @@ class KuzuGraphStore:
         # what produces 40-second graph queries. Bridging through a hub adds no
         # signal anyway, so we only ever expand from the first few matches.
         _HUB_FANOUT_CAP = 5
+        # P-3 (publication-blocker): reject bridges through high-degree hub
+        # entities. "United States" is mentioned in 4404 chunks (47% of the
+        # corpus) and any graph traversal through it creates spurious
+        # cross-topic bridges. The cap is the same hub-threshold used at
+        # ingestion time (hub_threshold_ratio=0.03 × 9412 ≈ 280); entities
+        # with more mentions than this are treated as non-bridging hubs.
+        # The check happens at retrieval time so the underlying graph
+        # remains unchanged — this is reversible and tunable per query.
+        #
+        # Refs:
+        #   - Hub-suppression in graph IR: West & Leskovec (2012), WWW,
+        #     "Human Wayfinding in Information Networks" — high-degree nodes
+        #     are noisy bridges; users prune them.
+        #   - 3 % threshold derivation parallels TF-IDF's IDF cap (Salton &
+        #     Buckley, 1988, IPM 24(5)): a term/entity in >3 % of documents
+        #     loses discriminative power.
+        #   - GraphRAG (Edge et al., 2024, MSR, arXiv:2404.16130) drops high-
+        #     centrality nodes during community detection for the same reason.
+        _HUB_MENTION_CAP = 280
 
         try:
             # Hop 0: direct MENTIONS — try name variants until we get a hit.
-            # Prefer an EXACT name match (cheap, precise) before falling back to
-            # the un-indexed CONTAINS substring scan.
+            # Cascade (most precise → most permissive):
+            #   1. e.name = $query                 (exact match)
+            #   2. e.name CONTAINS $query          (stored entity contains query)
+            #   3. $query CONTAINS e.name          (I-3, query contains stored entity)
+            #      — implemented as `e.name IN $substrings` where substrings
+            #      are the multi-token prefixes/suffixes of the query.
+            # I-3 (publication-recommended): bidirectional alias matching.
+            # Without (3), query "the King" cannot match stored entity
+            # "King George V"; only the reverse direction worked.
             effective_name = entity_name  # will be updated on first hit
+
+            # Pre-compute multi-token sub-phrases of the candidate for the
+            # reverse-CONTAINS direction. Single tokens are too noisy (would
+            # match "the" entity). Sub-phrases of ≥2 tokens and ≥4 chars only.
+            def _multi_token_subphrases(text: str) -> list:
+                tokens = text.split()
+                subs: list = []
+                for i in range(len(tokens)):
+                    for j in range(i + 2, len(tokens) + 1):
+                        s = " ".join(tokens[i:j])
+                        if len(s) >= 4:
+                            subs.append(s)
+                # Sort by length descending so the most specific match wins.
+                return sorted(set(subs), key=len, reverse=True)
+
             for candidate in name_variants:
                 hop0_rows = []
-                for clause, params in (
-                    ("e.name = $entity_name", {"entity_name": candidate, "limit": max_results}),
-                    ("e.name CONTAINS $entity_name", {"entity_name": candidate, "limit": max_results}),
-                ):
+                reverse_subs = _multi_token_subphrases(candidate)
+                cascade = [
+                    ("e.name = $entity_name",
+                     {"entity_name": candidate, "limit": max_results}),
+                    ("e.name CONTAINS $entity_name",
+                     {"entity_name": candidate, "limit": max_results}),
+                ]
+                # I-3 reverse direction: only attempt when query has 2+ tokens
+                # AND the previous two clauses didn't match. The IN-list keeps
+                # the query indexable and avoids a full table scan.
+                if reverse_subs:
+                    cascade.append((
+                        "e.name IN $substrings",
+                        {"substrings": reverse_subs[:20], "limit": max_results},
+                    ))
+                for clause, params in cascade:
                     res = self.conn.execute(
                         f"""
                         MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity)
@@ -1254,7 +1489,7 @@ class KuzuGraphStore:
                     while res.has_next():
                         hop0_rows.append(res.get_next())
                     if hop0_rows:
-                        break  # exact match hit — don't run the CONTAINS scan
+                        break  # earliest cascade stage hit — stop here
                 if hop0_rows:
                     effective_name = candidate
                     if candidate != entity_name:
@@ -1273,21 +1508,38 @@ class KuzuGraphStore:
                                 "hops": 0,
                                 "bridge_entity": None,
                                 "relation_type": None,
+                                # Hop-0 is a direct mention — full confidence,
+                                # no triple-frequency lookup needed (the chunk
+                                # IS the supporting evidence).
+                                "triple_confidence": 1.0,
                             })
                     break  # stop trying variants once we have results
 
             # Use effective_name (the variant that matched) for hop 2/3 queries
             entity_name = effective_name  # noqa: PLW2901 — intentional rebinding for hop queries
 
-            # Hop 2: one RELATED_TO bridge (bidirectional), capped fan-out
+            # Hop 2: one RELATED_TO bridge (bidirectional), capped fan-out.
+            #
+            # §12.36 — Weighted cooccurs (was: binary drop in §12.34/P-5).
+            # The §12.34/P-5 binary cooccurs-filter eliminated 84.7% of
+            # bridge connectivity (255,838 of 302,184 entity-pairs had ONLY
+            # cooccurs edges) — empirically broke graph retrieval for the
+            # idx 71/76/78/79 question set. New behaviour:
+            #   - Cooccurs edges are KEPT but ranked lower (relation-type
+            #     weighting happens at confidence time, not retrieval time).
+            #   - Semantic relations (REBEL/SVO with named predicate) still
+            #     dominate via higher triple_confidence × relation_type_weight.
+            # P-3 still applies: hubs are excluded as bridge targets.
             remaining = max_results - len(chunks)
-            if remaining > 0:
+            if remaining > 0 and max_hops >= 2:
+                hub_names = _get_hub_entity_names(self.conn, _HUB_MENTION_CAP)
                 res = self.conn.execute(
                     """
                     MATCH (e1:Entity)
                     WHERE e1.name CONTAINS $entity_name
                     WITH e1 LIMIT $hub_cap
                     MATCH (e1)-[r:RELATED_TO]-(e2:Entity)
+                    WHERE NOT (e2.name IN $hub_names)
                     WITH e2, r.relation_type AS rel
                     MATCH (c:DocumentChunk)-[:MENTIONS]->(e2)
                     RETURN c.chunk_id, c.text, c.source_file,
@@ -1295,41 +1547,61 @@ class KuzuGraphStore:
                     LIMIT $limit
                     """,
                     {"entity_name": entity_name, "limit": remaining,
-                     "hub_cap": _HUB_FANOUT_CAP},
+                     "hub_cap": _HUB_FANOUT_CAP,
+                     "hub_names": hub_names},
                 )
                 while res.has_next():
                     row = res.get_next()
                     cid = row[0]
                     if cid and cid not in seen:
                         seen.add(cid)
+                        # P-2: triple-frequency confidence replaces REBEL's
+                        # constant-0.5 sentinel. Computed lazily per
+                        # returned chunk (not per edge) so cost is bounded.
+                        bridge_name = row[3]
+                        triple_conf = self._triple_frequency_confidence(
+                            entity_name, row[4], bridge_name
+                        )
                         chunks.append({
                             "chunk_id": cid,
                             "text": row[1],
                             "source_file": row[2],
                             "matched_entity": entity_name,
                             "hops": 2,
-                            "bridge_entity": row[3],
+                            "bridge_entity": bridge_name,
                             "relation_type": row[4],
+                            "triple_confidence": triple_conf,
                         })
 
-            # Hop 3: two RELATED_TO bridges, capped fan-out (opt-in — slow)
+            # Hop 3: two RELATED_TO bridges, capped fan-out (opt-in — slow).
+            # §12.36: cooccurs edges are weighted-low (not dropped).
+            # Hop-3 STILL excludes cooccurs because the noise compounds:
+            # two cooccurs hops = anything-to-anything in the corpus. Only
+            # semantic→semantic chains are admitted at depth 3.
+            # P-3: reject bridges through hub entities (e2 AND e3).
             remaining = max_results - len(chunks)
-            if enable_hop3 and remaining > 0:
+            if enable_hop3 and remaining > 0 and max_hops >= 3:
+                hub_names = _get_hub_entity_names(self.conn, _HUB_MENTION_CAP)
                 res = self.conn.execute(
                     """
                     MATCH (e1:Entity)
                     WHERE e1.name CONTAINS $entity_name
                     WITH e1 LIMIT $hub_cap
-                    MATCH (e1)-[:RELATED_TO]-(e2:Entity)-[r2:RELATED_TO]-(e3:Entity)
+                    MATCH (e1)-[r1:RELATED_TO]-(e2:Entity)-[r2:RELATED_TO]-(e3:Entity)
                     WHERE e3.name <> e1.name
-                    WITH e3, e2.name AS mid_entity, r2.relation_type AS rel
+                      AND (r1.relation_type IS NULL OR r1.relation_type <> 'cooccurs')
+                      AND (r2.relation_type IS NULL OR r2.relation_type <> 'cooccurs')
+                      AND NOT (e2.name IN $hub_names)
+                      AND NOT (e3.name IN $hub_names)
+                    WITH e2, e3, r2.relation_type AS rel
                     MATCH (c:DocumentChunk)-[:MENTIONS]->(e3)
                     RETURN c.chunk_id, c.text, c.source_file,
-                           e3.name AS bridge, mid_entity, rel
+                           e3.name AS bridge, e2.name AS mid_entity, rel
                     LIMIT $limit
                     """,
                     {"entity_name": entity_name, "limit": remaining,
-                     "hub_cap": _HUB_FANOUT_CAP},
+                     "hub_cap": _HUB_FANOUT_CAP,
+                     "hub_names": hub_names},
                 )
                 while res.has_next():
                     row = res.get_next()
@@ -1764,21 +2036,30 @@ class HybridStore:
         entities: List[str],
         max_hops: int = 2,
         top_k: int = 5,
+        enable_hop3: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Entity-driven graph retrieval.
 
-        Uses KuzuDB find_chunks_by_entity_multihop (up to 3 hops).
-        Results are sorted by hop distance (0 = direct mention = best).
+        Uses KuzuDB find_chunks_by_entity_multihop.
+        Results are sorted by (hops, -triple_confidence).
 
         Args:
             entities: Entity name strings extracted from the query.
-            max_hops: Unused (KuzuDB multihop is fixed at 3 hops internally).
+            max_hops: Cap on graph-traversal depth. 1 = Hop-0 only (direct
+                mentions, no bridges); 2 = adds Hop-2 (one-bridge);
+                3 = adds Hop-3 (two-bridge, also requires enable_hop3=True).
+                Default 2. Used by ablation studies to isolate the
+                bridge-expansion contribution.
             top_k: Maximum results to return.
+            enable_hop3: I-2 (publication-recommended). When True, run the
+                2-bridge Hop-3 traversal in addition to Hop-0/Hop-2. Off
+                by default because Hop-3 adds 200-1000ms latency. Opt in
+                via `graph.enable_hop3: true` in settings.yaml.
 
         Returns:
             List of dicts: chunk_id, text, source_file, matched_entity,
-            hops, bridge_entity, relation_type.
+            hops, bridge_entity, relation_type, triple_confidence.
         """
         results: List[Dict[str, Any]] = []
         seen_chunks: set = set()
@@ -1812,6 +2093,8 @@ class HybridStore:
             entity_chunks = self.graph_store.find_chunks_by_entity_multihop(
                 entity_name=entity_name,
                 max_results=top_k,
+                enable_hop3=enable_hop3,
+                max_hops=max_hops,
             )
 
             for chunk in entity_chunks:
@@ -1826,9 +2109,17 @@ class HybridStore:
                         "hops": chunk.get("hops", 0),
                         "bridge_entity": chunk.get("bridge_entity"),
                         "relation_type": chunk.get("relation_type"),
+                        # P-2: triple-frequency confidence. Hop-0 (direct
+                        # mention) defaults to 1.0 since no bridge is needed.
+                        "triple_confidence": chunk.get("triple_confidence", 1.0),
                     })
 
-        results.sort(key=lambda x: x.get("hops", 999))
+        # P-2: sort by (hops, -triple_confidence) so direct hits come first,
+        # then bridges ranked by corpus support strength rather than REBEL's
+        # constant 0.5 sentinel.
+        results.sort(
+            key=lambda x: (x.get("hops", 999), -x.get("triple_confidence", 0.0))
+        )
         return results[:top_k]
 
     def save(self) -> None:

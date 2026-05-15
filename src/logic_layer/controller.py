@@ -77,7 +77,7 @@ Review History:
 import logging
 import re
 import time
-from typing import Any, Dict, List, NotRequired, Optional, TypedDict, cast
+from typing import Any, Dict, List, NotRequired, Optional, Tuple, TypedDict, cast
 
 from ._config import ControllerConfig
 from .navigator import Navigator, NavigatorResult
@@ -349,8 +349,149 @@ class AgenticController:
                 "stage_timings": {"planner_ms": elapsed},
             }
 
+    # Query-keyword stopwords for relevance ranking. These are non-content
+    # words removed before measuring proximity between a candidate entity and
+    # the query keywords in the source chunk (§12.32 Fix 2).
+    _QUERY_STOPWORDS = frozenset({
+        "a", "an", "and", "are", "as", "at", "be", "by", "do", "does",
+        "for", "from", "has", "have", "he", "her", "him", "his", "how",
+        "in", "is", "it", "its", "of", "on", "or", "that", "the", "their",
+        "they", "this", "to", "was", "were", "what", "when", "where",
+        "which", "who", "whom", "whose", "why", "will", "with", "would",
+        "you", "your", "i", "we", "us", "our", "she", "them",
+    })
+
+    # Expected entity-type hints from interrogative words. Used to prefer
+    # candidates whose surface form matches the expected category.
+    _QUERY_TYPE_HINTS = {
+        # who/whose → person
+        "who": "PERSON", "whose": "PERSON", "whom": "PERSON",
+        # where → location/place
+        "where": "GPE",
+        # when → date/year (matched by digit pattern, not name-style)
+        "when": "DATE",
+    }
+
+    @classmethod
+    def _score_bridge_candidate(
+        cls,
+        candidate: str,
+        chunk: str,
+        query: str,
+        expected_type: Optional[str] = None,
+    ) -> float:
+        """
+        Relevance score for a bridge-entity candidate.
+
+        Combines three signals:
+            +α  Proximity to query keywords in the source chunk (the closer
+                the candidate sits to terms the user actually asked about,
+                the more likely it is the intended bridge).
+            +β  Match to expected entity type (PERSON candidates score
+                higher when the query says "who", GPE higher for "where").
+            -γ  Position penalty for being far from the start of the chunk
+                (top-of-chunk entities are usually the topic; later mentions
+                are tangential — "Robert Durst... Galveston" appears after
+                the subject's main definition).
+
+        Returns a float in roughly [0, 3]. Higher = more likely the bridge.
+        """
+        chunk_lower = chunk.lower()
+        candidate_lower = candidate.lower()
+        cand_pos = chunk_lower.find(candidate_lower)
+        if cand_pos < 0:
+            return 0.0
+
+        # ── Signal 1: proximity to query keywords ─────────────────────────
+        # Score inversely proportional to the distance (in characters)
+        # between the candidate and the nearest query keyword in the chunk.
+        query_keywords = [
+            w.lower() for w in re.findall(r"\b\w{3,}\b", query)
+            if w.lower() not in cls._QUERY_STOPWORDS
+        ]
+        min_dist = float("inf")
+        for kw in query_keywords:
+            kw_pos = chunk_lower.find(kw)
+            if kw_pos >= 0:
+                dist = abs(kw_pos - cand_pos)
+                if dist < min_dist:
+                    min_dist = dist
+        # Convert distance → score in (0, 1]: 0 chars → 1.0, 500 chars → ~0.5
+        if min_dist == float("inf"):
+            proximity = 0.0
+        else:
+            proximity = 1.0 / (1.0 + min_dist / 200.0)
+
+        # ── Signal 2: expected-type match ─────────────────────────────────
+        # PERSON type-bonus is gated by a role-noun blocklist. Multi-word
+        # capitalised phrases like "Texas Private Investigator" or "Sony
+        # Pictures Movie" match the surface pattern of a person name but
+        # are role descriptions, not names. They get NO type bonus —
+        # otherwise they outrank real names ("Sela Ward") when both happen
+        # to sit near the same query keywords.
+        type_bonus = 0.0
+        # Tokens that, when present, mark the candidate as a role/title
+        # rather than a person name. Conservative — only common role words.
+        _ROLE_TOKENS = {
+            "investigator", "director", "producer", "manager", "president",
+            "chairman", "founder", "owner", "captain", "coach", "lawyer",
+            "attorney", "officer", "secretary", "minister", "governor",
+            "actor", "actress", "author", "writer", "composer",
+            # Org/title fragments
+            "pictures", "studios", "movie", "film", "company", "corporation",
+            "investigations", "agency", "department", "division", "group",
+            "industries", "limited", "incorporated", "associates",
+            # Place-like that show up in addresses
+            "private", "public",
+        }
+        if expected_type == "PERSON":
+            tokens = candidate.split()
+            tokens_lower = [t.lower() for t in tokens]
+            has_role_token = any(t in _ROLE_TOKENS for t in tokens_lower)
+            # Heuristic: PERSON names typically have 2-3 capitalised tokens
+            # AND no role/title noun. Allow optional middle name.
+            if (
+                2 <= len(tokens) <= 3
+                and all(t[0].isupper() for t in tokens if t)
+                and not has_role_token
+            ):
+                type_bonus = 0.5
+            elif has_role_token:
+                # Active anti-bonus: this is almost certainly a role, not
+                # a person. Subtract to push it below real names.
+                type_bonus = -0.3
+        elif expected_type == "GPE":
+            # GPE: single capitalised token, often shorter (city/country).
+            if len(candidate.split()) <= 2:
+                type_bonus = 0.3
+
+        # ── Signal 3: position penalty ────────────────────────────────────
+        # Candidates in the first 200 chars are the topic; after that,
+        # they're usually distractors. Penalty grows linearly to -0.5.
+        position_penalty = min(0.5, cand_pos / 600.0)
+
+        return proximity + type_bonus - position_penalty
+
+    @classmethod
+    def _detect_expected_type(cls, query: str) -> Optional[str]:
+        """Infer the expected bridge-entity type from interrogative words.
+
+        Returns the first matching hint type, or None if the query has no
+        recognised question word. Conservative — only fires on canonical
+        question starters."""
+        q = query.lower().strip()
+        for prefix, etype in cls._QUERY_TYPE_HINTS.items():
+            if q.startswith(prefix + " ") or f" {prefix} " in q:
+                return etype
+        # Special case: "the actress who"/"the director who" → PERSON
+        if re.search(r"\bthe\s+\w+\s+who\b", q):
+            return "PERSON"
+        return None
+
     @staticmethod
-    def _extract_bridge_entities(chunks: List[str], exclude: List[str]) -> List[str]:
+    def _extract_bridge_entities(
+        chunks: List[str], exclude: List[str], query: str = "",
+    ) -> List[str]:
         """
         Extract candidate bridge entity names from retrieved text chunks.
 
@@ -399,10 +540,20 @@ class AgenticController:
         seen: set = set()
         candidates: List[str] = []
 
-        # ── Pass 0: location-context extraction ──────────────────────────────
-        # Only scan the top-ranked chunk (index 0) — it is the most relevant
-        # and city names there are the intended bridge target.
-        if chunks:
+        # ── Pass 0: location-context extraction (geography queries only) ─────
+        # Pass 0 was originally unconditional — fires on every chunk regardless
+        # of whether the query is asking about a place. That caused
+        # over-extraction on person-bridge questions: "What is the middle name
+        # of the actress who plays Bobbi Bacha?" returned "New York" and
+        # "Galveston" from the gold chunk's tangential clause about Robert
+        # Durst's murder trial.
+        #
+        # Fix (§12.32): gate Pass 0 to queries whose *expected type* is GPE.
+        # When the user asks "where/in which city/in which country", Pass 0
+        # is the right tool. When they ask "who/which actress/the X of Y",
+        # skip Pass 0 entirely so the relevance-ranked Pass 2 can do its job.
+        expected_type = AgenticController._detect_expected_type(query)
+        if chunks and expected_type == "GPE":
             for m in _LOCATION_CTX_RE.finditer(chunks[0]):
                 place = m.group(1).strip()
                 place_lower = place.lower()
@@ -418,12 +569,30 @@ class AgenticController:
             return candidates[:3]
 
         # ── Pass 1: surname-anchor search ────────────────────────────────────
+        # Only the LAST token of a 2-3 token exclusion is treated as a
+        # surname anchor. Previously this pass iterated EVERY long token of
+        # every exclusion, which caused token-level leaks when the exclude
+        # list contained compound entities like "Bobbi Bacha in Suburban
+        # Madness" — "Suburban" and "Madness" were both ≥6 chars, so the
+        # regex matched "Pictures Suburban" and "Movie Madness" as surname
+        # anchors. The fix restricts the heuristic to its intended scope:
+        # person names of the form "First [Middle] Surname".
         for known in exclude:
             tokens = known.split()
-            # Use only long tokens (≥6 chars) as surname anchors to avoid
-            # matching common first names ("Peter" = 5, but "Schmeichel" = 10).
-            surnames = [t for t in tokens if len(t) >= 6]
-            for surname in surnames:
+            # Restrict to 2- or 3-token exclusions; longer phrases (those
+            # with prepositional context like "X in Y") are not person names.
+            if len(tokens) not in (2, 3):
+                continue
+            # Skip exclusions containing prepositions or articles — they're
+            # not person names regardless of token count.
+            if any(t.lower() in {"in", "on", "of", "at", "by", "the", "a", "an"}
+                   for t in tokens):
+                continue
+            # Only the last token may be a surname anchor.
+            surname = tokens[-1]
+            if len(surname) < 6:
+                continue
+            for _ in (surname,):  # preserve loop indent for minimal diff
                 pat = re.compile(
                     r"\b([A-Z][^\s,.()\[\]]{1,})\s+(?:[A-Z][^\s,.()\[\]]+\s+)?"
                     + re.escape(surname)
@@ -451,28 +620,119 @@ class AgenticController:
         if candidates:
             return candidates[:3]
 
-        # ── Pass 2: general proper-noun fallback ──────────────────────────────
-        # Prefer 2-token person-name spans ("Carlo Rovelli") over longer title
-        # fragments ("Seven Brief Lessons on Physics").  Collect all candidates
-        # first, then sort: 2-token names first, longer spans last.
-        two_token: List[str] = []
-        multi_token: List[str] = []
+        # ── Pass 2: general proper-noun fallback, query-relevance ranked ──
+        # Previously: 2-token names first, then multi-token, in extraction
+        # order. That picked up the first geographic noun in a chunk even
+        # when a person name was the intended bridge — e.g. "Bobbi Bacha
+        # ... Sela Ward ... New York ... Galveston" returned "New York"
+        # before "Sela Ward" because of token-count tiebreaking.
+        #
+        # Now (§12.32 Fix 2): each candidate is scored against the query
+        # using proximity to query keywords, expected-type match, and a
+        # position penalty for late-in-chunk mentions (which tend to be
+        # tangential). The top-scoring candidates win.
+        #
+        # Also: the exclusion check is now token-substring-aware. When the
+        # exclude list contains a compound entity like "Bobbi Bacha in
+        # Suburban Madness", the constituent phrases "Bobbi Bacha" and
+        # "Suburban Madness" must also be excluded — they are not the
+        # bridge, they are the subject of the query.
+        expected_type = AgenticController._detect_expected_type(query)
+
+        # Build a set of all sub-phrases of every exclusion (for substring
+        # check): "Bobbi Bacha in Suburban Madness" → {"Bobbi Bacha",
+        # "Suburban Madness", "Bobbi", "Suburban Madness in", ...}. We only
+        # need 2+ token sub-phrases — single tokens are too noisy.
+        excluded_subphrases: set = set(exclude_lower)
+        for known in exclude:
+            tokens = known.split()
+            for i in range(len(tokens)):
+                for j in range(i + 2, len(tokens) + 1):
+                    sub = " ".join(tokens[i:j]).lower()
+                    # Skip sub-phrases starting/ending with a preposition
+                    # ("in suburban madness" should not become a key).
+                    if tokens[i].lower() in {"in", "on", "of", "at", "by", "the", "a", "an"}:
+                        continue
+                    if tokens[j - 1].lower() in {"in", "on", "of", "at", "by", "the", "a", "an"}:
+                        continue
+                    excluded_subphrases.add(sub)
+
+        scored: List[Tuple[float, str]] = []
         for chunk in chunks:
             for m in _PROPER_NOUN_RE.finditer(chunk):
                 phrase = m.group(1)
                 phrase_lower = phrase.lower()
                 if (
-                    phrase_lower not in exclude_lower
+                    phrase_lower not in excluded_subphrases
                     and len(phrase) > 4
                     and phrase_lower not in seen
                 ):
                     seen.add(phrase_lower)
-                    if len(phrase.split()) == 2:
-                        two_token.append(phrase)
-                    else:
-                        multi_token.append(phrase)
-        candidates = two_token + multi_token
-        return candidates[:3]
+                    score = AgenticController._score_bridge_candidate(
+                        phrase, chunk, query, expected_type,
+                    )
+                    # Two-token bias preserved as a small tie-breaker
+                    # bonus (NOT the primary sort key). PERSON names are
+                    # almost always 2 tokens; 3+ token phrases are typically
+                    # role descriptions ("Texas Private Investigator") or
+                    # multi-word titles, less likely to be bridges.
+                    n_tokens = len(phrase.split())
+                    if n_tokens == 2:
+                        score += 0.10
+                    elif n_tokens >= 4:
+                        score -= 0.20
+                    scored.append((score, phrase))
+        # Sort descending by score; preserve stable order for ties.
+        scored.sort(key=lambda x: -x[0])
+        return [phrase for _, phrase in scored[:3]]
+
+    @staticmethod
+    def _rewrite_hop_query_with_bridges(
+        sub_query: str, bridges: List[str],
+    ) -> str:
+        """
+        §12.37 Fix F: inject resolved bridge entities into a hop's sub-query.
+
+        Iterative multi-hop retrieval relies on each hop being able to find
+        its supporting paragraph in the index. Planner-generated sub-queries
+        are written before retrieval runs, so Hop-2 sub-queries are usually
+        under-specified (e.g. "What is the population?" with no entity).
+        After Hop-1 resolves a bridge entity (e.g. "Strasbourg"), Hop-2 must
+        be rewritten to "What is the population of Strasbourg?" before the
+        retriever sees it — otherwise the retriever returns random
+        population-discussing chunks.
+
+        Heuristic (conservative — only fires when SAFE):
+          - If sub_query already mentions any of the bridge entities (case-
+            insensitive), do nothing (no double-injection).
+          - Otherwise append `" — about <bridge_1>, <bridge_2>"` to the
+            sub-query. Vector retrievers tolerate this format well; BM25
+            picks up the entity tokens; graph search uses the entity names
+            from `current_hints` regardless.
+
+        Refs:
+          - Query rewriting in iterative retrieval: IRCoT (Trivedi et al.,
+            2023, ACL, arXiv:2212.10509).
+          - Sub-question augmentation: DSP / Self-Ask (Khattab et al., 2022,
+            arXiv:2212.14024; Press et al., 2022, EMNLP).
+        """
+        if not bridges or not sub_query:
+            return sub_query
+        sq_lower = sub_query.lower()
+        # Already mentioned? skip (avoid "...of Strasbourg of Strasbourg")
+        new_bridges = [b for b in bridges if b.lower() not in sq_lower]
+        if not new_bridges:
+            return sub_query
+        # Conservative join: "X — about Y, Z". Does not assume any verb form.
+        # The em-dash is rare in natural text → minimal risk of confusing
+        # entity extractors downstream.
+        injection = ", ".join(new_bridges[:3])  # cap at 3 to keep query short
+        rewritten = f"{sub_query.rstrip(' ?.')} — about {injection}"
+        logger.info(
+            "[S_N Iterative] Rewrote sub-query: %r → %r",
+            sub_query[:60], rewritten[:80],
+        )
+        return rewritten
 
     def _iterative_navigator_node(
         self,
@@ -501,6 +761,19 @@ class AgenticController:
         seen_raw: set = set()
         seen_filtered: set = set()
         current_hints = list(entity_names)
+        # §12.37 Fix F: track resolved bridge entities so subsequent hops can
+        # inject them into their sub_query before retrieval. Without this,
+        # Hop-2 sub-queries like "What is the population?" go to the
+        # retriever as-is and return irrelevant chunks because the bridge
+        # entity (e.g. "Strasbourg", "Sela Ward") is known but not used.
+        # Refs:
+        #   - Iterative multi-hop retrieval: IRCoT (Trivedi et al., 2023, ACL,
+        #     arXiv:2212.10509) — feeds retrieved entities back into the
+        #     next-hop query.
+        #   - Query rewriting with resolved entities: HippoRAG (Gutiérrez et
+        #     al., 2024, NeurIPS) — uses personalized-PageRank seeds from
+        #     hop-1 to guide hop-2 retrieval.
+        resolved_bridges: List[str] = []
 
         hops = sorted(hop_sequence_raw, key=lambda h: h.get("step_id", 0))
 
@@ -508,6 +781,17 @@ class AgenticController:
             sub_query = hop.get("sub_query", state["query"])
             is_bridge = hop.get("is_bridge", False)
             step_id = hop.get("step_id", 0)
+
+            # §12.37 Fix F: rewrite this hop's sub-query by injecting the
+            # bridge entities resolved in earlier hops. Only fires when:
+            #   1. We have at least one resolved bridge entity from prior hops
+            #   2. The bridge entity is NOT already mentioned in the sub_query
+            #   3. The sub_query depends on at least one prior bridge hop
+            depends_on = hop.get("depends_on") or []
+            if resolved_bridges and depends_on:
+                sub_query = self._rewrite_hop_query_with_bridges(
+                    sub_query, resolved_bridges
+                )
 
             logger.info(
                 "[S_N Iterative] Step %d (bridge=%s) query=%r  hints=%s",
@@ -554,9 +838,14 @@ class AgenticController:
             # All filtered chunks are used (not just first 2) so that bridge
             # entities in lower-ranked chunks are not missed.
             if is_bridge and nav_result.filtered_context:
+                # Pass the ORIGINAL query (not the sub-query) so the
+                # type-detection picks up "who"/"where"/"the actress who"
+                # from the user's surface phrasing rather than from the
+                # planner-generated stub.
                 bridge_entities = self._extract_bridge_entities(
                     nav_result.filtered_context,
                     exclude=current_hints,
+                    query=state["query"],
                 )
                 if bridge_entities:
                     logger.info(
@@ -564,6 +853,9 @@ class AgenticController:
                         bridge_entities,
                     )
                     current_hints = current_hints + bridge_entities
+                    # §12.37 Fix F: remember bridge entities so the NEXT hop
+                    # can inject them into its sub_query (see top of loop).
+                    resolved_bridges = resolved_bridges + bridge_entities
 
         elapsed = (time.time() - start_time) * 1000
         logger.info(
