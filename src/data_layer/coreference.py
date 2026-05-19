@@ -6,7 +6,7 @@ Applied per-article BEFORE chunking so that GLiNER (Phase 2) and the graph
 (Phase 3) capture the named entity behind each pronoun rather than dropping
 the mention or classifying the pronoun as PERSON.
 
-Effect on the graph:
+Worked example:
     Before:  "Christopher Nolan was born in London. He directed Inception."
              -> Phase 2 extracts: Christopher Nolan, London, Inception, "He" (PERSON)
              -> "He" is dropped by the stoplist; the link Nolan -> Inception
@@ -14,8 +14,15 @@ Effect on the graph:
     After:   "Christopher Nolan was born in London. Christopher Nolan
               directed Inception."
              -> Phase 2 extracts: Christopher Nolan (twice), London, Inception
-             -> Cooccurrence captures Nolan-London and Nolan-Inception in
-                separate sentences -> graph density doubles for the article.
+             -> Cooccurrence captures Nolan-London and Nolan-Inception
+                in the same paragraph.
+
+The magnitude of the effect on the final graph (entity count, mention count,
+relation count, isolated-entity rate) depends on the corpus and the
+performance of the underlying coreferee resolver and was not quantified
+empirically for this thesis; the design decision to enable coref by default
+is qualitative (pronoun-dropped mentions are unrecoverable downstream) and
+is documented as such in the methodology section.
 
 OPTIONAL DEPENDENCY
 -------------------
@@ -25,7 +32,8 @@ OPTIONAL DEPENDENCY
 
 If coreferee is not installed or no md/lg spaCy model is available, every
 call returns the input text unchanged. The pipeline keeps working — graph
-density just stays at the pre-coref level.
+density just stays at the pre-coref level. The Phase-3 ingestion log
+records whether coref was applied so the ingest manifest is reproducible.
 """
 
 from __future__ import annotations

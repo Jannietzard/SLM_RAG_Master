@@ -463,6 +463,362 @@ class TestKuzuGraphStore:
         assert KuzuGraphStore._classified_weight(None) == 1.0
         assert KuzuGraphStore._classified_weight("") == 1.0
 
+    def test_add_entities_bulk_inserts_all_distinct_nodes(self, temp_dir: Path) -> None:
+        """Phase-3b-fix (2026-05-19): add_entities_bulk must insert every
+        distinct entity_id provided, using a transactional MERGE so the call
+        is fast and idempotent.
+        """
+        from src.data_layer.storage import KuzuGraphStore
+
+        store = KuzuGraphStore(temp_dir / "graph_bulk_entities")
+        entities = [
+            (f"e_{i:03d}", f"Entity {i}", "person" if i % 2 == 0 else "org", 0.8)
+            for i in range(25)
+        ]
+        n = store.add_entities_bulk(entities, batch_size=10)
+        assert n == 25
+        res = store.conn.execute("MATCH (e:Entity) RETURN COUNT(e)")
+        count = res.get_next()[0]
+        assert count == 25, f"Expected 25 entities, got {count}"
+
+    def test_add_entities_bulk_is_idempotent_via_merge(self, temp_dir: Path) -> None:
+        """Calling add_entities_bulk twice with the same primary keys must
+        NOT create duplicate nodes. MERGE on the primary-key Entity table
+        is idempotent; a second call updates the SET fields and that's all.
+        """
+        from src.data_layer.storage import KuzuGraphStore
+
+        store = KuzuGraphStore(temp_dir / "graph_bulk_idempotent")
+        entities = [("e_001", "Alpha", "person", 0.9),
+                    ("e_002", "Beta",  "org",    0.8)]
+        store.add_entities_bulk(entities)
+        store.add_entities_bulk(entities)   # second call — must not duplicate
+
+        count = store.conn.execute(
+            "MATCH (e:Entity) RETURN COUNT(e)"
+        ).get_next()[0]
+        assert count == 2, (
+            f"add_entities_bulk must be idempotent at the primary-key level; "
+            f"got {count} nodes after two identical calls"
+        )
+
+    def test_add_mentions_relations_bulk_inserts_all_edges(self, temp_dir: Path) -> None:
+        """Phase-3b-fix (2026-05-19): add_mentions_relations_bulk must insert
+        one MENTIONS edge per supplied (chunk_id, entity_id) pair using a
+        transactional CREATE so the call avoids KuzuDB's adjacency-list
+        existence scan that MERGE-on-edge would incur.
+
+        This is the test that documents the per-edge CREATE design choice:
+        the caller deduplicates pairs in Python, then CREATE inserts each
+        edge without a scan.
+        """
+        from src.data_layer.storage import KuzuGraphStore
+
+        store = KuzuGraphStore(temp_dir / "graph_bulk_mentions")
+        # Seed 3 chunks + 4 entities.
+        for i in range(3):
+            store.add_document_chunk(
+                chunk_id=f"c_{i}", text=f"chunk {i}", page_number=1,
+                chunk_index=i, source_file="t.txt",
+            )
+        store.add_entities_bulk(
+            [(f"e_{i}", f"E{i}", "person", 0.9) for i in range(4)]
+        )
+
+        # 6 distinct mention edges.
+        pairs = [
+            ("c_0", "e_0"), ("c_0", "e_1"),
+            ("c_1", "e_1"), ("c_1", "e_2"),
+            ("c_2", "e_2"), ("c_2", "e_3"),
+        ]
+        n = store.add_mentions_relations_bulk(pairs, batch_size=4)
+        assert n == 6
+        edge_count = store.conn.execute(
+            "MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity) RETURN COUNT(*)"
+        ).get_next()[0]
+        assert edge_count == 6, f"Expected 6 MENTIONS edges, got {edge_count}"
+
+    def test_redirect_entity_edges_bulk_rewrites_correctly(self, temp_dir: Path) -> None:
+        """Phase-3d.5-fix (2026-05-19): _redirect_entity_edges_bulk must
+        move every MENTIONS / RELATED_TO edge from a set of `old_id`
+        entities to their mapped `new_id`, then delete the old entities.
+
+        Setup: A small graph with two PERSON entities (`e_old`, `e_new`)
+        sharing a chunk-MENTIONS link and a RELATED_TO edge each.
+        Calling `_redirect_entity_edges_bulk({e_old: e_new})` must:
+
+          - Move e_old's MENTIONS edges onto e_new.
+          - Move e_old's outgoing/incoming RELATED_TO edges onto e_new.
+          - Drop any edge that would self-loop after redirect.
+          - DETACH-DELETE e_old.
+        """
+        from src.data_layer.storage import KuzuGraphStore
+        from src.data_layer.graph_quality import _redirect_entity_edges_bulk
+
+        store = KuzuGraphStore(temp_dir / "graph_redirect_bulk")
+
+        # Two chunks, three entities. e_old will be redirected to e_new;
+        # e_other stays put and exchanges relations with both.
+        for cid in ("c1", "c2"):
+            store.add_document_chunk(cid, f"text {cid}", 1, 0, "t.txt")
+        store.add_entities_bulk([
+            ("e_old",   "Alpha",  "person", 0.9),
+            ("e_new",   "Beta",   "person", 0.9),
+            ("e_other", "Gamma",  "org",    0.8),
+        ])
+
+        # c1 mentions e_old; c2 mentions e_new — after redirect, both
+        # chunks should mention e_new (and there should be exactly one
+        # c1->e_new edge, exactly one c2->e_new edge).
+        store.add_mentions_relations_bulk([("c1", "e_old"), ("c2", "e_new")])
+
+        # RELATED_TO: e_old -> e_other (outgoing), e_other -> e_old (incoming).
+        store.add_related_to_relations_bulk([
+            ("e_old",   "e_other", "knows",   0.9, ""),
+            ("e_other", "e_old",   "friend",  0.9, ""),
+        ], use_create=True)
+
+        # Redirect e_old -> e_new.
+        _redirect_entity_edges_bulk(store, {"e_old": "e_new"})
+
+        # e_old must be gone.
+        n_old = store.conn.execute(
+            "MATCH (e:Entity {entity_id: 'e_old'}) RETURN COUNT(e)"
+        ).get_next()[0]
+        assert n_old == 0, f"e_old should have been deleted; found {n_old}"
+
+        # Both chunks should now mention e_new — exactly one edge each.
+        c1_to_new = store.conn.execute(
+            "MATCH (:DocumentChunk {chunk_id:'c1'})-[:MENTIONS]->"
+            "(:Entity {entity_id:'e_new'}) RETURN COUNT(*)"
+        ).get_next()[0]
+        c2_to_new = store.conn.execute(
+            "MATCH (:DocumentChunk {chunk_id:'c2'})-[:MENTIONS]->"
+            "(:Entity {entity_id:'e_new'}) RETURN COUNT(*)"
+        ).get_next()[0]
+        assert c1_to_new == 1, f"Expected 1 c1->e_new MENTIONS; got {c1_to_new}"
+        assert c2_to_new == 1, f"Expected 1 c2->e_new MENTIONS; got {c2_to_new}"
+
+        # RELATED_TO edges must now reference e_new on both sides.
+        n_out = store.conn.execute(
+            "MATCH (:Entity {entity_id:'e_new'})-[:RELATED_TO]->"
+            "(:Entity {entity_id:'e_other'}) RETURN COUNT(*)"
+        ).get_next()[0]
+        n_in = store.conn.execute(
+            "MATCH (:Entity {entity_id:'e_other'})-[:RELATED_TO]->"
+            "(:Entity {entity_id:'e_new'}) RETURN COUNT(*)"
+        ).get_next()[0]
+        assert n_out >= 1, f"Expected outgoing redirect; got {n_out}"
+        assert n_in  >= 1, f"Expected incoming redirect; got {n_in}"
+
+    def test_redirect_entity_edges_bulk_drops_self_loops(self, temp_dir: Path) -> None:
+        """If two entities being merged share a RELATED_TO edge between them
+        (A -> B and we redirect A to B), the result would be a self-loop
+        B -> B. _redirect_entity_edges_bulk must drop those.
+        """
+        from src.data_layer.storage import KuzuGraphStore
+        from src.data_layer.graph_quality import _redirect_entity_edges_bulk
+
+        store = KuzuGraphStore(temp_dir / "graph_redirect_selfloop")
+        store.add_entities_bulk([
+            ("e_a", "A", "person", 0.9),
+            ("e_b", "B", "person", 0.9),
+        ])
+        # A -> B exists. Redirecting A to B would produce B -> B.
+        store.add_related_to_relations_bulk(
+            [("e_a", "e_b", "knows", 0.9, "")], use_create=True,
+        )
+        _redirect_entity_edges_bulk(store, {"e_a": "e_b"})
+
+        n_selfloop = store.conn.execute(
+            "MATCH (e:Entity {entity_id:'e_b'})-[:RELATED_TO]->"
+            "(:Entity {entity_id:'e_b'}) RETURN COUNT(*)"
+        ).get_next()[0]
+        assert n_selfloop == 0, (
+            f"Self-loops must be dropped by the redirect; got {n_selfloop}"
+        )
+
+    def test_add_mentions_relations_bulk_skips_unknown_endpoints(
+        self, temp_dir: Path,
+    ) -> None:
+        """A pair referencing a missing chunk OR a missing entity must NOT
+        crash the batch — KuzuDB's MATCH simply fails to bind and the row
+        is skipped. The other edges in the batch must still be written.
+
+        This is the production safety contract: a stale extraction artifact
+        referencing a chunk_id that has been cleaned out of the chunk table
+        cannot poison the whole ingest.
+        """
+        from src.data_layer.storage import KuzuGraphStore
+
+        store = KuzuGraphStore(temp_dir / "graph_bulk_mentions_safe")
+        store.add_document_chunk(
+            "c_real", "real chunk", 1, 0, "t.txt",
+        )
+        store.add_entities_bulk([("e_real", "E", "person", 0.9)])
+
+        pairs = [
+            ("c_real",  "e_real"),
+            ("c_ghost", "e_real"),   # chunk does not exist
+            ("c_real",  "e_ghost"),  # entity does not exist
+        ]
+        store.add_mentions_relations_bulk(pairs)
+        edge_count = store.conn.execute(
+            "MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity) RETURN COUNT(*)"
+        ).get_next()[0]
+        # Exactly one real edge survives; the two ghost-endpoint inserts
+        # MATCH-fail in KuzuDB and write nothing.
+        assert edge_count == 1, (
+            f"Bulk MENTIONS must skip pairs with unbound endpoints; "
+            f"got {edge_count} edges"
+        )
+
+
+class TestEntityLinkingResume:
+    """Phase-3d.5 per-bucket checkpoint regression tests (2026-05-19).
+
+    These tests validate the resume contract of
+    `link_entities_by_embedding`:
+
+      - `done_buckets={"PERSON"}` causes the PERSON bucket to be skipped
+        wholesale — no embeddings called, no callback invoked for that
+        bucket. (Crash-recovery: if a previous run already linked PERSON,
+        the next `--resume` call must not redo it.)
+      - `on_bucket_done(etype, merged_in_type)` fires after every bucket
+        that is *processed* (whether merges happened or not). Skipped
+        buckets via `done_buckets` do NOT fire the callback (the caller
+        already recorded them).
+      - Buckets are iterated in sorted-by-name order so resume semantics
+        are deterministic across runs.
+
+    The embedder is a hand-rolled stub that returns orthogonal vectors,
+    so similarity is always 0 and no merging happens — we are testing
+    control flow, not the linker algorithm itself (the algorithm is
+    exercised by `test_redirect_entity_edges_bulk_*`).
+    """
+
+    def _make_orthogonal_embedder(self, dim: int = 16):
+        """Stub embedder: each text gets a distinct unit-basis vector, so
+        cosine similarity between any two texts is 0 — no merges fire."""
+
+        class _OrthEmbedder:
+            def __init__(self) -> None:
+                self._slot = 0
+
+            def embed_documents(self, texts):
+                out = []
+                for _ in texts:
+                    v = [0.0] * dim
+                    v[self._slot % dim] = 1.0
+                    self._slot += 1
+                    out.append(v)
+                return out
+
+        return _OrthEmbedder()
+
+    def _seed_graph(self, temp_dir: Path, suffix: str):
+        """Build a KuzuDB with 3 PERSON + 3 ORG entities (3 ≥ min_type_size=2)
+        and one MENTIONS edge per entity so the entity-load query returns
+        them. Returns the open store.
+        """
+        from src.data_layer.storage import KuzuGraphStore
+
+        store = KuzuGraphStore(temp_dir / f"graph_linking_resume_{suffix}")
+        store.add_document_chunk("c1", "text c1", 1, 0, "t.txt")
+        store.add_entities_bulk([
+            ("p1", "Alice",  "PERSON", 0.9),
+            ("p2", "Bob",    "PERSON", 0.9),
+            ("p3", "Carol",  "PERSON", 0.9),
+            ("o1", "Acme",   "ORG",    0.9),
+            ("o2", "Globex", "ORG",    0.9),
+            ("o3", "Initech","ORG",    0.9),
+        ])
+        store.add_mentions_relations_bulk([
+            ("c1", "p1"), ("c1", "p2"), ("c1", "p3"),
+            ("c1", "o1"), ("c1", "o2"), ("c1", "o3"),
+        ])
+        return store
+
+    def test_done_buckets_skips_listed_types(self, temp_dir: Path) -> None:
+        """PERSON listed in done_buckets must be skipped — no callback for
+        it, no embeddings drawn for PERSON names.
+        """
+        from src.data_layer.graph_quality import link_entities_by_embedding
+
+        store = self._seed_graph(temp_dir, "skip")
+        embedder = self._make_orthogonal_embedder()
+
+        seen: list[tuple[str, int]] = []
+        link_entities_by_embedding(
+            graph_store=store,
+            embedder=embedder,
+            similarity_threshold=0.92,
+            done_buckets={"PERSON"},
+            on_bucket_done=lambda etype, n: seen.append((etype, n)),
+        )
+
+        seen_types = {etype for etype, _ in seen}
+        assert "PERSON" not in seen_types, (
+            "PERSON was in done_buckets and must not fire the callback; "
+            f"got {seen_types}"
+        )
+        assert "ORG" in seen_types, (
+            f"ORG should have been processed; got {seen_types}"
+        )
+
+    def test_on_bucket_done_invoked_per_processed_bucket(
+        self, temp_dir: Path,
+    ) -> None:
+        """Without done_buckets, every type bucket that is large enough
+        must produce exactly one callback. The merged_in_type count is 0
+        because the orthogonal embedder forces zero similarity.
+        """
+        from src.data_layer.graph_quality import link_entities_by_embedding
+
+        store = self._seed_graph(temp_dir, "all")
+        embedder = self._make_orthogonal_embedder()
+
+        seen: list[tuple[str, int]] = []
+        link_entities_by_embedding(
+            graph_store=store,
+            embedder=embedder,
+            similarity_threshold=0.92,
+            on_bucket_done=lambda etype, n: seen.append((etype, n)),
+        )
+
+        seen_types = [etype for etype, _ in seen]
+        # Both buckets fire (3 entities each, >= min_type_size=2).
+        assert "PERSON" in seen_types and "ORG" in seen_types, (
+            f"Expected callbacks for both PERSON and ORG; got {seen_types}"
+        )
+        # Orthogonal embeddings → no merges anywhere.
+        assert all(n == 0 for _, n in seen), (
+            f"Orthogonal embedder must not produce merges; got {seen}"
+        )
+
+    def test_bucket_iteration_is_sorted(self, temp_dir: Path) -> None:
+        """Resume relies on a stable iteration order — sorted by type name."""
+        from src.data_layer.graph_quality import link_entities_by_embedding
+
+        store = self._seed_graph(temp_dir, "sorted")
+        embedder = self._make_orthogonal_embedder()
+
+        order: list[str] = []
+        link_entities_by_embedding(
+            graph_store=store,
+            embedder=embedder,
+            similarity_threshold=0.92,
+            on_bucket_done=lambda etype, _n: order.append(etype),
+        )
+
+        # Filter to the two types we seeded; any tiny implicit buckets
+        # (mention-degree side-effects) come from min_type_size skips and
+        # are also sorted, but we assert only on the seeded types.
+        seeded = [t for t in order if t in {"PERSON", "ORG"}]
+        assert seeded == sorted(seeded), (
+            f"Bucket iteration must be sorted for stable resume; got {seeded}"
+        )
+
 
 class TestHybridStore:
     """Tests for the combined Vector + Graph store facade."""

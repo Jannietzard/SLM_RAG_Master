@@ -663,25 +663,42 @@ class TestNavigator:
         )
 
     def test_entity_mention_filter_drops_non_matching_chunks(self, navigator) -> None:
-        """Non-matching chunks are actually removed — filter is not a no-op.
+        """Non-matching chunks past the top-2 RRF immunity slot are removed.
 
-        Verifies the filter does not silently pass all input unchanged.
-        Only the Einstein chunk (7-char token) matches; weather and Newton
-        chunks must be dropped.  Safety fallback must NOT fire here because
-        at least one chunk matches.
+        §12.33 introduced top-2 RRF immunity: the chunks at rank #1 and #2
+        bypass the entity-mention filter regardless of entity match, because
+        a chunk ranked #1/#2 by tri-source RRF is almost certainly the
+        bridge-answer chunk and dropping it would destroy multi-hop recall.
+
+        This test uses FOUR chunks so the non-matching distractor at rank
+        #3 (and #4) is actually filterable — only the Einstein chunk has
+        the entity match, but the weather chunk at rank #2 is immune, and
+        the Newton chunks at rank #3 and #4 are not immune so they MUST be
+        dropped. Expected survivors: Einstein (entity match) + weather
+        (rank-2 immunity) = 2 chunks.
         """
         results = [
             {"text": "Albert Einstein developed the theory of relativity.", "rrf_score": 0.9},
             {"text": "The weather is cold today.",                          "rrf_score": 0.7},
             {"text": "Newton invented calculus.",                           "rrf_score": 0.5},
+            {"text": "Bananas are yellow fruit.",                           "rrf_score": 0.3},
         ]
         filtered = navigator._entity_mention_filter(results, ["Einstein"])
-        assert len(filtered) == 1, (
-            f"Only Einstein chunk must survive; got {len(filtered)}: {[r['text'] for r in filtered]}"
+        # Top-2 immunity keeps ranks #1 and #2; ranks #3 and #4 are dropped
+        # because they have neither entity match nor immunity.
+        assert len(filtered) == 2, (
+            f"Top-2 immunity + Einstein match => 2 survivors; got "
+            f"{len(filtered)}: {[r['text'] for r in filtered]}"
         )
-        assert "Einstein" in filtered[0]["text"]
-        assert not any("weather" in r["text"] for r in filtered)
-        assert not any("Newton"  in r["text"] for r in filtered)
+        assert "Einstein" in filtered[0]["text"], (
+            "Einstein chunk must survive (entity match)"
+        )
+        assert not any("Newton" in r["text"] for r in filtered), (
+            "Newton chunk at rank #3 must be dropped (no immunity, no match)"
+        )
+        assert not any("Bananas" in r["text"] for r in filtered), (
+            "Bananas chunk at rank #4 must be dropped (no immunity, no match)"
+        )
 
     def test_entity_mention_filter_safety_fallback(self, navigator) -> None:
         """If all chunks would be filtered, all are returned (never empty context)."""

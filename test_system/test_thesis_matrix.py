@@ -472,9 +472,25 @@ def test_end_to_end_multi_hop_answer_references_bridge_entity():
     assert "british" in answer_lower or "nolan" in answer_lower, (
         f"Bridge entity answer expected; got: {result.answer!r}"
     )
-    # Two sub-queries must have been passed to Navigator (one per hop step).
-    nav_call_args = pipeline.navigator.navigate.call_args
-    sub_queries_passed = nav_call_args[0][1] if nav_call_args[0] else nav_call_args[1].get("sub_queries", [])
-    assert len(sub_queries_passed) == 2, (
-        f"Expected 2 sub-queries for a 2-hop plan, got {len(sub_queries_passed)}"
+    # §12.37 iterative-navigation contract: Navigator is called once per
+    # hop (not once with both sub-queries), so a 2-hop plan with bridge
+    # dependencies produces exactly 2 navigate() invocations. Each call
+    # carries a single-hop sub_queries list. Verify both invariants.
+    nav_calls = pipeline.navigator.navigate.call_args_list
+    assert len(nav_calls) == 2, (
+        f"Iterative navigation expects 2 hops -> 2 navigate() calls; "
+        f"got {len(nav_calls)}"
+    )
+    all_sub_queries: list = []
+    for call in nav_calls:
+        # Accept both positional and keyword forms of sub_queries.
+        sq = (
+            call.kwargs.get("sub_queries")
+            if "sub_queries" in call.kwargs
+            else (call.args[1] if len(call.args) > 1 else [])
+        )
+        all_sub_queries.extend(sq)
+    assert len(all_sub_queries) == 2, (
+        f"Expected 2 total sub-queries across hops, got "
+        f"{len(all_sub_queries)}: {all_sub_queries}"
     )

@@ -646,7 +646,8 @@ class Navigator:
         # 4-digit numbers ("Population 2014" should be a count, not a year).
         _COUNT_CONTEXT_WORDS = (
             "population", "people", "inhabitants", "residents",
-            "members", "employees", "users", "subscribers",
+            "members", "employees", "employs", "employ", "staff",
+            "workers", "users", "subscribers",
             "votes", "voters", "seats", "kilometers", "km",
             "miles", "dollars", "euros", "pounds",
             "versus", "vs",

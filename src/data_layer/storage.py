@@ -1035,6 +1035,124 @@ class KuzuGraphStore:
                     pass
         return written
 
+    def add_entities_bulk(
+        self,
+        entities: List[Tuple[str, str, str, float]],
+        batch_size: int = 500,
+    ) -> int:
+        """
+        Bulk-insert Entity nodes using explicit transactions.
+
+        Args:
+            entities:   List of (entity_id, name, entity_type, confidence).
+                        The caller is expected to deduplicate by entity_id
+                        in Python; MERGE here is therefore safe and cheap
+                        (the per-node primary-key index makes the existence
+                        check O(log N), not the O(degree) adjacency-list
+                        scan that MERGE on an EDGE incurs).
+            batch_size: Entities per transaction commit. 500 keeps the
+                        Windows fsync count manageable without bloating
+                        memory.
+
+        Returns:
+            Number of entity nodes the call attempted to insert (the actual
+            count of new nodes is `unique_entities` tracked by the caller).
+        """
+        if not entities:
+            return 0
+        _query = """
+            MERGE (e:Entity {entity_id: $entity_id})
+            SET e.name = $name,
+                e.type = $entity_type,
+                e.confidence = $confidence
+        """
+        written = 0
+        for i in range(0, len(entities), batch_size):
+            batch = entities[i : i + batch_size]
+            try:
+                self.conn.execute("BEGIN TRANSACTION")
+                for eid, name, etype, conf in batch:
+                    self.conn.execute(
+                        _query,
+                        {
+                            "entity_id":   eid,
+                            "name":        name,
+                            "entity_type": etype,
+                            "confidence":  float(conf),
+                        },
+                    )
+                    written += 1
+                self.conn.execute("COMMIT")
+            except _STORAGE_ERRORS as exc:
+                logger.warning(
+                    "Bulk Entity batch failed at offset %d: %s", i, exc
+                )
+                try:
+                    self.conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+        return written
+
+    def add_mentions_relations_bulk(
+        self,
+        pairs: List[Tuple[str, str]],
+        batch_size: int = 500,
+    ) -> int:
+        """
+        Bulk-insert MENTIONS edges (DocumentChunk -> Entity) using
+        transactions and CREATE — the same fast path the co-occurrence
+        phase uses for RELATED_TO edges.
+
+        Why this exists:
+            ``add_mentions_relation`` issues
+                MATCH (c) MATCH (e) MERGE (c)-[:MENTIONS]->(e)
+            per call. MERGE on an EDGE does an adjacency-list existence
+            scan whose cost scales with the entity's degree. For a popular
+            entity that grows to thousands of mentions, every subsequent
+            MENTIONS insert against that entity gets quadratically slower.
+            On HotpotQA this manifested as a ~87-hour Phase 3b vs. an
+            expected ~5-10 minutes.
+
+        Args:
+            pairs:      List of (chunk_id, entity_id). The CALLER MUST
+                        DEDUPLICATE the list — CREATE writes a separate
+                        edge for every call. Duplicates produce multiple
+                        identical MENTIONS edges, which inflate the graph
+                        and break MENTIONS-degree statistics.
+            batch_size: Edges per transaction commit.
+
+        Returns:
+            Number of edges written.
+        """
+        if not pairs:
+            return 0
+        _query = """
+            MATCH (c:DocumentChunk {chunk_id: $chunk_id})
+            MATCH (e:Entity        {entity_id: $entity_id})
+            CREATE (c)-[:MENTIONS]->(e)
+        """
+        written = 0
+        for i in range(0, len(pairs), batch_size):
+            batch = pairs[i : i + batch_size]
+            try:
+                self.conn.execute("BEGIN TRANSACTION")
+                for chunk_id, entity_id in batch:
+                    self.conn.execute(
+                        _query,
+                        {"chunk_id": chunk_id, "entity_id": entity_id},
+                    )
+                    written += 1
+                self.conn.execute("COMMIT")
+            except _STORAGE_ERRORS as exc:
+                logger.warning(
+                    "Bulk MENTIONS batch failed at offset %d: %s", i, exc
+                )
+                try:
+                    self.conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+        return written
+
     def add_relation(
         self,
         source_id: str,

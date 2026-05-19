@@ -220,6 +220,25 @@ def _save_checkpoint(graph_path: Path, phase: str, data: Dict[str, Any]) -> None
     )
     logger.info("  Checkpoint saved: phase=%s", phase)
 
+
+def _save_partial_checkpoint(
+    graph_path: Path, phase: str, data: Dict[str, Any],
+) -> None:
+    """Persist intra-phase progress WITHOUT marking the phase as done.
+
+    Used by per-bucket checkpointing inside Phase 3d.5 — the phase only
+    flips to `_CP_DONE=True` when the linker returns successfully (see
+    `_save_checkpoint`). If the process dies in the middle, the partial
+    entry survives so the next `--resume` run can skip already-finished
+    buckets.
+    """
+    cp = _load_checkpoint(graph_path)
+    cp[phase] = {_CP_DONE: False, _CP_TS: time.time(), **data}
+    _checkpoint_path(graph_path).write_text(
+        json.dumps(cp, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
 def _phase_done(checkpoint: Dict[str, Any], phase: str) -> bool:
     return checkpoint.get(phase, {}).get(_CP_DONE, False)
 
@@ -639,75 +658,74 @@ def ingest_knowledge_graph(
         for i, doc in enumerate(documents)
     }
 
-    # ── Batch-transaction constants for Phase 3b ─────────────────────────────
-    # KuzuDB auto-commits every conn.execute() call individually (one fsync
-    # per statement). For ~94 000 entity inserts + 94 000 MENTIONS + 12 000
-    # REBEL relations = ~200 000 individual fsyncs → 45 min on Windows.
-    # Grouping 200 chunks per transaction (typically ~2 000 inserts) cuts
-    # the fsync count by 200× and brings Phase 3b down to ~3-5 min.
-    _PHASE3B_BATCH = 200   # chunks per transaction commit
-
-    # ── Pass A: Entity nodes + MENTIONS edges ────────────────────────────────
+    # ── Pass A: Entity nodes + MENTIONS edges (BULK PATH) ────────────────────
     # Build the COMPLETE name_to_id map before touching relations. Relations
     # are resolved in Pass B, so a relation in chunk N can reference an entity
     # first extracted in chunk N+k (forward reference) — previously those were
     # silently dropped because the map was only partially populated.
-    for _batch_i, result in enumerate(
-        tqdm(extraction_results, desc="Entities & MENTIONS", unit="chunk")
-    ):
-        if _batch_i % _PHASE3B_BATCH == 0:
-            if _batch_i > 0:
-                try:
-                    graph_store.batch_commit()
-                except Exception:
-                    pass
-            graph_store.batch_begin()
+    #
+    # The original implementation issued one Cypher statement per entity and
+    # one per MENTIONS edge inside a `batch_begin/batch_commit` envelope. The
+    # transactions reduced fsyncs but did NOT eliminate Phase 3b's hot path:
+    # MERGE on a MENTIONS edge performs an adjacency-list existence scan on
+    # the target Entity. For popular entities ("Billboard", "President") the
+    # adjacency list grows to thousands of edges, and every subsequent
+    # MENTIONS insert against them scales with the existing degree. On
+    # HotpotQA this caused Phase 3b to take ~87 hours.
+    #
+    # The fix: collect entities and mention pairs in Python first, deduplicate
+    # by primary key (entity_id for nodes, (chunk_id, entity_id) for edges),
+    # then issue:
+    #   - `add_entities_bulk(...)` — MERGE on Entity (primary-key index, O(log N))
+    #   - `add_mentions_relations_bulk(...)` — CREATE on MENTIONS (no scan)
+    # CREATE is safe ONLY because we deduplicate the pair list in Python;
+    # CREATE without dedup would write multiple identical edges.
+    pending_entities: List[Tuple[str, str, str, float]] = []
+    pending_mentions: List[Tuple[str, str]] = []
+    seen_mention_pairs: Set[Tuple[str, str]] = set()
 
+    for result in tqdm(extraction_results, desc="Collecting entities & mentions",
+                        unit="chunk"):
         chunk_id = str(result["chunk_id"])
 
         for ent in result.get("entities", []):
             entity_name = (ent.get("name") or "").strip()
             entity_type = ent.get("entity_type") or ent.get("type", "UNKNOWN")
-            confidence = ent.get("confidence", 0.5)
+            confidence  = ent.get("confidence", 0.5)
 
             # Skip low-confidence entities (recall-vs-noise trade-off).
             if confidence < entity_confidence_threshold or not entity_name:
                 continue
 
             # Canonical entity_id: identical canonical surface forms produce
-            # the same id, so KuzuDB MERGE deduplicates at insert time.
+            # the same id, so the bulk MERGE deduplicates at insert time.
             entity_id = _canonical_entity_id(entity_name, entity_type)
             canon_key = canonical_form(entity_name)
             name_to_id[canon_key] = entity_id
 
             if entity_id not in seen_entities:
-                try:
-                    graph_store.add_entity(
-                        entity_id=entity_id,
-                        name=entity_name,
-                        entity_type=entity_type,
-                        confidence=confidence,
-                    )
-                    seen_entities.add(entity_id)
-                    stats["unique_entities"] += 1
-                except Exception as e:
-                    logger.debug(f"    Entity {entity_id}: {e}")
-
+                seen_entities.add(entity_id)
+                pending_entities.append(
+                    (entity_id, entity_name, entity_type, float(confidence))
+                )
+                stats["unique_entities"] += 1
             stats["entities"] += 1
 
-            try:
-                graph_store.add_mentions_relation(
-                    chunk_id=chunk_id,
-                    entity_id=entity_id,
-                )
+            # Deduplicate MENTIONS at (chunk_id, entity_id) granularity:
+            # GLiNER may emit the same entity twice within a chunk; we want
+            # ONE MENTIONS edge per pair, not N. (CREATE is non-idempotent.)
+            pair = (chunk_id, entity_id)
+            if pair not in seen_mention_pairs:
+                seen_mention_pairs.add(pair)
+                pending_mentions.append(pair)
                 stats["mentions"] += 1
-            except Exception as e:
-                logger.debug(f"    MENTIONS {chunk_id}->{entity_id}: {e}")
 
-    try:
-        graph_store.batch_commit()
-    except Exception:
-        pass
+    # Bulk-insert nodes first (MENTIONS edges MATCH against existing nodes).
+    logger.info("  Bulk-inserting %d Entity nodes...", len(pending_entities))
+    graph_store.add_entities_bulk(pending_entities, batch_size=500)
+
+    logger.info("  Bulk-inserting %d MENTIONS edges...", len(pending_mentions))
+    graph_store.add_mentions_relations_bulk(pending_mentions, batch_size=500)
 
     # ── Pass B: RELATED_TO edges (REBEL relations) ───────────────────────────
     # Resolution is strict on canonical_form (no lossy substring fallback).
@@ -759,26 +777,25 @@ def ingest_knowledge_graph(
         name_to_id.setdefault(key, cid)
         return cid
 
-    _batch_i = 0
-    for result in tqdm(extraction_results, desc="RELATED_TO (REBEL)", unit="chunk"):
-        if _batch_i % _PHASE3B_BATCH == 0:
-            if _batch_i > 0:
-                try:
-                    graph_store.batch_commit()
-                except Exception:
-                    pass
-            graph_store.batch_begin()
-        _batch_i += 1
+    # ── Pass B: RELATED_TO edges via the bulk-CREATE path ───────────────────
+    # Same fix as Pass A — collect, deduplicate, then issue the writes via
+    # add_related_to_relations_bulk(use_create=True), which the co-occurrence
+    # phase has used successfully for >170k edges in <20 min.
+    pending_relations: List[Tuple[str, str, str, float, str]] = []
+    pending_attribute_count = 0
 
+    for result in tqdm(extraction_results, desc="Collecting RELATED_TO (REBEL)",
+                        unit="chunk"):
         chunk_id = str(result["chunk_id"])
-
         for rel in result.get("relations", []):
-            subject = (rel.get("subject_entity") or rel.get("subject") or "").strip()
-            obj = (rel.get("object_entity") or rel.get("object") or "").strip()
-            rel_type = rel.get("relation_type") or rel.get("relation") or "related_to"
+            subject  = (rel.get("subject_entity") or rel.get("subject") or "").strip()
+            obj      = (rel.get("object_entity")  or rel.get("object")  or "").strip()
+            rel_type = rel.get("relation_type")   or rel.get("relation") or "related_to"
             rel_conf = float(rel.get("confidence", 0.5))
             _rel_confs.add(rel_conf)
-            rel_sources = rel.get("source_chunk_ids") or rel.get("source_chunks") or [chunk_id]
+            rel_sources = (rel.get("source_chunk_ids")
+                           or rel.get("source_chunks")
+                           or [chunk_id])
             if isinstance(rel_sources, str):
                 rel_sources = [rel_sources]
             if not subject or not obj:
@@ -810,24 +827,21 @@ def ingest_knowledge_graph(
                 continue
             seen_triples.add(triple)
 
-            try:
-                graph_store.add_related_to_relation(
-                    entity1_id=subject_id,
-                    entity2_id=object_id,
-                    relation_type=rel_type,
-                    confidence=rel_conf,
-                    source_chunks=[str(c) for c in rel_sources],
-                )
-                stats["relations"] += 1
-                if is_attribute:
-                    stats["attribute_relations"] += 1
-            except Exception as e:
-                logger.debug(f"    RELATED_TO: {e}")
+            pending_relations.append((
+                subject_id, object_id, rel_type, rel_conf,
+                ",".join(str(c) for c in rel_sources),
+            ))
+            stats["relations"] += 1
+            if is_attribute:
+                pending_attribute_count += 1
 
-    try:
-        graph_store.batch_commit()
-    except Exception:
-        pass
+    stats["attribute_relations"] = pending_attribute_count
+
+    logger.info("  Bulk-inserting %d RELATED_TO (REBEL) edges...",
+                len(pending_relations))
+    graph_store.add_related_to_relations_bulk(
+        pending_relations, batch_size=500, use_create=True,
+    )
 
     # REBEL emits a constant 0.5 confidence for every triple (no per-triplet
     # score from the seq2seq decoder). Surface this so downstream consumers
@@ -911,7 +925,7 @@ def run_full_import(
     cleanup_dry_run: bool = False,
     cooccurrence_min_confidence: float = 0.5,
     hub_threshold_ratio: float = 0.03,
-    enable_entity_linking: bool = True,
+    enable_entity_linking: bool = False,
     linking_threshold: float = 0.92,
     linking_max_type_size: int = 8000,
     resume: bool = False,
@@ -1470,26 +1484,78 @@ def run_full_import(
                         cache_path=cache_path,
                         device=perf_config.get("device", "cpu"),
                     )
+
+                # ── Per-bucket resume ────────────────────────────────────
+                # If a previous run died mid-phase (Ollama OOM, kill, etc.)
+                # it left a non-done `3d5` entry with `done_buckets` listed.
+                # Read those and skip them in this call; accumulate already
+                # merged counts so the final summary is accurate.
+                prev_partial = checkpoint.get("3d5", {})
+                done_buckets: List[str] = list(
+                    prev_partial.get("done_buckets", [])
+                )
+                prev_linked: int = int(prev_partial.get("linked", 0))
+                if done_buckets:
+                    logger.info(
+                        "  Resuming entity linking — %d bucket(s) already "
+                        "done in a prior run: %s",
+                        len(done_buckets), ", ".join(sorted(done_buckets)),
+                    )
+
+                # Mutable cell so the closure can update the running total
+                # (Python 2-style nonlocal-via-list; works on all versions).
+                linked_count_holder = [0]
+
+                def _on_bucket_done(etype: str, merged_in_type: int) -> None:
+                    """Persist this bucket's completion immediately.
+
+                    Writes a *partial* checkpoint (no `_CP_DONE`) after every
+                    bucket so a crash mid-phase doesn't lose progress on the
+                    buckets that already finished.
+                    """
+                    linked_count_holder[0] += merged_in_type
+                    if etype not in done_buckets:
+                        done_buckets.append(etype)
+                    _save_partial_checkpoint(
+                        graph_path,
+                        "3d5",
+                        {
+                            "linked": prev_linked + linked_count_holder[0],
+                            "done_buckets": list(done_buckets),
+                            "max_type_size": linking_max_type_size,
+                            "threshold": linking_threshold,
+                            "note": "partial — bucket-level checkpoint",
+                        },
+                    )
+
                 linked_count = link_entities_by_embedding(
                     graph_store=graph_store,
                     embedder=embedder,
                     similarity_threshold=linking_threshold,
                     max_type_size=linking_max_type_size,
                     dry_run=cleanup_dry_run,
+                    done_buckets=done_buckets,
+                    on_bucket_done=_on_bucket_done,
                 )
+                # Linker's return value covers ONLY buckets processed in this
+                # call; add any merges recorded by a prior partial run.
+                total_linked = prev_linked + linked_count
                 logger.info(
-                    "  Embedding-linked entities merged: %d (threshold=%.2f)",
-                    linked_count, linking_threshold,
+                    "  Embedding-linked entities merged: %d "
+                    "(this run: %d, prior partial: %d, threshold=%.2f)",
+                    total_linked, linked_count, prev_linked, linking_threshold,
                 )
                 _save_checkpoint(
                     graph_path,
                     "3d5",
                     {
-                        "linked": linked_count,
+                        "linked": total_linked,
+                        "done_buckets": list(done_buckets),
                         "max_type_size": linking_max_type_size,
                         "threshold": linking_threshold,
                     },
                 )
+                linked_count = total_linked
                 logger.info(_phase_eta("3d.5 entity linking", time.time() - _t0))
             except Exception as exc:
                 logger.error("Entity linking failed: %s", exc)

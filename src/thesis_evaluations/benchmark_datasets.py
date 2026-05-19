@@ -49,6 +49,15 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from abc import ABC, abstractmethod
 
+# Project-root bootstrap: this script lives at
+# `<root>/src/thesis_evaluations/benchmark_datasets.py`. Walk two levels up
+# from __file__ to find the project root, then prepend it to sys.path so the
+# `from src.pipeline...` / `from src.data_layer...` imports resolve no matter
+# how the script is launched (python path/to/file.py, python -m, etc.).
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 import yaml
 import numpy as np
 
@@ -1052,9 +1061,18 @@ def create_pipeline(
         graph_store=hybrid_store.graph_store,
         config=pipeline_config,
     )
-    
+
+    # #6 audit (2026-05-15): attach the BatchedOllamaEmbeddings instance to
+    # the pipeline so cmd_evaluate can print cache-hit-rate, batch-count and
+    # mean per-text latency at the end of the run. The metrics are owned by
+    # the embeddings object and accumulate across both ingestion (indirectly
+    # via the cache file) and evaluation (directly via embed_query calls).
+    # The underscore prefix signals "diagnostic accessor only" — production
+    # code must not depend on this attribute.
+    pipeline._embeddings = embeddings
+
     logger.info(f"Pipeline created for {dataset} (v={vector_weight}, g={graph_weight})")
-    
+
     return pipeline
 
 # ============================================================================
@@ -1673,6 +1691,26 @@ def cmd_evaluate(args, config: Dict, store_manager: StoreManager):
                     f"SF-Recall={stats.get('sf_recall_rate', 0.0):.2%} "
                     f"LLM-err={stats.get('llm_error_rate', 0.0):.2%}"
                 )
+
+        # #6 audit (2026-05-15): print embedding-cache metrics so the thesis
+        # report can defend "cache hit rate: X%" with a concrete number.
+        # See create_pipeline (pipeline._embeddings) for how the metrics
+        # accumulator is wired through to here.
+        emb = getattr(pipeline, "_embeddings", None)
+        if emb is not None and hasattr(emb, "get_metrics"):
+            try:
+                m = emb.get_metrics()
+                logger.info("")
+                logger.info("  Embedding cache (BatchedOllamaEmbeddings):")
+                logger.info(f"    Total texts processed:   {m.get('total_texts', 0):>8,}")
+                logger.info(f"    Cache hit rate:          {m.get('cache_hit_rate', 0.0):>7.1f}%")
+                logger.info(f"    Cache hits / misses:     "
+                            f"{m.get('cache_hits', 0):>6,} / {m.get('cache_misses', 0):>6,}")
+                logger.info(f"    Batch requests issued:   {m.get('batch_count', 0):>8,}")
+                logger.info(f"    Avg time per text:       "
+                            f"{m.get('avg_time_per_text_ms', 0.0):>7.2f} ms")
+            except Exception as _exc:
+                logger.debug(f"Embedding metrics unavailable: {_exc}")
 
         logger.info("")
         logger.info(f"  Per-question results: {jsonl_path}")

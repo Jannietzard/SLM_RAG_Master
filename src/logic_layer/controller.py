@@ -7,6 +7,14 @@ Master's Thesis: "Enhancing Reasoning Fidelity in Quantized SLMs on Edge"
 Artifact B: Agent-Based Query Processing — utility helpers used by the
 production pipeline (src/pipeline/agent_pipeline.py).
 
+For the thesis methodology section
+----------------------------------
+The production orchestrator of the three-agent pipeline (S_P → S_N → S_V)
+is ``src.pipeline.agent_pipeline.AgentPipeline``. ``AgenticController`` in
+this module is a namespace of stateless utility helpers (bridge-entity
+extraction and hop-query rewriting) consumed by AgentPipeline's iterative
+multi-hop path; it does not orchestrate any pipeline by itself.
+
 B7 (audit 2026-05-15) — historical context:
     This module used to be the S_P → S_N → S_V orchestrator with two
     execution modes (LangGraph StateGraph + sequential fallback). Both modes

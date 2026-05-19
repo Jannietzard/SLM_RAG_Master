@@ -428,10 +428,24 @@ class AgentPipeline:
         from ..logic_layer.controller import AgenticController
         from ..logic_layer.navigator import NavigatorResult
 
-        # Sort hops by step_id so dependencies resolve in order.
-        hops = sorted(
-            plan.hop_sequence, key=lambda h: h.step_id
-        )
+        # Sort hops by step_id so dependencies resolve in order. Fall back
+        # to original list order for hops whose step_id is missing or
+        # non-comparable (e.g. test doubles where step_id is a MagicMock
+        # that can't be sorted against another MagicMock). Using
+        # `(sort_key, list_index)` keeps the sort stable for real plans and
+        # degrades to insertion order for malformed ones.
+        def _hop_sort_key(item):
+            idx, hop = item
+            sid = getattr(hop, "step_id", None)
+            if isinstance(sid, int):
+                return (0, sid, idx)
+            return (1, idx, idx)
+
+        hops = [
+            h for _, h in sorted(
+                enumerate(plan.hop_sequence), key=_hop_sort_key,
+            )
+        ]
 
         # Initial entity hints come from the planner's NER pass.
         initial_entities = [e.text for e in (plan.entities or [])]

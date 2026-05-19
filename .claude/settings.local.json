@@ -149,7 +149,9 @@
       "Bash(python -X utf8 -m pytest test_system/test_verifier_semantic.py -q --tb=no -o \"addopts=\")",
       "Bash(python -X utf8 -m pytest test_system/test_verifier_semantic.py::TestB1QueryTypePlumbing -v --tb=short -o \"addopts=\")",
       "Bash(python -X utf8 -m pytest test_system/test_verifier_semantic.py test_system/test_planner_semantic.py test_system/test_pipeline.py --tb=line -o \"addopts=\")",
-      "Bash(python -X utf8 diagnose_verbose.py --idx 81)"
+      "Bash(python -X utf8 diagnose_verbose.py --idx 81)",
+      "Bash(python -X utf8 -c \"import ast; ast.parse\\(open\\('src/thesis_evaluations/chunking_ablation.py', encoding='utf-8'\\).read\\(\\)\\); print\\('SYNTAX OK'\\)\")",
+      "Bash(python -X utf8 -c \"from src.thesis_evaluations import chunking_ablation as m; print\\('Imports OK'\\); print\\('parse_configs sample:', m.parse_configs\\('3:1,5:2'\\)\\)\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\Jan Nietzard\\.claude\\projects\\c--Users-Jan-Nietzard-Documents-FOM-FOM-Masterarbeit-Masterarbeit-Edge-Entwicklungfolder\\memory"

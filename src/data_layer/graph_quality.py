@@ -32,7 +32,7 @@ import logging
 import re
 import unicodedata
 from itertools import combinations
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -723,6 +723,8 @@ def link_entities_by_embedding(
     max_type_size: int = 8000,
     length_ratio_floor: float = 0.4,
     dry_run: bool = False,
+    done_buckets: Optional[Iterable[str]] = None,
+    on_bucket_done: Optional[Callable[[str, int], None]] = None,
 ) -> int:
     """
     Merge entity nodes whose embedded names are sufficiently similar within type.
@@ -756,10 +758,33 @@ def link_entities_by_embedding(
                                "X World Championship" purely because the
                                embedder maps short names to similar vectors.
         dry_run:               Count operations without mutating the graph.
+        done_buckets:          Optional set/list of type-bucket names that
+                               have already been linked on a previous run.
+                               These are skipped wholesale (no embedding,
+                               no merging). Used by the per-bucket
+                               checkpoint resume path in
+                               local_importingestion.py: after each bucket
+                               completes, the caller records the type in
+                               the `3d5` checkpoint's `done_buckets` list
+                               and passes it back here on resume. Lets the
+                               user kill-and-restart the ingest (e.g. when
+                               Ollama OOMs mid-phase) without re-doing
+                               buckets that already completed.
+        on_bucket_done:        Optional callback invoked AFTER each bucket
+                               finishes (whether merges happened or not).
+                               Signature: ``(etype, merged_in_type) -> None``.
+                               The callback is responsible for persisting
+                               the bucket name so it can be resumed; this
+                               function does not write to disk itself.
 
     Returns:
         Number of entities merged (i.e., deleted because they had a parent).
+        The count covers ONLY buckets processed in this call — buckets
+        skipped via `done_buckets` are not counted (their work was done
+        on a previous invocation and recorded in the checkpoint).
     """
+    # Normalise the done-bucket set once. None -> empty set.
+    _done: set = set(done_buckets) if done_buckets else set()
     try:
         import numpy as np
     except ImportError:
@@ -789,25 +814,77 @@ def link_entities_by_embedding(
 
     merged_total = 0
 
-    for etype, members in by_type.items():
+    # Iterate in deterministic (sorted) order so resume semantics are stable:
+    # `done_buckets` from a previous run identifies buckets by name, not by
+    # the by_type-dict iteration order (which depends on insertion in
+    # the MATCH query — itself stable, but explicit sort makes the
+    # invariant obvious to a reviewer).
+    for etype in sorted(by_type.keys()):
+        members = by_type[etype]
+
+        # Per-bucket resume: skip wholesale if the caller's previous run
+        # already finished this bucket. No embedding, no merging, no
+        # callback — the work is done and persisted in the checkpoint.
+        if etype in _done:
+            logger.info(
+                "Embed-link: skipping type=%s (already completed in a "
+                "previous run; per-bucket checkpoint hit)",
+                etype,
+            )
+            continue
+
         if len(members) < min_type_size:
+            # Trivially "done" — still notify so the caller can record it
+            # and not re-evaluate it on resume.
+            if on_bucket_done is not None:
+                on_bucket_done(etype, 0)
             continue
         if len(members) > max_type_size:
             logger.warning(
                 "Embed-link: skipping type=%s with %d entities (above max_type_size=%d)",
                 etype, len(members), max_type_size,
             )
+            # Treat the cap-skip as "done for this run's parameters" so
+            # resume does not embed it again under the same cap.
+            if on_bucket_done is not None:
+                on_bucket_done(etype, 0)
             continue
 
         names = [name for _, name, _ in members]
+        # Embed with a one-shot warm-up retry. Ollama can return HTTP 500
+        # ("model failed to load") after long continuous embedding sessions
+        # — its model-cache state drifts and the next batch occasionally
+        # fails to allocate. A single warm-up probe (one short text) forces
+        # Ollama to reload the model into memory; the full bucket is then
+        # retried. If the retry also fails the bucket is skipped (the
+        # existing safety net), which is correct: a failed bucket is logged
+        # and produces zero spurious merges, vs. one bucket bringing down
+        # the whole phase.
         try:
             embeds_raw = embedder.embed_documents(names)
         except Exception as exc:
             logger.warning(
-                "Embed-link: embedder failed for type=%s (%s); skipping",
+                "Embed-link: embedder failed for type=%s (%s); "
+                "issuing warm-up probe and retrying once...",
                 etype, exc,
             )
-            continue
+            import time as _time
+            try:
+                # Single short text forces Ollama to reload the model.
+                _ = embedder.embed_query("warm up")
+                _time.sleep(2.0)
+                embeds_raw = embedder.embed_documents(names)
+                logger.info(
+                    "Embed-link: warm-up retry succeeded for type=%s", etype,
+                )
+            except Exception as exc2:
+                logger.warning(
+                    "Embed-link: embedder still failing for type=%s after "
+                    "warm-up (%s); skipping bucket. Restart Ollama and "
+                    "re-run the ingest if you want this bucket linked.",
+                    etype, exc2,
+                )
+                continue
 
         embeds = np.asarray(embeds_raw, dtype=np.float32)
         if embeds.ndim != 2 or embeds.shape[0] != len(members):
@@ -857,8 +934,13 @@ def link_entities_by_embedding(
                     continue
                 union(i, j)
 
-        # Apply merges: anyone whose root is not themselves gets redirected.
-        merged_in_type = 0
+        # Apply merges via the BULK path. Building a {old_id: new_id}
+        # redirect map for the whole type bucket lets us fetch incident
+        # edges in O(1) queries instead of O(merged_in_type) queries, and
+        # apply the rewrites via transactional CREATE — the same fast path
+        # the co-occurrence and Phase-3b passes use. On HotpotQA this
+        # replaces the per-entity loop that previously took ~14 hours.
+        redirect_map: Dict[str, str] = {}
         for i in range(n):
             root = find(i)
             if root == i:
@@ -867,12 +949,11 @@ def link_entities_by_embedding(
             new_id = members[root][0]
             if old_id == new_id:
                 continue
-            if dry_run:
-                merged_in_type += 1
-                continue
-            _redirect_entity_edges(graph_store, old_id=old_id, new_id=new_id)
-            _delete_entity_safely(graph_store, old_id)
-            merged_in_type += 1
+            redirect_map[old_id] = new_id
+
+        merged_in_type = len(redirect_map)
+        if not dry_run and redirect_map:
+            _redirect_entity_edges_bulk(graph_store, redirect_map)
 
         if merged_in_type:
             logger.info(
@@ -881,7 +962,162 @@ def link_entities_by_embedding(
             )
         merged_total += merged_in_type
 
+        # Per-bucket checkpoint hook: caller persists `etype` as done so a
+        # mid-phase crash (Ollama OOM, KeyboardInterrupt, …) does not lose
+        # progress on already-linked buckets.
+        if on_bucket_done is not None:
+            on_bucket_done(etype, merged_in_type)
+
     return merged_total
+
+
+def _redirect_entity_edges_bulk(
+    graph_store,
+    redirect_map: Dict[str, str],
+) -> None:
+    """Redirect every MENTIONS / RELATED_TO edge incident on any key of
+    `redirect_map` to its mapped value, then delete the old entities. ALL
+    work is done in two scan queries + transactional bulk writes — no
+    per-entity Cypher round-trips.
+
+    Why this exists
+    ---------------
+    The previous per-entity implementation (`_redirect_entity_edges`)
+    issued one Cypher MATCH+MERGE per incident edge inside a Python for-
+    loop. MERGE on a MENTIONS / RELATED_TO edge does an adjacency-list
+    existence scan whose cost scales with the destination entity's
+    degree. As popular entities accumulate edges during the merge loop,
+    every subsequent redirect into them gets quadratically slower. On
+    HotpotQA this caused Phase 3d.5 to take ~14 hours.
+
+    The bulk path mirrors the co-occurrence-edge fast path:
+      1. Fetch all incident MENTIONS edges in ONE query.
+      2. Fetch all incident RELATED_TO edges (in + out) in TWO queries.
+      3. Deduplicate target edges in Python (CREATE is non-idempotent).
+      4. Bulk-create the redirected edges via the existing primitives
+         add_mentions_relations_bulk + add_related_to_relations_bulk
+         (use_create=True).
+      5. Bulk-delete the old entities (cascades their incident edges).
+    """
+    if not redirect_map:
+        return
+    old_ids = list(redirect_map.keys())
+
+    # ── 1. MENTIONS: chunk -> old  ⇒  chunk -> new ───────────────────────
+    mention_rows = _fetch_all(
+        graph_store,
+        """
+        MATCH (c:DocumentChunk)-[:MENTIONS]->(e:Entity)
+        WHERE e.entity_id IN $old_ids
+        RETURN DISTINCT c.chunk_id, e.entity_id
+        """,
+        {"old_ids": old_ids},
+    )
+    seen_mention_pairs: set = set()
+    redirected_mentions: List[Tuple[str, str]] = []
+    for chunk_id, old_eid in mention_rows:
+        new_eid = redirect_map.get(old_eid, old_eid)
+        pair = (chunk_id, new_eid)
+        if pair in seen_mention_pairs:
+            continue
+        seen_mention_pairs.add(pair)
+        redirected_mentions.append(pair)
+
+    if redirected_mentions and hasattr(graph_store, "add_mentions_relations_bulk"):
+        logger.info(
+            "Embed-link redirect: writing %d MENTIONS edges (bulk)…",
+            len(redirected_mentions),
+        )
+        graph_store.add_mentions_relations_bulk(redirected_mentions,
+                                                 batch_size=500)
+
+    # ── 2. RELATED_TO outgoing: (old)->o  ⇒  (new)->o ────────────────────
+    out_rows = _fetch_all(
+        graph_store,
+        """
+        MATCH (e:Entity)-[r:RELATED_TO]->(o:Entity)
+        WHERE e.entity_id IN $old_ids
+        RETURN e.entity_id, o.entity_id, r.relation_type, r.confidence,
+               r.source_chunks
+        """,
+        {"old_ids": old_ids},
+    )
+
+    # ── 3. RELATED_TO incoming: o->(old)  ⇒  o->(new) ────────────────────
+    in_rows = _fetch_all(
+        graph_store,
+        """
+        MATCH (o:Entity)-[r:RELATED_TO]->(e:Entity)
+        WHERE e.entity_id IN $old_ids
+        RETURN o.entity_id, e.entity_id, r.relation_type, r.confidence,
+               r.source_chunks
+        """,
+        {"old_ids": old_ids},
+    )
+
+    # Redirect endpoints, drop self-loops, deduplicate by triple key.
+    seen_triples: set = set()
+    redirected_rels: List[Tuple[str, str, str, float, str]] = []
+    for src, dst, rel_type, conf, src_chunks in out_rows:
+        new_src = redirect_map.get(src, src)
+        new_dst = redirect_map.get(dst, dst)
+        if new_src == new_dst:
+            continue
+        key = (new_src, new_dst, rel_type or "related")
+        if key in seen_triples:
+            continue
+        seen_triples.add(key)
+        redirected_rels.append((
+            new_src, new_dst, rel_type or "related",
+            float(conf or 0.0), src_chunks or "",
+        ))
+    for src, dst, rel_type, conf, src_chunks in in_rows:
+        new_src = redirect_map.get(src, src)
+        new_dst = redirect_map.get(dst, dst)
+        if new_src == new_dst:
+            continue
+        key = (new_src, new_dst, rel_type or "related")
+        if key in seen_triples:
+            continue
+        seen_triples.add(key)
+        redirected_rels.append((
+            new_src, new_dst, rel_type or "related",
+            float(conf or 0.0), src_chunks or "",
+        ))
+
+    if redirected_rels and hasattr(graph_store, "add_related_to_relations_bulk"):
+        logger.info(
+            "Embed-link redirect: writing %d RELATED_TO edges (bulk)…",
+            len(redirected_rels),
+        )
+        graph_store.add_related_to_relations_bulk(
+            redirected_rels, batch_size=500, use_create=True,
+        )
+
+    # ── 4. Delete the old entities. KuzuDB cascades incident edges. ──────
+    # Single transactional batch — same fsync-amortisation as the writes.
+    logger.info("Embed-link redirect: deleting %d old entities (bulk)…",
+                len(old_ids))
+    BATCH = 500
+    for i in range(0, len(old_ids), BATCH):
+        batch = old_ids[i : i + BATCH]
+        try:
+            graph_store.conn.execute("BEGIN TRANSACTION")
+            for oid in batch:
+                try:
+                    graph_store.conn.execute(
+                        "MATCH (e:Entity {entity_id: $eid}) DETACH DELETE e",
+                        {"eid": oid},
+                    )
+                except Exception as exc:
+                    logger.debug("delete entity %s failed: %s", oid, exc)
+            graph_store.conn.execute("COMMIT")
+        except Exception as exc:
+            logger.warning("Bulk delete batch %d failed: %s", i // BATCH, exc)
+            try:
+                graph_store.conn.execute("ROLLBACK")
+            except Exception:
+                pass
 
 
 def _redirect_entity_edges(graph_store, old_id: str, new_id: str) -> None:
