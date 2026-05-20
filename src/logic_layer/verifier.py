@@ -1663,14 +1663,22 @@ Please provide a partial answer based on the available evidence, clearly indicat
                     lines.append(
                         "Step %d: %s → derive the final answer" % (step, sub_q)
                     )
-                elif is_bridge and bridge_idx < len(grounded_bridges):
-                    lines.append(
-                        "Step %d: %s → %s" % (step, sub_q, grounded_bridges[bridge_idx])
-                    )
-                    bridge_idx += 1
                 else:
-                    # Bridge entity unavailable or not grounded — leave
-                    # the resolution open instead of pre-filling a wrong value.
+                    # Bridge entity injection disabled (2026-05-20).
+                    # The grounding check (entity appears in context) is
+                    # insufficient — appearing in context does not mean the
+                    # entity answers the sub-query. Observed failure modes
+                    # in 20-sample diagnostic:
+                    #   - injected current name where the question asked for
+                    #     the former name (SLM copied the wrong value),
+                    #   - injected a random PERSON pulled from a noisy
+                    #     sub-query (SLM picked a different label),
+                    #   - injected a useless synonym (SLM abstained despite
+                    #     both gold paragraphs being present in context).
+                    # The directive form was already deployed in the prior
+                    # ungrounded-fallback branch; we unify both bridge paths
+                    # onto it. `grounded_bridges` and `bridge_idx` remain in
+                    # scope for any caller-side telemetry.
                     lines.append(
                         "Step %d: %s → identify the intermediate result"
                         % (step, sub_q)

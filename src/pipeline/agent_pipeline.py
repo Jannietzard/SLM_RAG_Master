@@ -30,9 +30,12 @@ SCIENTIFIC CONTRIBUTION
 
 The central thesis contribution of Artifact B is the self-correction loop in
 S_V: the Verifier generates an initial answer, checks it against the retrieved
-context via NLI-style consistency verification, and iteratively applies a
+context via entity-presence verification (named entities in the answer must
+appear in at least one context chunk), and iteratively applies a
 CORRECTION_PROMPT with concrete violation feedback for up to
-max_verification_iterations rounds.
+max_verification_iterations rounds. An NLI-based contradiction detector
+(`enable_contradiction_detection`) is available as an ablation flag but is
+OFF by default — it is not active in the thesis evaluation.
 
 This design follows the Self-Refine paradigm:
     Madaan, A. et al. (2023). "Self-Refine: Iterative Refinement with

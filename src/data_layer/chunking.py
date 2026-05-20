@@ -31,9 +31,11 @@ DESIGN DECISIONS
 ================================================================================
 
 3-Sentence Window:
-    Empirical evaluation on HotpotQA (Thesis Section 4.2) demonstrated that
-    3-sentence windows achieve the best F1/recall tradeoff for bridge queries.
-    An overlap of 1 sentence prevents entity-bridge fragmentation at boundaries.
+    The production configuration uses 3-sentence sliding windows with 1-sentence
+    overlap. The overlap prevents entity-bridge fragmentation at chunk boundaries,
+    which is critical for multi-hop retrieval where the bridging entity may span
+    adjacent sentences. Sensitivity of retrieval recall to this parameter is
+    characterised in chunking_ablation.py (configurations 3:1, 5:1, 7:1).
     Reference: Lewis, P. et al. (2020). "Retrieval-Augmented Generation for
     Knowledge-Intensive NLP Tasks." NeurIPS 2020.
 

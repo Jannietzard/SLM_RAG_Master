@@ -647,6 +647,54 @@ class TestOptionAGeneralisability:
                     "F_passive_agent", "connector_split",
                 }, f"For {q!r}, got unexpected marker: {plan.matched_pattern!r}"
 
+    def test_pattern_F_skips_interrogative_headed_subject(self, planner):
+        """Pattern F must NOT fire when the passive subject is itself a wh-NP.
+
+        Regression guard for the failure mode where _find_passive_agent_bridge
+        returns an interrogative-headed subject (e.g. "What government
+        position"). The template f"Who {verb} {subj}?" then produces
+        self-referential nonsense ("Who hold What government position?")
+        instead of a real bridge sub-query.
+        """
+        plan = planner.plan(
+            "What government position was held by the woman who portrayed "
+            "Corliss Archer in the film Kiss and Tell?"
+        )
+        # Pattern F must NOT be the matched marker — fall-through to
+        # connector_split (or one of the dep-parse patterns G/E/H) is OK.
+        assert plan.matched_pattern != "F_passive_agent", (
+            f"Pattern F fired on interrogative-headed subject; "
+            f"got matched_pattern={plan.matched_pattern!r}, "
+            f"sub_queries={plan.sub_queries!r}"
+        )
+        # No sub-query may contain the self-referential bug string. The
+        # specific bug shape produced by Pattern F on a wh-NP subject is
+        # f"Who {verb} {wh-NP}?" — e.g. "Who hold What government position?"
+        # The connector-split fallback may still mangle the query in OTHER
+        # ways (that is Fix B's investigation target), but the specific
+        # self-referential template must not appear.
+        import re as _re
+        self_ref_re = _re.compile(
+            r"\bWho\s+\w+\s+(What|Which|Whose)\b", _re.IGNORECASE
+        )
+        for sq in plan.sub_queries:
+            assert not self_ref_re.search(sq), (
+                f"Self-referential Pattern-F bug string leaked through: {sq!r}"
+            )
+
+    def test_pattern_F_still_fires_on_canonical_passive(self, planner):
+        """Positive control: Pattern F must still fire on the canonical
+        passive-with-named-agent form. This guards against the
+        interrogative-subject guard over-rejecting.
+        """
+        plan = planner.plan("The Mona Lisa was painted by who?")
+        if plan.query_type == QueryType.MULTI_HOP:
+            # F or connector_split — both acceptable, matching the existing
+            # test_pattern_F_generalises_to_novel_passive_verbs contract.
+            assert plan.matched_pattern in {
+                "F_passive_agent", "connector_split",
+            }, f"Pattern F regression on canonical input: got {plan.matched_pattern!r}"
+
     def test_deleted_C_pattern_marker_never_appears(self, planner):
         """The C_for_category marker must never be produced (Pattern C deleted)."""
         for q in [

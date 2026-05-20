@@ -1,8 +1,10 @@
 # Technical Architecture
 
-**Project:** Enhancing Reasoning Fidelity in Quantized Small Language Models on Edge Devices via Hybrid Retrieval-Augmented Generation
+**Project:** Enhancing Reasoning Fidelity in Quantized Small Language Models:
+Agentic Verification for Hybrid Retrieval-Augmented Generation on
+Resource-Constrained Devices
 **Author:** Jan Nietzard
-**Institution:** FOM Hochschule, Master of Science
+**Institution:** RWTH, Master of Science
 **Document version:** 5.1 — paper-release (2026-05-15), refreshed 2026-05-20 to reflect the empirical disabling of Phase 3d.5 entity linking and the bulk-redirect / per-bucket-checkpoint infrastructure.
 
 > This document describes the system as it stands at the paper-release
@@ -64,14 +66,79 @@ layers.
 
 **Edge-deployment constraints (binding throughout the design):**
 
+The term *edge device* in this work refers to a single-host commodity
+machine without server-grade GPU acceleration and without cloud
+dependency at inference time. The concrete operating envelope used as
+the design target throughout this thesis is:
+
+| Resource | Budget | Rationale |
+|---|---|---|
+| Host RAM | ≤ 16 GB total; system targets ≤ 8 GB working set | Covers laptops, mini-PCs (Intel NUC / Mac mini class), and industrial single-board computers (Jetson Orin Nano 8 GB, Raspberry Pi 5 8 GB). |
+| Compute | CPU-only at inference; x86-64 or ARM64; no CUDA / ROCm requirement | GPU is available only for the GPU-bound extraction phase (Phase 2, run offline in Colab); production inference must run without it. |
+| Disk | ≤ 10 GB for code + databases + caches per dataset | Fits a typical embedded device storage profile. |
+| Per-query latency (target) | < 60 s end-to-end on the reference hardware | Matches the budget profiled in `latency_memory_profile.py`. |
+| External network | Not required at evaluation time | Ollama runs locally on `localhost:11434`; no cloud API calls. |
+| Reference hardware (development & evaluation) | Intel-class CPU, 16 GB RAM, Windows 11 / Linux | Hardware on which the reported numbers were produced. |
+
+These limits are not aspirational — they constrain every component
+design choice in §3 (embedded stores; no GPU at runtime; quantised
+generation), §4 (small generation models, single-pass orchestration,
+bounded self-correction), and §10 (memory profiling).
+
 - Every persistence backend is *embedded*: no separate database server.
   LanceDB stores vectors as Apache Arrow files; KuzuDB stores the graph
   as memory-mapped column store files; SQLite stores the embedding cache.
 - All language models are served locally via Ollama; no cloud API
   dependency at evaluation time.
-- The system is required to operate within < 16 GB host RAM and produce
-  end-to-end answers on CPU-only hardware.
 - Generation uses 4-bit GGUF quantisation (llama.cpp backend) via Ollama.
+
+### 1.1 Position relative to prior work
+
+Three recent lines of work are the closest neighbours; each is cited
+throughout this document where its mechanism is reused.
+
+**vs. IRCoT** (Trivedi et al. 2023, ACL; arXiv:2212.10509) —
+*Interleaving Retrieval with Chain-of-Thought.* IRCoT interleaves
+free-form CoT reasoning with retrieval steps on large LLMs (GPT-3,
+Flan-T5 XXL). This work adopts the *iterative bridge-grounding* idea
+(step-N retrieved entities feed step-N+1 query, see §4.4 and
+`AgentPipeline._iterative_navigate`) but replaces free-form CoT with a
+**structured Planner that emits a finite, parse-derived hop graph**
+(Patterns E/G/H/K/L) executable by a 1.5B-parameter quantised SLM.
+Free-form CoT is not robust at this model size; the dependency-parse
+backbone supplies the reasoning skeleton externally.
+
+**vs. HippoRAG** (Gutiérrez et al. 2024, NeurIPS; arXiv:2405.14831) —
+*Neurobiologically inspired long-term memory.* HippoRAG runs personalised
+PageRank over a passage graph at query time using a GPT-3.5 OpenIE
+extractor. This work shares the typed-vs-untyped relation-weighting
+intuition (cooccurrence edges down-weighted, semantic edges full
+weight; §12.36) and the use of named-entity bridges as retrieval
+anchors, but (i) extracts relations *offline* with GLiNER + REBEL
+(open-source, edge-feasible), (ii) replaces personalised PageRank with
+**bounded multi-hop Cypher traversal capped at hop-3** (§3.5), and
+(iii) does not require a cloud LLM at extraction or query time.
+
+**vs. Self-Refine** (Madaan et al. 2023, NeurIPS) — *Iterative
+refinement with self-feedback.* Self-Refine has the same LLM critique
+and revise its own output. This work uses the same *single feedback
+loop* in the Verifier (§4.3) but replaces self-feedback with
+**deterministic entity-presence verification** against retrieved
+context (an external signal, not the model's own opinion). The
+self-correction round count is bounded to ≤ 1 by default; the
+ablation in §11.9 / `agentic_ablation.py` quantifies its marginal
+contribution.
+
+**The combined contribution** of this work is: a *parse-grounded,
+edge-feasible* instantiation of the IRCoT / HippoRAG / Self-Refine
+family in which (a) each agentic step is implementable without a
+large LLM, (b) every retrieval modality and every reasoning hop fits
+within the edge envelope defined above, and (c) the multi-modal
+retrieval is weighted by an empirically-justified RRF schedule
+(§3.5, §12.35 / I-1) rather than uniform fusion. The end-to-end
+evaluation in Artifact C tests the hypothesis that this combination
+exceeds vector-only and graph-only retrieval on bridge-heavy
+multi-hop QA at the edge-device scale.
 
 ---
 
@@ -141,7 +208,6 @@ Entwicklungfolder/
 ├── diagnose_verbose.py               # Full pipeline trace with gold-tracking hooks
 ├── diagnose_ingestion.py             # Ingestion-side consistency probe
 ├── diagnose_graph_baseline.py        # Read-only graph-quality reporter
-├── dryrun_ingestion.py               # Pre-ingest sanity check on N chunks
 │
 ├── test_system/                      # Test suite (~450 tests collected)
 │   ├── conftest.py
@@ -462,9 +528,8 @@ exceeds a threshold (`--linking-threshold`, default `0.92`). The linker
 also supports per-bucket resume via `done_buckets` + `on_bucket_done`,
 so a mid-phase crash does not lose finished buckets.
 
-A probe analysis (`probe_linking_threshold.py`) over a 2000-entity
-sample per type bucket measured the following merge rates with
-nomic-embed-text:
+A threshold analysis over a 2000-entity sample per type bucket measured
+the following merge rates with nomic-embed-text:
 
 | Type | n | threshold 0.98 | threshold 0.99 | Largest cluster (0.98) |
 |---|---|---|---|---|
@@ -637,6 +702,39 @@ sub-queries ───→ │                                              │
                                 ▼
                   filtered_context, retrieval_methods → S_V
 ```
+
+**Filter chain ordering rationale.** The six filters are ordered by
+*increasing computational cost and decreasing reversibility*, so cheap
+deterministic operations narrow the candidate set before expensive or
+lossy ones run.
+
+1. **Relevance filter** (lexical overlap) — cheapest, deterministic;
+   removes manifest off-topic chunks first so subsequent filters
+   operate on a relevance-aligned pool.
+2. **Redundancy (Jaccard) filter** — pairwise n-gram comparison;
+   removes near-duplicates *before* entity reasoning so duplicate
+   chunks do not double-vote downstream.
+3. **Contradiction filter** (numeric heuristic, context-aware) —
+   removes pairs with mutually-exclusive numeric claims (year vs.
+   count classification per §12.32). Runs after redundancy so a
+   single duplicate cluster cannot dominate the contradiction
+   evidence count.
+4. **Entity-overlap pruning** — drops chunks whose entity set is a
+   strict subset of a higher-ranked chunk's entity set; preserves
+   broader-coverage chunks.
+5. **Entity-mention filter** (top-K RRF immune) — checks that planned
+   query entities appear in the chunk text. Lossy by design and gated
+   by the top-2 immunity carve-out so the implicit-bridge case (§12.33)
+   is not destroyed.
+6. **Context shrinkage** — last, because it commits to a final budget;
+   any filter that runs after this would operate on an already-truncated
+   pool.
+
+The cross-encoder reranker (Stage 2.5) runs *after* the chain because
+it is the only step with a per-pair neural cost (~2 ms × K on CPU); it
+must operate on a small, pre-cleaned pool to stay within the latency
+budget defined in §1. The ordering is empirically defended by
+`agentic_ablation.py` row-3 / row-4 deltas.
 
 **Cross-encoder reranker (Stage 2.5).** When `enable_reranker: true`,
 the top-K candidates after RRF are rescored with
@@ -1168,17 +1266,36 @@ scores `(_best_sub_query, chunk)` rather than `(surface_query, chunk)`,
 where `_best_sub_query` is the sub-query for which the chunk had the
 highest per-sub-query RRF rank.
 
-### 11.8 Two generalisable mechanisms in the Planner, no example lists
+### 11.8 Planner pattern classification: dependency parse + surface heuristics
 
-Pattern recognition in the Planner uses **only** dependency-parse
-labels (relcl, acl, agent, auxpass, prep("of"), pobj) and closed-class
-English markers (both, another). No verb enumeration, no role
-enumeration, no category enumeration. The Patterns C and D from earlier
-implementation iterations have been removed because their verb / role
-lists were example-derived and not defensible as closed grammatical
-categories. The retained patterns cite linguistic literature: Quirk et
-al. 1985; Bresnan 1982; Karttunen 1976/1977; Partee 1995; Barker 1995;
-Levin 1993.
+The Planner uses **two complementary mechanisms** for query type
+classification.
+
+**Primary mechanism — structural patterns (Patterns E, G, H, K, L):**
+Named patterns use SpaCy dependency-parse labels (relcl, acl, agent,
+auxpass, prep("of"), pobj) and closed-class English markers (both,
+another) to fire structural decomposition. These cite linguistic
+literature: Quirk et al. 1985; Bresnan 1982; Karttunen 1976/1977;
+Partee 1995; Barker 1995; Levin 1993.
+
+**Secondary mechanism — `MULTI_HOP_PATTERNS` (regex pre-screen):**
+Before structural patterns fire, a set of surface-level regex patterns
+(`MULTI_HOP_PATTERNS`) screens whether the query *may* be multi-hop.
+This set includes closed-class syntactic markers ("of a/the X
+that/who", possessive chains) as well as a curated list of attribution
+verbs (starring, featuring, directed by, written by, composed by) and
+relational nouns (father/mother/son/daughter of, creator/founder of)
+that consistently signal an unresolved nominal bridge in English (Quirk
+et al. 1985 §17.7-15). The pre-screen is conservative: a false
+positive escalates to structural parsing, which may still emit a
+single-hop plan; a false negative degrades to the generic 2-hop
+fallback seeded on detected entities.
+
+The combined approach trades theoretical elegance for empirical
+robustness on HotpotQA bridge questions: structural patterns provide
+defensible linguistic grounding; the surface pre-screen recovers
+questions where the bridge is lexically marked but syntactically opaque
+to the dependency parser (e.g., passive nominalizations, fragments).
 
 ### 11.9 Single-pass generation by default, self-correction as ablation
 

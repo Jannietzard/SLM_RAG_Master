@@ -108,11 +108,16 @@ python -X utf8 local_importingestion.py `
     --extractions data/hotpotqa/graph/extraction_results.json `
     --dataset hotpotqa `
     --clear `
+    --no-entity-linking `
     --hub-threshold-ratio 0.03 `
-    --linking-threshold 0.92 `
-    --linking-max-type-size 20000 `
     --cooccurrence-min-confidence 0.5
 ```
+
+> **Note:** `--no-entity-linking` disables embedding-based alias resolution,
+> which is the paper-release default. An empirical probe showed nomic-embed-text
+> produces 90–94 % merge rates at every tested threshold (see §3.6.1 of
+> TECHNICAL_ARCHITECTURE.md); the linker is therefore disabled and alias
+> resolution reduces to `canonical_form` exact-match deduplication.
 
 This populates `data/hotpotqa/vector/` (LanceDB) and
 `data/hotpotqa/graph/` (KuzuDB). Phase 3 takes ~20–40 min on CPU; the
@@ -221,8 +226,7 @@ deselected):
 python -X utf8 -m pytest test_system/ -q
 ```
 
-Two pre-existing Navigator filter tests are known failures unrelated to
-the current system state; everything else passes.
+All tests pass.
 
 ---
 

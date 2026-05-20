@@ -1429,6 +1429,18 @@ class PlanGenerator:
         r"^(what|who|where|when|why|how|which|is|are|was|were|did|does|do)\b",
         re.IGNORECASE,
     )
+    # Pattern F guard (added 2026-05-20): when _find_passive_agent_bridge
+    # returns an interrogative-headed subject (e.g. "What government
+    # position", "Which film"), the template "Who {verb} {subj}?" produces
+    # self-referential nonsense. Detect and skip in that case.
+    # Note: stricter than _INTERROGATIVE_PREFIX — only the determiner-style
+    # wh-words that head NPs ("what NP", "which NP", "whose NP"), not the
+    # pronoun-style ones ("who", "whom") that are valid subjects on their
+    # own (e.g. "Who painted the Mona Lisa?" → subj="Who" is grammatical).
+    _PASSIVE_F_INTERROGATIVE_SUBJ_RE = re.compile(
+        r"^\s*(what|which|whose)\b",
+        re.IGNORECASE,
+    )
 
     # Pre-compiled regexes for _extract_constraints (called on every query)
     _TEMPORAL_TERMS_RE = re.compile(
@@ -2397,29 +2409,45 @@ class PlanGenerator:
         pa = self._find_passive_agent_bridge(query)
         if pa is not None and len(parts) >= 1:
             subj, active_verb = pa
-            bridge_q = f"Who {active_verb} {subj}?"
-            hop_sequence = [
-                HopStep(
-                    step_id=0,
-                    sub_query=bridge_q,
-                    target_entities=[e.text for e in entities],
-                    depends_on=[],
-                    is_bridge=True,
-                ),
-                HopStep(
-                    step_id=1,
-                    sub_query=query,
-                    target_entities=[e.text for e in entities],
-                    depends_on=[0],
-                    is_bridge=False,
-                ),
-            ]
-            logger.debug(
-                "_decompose_multi_hop: Pattern F passive-agent (%s/%s) → %r",
-                subj[:30], active_verb, bridge_q[:60],
-            )
-            self._last_matched_pattern = "F_passive_agent"
-            return hop_sequence, [bridge_q, query]
+            # GUARD: skip Pattern F when the passive subject is itself an
+            # interrogative noun phrase. The template f"Who {verb} {subj}?" with
+            # an interrogative subject (e.g. "What government position") produces
+            # self-referential nonsense ("Who hold What government position?")
+            # that retrieves arbitrary chunks. Falling through to the
+            # connector-split baseline is documented as the safer behaviour
+            # (see class docstring, "Baseline — Connector-split decomposition").
+            if self._PASSIVE_F_INTERROGATIVE_SUBJ_RE.match(subj):
+                logger.debug(
+                    "_decompose_multi_hop: Pattern F skipped — interrogative-headed "
+                    "subject %r; falling through to connector-split baseline",
+                    subj[:60],
+                )
+                # Do NOT set _last_matched_pattern here — let the downstream path
+                # set its own marker (connector_split / fallback_*).
+            else:
+                bridge_q = f"Who {active_verb} {subj}?"
+                hop_sequence = [
+                    HopStep(
+                        step_id=0,
+                        sub_query=bridge_q,
+                        target_entities=[e.text for e in entities],
+                        depends_on=[],
+                        is_bridge=True,
+                    ),
+                    HopStep(
+                        step_id=1,
+                        sub_query=query,
+                        target_entities=[e.text for e in entities],
+                        depends_on=[0],
+                        is_bridge=False,
+                    ),
+                ]
+                logger.debug(
+                    "_decompose_multi_hop: Pattern F passive-agent (%s/%s) → %r",
+                    subj[:30], active_verb, bridge_q[:60],
+                )
+                self._last_matched_pattern = "F_passive_agent"
+                return hop_sequence, [bridge_q, query]
 
         if len(parts) > 1:
             # P1-fix: the generic connector-split path is the baseline algorithm

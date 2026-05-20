@@ -23,9 +23,9 @@ Background facts (so the tasks make sense):
   weight-precision loss → possible accuracy drop.
 - Quantization does NOT change the context-window length (that is an
   architecture property), and does NOT make the model "smarter."
-- The `#`-commented models in `test_prompt_idk.py` failed the 60 s budget
-  because they are larger, not because of quantization. Quantizing them
-  harder is the lever that could make them budget-viable.
+- Larger models (e.g. qwen2:7b, phi3) failed the 60 s budget because of
+  model size, not quantization. Quantizing harder is the lever that could
+  make them budget-viable.
 
 ### Tasks
 
@@ -169,3 +169,6 @@ Check how much graph visible: - graph gernell einmal durchtesten mehrwert in res
 70-80 testen 
 fastes SLM / How do i quantisise? 
 import laufen lassen
+
+
+chunking ablation

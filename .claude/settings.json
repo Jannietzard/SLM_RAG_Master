@@ -150,7 +150,21 @@
       "PowerShell($f = 'evaluation_results\\\\hotpotqa_qwen2-1.5b_20260515_012736.jsonl'; \\(Get-Content $f | Measure-Object -Line\\).Lines; Get-Content $f -TotalCount 1)",
       "PowerShell($f = 'evaluation_results\\\\hotpotqa_qwen2-1.5b_20260515_012736.jsonl'; $rows = Get-Content $f | ForEach-Object { $_ | ConvertFrom-Json }; $em = \\($rows | Measure-Object -Property exact_match -Sum\\).Sum; $f1 = \\($rows | Measure-Object -Property f1_score -Average\\).Average; $sf = \\($rows | Measure-Object -Property sf_f1 -Average\\).Average; $recall = \\($rows | Measure-Object -Property retrieval_recall -Average\\).Average; $all_gold = \\($rows | Where-Object { $_.all_gold_retrieved } | Measure-Object\\).Count; \"n=$\\($rows.Count\\)`nEM rate: $\\([math]::Round\\($em / $rows.Count, 4\\)\\)`nMean F1: $\\([math]::Round\\($f1, 4\\)\\)`nMean SF-F1: $\\([math]::Round\\($sf, 4\\)\\)`nMean retrieval recall: $\\([math]::Round\\($recall, 4\\)\\)`nall_gold_retrieved: $all_gold / $\\($rows.Count\\) = $\\([math]::Round\\($all_gold / $rows.Count, 4\\)\\)\")",
       "PowerShell($f = 'evaluation_results\\\\hotpotqa_qwen2-1.5b_20260520_001355.jsonl'; $rows = Get-Content $f | ForEach-Object { $_ | ConvertFrom-Json }; $sf = \\($rows | Measure-Object -Property sf_f1 -Average\\).Average; $recall = \\($rows | Measure-Object -Property retrieval_recall -Average\\).Average; $all_gold = \\($rows | Where-Object { $_.all_gold_retrieved } | Measure-Object\\).Count; \"n=$\\($rows.Count\\)`nMean SF-F1: $\\([math]::Round\\($sf, 4\\)\\)`nMean retrieval recall: $\\([math]::Round\\($recall, 4\\)\\)`nall_gold_retrieved: $all_gold / $\\($rows.Count\\) = $\\([math]::Round\\($all_gold / $rows.Count, 4\\)\\)`n---Rows---\"; $rows | Format-Table question_id, exact_match, f1_score, sf_f1, retrieval_recall, all_gold_retrieved, time_ms -AutoSize | Out-String -Width 200)",
-      "Bash(awk '{print $NF}')"
+      "Bash(awk '{print $NF}')",
+      "Bash(del \"Technical_Architekture_Alt_59.md\" \"Promptsfortest.md\" \"diagnose_out.txt\" \"eval_20_out.txt\" \"test_system\\\\diagnose_spacy.py\")",
+      "Bash(xargs -I{} basename {})",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(python -X utf8 -c \"import ast; ast.parse\\(open\\(r'c:\\\\Users\\\\Jan Nietzard\\\\Documents\\\\FOM\\\\FOM Masterarbeit\\\\Masterarbeit Edge\\\\Entwicklungfolder\\\\src\\\\pipeline\\\\agent_pipeline.py', encoding='utf-8'\\).read\\(\\)\\); print\\('agent_pipeline.py: parses OK'\\)\")",
+      "Bash(dir \"c:\\\\Users\\\\Jan Nietzard\\\\Documents\\\\FOM\\\\FOM Masterarbeit\\\\Masterarbeit Edge\\\\Entwicklungfolder\" /B)",
+      "Bash(python -X utf8 -m py_compile test_system/test_planner_semantic.py)",
+      "Bash(grep -v \"^[ \\\\t]*$\")",
+      "Bash(python -X utf8 -m pytest test_system/test_planner_semantic.py -q)",
+      "Bash(python -X utf8 -m pytest test_system/test_planner_semantic.py)",
+      "Bash(python -X utf8 -m py_compile src/logic_layer/verifier.py)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\Jan Nietzard\\.claude"
     ]
   }
 }
