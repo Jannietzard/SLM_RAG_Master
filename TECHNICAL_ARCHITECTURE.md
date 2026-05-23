@@ -5,7 +5,7 @@ Agentic Verification for Hybrid Retrieval-Augmented Generation on
 Resource-Constrained Devices
 **Author:** Jan Nietzard
 **Institution:** RWTH, Master of Science
-**Document version:** 5.1 — paper-release (2026-05-15), refreshed 2026-05-20 to reflect the empirical disabling of Phase 3d.5 entity linking and the bulk-redirect / per-bucket-checkpoint infrastructure.
+**Document version:** 5.2 — paper-release (2026-05-15), refreshed 2026-05-23 to reflect the query-side NER normalization layer (§3.5), the entity-free definite-description and classifier-abstention decompositions (§4.1), the graded entity-mention filter with a survivor floor (§4.2), the IDF-specificity / structural-coverage / sentence-aware context budgeting in the Verifier (§4.3), the rank-aware single-pool bridge scorer (§4.5), and the random/seeded/range question-selection modes of the evaluator (§7.1).
 
 > This document describes the system as it stands at the paper-release
 > milestone. Earlier versions tracked an incremental change-log; that
@@ -500,6 +500,38 @@ The retriever also exposes:
 - Optional cross-encoder reranker stage (`enable_reranker: true`) using
   `cross-encoder/ms-marco-MiniLM-L-6-v2` (Reimers & Gurevych 2019).
 
+#### Query-side entity extraction and normalization
+
+Query-time entities (used both as graph-search anchors and as
+entity-mention filter tokens in §4.2) are produced by
+`ImprovedQueryEntityExtractor`, which runs the same GLiNER model as
+ingestion (with SpaCy then regex fallbacks). Because the two consumers
+trust these spans directly, a deterministic, query-side-only
+normalization layer repairs span boundaries and gates non-discriminative
+spans **before** they reach retrieval:
+
+- **Span-boundary normalization.** (a) A leading auxiliary/copula verb
+  absorbed into a span by the tagger is stripped (`_strip_leading_function_word`,
+  closed class `is/are/was/were/do/does/did` only — wh-words and articles
+  are deliberately *not* stripped, since legitimate titles begin with
+  them, e.g. "Who Framed Roger Rabbit", and article handling is already
+  type-aware in the shared normaliser). (b) Overlapping fragments of one
+  span are merged to the maximal span using GLiNER character offsets
+  (`_dedup_overlapping_spans`), so "Hook-Handed Man" survives intact
+  rather than fragmenting. (c) A 4-digit year *interior* to a span
+  (alphabetic tokens on both sides) is split off as a separate temporal
+  constraint (`_strip_embedded_year`); leading/trailing years are kept,
+  as they are often part of a title.
+- **Discriminativeness gate** (`_is_junk_entity`). A span is rejected as
+  an anchor/filter token if it is a stop-listed token, a generic question
+  stem, or a *pure temporal/measure phrase* — all tokens are digits,
+  measure nouns, or quantity adjectives with no capitalised proper-noun
+  token (e.g. "7 consecutive seasons", "25 laps"). Such phrases match no
+  graph node and, used as a filter token, retain noise.
+
+Both passes are query-side only; the ingestion path is untouched, so
+query/ingestion entity-ID consistency is preserved.
+
 ### 3.6 Graph Quality
 
 **File:** [`src/data_layer/graph_quality.py`](src/data_layer/graph_quality.py)
@@ -625,7 +657,15 @@ any temporal or comparative constraints.
      `auxpass + nsubjpass + agent` children. Past-participle →
      infinitive transformation uses SpaCy's morphological lemmatiser,
      so the recogniser is **vocabulary-independent**. Implemented by
-     `_find_passive_agent_bridge`.
+     `_find_passive_agent_bridge`. **Subject guards:** Pattern F is
+     skipped when the extracted passive subject is itself an
+     interrogative noun phrase (`_PASSIVE_F_INTERROGATIVE_SUBJ_RE`:
+     leading what/which/whose) or a bare pronoun
+     (`_PASSIVE_F_BARE_PRONOUN_SUBJ`: that/this/it/who/…). The template
+     "Who {verb} {subject}?" with such a subject yields a
+     self-referential sub-query ("Who hold what government position?")
+     or a context-free one ("Who form that?"); both guards fall through
+     to the connector-split baseline instead.
 
    **Mechanism B — Closed-class lexical pre-empts.** As above
    (Patterns I and J), routed before the scoring classifier.
@@ -637,12 +677,43 @@ any temporal or comparative constraints.
    final sub-query. A 2-hop cap collapses spurious 3-part splits
    whose middle parts contain no named entity.
 
+   **Mechanism C — Entity-free definite-description bridge.** When a
+   `MULTI_HOP` query names no anchor entity (NER returns nothing
+   seedable), the bridge referent is often given by *description*
+   rather than by name ("the only player … to have a 0.300 batting
+   average for 7 consecutive seasons"). `_find_entity_free_description`
+   selects the longest object/complement noun phrase (pobj/dobj/attr
+   head) that is entity-free and carries ≥ 2 description-modifier
+   dependents (a *definite description*; Russell 1905; Strawson 1950)
+   and emits its subtree text as the hop-0 retrieval query. This
+   replaces what was previously a silent degrade-to-single-hop.
+
+   **Classifier-abstention override (A4).** The classifier returns
+   `SINGLE_HOP` with exactly `classifier_fallback_confidence` (0.5)
+   *only* when no pattern scored (its documented no-signal sentinel;
+   any real match yields ≥ 0.6). In that abstention case — and only
+   then — `_attribute_over_entity_signal` consults the dependency parse:
+   if the question asks for a wh-determined attribute of a thing related
+   to a named entity (e.g. "what class of instrument does X play?"),
+   the type is re-routed to `MULTI_HOP` so the entity-seeded 2-hop
+   decomposition runs. The gate cannot override a classification that
+   had positive evidence, so it cannot regress confident single-hop
+   questions.
+
+   **Never-collapse contract.** `_decompose_multi_hop` enforces a logged
+   invariant: a `MULTI_HOP` classification must never silently emit a
+   single sub-query; the only permitted single-sub-query output is the
+   explicitly-marked degrade path below.
+
    **Failure modes**, explicit and surfaced in `matched_pattern`:
+   - `structural_descriptive_2hop`: Mechanism C fired — entity-free
+     definite-description bridge.
    - `fallback_generic_2hop`: classified `MULTI_HOP`, no mechanism
      applied, seed entity available. Emits "Who or what is X?" as
      hop-0 and the original query as hop-1.
    - `fallback_degraded_to_single_hop`: classified `MULTI_HOP`, no
-     mechanism applied, no entity available. Logged at WARNING.
+     mechanism applied, no entity *and* no usable description. Logged at
+     WARNING — the only sanctioned single-sub-query output.
 
 #### Per-pattern diagnostics
 
@@ -722,10 +793,21 @@ lossy ones run.
 4. **Entity-overlap pruning** — drops chunks whose entity set is a
    strict subset of a higher-ranked chunk's entity set; preserves
    broader-coverage chunks.
-5. **Entity-mention filter** (top-K RRF immune) — checks that planned
-   query entities appear in the chunk text. Lossy by design and gated
-   by the top-2 immunity carve-out so the implicit-bridge case (§12.33)
-   is not destroyed.
+5. **Entity-mention filter** (tiered, top-K RRF immune, survivor floor)
+   — assigns each chunk a tier: tier 0 mentions a *specific* query
+   entity (multi-word, or a distinctive single token ≥ 8 chars), tier 1
+   mentions only a generic entity or has strong query content-word
+   overlap, tier 2 mentions neither. Tier-2 chunks are dropped, with two
+   safeguards: the **top-2 RRF chunks are immune** (the implicit-bridge
+   carve-out), and a **survivor floor** guarantees that when a full
+   candidate set (≥ 5 chunks) was supplied the filter never reduces it
+   below 5 — if matching kept fewer, it tops up with the highest-RRF
+   dropped chunks. The floor engages only for full sets, so small inputs
+   are still filtered normally (it does not force-keep noise in a 2–3
+   chunk set). When the query yields *no* usable entities the filter no
+   longer silently passes everything: it logs a structural warning and
+   sets `_entity_filter_skipped`, then relies on RRF/reranker ranking —
+   making the no-gating case observable rather than silent.
 6. **Context shrinkage** — last, because it commits to a final budget;
    any filter that runs after this would operate on an already-truncated
    pool.
@@ -801,6 +883,37 @@ enabled by default; the Verifier-side NLI check requires a 270 MB
 cross-encoder download and is therefore retained only as a
 research-mode toggle for ablation studies.
 
+#### Context ordering and budgeting
+
+Before the prompt is built, the surviving context is re-ordered and
+truncated so the answer-bearing chunk reaches the small LLM early and
+intact (small models attend poorly to later/long context;
+Liu et al. 2024 "lost in the middle").
+
+1. **Relevance re-ordering** (`_reorder_by_question_relevance`). Chunks
+   are stable-sorted by a score combining three terms:
+   - *IDF-weighted query-term overlap* — a query term occurring in many
+     candidate chunks (a generic category word like "magazines") is
+     down-weighted; a rare term (the specific entity) is decisive
+     (inverse document frequency over the candidate set; Spärck Jones
+     1972; Robertson 2004). IDF is applied only with ≥ 4 candidates;
+     below that, document frequency is degenerate and the score falls
+     back to length-normalised hit count.
+   - *sqrt(word-count) length normalisation* — a short direct-answer
+     chunk is not penalised against a long topic chunk that accumulates
+     hits from sheer length (standard TF length normalisation).
+   - *structural-coverage floor* — a chunk naming a distinctive query
+     entity (multi-word, or a single token ≥ 8 chars) receives a score
+     floor, so a required entity's article (a comparison conjunct, or a
+     bridge target) cannot be demoted below the context cap by keyword
+     sparsity.
+2. **Sentence-aware per-doc truncation** (`_truncate_sentence_aware`).
+   When a chunk exceeds `max_chars_per_doc`, the most query-relevant
+   *sentences* are kept (in original order, preserving local coherence)
+   rather than a blind head-truncation — so an answer-bearing sentence
+   in the tail of a chunk survives. Falls back to head-truncation when
+   no query is supplied or the chunk has no sentence structure.
+
 #### Prompt selection
 
 S_V selects one of four prompt templates based on `query_type` and
@@ -809,7 +922,7 @@ pre-validation status:
 | Prompt | When |
 |---|---|
 | `ANSWER_PROMPT` | Single-hop / temporal / aggregate / default. |
-| `BRIDGE_PROMPT` | `query_type in {"multi_hop", "bridge"}` and `hop_sequence` non-empty. The prompt includes a reasoning chain built by `_build_bridge_chain` that names the resolved bridge entities verbatim only when those entities are grounded in the retrieved context. |
+| `BRIDGE_PROMPT` | `query_type in {"multi_hop", "bridge"}` and `hop_sequence` non-empty. The prompt includes a reasoning scaffold built by `_build_bridge_chain`. Non-final steps render as the directive "→ identify the intermediate result" rather than a pre-filled bridge entity: an entity merely *appearing* in context does not mean it *answers* the sub-query, and injecting it was observed to poison the SLM (it copied a wrong-but-grounded value, or over-abstained). The final step renders as "→ derive the final answer" (never a literal placeholder a small model could echo). |
 | `COMPARISON_PROMPT` | `query_type == "comparison"`. |
 | `INSUFFICIENT_EVIDENCE_PROMPT` | Pre-validation reports insufficient context. |
 
@@ -901,18 +1014,31 @@ average per-text latency at the end of every run.
 `AgenticController` is a stateless container of utility helpers
 consumed by `AgentPipeline._iterative_navigate`. It contains:
 
-- `_extract_bridge_entities(chunks, exclude, query)` — three-pass
-  bridge-entity extraction from retrieved chunk text:
-  1. **Pass 0** (GPE queries only) — location-context regex
-     ("in the city of X", "capital of X").
-  2. **Pass 1** — surname-anchor: for each known entity, search the
-     chunks for a 2- or 3-token proper-noun sequence ending with that
-     entity's surname.
-  3. **Pass 2** — general proper-noun extraction over all chunks,
-     ranked by `_score_bridge_candidate`.
-- `_score_bridge_candidate(candidate, chunk, query, expected_type)` —
-  proximity-to-query-keywords + expected-type bonus +
-  position penalty.
+- `_extract_bridge_entities(chunks, exclude, query)` — bridge-entity
+  extraction from retrieved chunk text. **Pass 0** (GPE queries only)
+  applies a location-context regex ("in the city of X", "capital of X")
+  and returns early. The former surname-anchor (Pass 1) and
+  general-proper-noun (Pass 2) passes are **merged into one scored
+  candidate pool** rather than a priority-ordered cascade: the old
+  early-return on the first surname match let a low-precision
+  reconstruction preempt a stronger general candidate (e.g. a spurious
+  "Salisbury Gardens" blocking the real "Thomas Mawson"). Candidates from
+  both generators now compete on the same scoring function and the
+  strongest wins. Chunks arrive in RRF rank order, so the list index is
+  the chunk's retrieval rank. A substring-aware exclusion drops contiguous
+  sub-phrases of an excluded compound entity.
+- `_score_bridge_candidate(candidate, chunk, query, expected_type, chunk_rank)` —
+  query-keyword proximity + expected-type bonus − position penalty, with
+  type/length features gated on positive proximity, the whole **multiplied
+  by a reciprocal chunk-rank prior `1/(1+rank)`** (Cormack et al. 2009;
+  the same primitive RRF uses) so an entity from a top-ranked chunk
+  outranks one from a low-ranked noise chunk. The local score is clamped
+  non-negative before the rank multiply. A returned score of 0 means
+  "not found / no query proximity".
+  **Abstention floor:** if the best candidate scores ≤ 0,
+  `_extract_bridge_entities` returns `[]` — a confidently-wrong bridge
+  would misdirect hop-2 retrieval (and reranker hints), which is worse
+  than none; hop-2 then falls back to its un-rewritten sub-query.
 - `_detect_expected_type(query)` — interrogative-word → expected entity
   type (who → PERSON; where → GPE; when → DATE).
 - `_rewrite_hop_query_with_bridges(sub_query, bridges)` — IRCoT-style
@@ -991,8 +1117,21 @@ unit-test scenarios.
 ### 7.1 Benchmark runner
 
 [`benchmark_datasets.py`](src/thesis_evaluations/benchmark_datasets.py)
-exposes `ingest`, `evaluate`, and `ablation` sub-commands. The
-evaluation summary block reports:
+exposes `ingest`, `evaluate`, and `ablation` sub-commands.
+
+**Question selection (`evaluate`).** The evaluator draws a **random
+sample by default** (`--samples N`, default 20) so repeated runs probe
+different questions and a gain is shown to be robust rather than tuned to
+a fixed prefix. The random seed is auto-generated and logged
+(`Question sample seed: N  (re-run with --seed N to reproduce)`), and
+`--seed N` fixes the draw for exact reproduction or for comparing two
+code versions on the same questions. For deterministic selection,
+`--range START-END` takes `questions[START:END]` in index order
+(separators `-`, `_`, `:`): `--range 0-20` reproduces the pre-2026-05
+"first 20" behaviour; `--range 10-30` runs a defined band or shards a
+large run. `--range` overrides `--samples` when both are given.
+
+The evaluation summary block reports:
 
 - Exact Match, F1, average wall-clock per query, coverage.
 - Supporting-fact F1, SF-Recall (`all_gold_retrieved` rate).
@@ -1313,6 +1452,70 @@ in `src/pipeline/` is the only production orchestrator.**
 `AgenticController` in `src/logic_layer/` is a stateless namespace of
 bridge-handling helpers consumed by `AgentPipeline._iterative_navigate`.
 
+### 11.11 Query-side NER normalization as a pre-consumer contract
+
+GLiNER spans are consumed directly as graph anchors and filter tokens,
+so boundary defects (an absorbed leading auxiliary, a fragmented
+hyphenated name, an embedded year) propagate into retrieval. A
+deterministic normalization layer repairs boundaries and gates
+non-discriminative spans before use (§3.5). The rules are deliberately
+narrow and closed-class (auxiliaries only, interior years only,
+offset-overlap merges only) so they have no known false positives on
+real entity names — wh-words and articles, which legitimately begin
+titles, are not touched. This is a query-side-only contract; the
+ingestion path is untouched, preserving entity-ID consistency.
+
+### 11.12 Definite descriptions and classifier abstention as decomposition signals
+
+Two decomposition mechanisms key on *general linguistic notions*, not
+enumerated surface constructions (consistent with §11.8's structural
+philosophy). (i) When a multi-hop query names no entity, the bridge
+referent is given by a *definite description* — a heavily-modified noun
+phrase denoting an entity by its properties (Russell 1905; Strawson
+1950); the longest such entity-free phrase becomes the hop-0 query.
+(ii) The classifier's no-signal sentinel (`SINGLE_HOP` at exactly the
+fallback confidence) is treated as *abstention*, and only then is the
+dependency parse consulted as a tie-breaker. Gating on the exact
+sentinel — not a tuned threshold — guarantees the override cannot
+regress any classification that had positive evidence.
+
+### 11.13 IDF specificity and structural coverage in context ordering
+
+The Verifier's context re-ordering combines IDF-weighted term overlap
+(Spärck Jones 1972; Robertson 2004), sqrt length normalisation, and a
+structural-coverage floor. IDF counters the failure where generic
+category words ("magazines", "athletes") shared by many candidate
+chunks dominate ranking over the rare entity term that actually
+identifies the gold chunk; it is guarded to ≥ 4 candidates because
+document frequency over fewer is degenerate. The coverage floor is a
+*hard guarantee* (not a tuned weight) that a required entity's article
+survives the context cap — restricted to distinctive entities so a
+common single-word name does not over-fire.
+
+### 11.14 Reciprocal-rank prior and abstention in bridge extraction
+
+The bridge-entity scorer multiplies local relevance by a reciprocal
+chunk-rank prior `1/(1+rank)` (Cormack et al. 2009): the retriever's own
+rank is the strongest available prior for which chunk holds the bridge
+referent, so an entity from a top-ranked chunk is preferred over one
+from a low-ranked noise chunk. The three passes are merged into one
+confidence-scored pool rather than a priority-ordered cascade, so a
+low-precision heuristic can no longer short-circuit a stronger
+candidate. An abstention floor (best score ≤ 0 → return none) converts a
+confidently-wrong bridge — which would misdirect hop-2 retrieval — into
+a neutral no-op, after which hop-2 runs on its un-rewritten sub-query.
+
+### 11.15 Survivor floor over hard entity-mention dropping
+
+The entity-mention filter (§4.2) is lossy by design. A survivor floor
+guarantees that, when a full candidate set was retrieved, the filter
+never strands the Verifier with too little context to tolerate a single
+retrieval error (observed degenerate case: 10 → 2). It generalises the
+top-2 RRF immunity into a floor and engages only for full candidate
+sets, so it does not force-keep noise in already-small inputs. The
+no-usable-entity case is made observable (logged + flagged) rather than
+silently passing all chunks unfiltered.
+
 ---
 
 ## 12. Known Limitations and Future Work
@@ -1423,6 +1626,8 @@ bridge-handling helpers consumed by `AgentPipeline._iterative_navigate`.
   of Chicago Press.
 - Lewis, P., et al. (2020). "Retrieval-Augmented Generation for
   Knowledge-Intensive NLP Tasks." NeurIPS 2020.
+- Liu, N. F., et al. (2024). "Lost in the Middle: How Language Models
+  Use Long Contexts." *TACL* 12; arXiv:2307.03172.
 - Madaan, A., et al. (2023). "Self-Refine." NeurIPS 2023;
   arXiv:2303.17651.
 - Malkov, Y. A., & Yashunin, D. A. (2018). "Efficient and robust
@@ -1437,9 +1642,16 @@ bridge-handling helpers consumed by `AgentPipeline._iterative_navigate`.
   Comprehensive Grammar of the English Language.* Longman.
 - Reimers, N., & Gurevych, I. (2019). "Sentence-BERT." EMNLP 2019;
   arXiv:1908.10084.
+- Robertson, S. (2004). "Understanding inverse document frequency: on
+  theoretical arguments for IDF." *Journal of Documentation* 60(5).
+- Russell, B. (1905). "On Denoting." *Mind* 14(56).
 - Salton, G., & Buckley, C. (1988). "Term-weighting approaches in
   automatic text retrieval." *Information Processing & Management*
   24(5).
+- Spärck Jones, K. (1972). "A statistical interpretation of term
+  specificity and its application in retrieval." *Journal of
+  Documentation* 28(1).
+- Strawson, P. F. (1950). "On Referring." *Mind* 59(235).
 - Trivedi, H., et al. (2023). "Interleaving Retrieval with
   Chain-of-Thought Reasoning for Knowledge-Intensive Multi-Step
   Questions" (IRCoT). ACL; arXiv:2212.10509.

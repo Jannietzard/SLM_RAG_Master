@@ -140,6 +140,7 @@ Review History:
 """
 
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -1360,6 +1361,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
         self,
         query: str,
         context: List[str],
+        entities: Optional[List[str]] = None,
     ) -> List[str]:
         """
         Stable-sort context chunks so those sharing more content words with the
@@ -1372,14 +1374,26 @@ Please provide a partial answer based on the available evidence, clearly indicat
         By positioning the most answer-relevant chunk first, the LLM is
         exposed to the fact it needs before encountering distractors.
 
-        Algorithm (O(n × |query_tokens|)):
-        1. Tokenise the query into lowercase content words (≥ 4 chars,
-           not in _QR_STOPWORDS).
-        2. Count how many query tokens occur anywhere in each chunk
-           (case-insensitive substring match).
-        3. Stable-sort descending by count — ties preserve original order
-           (Navigator RRF order), so the change is a no-op when all chunks
-           are equally relevant.
+        Scoring combines three terms:
+        1. IDF-weighted query-term overlap (F1a) — a query term occurring in
+           MANY candidate chunks (a generic category word like "magazines")
+           carries little discriminative power; a rare term (the specific
+           entity) is decisive. Classic inverse document frequency (Spärck
+           Jones 1972; Robertson 2004), computed over the candidate set in
+           hand. Applied only when there are >= _IDF_MIN_CANDIDATES chunks —
+           below that, document frequency is degenerate, so the score falls
+           back to the validated length-normalised hit count (Fix E).
+        2. sqrt(word_count) length normalisation (Fix E) — short direct-answer
+           chunks are not penalised against long topic chunks that accumulate
+           hits from sheer length.
+        3. Structural-coverage floor (D1) — a chunk that names a DISTINCTIVE
+           query entity (multi-word, or a single token >= 8 chars) receives a
+           score floor so a required entity's article (e.g. a comparison
+           conjunct, or a bridge target) cannot be demoted below the cap by
+           keyword sparsity. Restricted to distinctive entities so a common
+           single-word name does not over-fire.
+
+        Stable-sort descending — ties preserve original (Navigator RRF) order.
         """
         if len(context) <= 1:
             return context
@@ -1391,22 +1405,87 @@ Please provide a partial answer based on the available evidence, clearly indicat
         if not query_tokens:
             return context
 
-        def _score(chunk: str) -> int:
+        # F1a: IDF over the candidate set, guarded by a minimum count below
+        # which document frequency is statistically meaningless.
+        _IDF_MIN_CANDIDATES = 4
+        if len(context) >= _IDF_MIN_CANDIDATES:
+            n_docs = len(context)
+            lowered_all = [c.lower() for c in context]
+            idf = {
+                t: math.log((n_docs + 1.0) / (1.0 + sum(1 for c in lowered_all if t in c)))
+                for t in query_tokens
+            }
+        else:
+            idf = {t: 1.0 for t in query_tokens}
+
+        # D1: distinctive query entities that earn a coverage floor.
+        distinctive_entities = [
+            e.lower() for e in (entities or [])
+            if len(e.split()) >= 2 or len(e) >= 8
+        ]
+        # The floor is the maximum achievable IDF mass, so an entity-bearing
+        # chunk always outranks a chunk that merely shares generic terms.
+        coverage_floor = sum(idf.values()) if idf else 1.0
+
+        def _score(chunk: str) -> float:
             chunk_lower = chunk.lower()
-            return sum(1 for t in query_tokens if t in chunk_lower)
+            weighted = sum(idf[t] for t in query_tokens if t in chunk_lower)
+            word_count = max(1, len(chunk_lower.split()))
+            base = weighted / (word_count ** 0.5)
+            if distinctive_entities and any(e in chunk_lower for e in distinctive_entities):
+                base += coverage_floor
+            return base
 
         return sorted(context, key=_score, reverse=True)
 
     # ── Context Formatting ────────────────────────────────────────────────────
 
-    def _format_context(self, context: List[str]) -> str:
+    @staticmethod
+    def _truncate_sentence_aware(doc: str, budget: int, query: str) -> str:
+        """F2: truncate a doc to `budget` chars by keeping the most
+        query-relevant SENTENCES (in original order), not the first N chars.
+
+        Head-truncation silently drops an answer-bearing sentence that sits in
+        the tail of a chunk (confirmed failure: a chunk whose defining fact was
+        in its last sentence). Selecting by query overlap and re-emitting the
+        kept sentences in their ORIGINAL order preserves local coherence (which
+        matters for a small LLM) while ensuring the answer sentence survives.
+        """
+        sentences = re.split(r"(?<=[.!?])\s+", doc)
+        if len(sentences) <= 1:
+            # No sentence structure to exploit — fall back to head truncation.
+            cut = doc[:budget]
+            sp = cut.rfind(" ")
+            return (cut[:sp] + "...") if sp > 0 else cut
+        q_tokens = {t for t in re.findall(r"\b\w{4,}\b", query.lower())}
+
+        def _rel(s: str) -> int:
+            sl = s.lower()
+            return sum(1 for t in q_tokens if t in sl)
+
+        # Rank sentence INDICES by relevance, take the highest-scoring ones
+        # that fit the budget, then emit them in original order.
+        order = sorted(range(len(sentences)), key=lambda i: -_rel(sentences[i]))
+        keep: set = set()
+        used = 0
+        for idx in order:
+            s_len = len(sentences[idx]) + 1
+            if used + s_len > budget and keep:
+                break
+            keep.add(idx)
+            used += s_len
+        kept = [sentences[i] for i in range(len(sentences)) if i in keep]
+        return " ".join(kept).strip()
+
+    def _format_context(self, context: List[str], query: str = "") -> str:
         """
         Format context chunks into a single prompt string with size limits.
 
         Strategy:
         1. Take at most ``max_docs`` chunks.
-        2. Truncate each chunk at ``max_chars_per_doc``, preferring a
-           sentence boundary if one falls in the last 30 % of the window.
+        2. Truncate each chunk at ``max_chars_per_doc`` (F2: sentence-aware,
+           keeping the most query-relevant sentences in original order when a
+           query is supplied; head-truncation otherwise).
         3. Stop adding chunks once ``max_context_chars`` is reached.
         """
         if not context:
@@ -1415,14 +1494,19 @@ Please provide a partial answer based on the available evidence, clearly indicat
         total_chars = 0
         for i, doc in enumerate(context[: self.config.max_docs]):
             if len(doc) > self.config.max_chars_per_doc:
-                truncated = doc[: self.config.max_chars_per_doc]
-                last_period = truncated.rfind(". ")
-                if last_period > self.config.max_chars_per_doc * self.config.format_sentence_boundary_fraction:
-                    truncated = truncated[: last_period + 1]
+                if query:
+                    truncated = self._truncate_sentence_aware(
+                        doc, self.config.max_chars_per_doc, query,
+                    )
                 else:
-                    last_space = truncated.rfind(" ")
-                    if last_space > 0:
-                        truncated = truncated[:last_space] + "..."
+                    truncated = doc[: self.config.max_chars_per_doc]
+                    last_period = truncated.rfind(". ")
+                    if last_period > self.config.max_chars_per_doc * self.config.format_sentence_boundary_fraction:
+                        truncated = truncated[: last_period + 1]
+                    else:
+                        last_space = truncated.rfind(" ")
+                        if last_space > 0:
+                            truncated = truncated[:last_space] + "..."
             else:
                 truncated = doc
             part = "[%d] %s" % (i + 1, truncated)
@@ -1819,8 +1903,10 @@ Please provide a partial answer based on the available evidence, clearly indicat
                 confidence_medium_threshold=self.config.confidence_medium_threshold,
             )
 
-        working_context = self._reorder_by_question_relevance(query, working_context)
-        formatted_context = self._format_context(working_context)
+        working_context = self._reorder_by_question_relevance(
+            query, working_context, entities=entities,
+        )
+        formatted_context = self._format_context(working_context, query=query)
 
         best_answer: Optional[str] = None
         best_verified: List[str] = []

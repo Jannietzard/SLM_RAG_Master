@@ -1301,6 +1301,118 @@ class TestNormalizeQueryEntity:
         assert _normalize_query_entity("", "PERSON") == ""
 
 
+class TestB1SpanNormalization:
+    """B1: query-side span-boundary normalization (deterministic, no model)."""
+
+    def test_strip_leading_auxiliary(self) -> None:
+        """'Are  Chrysalis' → 'Chrysalis' (leading auxiliary + double-space)."""
+        from src.data_layer.hybrid_retriever import _strip_leading_function_word
+        assert _strip_leading_function_word("Are  Chrysalis") == "Chrysalis"
+
+    def test_preserve_wh_word_title(self) -> None:
+        """Wh-words are NOT stripped — legitimate titles begin with them."""
+        from src.data_layer.hybrid_retriever import _strip_leading_function_word
+        assert _strip_leading_function_word("Who Framed Roger Rabbit") == "Who Framed Roger Rabbit"
+        assert _strip_leading_function_word("What Women Want") == "What Women Want"
+
+    def test_preserve_the_band(self) -> None:
+        """'The Who' is untouched here — article handling is type-aware
+        downstream in normalize_entity_name(), not in B1a."""
+        from src.data_layer.hybrid_retriever import _strip_leading_function_word
+        assert _strip_leading_function_word("The Who") == "The Who"
+
+    def test_single_token_unchanged(self) -> None:
+        """A bare single token is never trimmed (would empty the span)."""
+        from src.data_layer.hybrid_retriever import _strip_leading_function_word
+        assert _strip_leading_function_word("Are") == "Are"
+
+    def test_split_interior_year(self) -> None:
+        """'National 1993 Baseball Hall of Fame' → anchor + year 1993."""
+        from src.data_layer.hybrid_retriever import _strip_embedded_year
+        anchor, year = _strip_embedded_year("National 1993 Baseball Hall of Fame")
+        assert anchor == "National Baseball Hall of Fame"
+        assert year == "1993"
+
+    def test_no_year_returns_unchanged(self) -> None:
+        from src.data_layer.hybrid_retriever import _strip_embedded_year
+        anchor, year = _strip_embedded_year("Baseball Hall of Fame")
+        assert anchor == "Baseball Hall of Fame"
+        assert year is None
+
+    def test_leading_year_preserved(self) -> None:
+        """A leading year is part of the title, not an interior qualifier."""
+        from src.data_layer.hybrid_retriever import _strip_embedded_year
+        anchor, year = _strip_embedded_year("2001: A Space Odyssey")
+        assert anchor == "2001: A Space Odyssey"
+        assert year is None
+
+    def test_trailing_year_preserved(self) -> None:
+        from src.data_layer.hybrid_retriever import _strip_embedded_year
+        anchor, year = _strip_embedded_year("Live Aid 1985")
+        assert anchor == "Live Aid 1985"
+        assert year is None
+
+    def test_bare_year_not_stripped(self) -> None:
+        """A span that IS just a year is left intact (no alphabetic sides)."""
+        from src.data_layer.hybrid_retriever import _strip_embedded_year
+        anchor, year = _strip_embedded_year("1993")
+        assert anchor == "1993"
+        assert year is None
+
+    def test_dedup_overlapping_keeps_maximal(self) -> None:
+        """Fragments contained in a longer span are dropped (hyphen-name merge)."""
+        from src.data_layer.hybrid_retriever import _dedup_overlapping_spans
+        ents = [
+            {"text": "Hook", "start": 14, "end": 18, "label": "organization"},
+            {"text": "Hook-Handed Man", "start": 14, "end": 29, "label": "organization"},
+            {"text": "Handed Man", "start": 19, "end": 29, "label": "person"},
+        ]
+        out = _dedup_overlapping_spans(ents)
+        texts = [e["text"] for e in out]
+        assert texts == ["Hook-Handed Man"]
+
+    def test_dedup_keeps_disjoint_spans(self) -> None:
+        """Non-overlapping spans are all kept, in left-to-right order."""
+        from src.data_layer.hybrid_retriever import _dedup_overlapping_spans
+        ents = [
+            {"text": "Chrysalis", "start": 4, "end": 13, "label": "organization"},
+            {"text": "Look", "start": 18, "end": 22, "label": "organization"},
+        ]
+        out = _dedup_overlapping_spans(ents)
+        assert [e["text"] for e in out] == ["Chrysalis", "Look"]
+
+
+class TestB2TemporalMeasureGate:
+    """B2.2a: pure temporal/measure phrases are rejected as entities."""
+
+    def test_rejects_consecutive_seasons(self) -> None:
+        from src.data_layer.hybrid_retriever import ImprovedQueryEntityExtractor as E
+        assert E._is_junk_entity("7 consecutive seasons") is True
+
+    def test_rejects_laps(self) -> None:
+        from src.data_layer.hybrid_retriever import ImprovedQueryEntityExtractor as E
+        assert E._is_junk_entity("25 laps") is True
+
+    def test_rejects_bare_year(self) -> None:
+        from src.data_layer.hybrid_retriever import ImprovedQueryEntityExtractor as E
+        assert E._is_junk_entity("1993") is True
+
+    def test_keeps_proper_noun_with_number(self) -> None:
+        """A capitalised proper-noun token survives even with a number present."""
+        from src.data_layer.hybrid_retriever import ImprovedQueryEntityExtractor as E
+        assert E._is_junk_entity("World War II") is False
+
+    def test_keeps_person(self) -> None:
+        from src.data_layer.hybrid_retriever import ImprovedQueryEntityExtractor as E
+        assert E._is_junk_entity("Frank Thomas") is False
+
+    def test_filter_drops_temporal_keeps_person(self) -> None:
+        """End-to-end: _filter_entities drops the measure phrase, keeps the name."""
+        from src.data_layer.hybrid_retriever import ImprovedQueryEntityExtractor as E
+        out = E._filter_entities(["7 consecutive seasons", "Frank Thomas"])
+        assert out == ["Frank Thomas"]
+
+
 # PreGenerativeFilter contradiction-passthrough tests were removed together
 # with the PreGenerativeFilter class itself in the 2026-05-06 cleanup audit.
 

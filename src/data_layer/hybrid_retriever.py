@@ -140,6 +140,95 @@ def _normalize_query_entity(text: str, label: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# B1 — query-side span-boundary normalization (deterministic, query-only).
+# GLiNER/SpaCy spans occasionally absorb a leading copular/auxiliary verb
+# ("Are Chrysalis"), an interior year ("National 1993 Baseball Hall of Fame"),
+# or emit overlapping fragments of one hyphenated name. These helpers repair the
+# span *boundaries* before the entity becomes a graph anchor or filter token.
+# They never touch the ingestion path — query-side only.
+#
+# Design constraints (publication-defensibility):
+#  - B1a strips only CLOSED-CLASS auxiliary/copula verbs (is/are/was/were/
+#    do/does/did). These never begin an English proper-noun entity name, so the
+#    rule has no known false positives. Interrogative wh-words are deliberately
+#    EXCLUDED because legitimate titles begin with them ("Who Framed Roger
+#    Rabbit", "What Women Want"). Leading ARTICLES are also excluded here —
+#    article handling is already done type-aware by the shared
+#    normalize_entity_name() (so 'The Who' is preserved, 'The Cold War' is
+#    handled identically to ingestion).
+#  - B1c strips a year only when it is INTERIOR (alphabetic tokens on both
+#    sides) — the linguistic signature of a temporal qualifier inserted into an
+#    ORG/EVENT name. Leading/trailing years are preserved because they are often
+#    part of a title ("2001: A Space Odyssey", "Live Aid 1985").
+# ---------------------------------------------------------------------------
+_B1_LEADING_AUX_COPULA: frozenset = frozenset({
+    "is", "are", "was", "were", "do", "does", "did",
+})
+_B1_YEAR_RE = re.compile(r"\b(1[0-9]{3}|20[0-9]{2})\b")
+
+
+def _strip_leading_function_word(text: str) -> str:
+    """B1a: drop a leading auxiliary/copula verb absorbed into the span by the
+    NER tagger. Closed-class only (no wh-words, no articles) — see module note.
+    Collapses internal whitespace ('Are  Chrysalis' → 'Chrysalis')."""
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    if not cleaned:
+        return cleaned
+    tokens = cleaned.split(" ")
+    if len(tokens) <= 1:
+        return cleaned
+    if tokens[0].lower() in _B1_LEADING_AUX_COPULA:
+        tokens = tokens[1:]
+    return " ".join(tokens).strip()
+
+
+def _strip_embedded_year(text: str) -> Tuple[str, Optional[str]]:
+    """B1c: if a standalone 4-digit year is INTERIOR to the span (alphabetic
+    tokens on both sides), return (year_stripped_anchor, year). Otherwise
+    (text, None). The year is returned separately so a caller can treat it as a
+    temporal constraint. Leading/trailing years are preserved (often part of a
+    title), and a span that is *only* a year is left intact."""
+    m = _B1_YEAR_RE.search(text)
+    if not m:
+        return text, None
+    before = text[:m.start()].strip()
+    after = text[m.end():].strip()
+    # Require alphabetic content on BOTH sides → the year is an interior
+    # qualifier, not a leading/trailing title component.
+    if not (re.search(r"[A-Za-z]", before) and re.search(r"[A-Za-z]", after)):
+        return text, None
+    year = m.group(0)
+    stripped = re.sub(r"\s+", " ", (before + " " + after)).strip()
+    if len(stripped) < 3:
+        return text, None
+    return stripped, year
+
+
+def _dedup_overlapping_spans(ents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """B1b: drop spans whose character range is contained within a longer span,
+    keeping the maximal span (merges fragmented hyphenated names like
+    'Hook'/'Handed Man' into the surviving 'Hook-Handed Man'). Spans without
+    offsets are kept as-is. Original left-to-right order is restored."""
+    kept: List[Dict[str, Any]] = []
+    for e in sorted(ents, key=lambda x: (x.get("end", 0) - x.get("start", 0)), reverse=True):
+        s, en = e.get("start"), e.get("end")
+        if s is None or en is None:
+            kept.append(e)
+            continue
+        contained = any(
+            k.get("start") is not None
+            and k.get("end") is not None
+            and k["start"] <= s
+            and en <= k["end"]
+            for k in kept
+        )
+        if not contained:
+            kept.append(e)
+    kept.sort(key=lambda x: x.get("start", 0))
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # Module-level GLiNER cache — loaded at most once per process
 # ---------------------------------------------------------------------------
 _GLINER_MODEL_CACHE = None
@@ -618,16 +707,57 @@ class ImprovedQueryEntityExtractor:
         "the", "a", "an",
     })
 
+    # B2.2a: measure / temporal nouns. A span composed only of digits, these
+    # nouns, and generic quantity adjectives (with NO capitalised proper-noun
+    # token) is a statistical descriptor, not a graph-anchorable entity
+    # (e.g. "7 consecutive seasons", "25 laps", "1993"). It matches no graph
+    # node and, as a filter token, retains noise — so it must be gated out.
+    _MEASURE_NOUNS: frozenset = frozenset({
+        "season", "seasons", "year", "years", "game", "games", "time", "times",
+        "match", "matches", "point", "points", "goal", "goals", "run", "runs",
+        "win", "wins", "loss", "losses", "day", "days", "week", "weeks",
+        "month", "months", "lap", "laps", "metre", "metres", "meter", "meters",
+        "mile", "miles", "kilometre", "kilometres", "inning", "innings",
+        "round", "rounds", "set", "sets", "place", "places", "title", "titles",
+    })
+    _GENERIC_QUANT_ADJ: frozenset = frozenset({
+        "consecutive", "total", "straight", "combined", "overall",
+        "first", "second", "third", "last", "only", "more", "fewer",
+        "most", "least", "career", "single", "double", "triple",
+    })
+
+    @classmethod
+    def _is_temporal_measure_phrase(cls, text: str) -> bool:
+        """B2.2a: True if `text` is a pure digit/measure/quantity phrase with no
+        proper-noun token. Capitalisation is checked on the *original* tokens
+        (proper nouns survive); membership is checked on canonical tokens."""
+        toks = text.split()
+        if not toks:
+            return False
+        # Any capitalised token (other than a leading determiner already handled
+        # by B1) signals a proper noun — not a pure measure phrase.
+        if any(t[:1].isupper() for t in toks):
+            return False
+        canon_toks = canonical_form(text).split()
+        if not canon_toks:
+            return False
+        return all(
+            t.isdigit() or t in cls._MEASURE_NOUNS or t in cls._GENERIC_QUANT_ADJ
+            for t in canon_toks
+        )
+
     @classmethod
     def _is_junk_entity(cls, text: str) -> bool:
         """Return True if `text` is a question phrase or stoplisted token.
 
-        Combines three checks (Bug 2):
+        Combines four checks:
         1. Length / canonical_form normalisation (drops empty + single chars).
         2. canonical_form ∈ DEFAULT_STOPLIST (pronouns, demonyms — shared
            with ingestion-time graph cleanup, so query side and graph side
            agree).
         3. canonical_form is a generic question stem (e.g. "what year").
+        4. B2.2a: pure temporal/measure phrase with no proper-noun token
+           (e.g. "7 consecutive seasons", "25 laps").
         """
         if not text or len(text.strip()) < 2:
             return True
@@ -641,6 +771,8 @@ class ImprovedQueryEntityExtractor:
         for rx in cls._QUERY_JUNK_REGEXES:
             if rx.search(canon):
                 return True
+        if cls._is_temporal_measure_phrase(text):
+            return True
         return False
 
     @classmethod
@@ -723,6 +855,11 @@ class ImprovedQueryEntityExtractor:
         """
         threshold = confidence_threshold if confidence_threshold is not None else self.confidence_threshold
 
+        # B1: temporal constraints stripped from entity spans this call (e.g.
+        # the "1993" in "National 1993 Baseball Hall of Fame"). Recorded for any
+        # downstream consumer (Planner constraint hops); inert until consumed.
+        self._last_temporal_constraints: List[str] = []
+
         # Method 1: GLiNER (preferred for ingestion-query consistency)
         if self.gliner is not None:
             try:
@@ -731,7 +868,12 @@ class ImprovedQueryEntityExtractor:
                     self.entity_types,
                     threshold=threshold,
                 )
-                raw = [_normalize_query_entity(ent["text"], ent["label"]) for ent in entities]
+                # B1b: merge/drop overlapping fragments of one span (offsets present).
+                entities = _dedup_overlapping_spans(entities)
+                raw = [
+                    _normalize_query_entity(self._b1_string_norm(ent["text"]), ent["label"])
+                    for ent in entities
+                ]
                 return self._filter_entities(raw)
             except (RuntimeError, ValueError) as e:
                 logger.warning("GLiNER query extraction failed: %s", e)
@@ -741,14 +883,28 @@ class ImprovedQueryEntityExtractor:
             logger.warning(
                 "FALLBACK ACTIVE: GLiNER not available -> SpaCy extraction for query entities."
             )
-            return self._filter_entities(self._spacy_extract(query))
+            return self._filter_entities(
+                [self._b1_string_norm(t) for t in self._spacy_extract(query)]
+            )
 
         # Method 3: Regex (last resort — neither GLiNER nor SpaCy available)
         logger.warning(
             "FALLBACK ACTIVE: Neither GLiNER nor SpaCy available -> regex extraction."
             " Graph retrieval will be severely limited!"
         )
-        return self._filter_entities(self._fallback_extract(query))
+        return self._filter_entities(
+            [self._b1_string_norm(t) for t in self._fallback_extract(query)]
+        )
+
+    def _b1_string_norm(self, text: str) -> str:
+        """B1a + B1c applied to a single entity string (all extraction paths):
+        strip a leading function word, then split off an embedded year (recorded
+        as a temporal constraint). Boundary repair only — no gating here."""
+        cleaned = _strip_leading_function_word(text)
+        cleaned, year = _strip_embedded_year(cleaned)
+        if year is not None:
+            self._last_temporal_constraints.append(year)
+        return cleaned
 
     # SpaCy label → canonical type; GPE→GPE matches entity_extraction.py ingestion path
     # so that entity IDs are consistent across query-time and ingestion-time extraction.

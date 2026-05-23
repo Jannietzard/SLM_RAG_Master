@@ -48,7 +48,7 @@ References:
 
 import logging
 import re
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ._settings import _PROPER_NOUN_RE
 
@@ -112,11 +112,12 @@ class AgenticController:
         chunk: str,
         query: str,
         expected_type: Optional[str] = None,
+        chunk_rank: int = 0,
     ) -> float:
         """
         Relevance score for a bridge-entity candidate.
 
-        Combines three signals:
+        Combines four signals:
             +α  Proximity to query keywords in the source chunk (the closer
                 the candidate sits to terms the user actually asked about,
                 the more likely it is the intended bridge).
@@ -126,8 +127,16 @@ class AgenticController:
                 (top-of-chunk entities are usually the topic; later mentions
                 are tangential — "Robert Durst... Galveston" appears after
                 the subject's main definition).
+            ×δ  C1 reciprocal chunk-rank prior 1/(1+rank): an entity from a
+                top-ranked retrieval chunk is far more likely to be the bridge
+                target than one from a low-ranked noise chunk. Reciprocal rank
+                is the same primitive RRF uses (Cormack et al. 2009, SIGIR).
+                The local score is clamped to be non-negative before the
+                multiplicative prior so it cannot invert the ordering of
+                negative-scoring candidates.
 
-        Returns a float in roughly [0, 3]. Higher = more likely the bridge.
+        Returns a non-negative float. Higher = more likely the bridge; 0 means
+        "not found / no query proximity" (used by the C4 abstention floor).
         """
         chunk_lower = chunk.lower()
         candidate_lower = candidate.lower()
@@ -185,7 +194,28 @@ class AgenticController:
         # ── Signal 3: position penalty ────────────────────────────────────
         position_penalty = min(0.5, cand_pos / 600.0)
 
-        return proximity + type_bonus - position_penalty
+        local_score = proximity
+
+        # Type and length features MODULATE a candidate only when it has
+        # lexical proximity to the question. Absent proximity, a candidate has
+        # no positive evidence of being the answer (it merely "looks like" the
+        # right type or length), so it must not clear the C4 abstention floor.
+        if proximity > 0.0:
+            local_score += type_bonus
+            # Token-count preference (folded in from the former Pass-2 external
+            # adjustment so there is a SINGLE scoring function — 2-token names
+            # are typically the intended bridge; long spans are usually noise).
+            n_tokens = len(candidate.split())
+            if n_tokens == 2:
+                local_score += 0.10
+            elif n_tokens >= 4:
+                local_score -= 0.20
+
+        local_score -= position_penalty
+
+        # ── Signal 4 (C1): reciprocal chunk-rank prior ────────────────────
+        rank_prior = 1.0 / (1.0 + max(0, chunk_rank))
+        return max(0.0, local_score) * rank_prior
 
     @classmethod
     def _detect_expected_type(cls, query: str) -> Optional[str]:
@@ -258,7 +288,36 @@ class AgenticController:
         if candidates:
             return candidates[:3]
 
-        # ── Pass 1: surname-anchor search ─────────────────────────────────
+        # ── Passes 1 & 2 unified (C2): one confidence-scored candidate pool ──
+        # The former design ran a surname-anchor pass that RETURNED EARLY on
+        # first match, so a low-precision reconstruction (e.g. a spurious
+        # "Salisbury Gardens" built from an exclude entity's surname) could
+        # preempt a stronger general-proper-noun candidate (the real "Thomas
+        # Mawson") that the second pass would have found. Scoring both
+        # generators in a single pool removes that priority-on-specificity
+        # short-circuit: candidates compete on the same scoring function and
+        # the strongest wins regardless of which generator proposed it.
+        expected_type = AgenticController._detect_expected_type(query)
+
+        # Substring-aware exclusion: a compound exclude entity ("Salisbury
+        # Woodland Gardens") also excludes its multi-token sub-phrases so a
+        # partial variant cannot be proposed as a "new" bridge.
+        excluded_subphrases: set = set(exclude_lower)
+        for known in exclude:
+            tokens = known.split()
+            for i in range(len(tokens)):
+                for j in range(i + 2, len(tokens) + 1):
+                    if tokens[i].lower() in {"in", "on", "of", "at", "by", "the", "a", "an"}:
+                        continue
+                    if tokens[j - 1].lower() in {"in", "on", "of", "at", "by", "the", "a", "an"}:
+                        continue
+                    excluded_subphrases.add(" ".join(tokens[i:j]).lower())
+
+        # Candidate generators → (candidate_text, source_chunk, chunk_rank).
+        # Chunks arrive in RRF rank order, so the list index IS the rank.
+        proposals: List[Tuple[str, str, int]] = []
+
+        # Generator A — surname-anchor reconstruction (former Pass 1).
         for known in exclude:
             tokens = known.split()
             if len(tokens) not in (2, 3):
@@ -275,60 +334,48 @@ class AgenticController:
                 + r"\b",
                 re.UNICODE,
             )
-            for chunk in chunks:
+            for rank, chunk in enumerate(chunks):
                 for m in pat.finditer(chunk):
                     first = m.group(1)
                     full = f"{first} {surname}"
-                    full_lower = full.lower()
                     if (
-                        full_lower not in exclude_lower
-                        and full_lower not in seen
-                        and len(full) > 4
+                        len(full) > 4
                         and first not in {"The", "A", "An", "This", "In", "Of"}
                         and ":" not in first
                     ):
-                        seen.add(full_lower)
-                        candidates.append(full)
+                        proposals.append((full, chunk, rank))
 
-        if candidates:
-            return candidates[:3]
-
-        # ── Pass 2: general proper-noun fallback, query-relevance ranked ──
-        expected_type = AgenticController._detect_expected_type(query)
-        excluded_subphrases: set = set(exclude_lower)
-        for known in exclude:
-            tokens = known.split()
-            for i in range(len(tokens)):
-                for j in range(i + 2, len(tokens) + 1):
-                    sub = " ".join(tokens[i:j]).lower()
-                    if tokens[i].lower() in {"in", "on", "of", "at", "by", "the", "a", "an"}:
-                        continue
-                    if tokens[j - 1].lower() in {"in", "on", "of", "at", "by", "the", "a", "an"}:
-                        continue
-                    excluded_subphrases.add(sub)
-
-        scored: List[Tuple[float, str]] = []
-        for chunk in chunks:
+        # Generator B — general proper-noun (former Pass 2).
+        for rank, chunk in enumerate(chunks):
             for m in _PROPER_NOUN_RE.finditer(chunk):
                 phrase = m.group(1)
-                phrase_lower = phrase.lower()
-                if (
-                    phrase_lower not in excluded_subphrases
-                    and len(phrase) > 4
-                    and phrase_lower not in seen
-                ):
-                    seen.add(phrase_lower)
-                    score = AgenticController._score_bridge_candidate(
-                        phrase, chunk, query, expected_type,
-                    )
-                    n_tokens = len(phrase.split())
-                    if n_tokens == 2:
-                        score += 0.10
-                    elif n_tokens >= 4:
-                        score -= 0.20
-                    scored.append((score, phrase))
-        scored.sort(key=lambda x: -x[0])
-        return [phrase for _, phrase in scored[:3]]
+                if len(phrase) > 4:
+                    proposals.append((phrase, chunk, rank))
+
+        # Score the merged pool with a single function; keep the best-scoring
+        # (best-rank) instance of each distinct candidate.
+        best: Dict[str, Tuple[float, str]] = {}
+        for cand, chunk, rank in proposals:
+            cl = cand.lower()
+            if cl in excluded_subphrases or cl in seen:
+                continue
+            score = AgenticController._score_bridge_candidate(
+                cand, chunk, query, expected_type, chunk_rank=rank,
+            )
+            if cl not in best or score > best[cl][0]:
+                best[cl] = (score, cand)
+
+        scored = sorted(best.values(), key=lambda x: -x[0])
+
+        # ── C4: abstention floor ──────────────────────────────────────────
+        # A candidate scoring 0 was either not found in its chunk or had no
+        # query proximity. Returning a confidently-wrong bridge actively
+        # misdirects hop-2 retrieval (and reranker hints), which is worse than
+        # returning none — hop-2 then falls back to its un-rewritten sub-query.
+        # So when the BEST candidate scores <= 0, abstain.
+        if not scored or scored[0][0] <= 0.0:
+            return []
+        return [text for score, text in scored[:3] if score > 0.0]
 
     @staticmethod
     def _rewrite_hop_query_with_bridges(

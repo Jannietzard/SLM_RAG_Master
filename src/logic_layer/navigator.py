@@ -849,7 +849,19 @@ class Navigator:
         Regexes are pre-compiled before the chunk loop (Python's re cache is 512
         entries; many entities × tokens × chunks can overflow it).
         """
+        # Step 3 (B-plan): no usable query entities. Behaviour is unchanged
+        # (we cannot entity-gate without entities), but it is no longer SILENT —
+        # the prior bare `return results` hid the case where NER yielded only a
+        # non-anchorable phrase (e.g. a DATE) and 10 unfiltered noise chunks
+        # reached the verifier. Log + flag so it is observable and measurable;
+        # downstream ranking (RRF / reranker) carries relevance instead.
+        self._entity_filter_skipped = not bool(entity_names)
         if not entity_names:
+            logger.warning(
+                "[Navigator] entity-mention filter received no usable entities — "
+                "relying on RRF/reranker ranking, no entity gating applied (%d chunks kept)",
+                len(results),
+            )
             return results
 
         # §12.28: per-token fallback raised to ≥8 chars for multi-word entities
@@ -943,6 +955,25 @@ class Navigator:
         if not kept:
             logger.debug("[Navigator] Entity-mention filter: all chunks filtered — returning all")
             return results
+
+        # E2: survivor floor. When the retriever supplied a full candidate set
+        # (>= _SURVIVOR_FLOOR chunks) an over-specific entity match must not
+        # leave the Verifier with too little context to tolerate a single
+        # retrieval error (observed: 10→2). If matching kept fewer than the
+        # floor, top up with the highest-RRF dropped chunks (results are in RRF
+        # rank order, so the lowest not-yet-kept indices are the strongest).
+        # The floor engages only for full candidate sets — small inputs are
+        # filtered normally (it does not force-keep noise in a 2-3 chunk set).
+        _SURVIVOR_FLOOR = 5
+        if len(results) >= _SURVIVOR_FLOOR and len(kept) < _SURVIVOR_FLOOR:
+            kept_ranks = {rank for _, rank, _ in kept}
+            for rank, r in enumerate(results):
+                if rank not in kept_ranks:
+                    kept.append((tiers[rank], rank, r))
+                    kept_ranks.add(rank)
+                    if len(kept) >= _SURVIVOR_FLOOR:
+                        break
+            dropped = len(results) - len(kept)
 
         kept.sort(key=lambda x: (x[0], x[1]))   # tier asc, then original RRF rank
         out = [r for _, _, r in kept]

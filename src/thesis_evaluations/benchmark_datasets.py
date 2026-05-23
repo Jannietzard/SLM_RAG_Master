@@ -26,14 +26,41 @@ Usage:
     # Ingest all datasets (separate stores)
     python benchmark_datasets.py ingest --dataset all --samples 500
 
-    # Evaluate single dataset
-    python benchmark_datasets.py evaluate --dataset hotpotqa --samples 100
-
     # Full ablation study
     python benchmark_datasets.py ablation --samples 100
 
     # Self-test
     python benchmark_datasets.py test
+
+Evaluate — question selection (the `evaluate` sub-command):
+    The evaluator picks which questions to run in one of two ways. By default
+    it draws a RANDOM sample (so repeated runs probe different questions and
+    you can see whether a gain is robust rather than tuned to the first 20).
+
+    1) Random sample (default). `--samples N` draws N random questions. A seed
+       is auto-generated and logged ("Question sample seed: 12345 …") so any
+       run can be reproduced exactly with `--seed`.
+         python benchmark_datasets.py evaluate --dataset hotpotqa
+         python benchmark_datasets.py evaluate --dataset hotpotqa --samples 20
+
+    2) Reproducible random sample. Pass `--seed` to fix the random draw — same
+       seed + same `--samples` → identical question set across runs (use this
+       to compare two code versions on the *same* random questions).
+         python benchmark_datasets.py evaluate --dataset hotpotqa --samples 20 --seed 42
+
+    3) First N (deterministic, the pre-2026-05 behaviour). Use `--range 0-N` to
+       take questions in index order from the start — handy for a stable smoke
+       test or to reproduce older results.
+         python benchmark_datasets.py evaluate --dataset hotpotqa --range 0-20
+
+    4) Defined slice. `--range START-END` takes questions[START:END] in order
+       (separators '-', '_' or ':' all work). Use this to run a specific band,
+       e.g. questions 10 through 30, or to shard a 500-question run.
+         python benchmark_datasets.py evaluate --dataset hotpotqa --range 10-30
+
+    Notes:
+      * `--range` overrides `--samples` when both are given (range is explicit).
+      * Default `--samples` is 20.
 """
 
 import argparse
@@ -1617,10 +1644,43 @@ def cmd_evaluate(args, config: Dict, store_manager: StoreManager):
     questions = store_manager.load_questions(dataset)
     if not questions:
         return
-    
-    if args.samples:
-        questions = questions[:args.samples]
-    
+
+    # Question selection: either a fixed slice (--range) or a random sample
+    # (--samples, default 20). --seed lets you reproduce a previous random
+    # selection. The two are mutually exclusive: --range wins if both given.
+    range_spec = getattr(args, "range", None)
+    if range_spec:
+        sep = next((s for s in ("-", "_", ":") if s in range_spec), None)
+        if sep is None:
+            logger.error("--range must contain a separator (-, _, or :); got %r", range_spec)
+            return
+        try:
+            start_s, end_s = range_spec.split(sep, 1)
+            start, end = int(start_s), int(end_s)
+        except ValueError:
+            logger.error("--range expects two integers; got %r", range_spec)
+            return
+        if start < 0 or end > len(questions) or start >= end:
+            logger.error(
+                "--range %d-%d out of bounds for %d questions",
+                start, end, len(questions),
+            )
+            return
+        questions = questions[start:end]
+        logger.info("Question range: [%d..%d) → %d questions", start, end, len(questions))
+    elif args.samples:
+        import random
+        seed = getattr(args, "seed", None)
+        if seed is None:
+            seed = random.randint(0, 99999)
+        logger.info(
+            "Question sample seed: %d  (re-run with --seed %d to reproduce)",
+            seed, seed,
+        )
+        rng = random.Random(seed)
+        questions = rng.sample(questions, min(args.samples, len(questions)))
+
+
     model_name = getattr(args, "model", None) or config.get("llm", {}).get("model_name", "phi3")
     enable_planner = not getattr(args, "no_planner", False)
     enable_verifier = not getattr(args, "no_verifier", False)
@@ -2171,7 +2231,23 @@ def main():
     # EVALUATE
     eval_p = subparsers.add_parser("evaluate", help="Evaluate single dataset")
     eval_p.add_argument("--dataset", "-d", type=str, required=True)
-    eval_p.add_argument("--samples", "-n", type=int, default=100)
+    eval_p.add_argument(
+        "--samples", "-n", type=int, default=20,
+        help="Number of questions to sample randomly (default: 20). "
+             "Ignored if --range is set.",
+    )
+    eval_p.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed for question sampling. Auto-generated and logged "
+             "for reproducibility if not set.",
+    )
+    eval_p.add_argument(
+        "--range", type=str, default=None, metavar="START-END",
+        help="Deterministic question slice questions[START:END] (separators "
+             "'-', '_' or ':'). Use '0-20' for the FIRST 20 questions (old "
+             "default behaviour), or '10-30' for a defined band. Overrides "
+             "--samples random sampling when set.",
+    )
     eval_p.add_argument("--vector-weight", type=float, default=0.7)
     eval_p.add_argument("--graph-weight", type=float, default=0.3)
     eval_p.add_argument("--model", "-m", type=str, default=None,

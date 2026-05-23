@@ -682,6 +682,29 @@ class TestOptionAGeneralisability:
                 f"Self-referential Pattern-F bug string leaked through: {sq!r}"
             )
 
+    def test_pattern_F_skips_bare_pronoun_subject(self, planner):
+        """Pattern F must NOT fire when the passive subject is a bare pronoun.
+
+        Regression guard for the failure mode where _find_passive_agent_bridge
+        returns a bare pronoun ("that", "this", "it"...) as the subject. The
+        template f"Who {verb} {subj}?" then produces a degenerate sub-query
+        ("Who form that?") that cannot anchor any retrieval.
+        """
+        plan = planner.plan(
+            "2014 S/S is the debut album of a South Korean boy group "
+            "that was formed by who?"
+        )
+        assert plan.matched_pattern != "F_passive_agent", (
+            f"Pattern F fired on bare-pronoun subject; "
+            f"got matched_pattern={plan.matched_pattern!r}, "
+            f"sub_queries={plan.sub_queries!r}"
+        )
+        # And no sub-query may be the broken string.
+        for sq in plan.sub_queries:
+            assert sq.lower().strip() != "who form that?", (
+                f"Broken sub-query leaked through: {sq!r}"
+            )
+
     def test_pattern_F_still_fires_on_canonical_passive(self, planner):
         """Positive control: Pattern F must still fire on the canonical
         passive-with-named-agent form. This guards against the
@@ -694,6 +717,72 @@ class TestOptionAGeneralisability:
             assert plan.matched_pattern in {
                 "F_passive_agent", "connector_split",
             }, f"Pattern F regression on canonical input: got {plan.matched_pattern!r}"
+
+    def test_a1_entityfree_description_emits_two_hops(self, planner):
+        """A1: a multi-hop question whose bridge entity is referenced by
+        DESCRIPTION (no named entity) must produce a 2-hop plan with a
+        descriptive hop-0, not silently degrade to single-hop.
+        """
+        plan = planner.plan(
+            "What arcade game is named after the only player in major league "
+            "history to have a 0.300 batting average for 7 consecutive seasons?"
+        )
+        if plan.query_type == QueryType.MULTI_HOP:
+            assert len(plan.sub_queries) >= 2, (
+                f"entity-free bridge must not collapse to single-hop; "
+                f"got {plan.sub_queries!r}"
+            )
+            assert plan.matched_pattern in {
+                "structural_descriptive_2hop", "connector_split",
+                "fallback_generic_2hop",
+            }, f"unexpected marker: {plan.matched_pattern!r}"
+            # hop-0 must differ from the full question (real decomposition).
+            assert plan.sub_queries[0].lower() != plan.original_query.lower()
+
+    def test_a1_never_silent_single_for_multihop(self, planner):
+        """A1 contract: a MULTI_HOP classification never yields a single
+        sub-query unless explicitly marked as the degrade path."""
+        for q in [
+            "What arcade game is named after the only player to have a 0.300 "
+            "batting average for 7 consecutive seasons?",
+            "What class of instrument does Apatim Majumdar play?",
+        ]:
+            plan = planner.plan(q)
+            if plan.query_type == QueryType.MULTI_HOP:
+                assert (
+                    len(plan.sub_queries) >= 2
+                    or plan.matched_pattern == "fallback_degraded_to_single_hop"
+                ), (
+                    f"contract violated for {q!r}: {len(plan.sub_queries)} "
+                    f"sub-query, marker={plan.matched_pattern!r}"
+                )
+
+    def test_a4_reroutes_attribute_over_entity(self, planner):
+        """A4: a question the classifier abstained on (no pattern) but which
+        asks a wh-attribute of a thing related to a named entity is re-routed
+        to MULTI_HOP."""
+        plan = planner.plan("What class of instrument does Apatim Majumdar play?")
+        assert plan.query_type == QueryType.MULTI_HOP, (
+            f"A4 should re-route attribute-over-entity to MULTI_HOP; "
+            f"got {plan.query_type!r}"
+        )
+        assert len(plan.sub_queries) >= 2
+
+    def test_a4_does_not_override_simple_single_hop(self, planner):
+        """A4 negative control: a direct single-hop question stays single-hop —
+        'What is X?' has no wh-determiner on a noun and no abstention bridge."""
+        plan = planner.plan("What is the capital of France?")
+        assert plan.query_type == QueryType.SINGLE_HOP, (
+            f"A4 must not over-route a simple single-hop; got {plan.query_type!r}"
+        )
+
+    def test_a4_does_not_override_confident_classification(self, planner):
+        """A4 negative control: a confidently-classified comparison is never
+        touched (A4 fires only on the SINGLE_HOP no-signal sentinel)."""
+        plan = planner.plan(
+            "Were Scott Derrickson and Ed Wood of the same nationality?"
+        )
+        assert plan.query_type != QueryType.SINGLE_HOP
 
     def test_deleted_C_pattern_marker_never_appears(self, planner):
         """The C_for_category marker must never be produced (Pattern C deleted)."""

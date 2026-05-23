@@ -756,8 +756,8 @@ def patch_verifier(verifier) -> None:
     # ── _reorder_by_question_relevance ────────────────────────────────────────
     orig_reorder = verifier._reorder_by_question_relevance
 
-    def _reorder_wrapper(query, context):
-        reordered = orig_reorder(query, context)
+    def _reorder_wrapper(query, context, *args, **kwargs):
+        reordered = orig_reorder(query, context, *args, **kwargs)
         subsection(f"_reorder_by_question_relevance()  {len(context)} chunks")
         if reordered != context:
             print(f"    {bold('Order changed')} — LLM sees chunks in this order:")
@@ -779,8 +779,8 @@ def patch_verifier(verifier) -> None:
     # ── _format_context ───────────────────────────────────────────────────────
     orig_format = verifier._format_context
 
-    def _fmt_wrapper(context):
-        formatted = orig_format(context)
+    def _fmt_wrapper(context, *args, **kwargs):
+        formatted = orig_format(context, *args, **kwargs)
         subsection(f"_format_context()  {len(context)} chunks -> {len(formatted)} chars")
         max_docs = verifier.config.max_docs
         max_chars = verifier.config.max_chars_per_doc

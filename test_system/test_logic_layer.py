@@ -717,6 +717,50 @@ class TestNavigator:
         results = [{"text": "Some text.", "rrf_score": 0.9}]
         assert navigator._entity_mention_filter(results, []) == results
 
+    def test_e2_survivor_floor_tops_up_full_candidate_set(self, navigator) -> None:
+        """E2: with a full candidate set (>=5), an over-specific entity match
+        must not strand the verifier — the result is topped up to the floor
+        with the highest-RRF chunks."""
+        # 10 chunks, only ONE mentions the entity → naive filter would keep 1.
+        results = [{"text": "Albert Einstein developed relativity.", "rrf_score": 0.99}]
+        results += [
+            {"text": f"Unrelated paragraph number {i} about other topics.",
+             "rrf_score": 0.9 - i * 0.05}
+            for i in range(9)
+        ]
+        out = navigator._entity_mention_filter(results, ["Einstein"])
+        assert len(out) >= 5, f"survivor floor should keep >=5; got {len(out)}"
+        # The entity chunk must still be present.
+        assert any("Einstein" in r["text"] for r in out)
+
+    def test_e2_floor_does_not_force_keep_in_small_set(self, navigator) -> None:
+        """E2: for a small input (<5 chunks) the floor does not engage — a
+        clearly non-matching distractor is still dropped."""
+        results = [
+            {"text": "Albert Einstein developed the theory of relativity.", "rrf_score": 0.99},
+            {"text": "Einstein was born in Ulm in 1879.", "rrf_score": 0.95},
+            {"text": "Bananas are a good source of potassium.", "rrf_score": 0.10},
+        ]
+        out = navigator._entity_mention_filter(results, ["Einstein"])
+        assert all("Einstein" in r["text"] for r in out)
+        assert len(out) < 3
+
+    def test_entity_mention_filter_empty_sets_skip_flag(self, navigator) -> None:
+        """Step 3 (B-plan): empty entities is no longer SILENT — the filter
+        flags `_entity_filter_skipped` so the no-gating case is observable."""
+        results = [{"text": "Some text.", "rrf_score": 0.9}]
+        navigator._entity_mention_filter(results, [])
+        assert getattr(navigator, "_entity_filter_skipped", None) is True
+
+    def test_entity_mention_filter_nonempty_clears_skip_flag(self, navigator) -> None:
+        """With usable entities the skip flag is False (gating did apply)."""
+        results = [
+            {"text": "Albert Einstein developed relativity.", "rrf_score": 0.9},
+            {"text": "Water is liquid.", "rrf_score": 0.7},
+        ]
+        navigator._entity_mention_filter(results, ["Einstein"])
+        assert getattr(navigator, "_entity_filter_skipped", None) is False
+
     def test_contradiction_filter_removes_lower_scored_chunk(self, navigator) -> None:
         """Lower-scored chunk with a contradictory number is removed.
 
@@ -1682,6 +1726,63 @@ class TestAgenticControllerStaticHelpers:
         sq = "What is the population of Strasbourg?"
         out = AgenticController._rewrite_hop_query_with_bridges(sq, ["Strasbourg"])
         assert out == sq
+
+    # ── C1: reciprocal chunk-rank prior ──────────────────────────────────
+    def test_c1_rank_prior_favours_top_chunk(self) -> None:
+        """Same candidate in a top-ranked vs low-ranked chunk: the top-ranked
+        instance must score strictly higher (1/(1+rank) decay)."""
+        from src.logic_layer.controller import AgenticController as C
+        chunk = "Reggie Jackson was a baseball player."
+        top = C._score_bridge_candidate("Reggie Jackson", chunk, "who was the player?", "PERSON", chunk_rank=0)
+        low = C._score_bridge_candidate("Reggie Jackson", chunk, "who was the player?", "PERSON", chunk_rank=7)
+        assert top > low > 0.0
+
+    def test_c1_score_is_nonnegative(self) -> None:
+        """The clamped score is never negative regardless of penalties."""
+        from src.logic_layer.controller import AgenticController as C
+        s = C._score_bridge_candidate("X", "irrelevant text here", "unrelated query", None, chunk_rank=3)
+        assert s >= 0.0
+
+    # ── C2: no priority-on-specificity short-circuit ─────────────────────
+    def test_c2_strong_candidate_beats_weak_surname_reconstruction(self) -> None:
+        """A strong proper-noun candidate in a top chunk must win over a
+        spurious surname reconstruction — the former Pass-1 early return would
+        have returned the spurious one and never reached the strong one."""
+        from src.logic_layer.controller import AgenticController as C
+        chunks = [
+            "The garden was designed by Thomas Mawson, a landscape architect.",
+            "Salisbury Gardens is a different place entirely.",
+        ]
+        out = C._extract_bridge_entities(
+            chunks, exclude=["Salisbury Woodland Gardens", "Woodland Gardens"],
+            query="Who designed the garden?",
+        )
+        assert "Thomas Mawson" in out
+
+    def test_c2_excludes_contiguous_subphrase_of_exclude_entity(self) -> None:
+        """A contiguous multi-token sub-phrase of an excluded compound entity
+        is never re-proposed as a 'new' bridge ('Woodland Gardens' ⊂
+        'Salisbury Woodland Gardens'). Note: non-contiguous subsequences are
+        intentionally NOT excluded (token-subset exclusion would wrongly drop
+        'New York' when 'New York Times' is excluded)."""
+        from src.logic_layer.controller import AgenticController as C
+        chunks = ["The Woodland Gardens were redesigned in 1920."]
+        out = C._extract_bridge_entities(
+            chunks, exclude=["Salisbury Woodland Gardens"],
+            query="What was redesigned?",
+        )
+        assert "Woodland Gardens" not in out
+
+    # ── C4: abstention floor ─────────────────────────────────────────────
+    def test_c4_abstains_when_no_positive_candidate(self) -> None:
+        """When no candidate has query proximity (all score 0), return []."""
+        from src.logic_layer.controller import AgenticController as C
+        # Query shares no content words with the chunk → zero proximity.
+        chunks = ["Xyz Qwerty and Zzz Vvvv lived in Asdf."]
+        out = C._extract_bridge_entities(
+            chunks, exclude=[], query="What colour is the sky?",
+        )
+        assert out == []
 
 
 # =============================================================================

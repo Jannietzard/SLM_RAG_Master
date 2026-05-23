@@ -161,7 +161,17 @@
       "Bash(grep -v \"^[ \\\\t]*$\")",
       "Bash(python -X utf8 -m pytest test_system/test_planner_semantic.py -q)",
       "Bash(python -X utf8 -m pytest test_system/test_planner_semantic.py)",
-      "Bash(python -X utf8 -m py_compile src/logic_layer/verifier.py)"
+      "Bash(python -X utf8 -m py_compile src/logic_layer/verifier.py)",
+      "Bash(python -X utf8 -m py_compile src/logic_layer/planner.py test_system/test_planner_semantic.py)",
+      "Bash(python -X utf8 -m py_compile src/logic_layer/verifier.py test_system/test_verifier_semantic.py)",
+      "Bash(python -X utf8 -m py_compile src/thesis_evaluations/benchmark_datasets.py)",
+      "Bash(python -X utf8 src/thesis_evaluations/benchmark_datasets.py evaluate --help)",
+      "Bash(grep -E \"^Q:|^   KEYS|^$\")",
+      "Bash(python -X utf8 -m py_compile src/data_layer/hybrid_retriever.py)",
+      "Bash(python -X utf8 -m py_compile src/data_layer/hybrid_retriever.py test_system/test_data_layer.py)",
+      "Bash(python -X utf8 -m py_compile src/logic_layer/controller.py)",
+      "Bash(grep -iB1 \"bridge\\\\|class Test\")",
+      "Bash(python -X utf8 -m py_compile src/logic_layer/navigator.py src/logic_layer/verifier.py)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Jan Nietzard\\.claude"

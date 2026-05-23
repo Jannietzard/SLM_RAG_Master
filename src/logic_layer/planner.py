@@ -1441,6 +1441,21 @@ class PlanGenerator:
         r"^\s*(what|which|whose)\b",
         re.IGNORECASE,
     )
+    # Pattern F additional guard (added 2026-05-21): when
+    # _find_passive_agent_bridge returns a bare pronoun as subject (e.g.
+    # "that", "this", "it", "who"), the template "Who {verb} {subj}?"
+    # produces equally degenerate sub-queries ("Who form that?", "Who paint
+    # it?"). Bare pronouns standing alone cannot anchor a bridge retrieval.
+    # Determiner+noun subjects ("The book", "This painting") are not
+    # affected because they are multi-token; only standalone pronouns are
+    # listed here.
+    _PASSIVE_F_BARE_PRONOUN_SUBJ = frozenset({
+        "that", "this", "these", "those",
+        "it", "he", "she", "they", "them",
+        "who", "whom",
+        "someone", "something", "somebody",
+        "anyone", "anything", "everyone", "everything",
+    })
 
     # Pre-compiled regexes for _extract_constraints (called on every query)
     _TEMPORAL_TERMS_RE = re.compile(
@@ -1495,6 +1510,28 @@ class PlanGenerator:
         # P1-fix: reset the pattern marker before this call so stale state from
         # a previous plan() invocation cannot bleed in.
         self._last_matched_pattern = None
+
+        # A4: classifier-abstention structural override. The classifier returns
+        # query_type=SINGLE_HOP with exactly `classifier_fallback_confidence`
+        # ONLY when no lexical pattern scored (its documented no-signal
+        # sentinel). In that abstention case — and only then — consult the
+        # dependency parse: if the question asks for a wh-attribute of something
+        # related to a named entity (a general multi-hop signature), re-route to
+        # MULTI_HOP so the entity-seeded 2-hop decomposition runs. This can
+        # never override a classification that had positive evidence (confidence
+        # >= base 0.6), so it cannot regress confident single-hop questions.
+        if (
+            query_type == QueryType.SINGLE_HOP
+            and confidence == self.config.classifier_fallback_confidence
+            and self._attribute_over_entity_signal(query, entities)
+        ):
+            logger.info(
+                "A4 structural override: classifier abstained (SINGLE_HOP@%.3f) "
+                "but a wh-attribute-over-entity bridge is present → "
+                "re-routing to MULTI_HOP: %r",
+                confidence, query[:80],
+            )
+            query_type = QueryType.MULTI_HOP
 
         strategy = self._determine_strategy(query_type, entities)
         hop_sequence, sub_queries = self._generate_hops(query, query_type, entities)
@@ -2212,6 +2249,118 @@ class PlanGenerator:
         )
         return hop_sequence, [hop0_q, hop1_q, query]
 
+    # Modifier dependency labels that make a noun phrase a "definite
+    # description" — a referring expression that identifies an entity by its
+    # properties rather than by name (Russell 1905; Strawson 1950). A1 uses the
+    # longest entity-free such phrase as the bridge-resolution (hop-0) query.
+    _A1_DESCRIPTION_MODIFIERS: frozenset = frozenset({
+        "det", "amod", "nummod", "compound", "prep", "acl", "relcl",
+        "advcl", "poss", "nmod",
+    })
+    # Wh-determiners that head a questioned attribute ("what class", "which
+    # film"). Used by A4 to detect "attribute-of-a-related-entity" questions.
+    _A4_WH_DETERMINERS: frozenset = frozenset({"what", "which", "whose"})
+
+    def _find_entity_free_description(
+        self,
+        query: str,
+        entities: List[EntityInfo],
+    ) -> Optional[str]:
+        """A1: when a multi-hop question references its bridge entity by
+        DESCRIPTION rather than by name, return that description as a retrieval
+        query (hop-0), else None.
+
+        Generality (publication-defensibility): this keys on the linguistic
+        notion of a *definite description* (a heavily-modified noun phrase that
+        denotes an entity by its properties), not on any surface construction or
+        verb list. Operationally: the longest object/complement noun phrase
+        (pobj/dobj/attr head) whose subtree (a) contains NO named entity and
+        (b) carries >=2 description-modifier dependents. Returns the cleaned
+        subtree text. Fires only on the entity-free path, so it cannot compete
+        with the named-entity decomposition routes above.
+        """
+        if not SPACY_AVAILABLE or NLP is None:
+            return None
+        # Only meaningful when the question names no usable anchor entity —
+        # otherwise the entity-seeded routes handle it.
+        seedable = {"PERSON", "ORG", "GPE", "LOC", "WORK_OF_ART", "EVENT",
+                    "FAC", "PRODUCT", "NORP"}
+        if any(e.label in seedable for e in entities):
+            return None
+        try:
+            doc = NLP(query)
+            ner_token_indices = {t.i for ent in doc.ents for t in ent}
+            best_text: Optional[str] = None
+            best_len = 0
+            for token in doc:
+                if token.pos_ not in ("NOUN", "PROPN"):
+                    continue
+                if token.dep_ not in ("pobj", "dobj", "attr", "nsubjpass"):
+                    continue
+                subtree = list(token.subtree)
+                # (a) entity-free: no NER token inside the phrase.
+                if any(t.i in ner_token_indices for t in subtree):
+                    continue
+                # (b) >=2 description modifiers among the head's dependents.
+                mod_count = sum(
+                    1 for c in token.children
+                    if c.dep_ in self._A1_DESCRIPTION_MODIFIERS
+                )
+                if mod_count < 2:
+                    continue
+                phrase = " ".join(t.text for t in subtree if not t.is_punct).strip()
+                # Length in tokens — prefer the most specific (longest) phrase.
+                if len(subtree) > best_len and len(phrase) >= 8:
+                    best_len = len(subtree)
+                    best_text = phrase
+            return best_text
+        except Exception as exc:
+            logger.debug("_find_entity_free_description failed: %s", exc)
+            return None
+
+    def _attribute_over_entity_signal(
+        self,
+        query: str,
+        entities: List[EntityInfo],
+    ) -> bool:
+        """A4 signal: True if the question asks for a wh-determined ATTRIBUTE
+        ("what class", "which network") of something RELATED TO a named entity,
+        rather than a direct property of the entity itself — a general
+        multi-hop signature ('attribute of a thing the entity relates to').
+
+        Defensibility: keys on (i) a wh-determiner on a head noun and (ii) the
+        presence of a named entity that is NOT that head noun. No verb/role
+        lexicon. Used only as a tie-breaker when the classifier already
+        abstained (see A4 gate in generate()).
+        """
+        if not SPACY_AVAILABLE or NLP is None:
+            return False
+        if not any(
+            e.label in {"PERSON", "ORG", "GPE", "LOC", "WORK_OF_ART", "EVENT",
+                        "FAC", "PRODUCT", "NORP"}
+            for e in entities
+        ):
+            return False
+        try:
+            doc = NLP(query)
+            ent_texts = {e.text.lower() for e in entities}
+            for token in doc:
+                if token.text.lower() not in self._A4_WH_DETERMINERS:
+                    continue
+                if token.dep_ != "det":
+                    continue
+                head = token.head  # the questioned attribute noun
+                if head.pos_ not in ("NOUN", "PROPN"):
+                    continue
+                # The questioned attribute head must not itself be the entity.
+                if head.text.lower() in ent_texts:
+                    continue
+                return True
+            return False
+        except Exception as exc:
+            logger.debug("_attribute_over_entity_signal failed: %s", exc)
+            return False
+
     def _decompose_multi_hop(
         self,
         query: str,
@@ -2416,10 +2565,12 @@ class PlanGenerator:
             # that retrieves arbitrary chunks. Falling through to the
             # connector-split baseline is documented as the safer behaviour
             # (see class docstring, "Baseline — Connector-split decomposition").
-            if self._PASSIVE_F_INTERROGATIVE_SUBJ_RE.match(subj):
+            if (self._PASSIVE_F_INTERROGATIVE_SUBJ_RE.match(subj)
+                    or subj.strip().lower() in self._PASSIVE_F_BARE_PRONOUN_SUBJ):
                 logger.debug(
-                    "_decompose_multi_hop: Pattern F skipped — interrogative-headed "
-                    "subject %r; falling through to connector-split baseline",
+                    "_decompose_multi_hop: Pattern F skipped — interrogative or "
+                    "bare-pronoun subject %r; falling through to connector-split "
+                    "baseline",
                     subj[:60],
                 )
                 # Do NOT set _last_matched_pattern here — let the downstream path
@@ -2560,24 +2711,65 @@ class PlanGenerator:
                 ]
                 sub_queries = [hop0_q, query]
             else:
-                logger.warning(
-                    "_decompose_multi_hop: query classified MULTI_HOP but no "
-                    "pattern matched and no anchor entity available — "
-                    "degrading to single-hop: %r", query[:100]
-                )
-                hop_sequence.append(HopStep(
-                    step_id=0,
-                    sub_query=query,
-                    target_entities=[e.text for e in entities],
-                    depends_on=[],
-                    is_bridge=False,
-                ))
-                sub_queries = [query]
-                # P1-fix: failure marker. The classifier said MULTI_HOP but
-                # NOTHING worked. Surfacing this is essential — without it,
-                # the eval cannot distinguish "we solved this" from "we silently
-                # gave up".
-                self._last_matched_pattern = "fallback_degraded_to_single_hop"
+                # A1: before degrading, try definite-description resolution —
+                # the bridge entity may be referenced by DESCRIPTION rather than
+                # by name (e.g. "the only player ... to have a 0.300 average").
+                # Use that description as the hop-0 retrieval query.
+                description = self._find_entity_free_description(query, entities)
+                if description and description.lower() != query.lower():
+                    logger.debug(
+                        "_decompose_multi_hop: entity-free definite-description "
+                        "bridge → descriptive 2-hop (hop0=%r)", description[:60]
+                    )
+                    self._last_matched_pattern = "structural_descriptive_2hop"
+                    hop_sequence = [
+                        HopStep(
+                            step_id=0,
+                            sub_query=description,
+                            target_entities=[],
+                            depends_on=[],
+                            is_bridge=True,
+                        ),
+                        HopStep(
+                            step_id=1,
+                            sub_query=query,
+                            target_entities=[e.text for e in entities],
+                            depends_on=[0],
+                            is_bridge=False,
+                        ),
+                    ]
+                    sub_queries = [description, query]
+                else:
+                    logger.warning(
+                        "_decompose_multi_hop: query classified MULTI_HOP but no "
+                        "pattern matched and no anchor entity available — "
+                        "degrading to single-hop: %r", query[:100]
+                    )
+                    hop_sequence.append(HopStep(
+                        step_id=0,
+                        sub_query=query,
+                        target_entities=[e.text for e in entities],
+                        depends_on=[],
+                        is_bridge=False,
+                    ))
+                    sub_queries = [query]
+                    # P1-fix: failure marker. The classifier said MULTI_HOP but
+                    # NOTHING worked. Surfacing this is essential — without it,
+                    # the eval cannot distinguish "we solved this" from "we
+                    # silently gave up".
+                    self._last_matched_pattern = "fallback_degraded_to_single_hop"
+
+        # A1 contract: a MULTI_HOP classification must never SILENTLY collapse
+        # to a single sub-query. The only permitted single-sub-query output is
+        # the explicitly logged + marked degrade path above. This is a logged
+        # invariant (not a hard assert) so an unforeseen edge case degrades
+        # gracefully instead of crashing the pipeline.
+        if len(sub_queries) < 2 and self._last_matched_pattern != "fallback_degraded_to_single_hop":
+            logger.error(
+                "_decompose_multi_hop: contract violation — multi-hop produced "
+                "%d sub-query with marker %r (query=%r)",
+                len(sub_queries), self._last_matched_pattern, query[:80],
+            )
 
         return hop_sequence, sub_queries
 

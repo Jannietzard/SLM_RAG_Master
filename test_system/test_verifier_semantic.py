@@ -515,17 +515,125 @@ class TestQuestionRelevanceReorder:
         assert reordered == context
 
     def test_reorder_is_stable(self, minimal_cfg):
-        """Chunks with equal score preserve their original relative order."""
+        """Chunks with equal score preserve their original relative order.
+
+        Note: scoring is sqrt-length-normalised (Fix E, 2026-05-21), so a
+        true tie requires both equal hit count AND equal word count.
+        """
         v = create_verifier(cfg=minimal_cfg)
         query = "goalkeeper voted"
+        # Both chunks: 8 words, 2 hits → identical normalised scores.
         context = [
             "Peter Schmeichel was voted goalkeeper of the year.",
-            "The goalkeeper voted most valuable was legendary.",
+            "Jens Lehmann was voted goalkeeper of the season.",
             "Some unrelated text about football.",
         ]
         reordered = v._reorder_by_question_relevance(query, context)
         assert reordered[0] == context[0]
         assert reordered[1] == context[1]
+
+    def test_f1a_idf_demotes_generic_term_chunk(self, minimal_cfg):
+        """F1a: with >=4 candidates, a chunk that only echoes a GENERIC query
+        term (present in most candidates) ranks below the specific-entity chunk.
+        Regression guard for the 'women's magazines' failure (T9)."""
+        v = create_verifier(cfg=minimal_cfg)
+        query = "Are Chrysalis and Look both women's magazines?"
+        specific = "Chrysalis was a women's magazine published in the 1970s."
+        generic1 = "Magazines in Portugal are numerous and women read magazines."
+        generic2 = "Magazines in Malaysia: many women's magazines are published."
+        generic3 = "Austria has many women's magazines in circulation today."
+        out = v._reorder_by_question_relevance(
+            query, [generic1, generic2, specific, generic3],
+        )
+        assert out[0] == specific, (
+            f"IDF should rank the specific-entity chunk first; got {out[0][:50]!r}"
+        )
+
+    def test_f1a_falls_back_below_min_candidates(self, minimal_cfg):
+        """F1a guard: with < 4 candidates, IDF is disabled and behaviour is the
+        validated length-normalised hit count (Fix E preserved)."""
+        v = create_verifier(cfg=minimal_cfg)
+        query = "Who was voted World's Best Goalkeeper by IFFHS in 1992?"
+        context = [
+            "Kasper Schmeichel is a Danish footballer.",
+            "Peter Schmeichel was voted the IFFHS World's Best Goalkeeper in 1992.",
+        ]
+        out = v._reorder_by_question_relevance(query, context)
+        assert out[0] == context[1]
+
+    def test_d1_coverage_floor_keeps_entity_chunk_first(self, minimal_cfg):
+        """D1: a chunk naming a distinctive query entity gets a coverage floor,
+        so it outranks a chunk that only shares generic query terms."""
+        v = create_verifier(cfg=minimal_cfg)
+        query = "Where is the Esma Sultan Mansion located?"
+        entity_chunk = "The Esma Sultan Mansion is on the Bosphorus in Ortakoy."
+        generic = "The mansion located here is a popular tourist attraction located downtown."
+        filler1 = "Some unrelated text about architecture and history here."
+        filler2 = "Another unrelated paragraph mentioning located buildings."
+        out = v._reorder_by_question_relevance(
+            query, [generic, filler1, entity_chunk, filler2],
+            entities=["Esma Sultan Mansion"],
+        )
+        assert out[0] == entity_chunk
+
+    def test_f2_sentence_truncation_keeps_answer_in_tail(self, minimal_cfg):
+        """F2: when a doc exceeds the per-doc budget, the query-relevant
+        sentence in the TAIL survives (head-truncation would drop it)."""
+        v = create_verifier(cfg=minimal_cfg)
+        filler = "This sentence is filler. " * 60  # ~1500 chars of filler
+        answer = "The director of the film was Brad Silberling."
+        doc = filler + answer
+        budget = 800
+        out = v._truncate_sentence_aware(doc, budget, "Who was the director?")
+        assert "Brad Silberling" in out
+        assert len(out) <= budget + 100  # roughly within budget
+        """Length normalization must not penalise short direct-answer chunks.
+
+        Regression guard for the failure mode where a short fight-song chunk
+        ranks below long topic-description chunks under absolute hit count —
+        pushing the gold below the max_docs=5 cutoff. After sqrt normalisation,
+        a chunk with 4 hits in ~20 words (score ≈ 0.89) outranks a chunk with
+        8 hits in ~150 words (score ≈ 0.65), matching the production trace.
+        """
+        v = create_verifier(cfg=minimal_cfg)
+        query = ("What is the name of the fight song of the university "
+                 "whose main campus is in Lawrence, Kansas and whose branch "
+                 "campuses are in the Kansas City metropolitan area?")
+        # Short direct-answer chunk: ~20 words, 4 query-token hits
+        # ("fight", "song", "kansas", "university") → 4/sqrt(20) ≈ 0.894
+        short_answer = (
+            "Kansas Song is a popular fight song most often associated "
+            "with the University of Kansas Jayhawks."
+        )
+        # Long topic chunk: ~150 words, 8 query-token hits spread thinly →
+        # 8/sqrt(150) ≈ 0.653. Padded with neutral biographical content so
+        # the additional length does not raise the hit count further.
+        long_topic = (
+            "The University of Kansas, often referred to as KU, is a "
+            "public research institution founded in eighteen sixty-five. "
+            "Its main location sits atop Mount Oread, a prominent ridge "
+            "that overlooks the surrounding river valley. The institution "
+            "houses sixteen schools and offers more than three hundred "
+            "academic programs across the undergraduate and graduate levels. "
+            "Researchers there have contributed to advances in pharmacy, "
+            "engineering, journalism, and the social sciences. The school "
+            "competes athletically in the Big Twelve Conference and has "
+            "produced numerous Olympic athletes over its long history. "
+            "Notable alumni include politicians, novelists, business "
+            "leaders, scientists, and several professional basketball "
+            "players who went on to coach at the collegiate level. The "
+            "Lawrence community has long supported the institution through "
+            "civic partnerships. Two additional branch campuses operate in "
+            "the metropolitan area surrounding Kansas City, focused mainly "
+            "on continuing-education programs."
+        )
+        reordered = v._reorder_by_question_relevance(
+            query, [long_topic, short_answer]
+        )
+        assert reordered[0] == short_answer, (
+            "Short direct-answer chunk must rank above long topic chunk after "
+            f"length normalisation; got order: [{reordered[0][:60]!r}, ...]"
+        )
 
 
 # ---------------------------------------------------------------------------
