@@ -14,14 +14,29 @@ ARCHITECTURE ROLE
 This module implements the Hybrid Retrieval component of Artifact A (Data Layer).
 It is consumed by:
   - src/logic_layer/navigator.py  (S_N agent, primary consumer)
-  - src/evaluations/evaluate_hotpotqa.py  (evaluation harness)
+  - src/thesis_evaluations/benchmark_datasets.py  (primary evaluation harness;
+    constructs the production pipeline via `create_pipeline`)
+  - src/evaluations/  (legacy harness; `ablation_study.py` still imported by
+    benchmark_datasets)
   - src/pipeline/ingestion_pipeline.py  (end-to-end smoke tests)
+
+Construction: use the settings-reading factory
+`create_hybrid_retriever(hybrid_store, embeddings, cfg)` so every
+`rag.*` / `vector_store.*` / `graph.*` key in `config/settings.yaml`
+(including `vector_top_k`, `bm25_top_k`, `rrf_k`, `cross_source_boost`,
+`enable_bm25`, `hub_mention_cap`, `enable_hop3`, and the per-source RRF
+weights) is honoured. Hand-constructing `RetrievalConfig` with only a
+subset of fields silently falls back to dataclass defaults
+(`vector_top_k=10`, `bm25_top_k=10`) — the 2026-05-24 audit
+(`TECHNICAL_ARCHITECTURE.md §11.16.4`) caught exactly that bug in the
+evaluation path; the fixture now reads from settings.
 
 Data flow:
   query string
     → ImprovedQueryEntityExtractor  (GLiNER → SpaCy → Regex NER chain)
     → HybridRetriever.retrieve()
         ├── VectorStoreAdapter.vector_search()  (LanceDB ANN, top-K)
+        ├── BM25 lane (rank_bm25, third RRF lane; §12.29)
         └── HybridStore.graph_search()          (KuzuDB 1-hop + 2-hop)
     → RRFFusion.fuse()              (RRF + cross-source boost)
     → List[RetrievalResult]
@@ -55,23 +70,6 @@ Scientific references:
   Jaccard: Jaccard, P. (1901). Distribution de la flore alpine dans le bassin
            des Dranses et dans quelques regions voisines.
            Bull. Soc. Vaudoise Sci. Nat. 37, 241-272.
-
-Review History:
-    Last Reviewed:  2026-04-21
-    Review Result:  0 CRITICAL, 0 IMPORTANT, 0 RECOMMENDED
-    Reviewer:       Code Review Prompt v2.1
-    Next Review:    After changes to RRF fusion or entity extraction pipeline
-    ---
-    Initial Review: 2026-04-21 (first pass)
-    Initial Result: 0 CRITICAL, 5 IMPORTANT, 7 RECOMMENDED
-    Changes Since:  GPE→GPE in _SPACY_TYPE_MAP (entity ID consistency);
-                    except Exception narrowed in vector path;
-                    entity_pipeline.ner_extractor.model guarded (AttributeError);
-                    entity hints normalised via _normalize_query_entity;
-                    _ABBREV_SUFFIXES + _FP_LEN module constants; _SPACY_TYPE_MAP class constant;
-                    seen_fps: set[str]; _embed_query np.ndarray annotation;
-                    re module-level import; jaccard_similarity → @staticmethod;
-                    data flow + SpaCy/Jaccard references added to docstring
 
 ===============================================================================
 """
@@ -164,20 +162,31 @@ def _normalize_query_entity(text: str, label: str) -> str:
 _B1_LEADING_AUX_COPULA: frozenset = frozenset({
     "is", "are", "was", "were", "do", "does", "did",
 })
+# Correlative/distributive quantifiers that head comparison/intersection
+# question stems ("Both X and Y …", "Either X or Y …", "Neither X nor Y …").
+# These are question-level function words, never proper-noun-name components,
+# so the NER tagger absorbing them into the first entity span ("Both Truth in
+# Science") is always an error. Deliberately EXCLUDES "all"/"each", which DO
+# begin legitimate names ("All Saints", "Each Tear"), keeping the rule
+# false-positive-free.
+_B1_LEADING_QUANTIFIER: frozenset = frozenset({"both", "either", "neither"})
 _B1_YEAR_RE = re.compile(r"\b(1[0-9]{3}|20[0-9]{2})\b")
 
 
 def _strip_leading_function_word(text: str) -> str:
-    """B1a: drop a leading auxiliary/copula verb absorbed into the span by the
-    NER tagger. Closed-class only (no wh-words, no articles) — see module note.
-    Collapses internal whitespace ('Are  Chrysalis' → 'Chrysalis')."""
+    """B1a: drop a leading auxiliary/copula verb or correlative quantifier
+    absorbed into the span by the NER tagger. Closed-class only (no wh-words,
+    no articles, no all/each) — see module note. Collapses internal whitespace
+    ('Are  Chrysalis' → 'Chrysalis'; 'Both Truth in Science' → 'Truth in
+    Science')."""
     cleaned = re.sub(r"\s+", " ", text).strip()
     if not cleaned:
         return cleaned
     tokens = cleaned.split(" ")
     if len(tokens) <= 1:
         return cleaned
-    if tokens[0].lower() in _B1_LEADING_AUX_COPULA:
+    first = tokens[0].lower()
+    if first in _B1_LEADING_AUX_COPULA or first in _B1_LEADING_QUANTIFIER:
         tokens = tokens[1:]
     return " ".join(tokens).strip()
 

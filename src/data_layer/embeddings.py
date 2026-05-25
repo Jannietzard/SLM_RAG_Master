@@ -36,21 +36,22 @@ Cache design:
   server process.
 
 Classes:
-  EmbeddingMetrics          — dataclass for cumulative performance counters
-  EmbeddingCache            — SQLite-based persistent embedding store
-  BatchedOllamaEmbeddings   — LangChain-compatible embedding client
+  EmbeddingMetrics          -- dataclass for cumulative performance counters
+                               (internal; not re-exported from the package)
+  EmbeddingCache            -- SQLite-based persistent embedding store
+                               (internal; not re-exported from the package)
+  BatchedOllamaEmbeddings   -- LangChain-compatible embedding client
+                               (public API; re-exported from src.data_layer)
 
-Review History:
-    Last Reviewed:  2026-04-19
-    Review Result:  0 CRITICAL, 4 IMPORTANT, 3 RECOMMENDED
-    Reviewer:       Code Review Prompt v2.1
-    Next Review:    After changes to cache schema or Ollama API integration
-    ---
-    Previous Review: 2026-04-04
-    Previous Result: 3 CRITICAL, 6 IMPORTANT, 3 RECOMMENDED
-    Changes Since:   All prior findings addressed (get_batch bulk lookup,
-                     total_texts counter, logger.info for print_metrics,
-                     context manager, exception narrowing, get_stats guard)
+Settings.yaml integrity check
+-----------------------------
+If `embeddings.embedding_dim` is set in settings.yaml and the dimension
+detected from the live Ollama API differs, `create_embeddings()` raises
+`RuntimeError` at startup. This prevents silent shape drift between the
+embedding layer and the storage layer (which enforces `embedding_dim` on
+LanceDB writes) when the embedding model is swapped.
+
+Last reviewed: 2026-05-25 (audit pass, project version 5.4).
 """
 
 import logging
@@ -68,6 +69,15 @@ from langchain_core.embeddings import Embeddings
 
 
 logger = logging.getLogger(__name__)
+
+
+# Public API. EmbeddingCache and EmbeddingMetrics are implementation details
+# of BatchedOllamaEmbeddings and intentionally NOT re-exported -- grep confirms
+# zero external import sites for either class.
+__all__ = [
+    "BatchedOllamaEmbeddings",
+    "create_embeddings",
+]
 
 
 # ============================================================================
@@ -178,11 +188,6 @@ class EmbeddingCache:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn: Optional[sqlite3.Connection] = None
         self._init_db()
-
-    @property
-    def db_path(self) -> Path:
-        """Alias for cache_path (API compatibility)."""
-        return self.cache_path
 
     def _init_db(self) -> None:
         """
@@ -528,15 +533,15 @@ class BatchedOllamaEmbeddings(Embeddings):
                 raise ConnectionError(
                     f"Ollama API error: HTTP {response.status_code}"
                 )
-        except requests.exceptions.ConnectionError:
+        except requests.exceptions.ConnectionError as exc:
             raise ConnectionError(
                 f"Cannot connect to Ollama at {self.base_url}. "
                 f"Ensure Ollama is running: ollama serve"
-            )
-        except requests.exceptions.Timeout:
+            ) from exc
+        except requests.exceptions.Timeout as exc:
             raise ConnectionError(
                 "Ollama connection timeout. Server may be overloaded."
-            )
+            ) from exc
 
     @property
     def embedding_dim(self) -> Optional[int]:
@@ -696,6 +701,10 @@ class BatchedOllamaEmbeddings(Embeddings):
             return cached
         self.metrics.cache_misses += 1
         embedding = self._embed_batch([text])[0]
+        # Count the API round-trip in batch_count so cumulative metrics stay
+        # accurate when queries dominate the workload (embed_documents accounts
+        # for its own batches via the inner loop).
+        self.metrics.batch_count += 1
         self.cache.put(text, embedding, self.model_name)
         return embedding
 
@@ -793,12 +802,23 @@ def create_embeddings(
     settings.yaml configuration dictionary.
 
     Parameter mapping from settings.yaml:
-        embeddings.model_name  → model_name
-        embeddings.base_url    → base_url
-        embeddings.cache_path  → cache_path
-        performance.batch_size → batch_size
-        performance.device     → device
-        llm.timeout            → timeout
+        embeddings.model_name     -> model_name
+        embeddings.base_url       -> base_url
+        embeddings.cache_path     -> cache_path
+        embeddings.embedding_dim  -> startup cross-check (see below)
+        performance.batch_size    -> batch_size
+        performance.device        -> device
+        llm.timeout               -> timeout
+
+    Settings.yaml integrity check
+    -----------------------------
+    If `embeddings.embedding_dim` is set in settings.yaml, the value is
+    compared against the dimension the Ollama API actually returned during
+    `_test_connection()`. A mismatch raises `RuntimeError` at construction
+    time. This catches model-swap inconsistencies (where the embedding
+    model now serves a different dim than `storage.py` is configured to
+    accept on LanceDB writes) at the point where the error message is
+    actionable, rather than as a cryptic LanceDB shape error later.
 
     Args:
         cfg: Full settings dict as loaded from config/settings.yaml.
@@ -806,6 +826,10 @@ def create_embeddings(
 
     Returns:
         Configured BatchedOllamaEmbeddings instance.
+
+    Raises:
+        RuntimeError: configured `embeddings.embedding_dim` does not match
+                      the dim returned by the live Ollama API.
     """
     cfg = cfg or {}
     emb_cfg = cfg.get("embeddings", {})
@@ -813,7 +837,7 @@ def create_embeddings(
     llm_cfg = cfg.get("llm", {})
 
     _D = BatchedOllamaEmbeddings
-    return BatchedOllamaEmbeddings(
+    emb = BatchedOllamaEmbeddings(
         model_name=emb_cfg.get("model_name", _D.DEFAULT_MODEL),
         base_url=emb_cfg.get("base_url", _D.DEFAULT_URL),
         batch_size=perf_cfg.get("batch_size", _D.DEFAULT_BATCH_SIZE),
@@ -821,6 +845,19 @@ def create_embeddings(
         device=perf_cfg.get("device", "cpu"),
         timeout=llm_cfg.get("timeout", _D.DEFAULT_TIMEOUT),
     )
+
+    configured_dim = emb_cfg.get("embedding_dim")
+    if configured_dim is not None and emb.embedding_dim is not None:
+        if int(configured_dim) != emb.embedding_dim:
+            raise RuntimeError(
+                f"Embedding dimension mismatch: settings.yaml declares "
+                f"embeddings.embedding_dim={configured_dim} but the Ollama "
+                f"model '{emb.model_name}' returned vectors of dimension "
+                f"{emb.embedding_dim}. Either pull the correct model "
+                f"(ollama pull {emb.model_name}) or update "
+                f"embeddings.embedding_dim in config/settings.yaml to match."
+            )
+    return emb
 
 
 # ============================================================================
@@ -862,12 +899,12 @@ if __name__ == "__main__":
                 cache_path=db_path,
             ) as emb:
                 vecs = emb.embed_documents(texts)
-                logger.info("── embed_documents ──  %d vectors, dim=%d", len(vecs), len(vecs[0]))
+                logger.info("-- embed_documents --  %d vectors, dim=%d", len(vecs), len(vecs[0]))
 
-                # Second call — all from cache, no API side_effect needed
+                # Second call -- all from cache, no API side_effect needed.
                 with patch("requests.post", side_effect=RuntimeError("should not call API")):
                     vecs2 = emb.embed_documents(texts)
-                    logger.info("── cache-only call ──  %d vectors (all from cache)", len(vecs2))
+                    logger.info("-- cache-only call --  %d vectors (all from cache)", len(vecs2))
 
                 # print_metrics() must be called while the context manager is still open
                 # so the SQLite connection is available for get_stats().

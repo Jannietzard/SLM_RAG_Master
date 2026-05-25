@@ -445,6 +445,14 @@ benchmark:
   # Default number of samples per dataset
   default_samples: 500
 
+  # Token-F1 threshold above which an answer counts as correct for the
+  # headline "Soft-EM" metric. Strict Exact Match is too brittle for HotpotQA's
+  # formal-vs-common name variants (gold 'Gerard "Gerry" Adams' vs predicted
+  # 'Gerry Adams' is EM=0 but F1=0.8). Strict EM is still reported alongside.
+  # Range [0.0, 1.0]; 0.6 admits middle-name/nickname variants while excluding
+  # answers that share only one token. Set to 1.0 to fall back to exact-match.
+  answer_f1_threshold: 0.6
+
   # ablation_configs removed (audit 2026-05-15): the vector_weight /
   # graph_weight knobs they referenced were never read by production code
   # (see comment under `rag:` ablation-mode section). Run ablations by

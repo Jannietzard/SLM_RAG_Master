@@ -25,23 +25,33 @@ DESIGN CHOICES
 - Confidence = 0.7 (between REBEL's 0.5 sentinel and cooccurrence's 1.0).
   Reflects that SVO is more specific than cooccurrence but less curated
   than REBEL's beam search.
-- Only ROOT verbs and conjuncts are inspected — avoids extracting verbs
+- Only ROOT verbs and conjuncts are inspected -- avoids extracting verbs
   inside relative clauses ("the man who directed Inception said ...")
   whose subject is the relative pronoun, not a content entity.
 - Prepositional objects are followed: "X was born in Paris" -> (X, bear, Paris).
+
+Last reviewed: 2026-05-25 (audit pass, project version 5.4).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Public API. Helpers (`_np_head_text`, `_find_active_subject`, ...) and the
+# lazy-loaded singleton state (`_NLP`, `_AVAILABLE`) are implementation
+# details, intentionally NOT re-exported.
+__all__ = [
+    "extract_svo_relations",
+    "is_available",
+]
 
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
 # LAZY SPACY LOADER
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 _NLP = None
 _AVAILABLE: Optional[bool] = None
@@ -56,7 +66,7 @@ def _try_load(spacy_model: str = "en_core_web_sm") -> None:
         _NLP = spacy.load(spacy_model)
         _AVAILABLE = True
         logger.info("SVO extractor loaded: %s", spacy_model)
-    except Exception as exc:
+    except (OSError, IOError, ValueError, ImportError, RuntimeError) as exc:
         _AVAILABLE = False
         logger.warning(
             "FALLBACK ACTIVE: spaCy not available for SVO extraction (%s)", exc
@@ -68,14 +78,24 @@ def is_available() -> bool:
     return bool(_AVAILABLE)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # DEPENDENCY-PARSE HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 # Subject and object dependency labels recognised by the extractor.
 _SUBJ_DEPS: frozenset = frozenset({"nsubj", "nsubjpass"})
 _DOBJ_DEPS: frozenset = frozenset({"dobj", "attr"})
 _HEAD_POS:  frozenset = frozenset({"NOUN", "PROPN"})
+
+# Confidence assigned to every emitted SVO triple. Calibrated between
+# REBEL's 0.5 sentinel and cooccurrence's 1.0 to reflect that SVO is more
+# specific than cooccurrence but less curated than REBEL's beam search.
+_SVO_CONFIDENCE: float = 0.7
+
+# Verbs filtered out as noise generators. "be"/"have"/"do" are auxiliaries
+# that produce vacuous relations; "say"/"tell"/"make" are reporting/light
+# verbs whose object is almost never an entity worth linking.
+_NOISE_VERBS: frozenset = frozenset({"be", "have", "do", "say", "tell", "make"})
 
 
 def _np_head_text(head_token) -> str:
@@ -169,9 +189,9 @@ def _inherit_from_conjunct_head(verb_tok):
     return subj, obj
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # ENTITY MATCHING
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def _match_entity(
     np_text: str,
@@ -216,14 +236,13 @@ def _match_entity(
     return candidates[0][1]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # PUBLIC API
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def extract_svo_relations(
     text: str,
     name_to_id: Dict[str, str],
-    chunk_id: str,
     canonical_form_fn,
     min_verb_length: int = 3,
 ) -> List[Tuple[str, str, str, float]]:
@@ -234,8 +253,6 @@ def extract_svo_relations(
         text:               The chunk text.
         name_to_id:         Map canonical_form(name) -> entity_id (built by
                             the caller during entity insertion).
-        chunk_id:           Source chunk identifier (recorded as source_chunks
-                            on the resulting RELATED_TO edge).
         canonical_form_fn:  Function (str -> str) that produces the canonical
                             surface form of an entity name. Imported lazily
                             to avoid a circular dependency with graph_quality.
@@ -245,6 +262,9 @@ def extract_svo_relations(
     Returns:
         List of (subject_id, verb_lemma, object_id, confidence) tuples.
         Subject and object are guaranteed to be different entities.
+        Chunk-provenance is recorded by the caller when inserting the
+        resulting RELATED_TO edges (see `add_related_to_relation`); this
+        function is stateless w.r.t. the originating chunk.
     """
     if not text or not name_to_id:
         return []
@@ -254,7 +274,7 @@ def extract_svo_relations(
 
     try:
         doc = _NLP(text)
-    except Exception as exc:
+    except (ValueError, RuntimeError, AttributeError) as exc:
         logger.debug("SVO: parse failed (%s)", exc)
         return []
 
@@ -268,8 +288,7 @@ def extract_svo_relations(
             lemma = tok.lemma_.lower()
             if len(lemma) < min_verb_length:
                 continue
-            if lemma in {"be", "have", "do", "say", "tell", "make"}:
-                # Generic verbs that produce mostly noise relations.
+            if lemma in _NOISE_VERBS:
                 continue
 
             # Try active voice, then passive voice, then inherit from a
@@ -298,28 +317,6 @@ def extract_svo_relations(
             if key in seen:
                 continue
             seen.add(key)
-            triples.append((subj_id, lemma, obj_id, 0.7))
+            triples.append((subj_id, lemma, obj_id, _SVO_CONFIDENCE))
 
     return triples
-
-
-def extract_svo_batch(
-    chunk_texts: Iterable[Tuple[str, str]],
-    name_to_id: Dict[str, str],
-    canonical_form_fn,
-) -> Dict[str, List[Tuple[str, str, str, float]]]:
-    """
-    Batch wrapper. Returns a dict of chunk_id -> list of SVO tuples.
-
-    Args:
-        chunk_texts: iterable of (chunk_id, text) pairs.
-    """
-    out: Dict[str, List[Tuple[str, str, str, float]]] = {}
-    for chunk_id, text in chunk_texts:
-        out[chunk_id] = extract_svo_relations(
-            text=text,
-            name_to_id=name_to_id,
-            chunk_id=chunk_id,
-            canonical_form_fn=canonical_form_fn,
-        )
-    return out

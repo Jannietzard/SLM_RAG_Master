@@ -31,9 +31,11 @@ OPTIONAL DEPENDENCY
     python -m spacy download en_core_web_md   # or en_core_web_lg
 
 If coreferee is not installed or no md/lg spaCy model is available, every
-call returns the input text unchanged. The pipeline keeps working — graph
+call returns the input text unchanged. The pipeline keeps working -- graph
 density just stays at the pre-coref level. The Phase-3 ingestion log
 records whether coref was applied so the ingest manifest is reproducible.
+
+Last reviewed: 2026-05-25 (audit pass, project version 5.4).
 """
 
 from __future__ import annotations
@@ -43,10 +45,17 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Public API. Underscored names below are implementation details of the
+# lazy-loaded singleton and intentionally NOT re-exported.
+__all__ = [
+    "resolve_coreferences",
+    "is_available",
+]
 
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
 # LAZY-LOADED SINGLETON (one spaCy + coreferee pipeline per process)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 _NLP = None
 _AVAILABLE: Optional[bool] = None  # tri-state: None=untried, True/False=resolved
@@ -83,7 +92,7 @@ def _try_load() -> None:
         )
         return
 
-    # Coreferee works with md/lg/trf — NOT with en_core_web_sm.
+    # Coreferee works with md/lg/trf -- NOT with en_core_web_sm.
     for model_name in ("en_core_web_lg", "en_core_web_md"):
         try:
             nlp = spacy.load(model_name)
@@ -94,7 +103,7 @@ def _try_load() -> None:
                 "Coreference resolver loaded: %s + coreferee", model_name
             )
             return
-        except Exception:
+        except (OSError, IOError, ValueError, ImportError, RuntimeError):
             continue
 
     _AVAILABLE = False
@@ -110,9 +119,9 @@ def is_available() -> bool:
     return bool(_AVAILABLE)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # RESOLVER
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def resolve_coreferences(text: str, max_chars: int = 100_000) -> str:
     """
@@ -146,7 +155,7 @@ def resolve_coreferences(text: str, max_chars: int = 100_000) -> str:
 
     try:
         doc = _NLP(text)
-    except Exception as exc:
+    except (ValueError, RuntimeError, AttributeError) as exc:
         logger.debug("Coref: spaCy parse failed (%s)", exc)
         return text
 
@@ -179,7 +188,7 @@ def resolve_coreferences(text: str, max_chars: int = 100_000) -> str:
                     doc[tok_end].idx + len(doc[tok_end].text),
                     canon_text,
                 ))
-        except Exception as exc:
+        except (IndexError, AttributeError, TypeError, ValueError) as exc:
             logger.debug("Coref: chain processing failed (%s)", exc)
             continue
 

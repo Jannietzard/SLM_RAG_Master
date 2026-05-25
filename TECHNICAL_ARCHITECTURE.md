@@ -4,8 +4,26 @@
 Agentic Verification for Hybrid Retrieval-Augmented Generation on
 Resource-Constrained Devices
 **Author:** Jan Nietzard
-**Institution:** RWTH, Master of Science
-**Document version:** 5.2 — paper-release (2026-05-15), refreshed 2026-05-23 to reflect the query-side NER normalization layer (§3.5), the entity-free definite-description and classifier-abstention decompositions (§4.1), the graded entity-mention filter with a survivor floor (§4.2), the IDF-specificity / structural-coverage / sentence-aware context budgeting in the Verifier (§4.3), the rank-aware single-pool bridge scorer (§4.5), and the random/seeded/range question-selection modes of the evaluator (§7.1).
+**Document version:** 5.4 (last refresh 2026-05-25). Adds §11.16, which
+consolidates the design decisions surfaced and validated during the
+2026-05-24/25 evaluation-rigor audit: the Verifier cap-by-RRF-first reorder
+contract; per-anchor fairness merge for parallel comparison decompositions;
+the structural-comparison classifier router (Phase 3.6); the
+`create_pipeline` settings-wiring fix (so `vector_top_k` / `bm25_top_k` /
+hub-cap / RRF weights are honoured in evaluation); the `_REQUIRED_SETTINGS`
+7→35 expansion as a reproducibility guard; the delivery-loss instrumentation
+and Soft-EM evaluation verdict; and the empirically-rejected hypotheses
+preserved as negative results. Refreshes the test count to 665 (the
+intermediate 668 fell back after a rejected hypothesis was reverted) and the
+version stamp. Builds on the 5.3 refresh, which built on the 5.2
+paper-release (2026-05-15), which documented the query-side NER normalization
+layer (§3.5), the entity-free definite-description and classifier-abstention
+decompositions (§4.1), the graded entity-mention filter with a survivor floor
+(§4.2), the IDF-specificity / structural-coverage / sentence-aware context
+budgeting in the Verifier (§4.3), the rank-aware single-pool bridge scorer
+(§4.5), and the random/seeded/range question-selection modes of the evaluator
+(§7.1). The 5.3 refresh corrected the planner pattern inventory (§1.1, §11.8)
+and the test-suite count (§2, §10.3) to match the code.
 
 > This document describes the system as it stands at the paper-release
 > milestone. Earlier versions tracked an incremental change-log; that
@@ -104,7 +122,7 @@ Flan-T5 XXL). This work adopts the *iterative bridge-grounding* idea
 (step-N retrieved entities feed step-N+1 query, see §4.4 and
 `AgentPipeline._iterative_navigate`) but replaces free-form CoT with a
 **structured Planner that emits a finite, parse-derived hop graph**
-(Patterns E/G/H/K/L) executable by a 1.5B-parameter quantised SLM.
+(Patterns E/F/G/H/I/J) executable by a 1.5B-parameter quantised SLM.
 Free-form CoT is not robust at this model size; the dependency-parse
 backbone supplies the reasoning skeleton externally.
 
@@ -179,7 +197,14 @@ Entwicklungfolder/
 │   │   ├── ingestion_pipeline.py     # End-to-end ingestion workflow
 │   │   └── conftest.py
 │   │
-│   ├── thesis_evaluations/           # Artifact C
+│   ├── evaluations/                  # Legacy evaluation helpers (pre-thesis_evaluations)
+│   │   ├── evaluate_hotpotqa.py       #   single-config HotpotQA runner
+│   │   ├── ablation_study.py          #   AblationStudy/AblationConfig — still imported
+│   │   │                              #   by thesis_evaluations/benchmark_datasets.py
+│   │   ├── metrics.py                 #   canonical EM/F1 normaliser
+│   │   └── test_rag_quality.py
+│   │
+│   ├── thesis_evaluations/           # Artifact C (current evaluation suite)
 │   │   ├── __init__.py
 │   │   ├── benchmark_datasets.py     # CLI: ingest / evaluate / ablation
 │   │   ├── agentic_ablation.py       # Component-wise ablation (LLM-only → full)
@@ -209,7 +234,7 @@ Entwicklungfolder/
 ├── diagnose_ingestion.py             # Ingestion-side consistency probe
 ├── diagnose_graph_baseline.py        # Read-only graph-quality reporter
 │
-├── test_system/                      # Test suite (~450 tests collected)
+├── test_system/                      # Test suite (665 tests collected)
 │   ├── conftest.py
 │   ├── fixtures/                     # Gold NER, etc.
 │   ├── test_*.py                     # Module-scoped tests
@@ -1315,7 +1340,7 @@ The evaluation summary block reports:
 
 ### 10.3 Test coverage
 
-The test suite collects **~450 tests** across the layers. Key modules:
+The test suite collects **665 tests** across the layers. Key modules:
 
 | Module | Test file |
 |---|---|
@@ -1327,6 +1352,8 @@ The test suite collects **~450 tests** across the layers. Key modules:
 | Navigator | `test_navigator_semantic.py` |
 | Verifier | `test_verifier_semantic.py` |
 | Pipeline | `test_pipeline.py` |
+| Thesis matrix | `test_thesis_matrix.py`, `test_thesis_matrix_ext.py` — capability-matrix coverage of the documented design decisions |
+| Coverage / robustness | `test_missing_coverage.py`, `test_config_robustness.py` — edge-case and config-validation guards |
 | Thesis cleanup | `test_thesis_cleanup.py` — regression guards that the paper-cleanup pass is intact (no dataset-revealing strings in source, no removed-pattern markers, etc.) |
 
 Markers in `pytest.ini` separate slow / nightly / llm / integration
@@ -1410,12 +1437,20 @@ highest per-sub-query RRF rank.
 The Planner uses **two complementary mechanisms** for query type
 classification.
 
-**Primary mechanism — structural patterns (Patterns E, G, H, K, L):**
-Named patterns use SpaCy dependency-parse labels (relcl, acl, agent,
-auxpass, prep("of"), pobj) and closed-class English markers (both,
-another) to fire structural decomposition. These cite linguistic
-literature: Quirk et al. 1985; Bresnan 1982; Karttunen 1976/1977;
-Partee 1995; Barker 1995; Levin 1993.
+**Primary mechanism — structural patterns (Patterns E, F, G, H; L is a
+relative-clause sub-form of G):** Named patterns use SpaCy dependency-parse
+labels (relcl, acl, agent, auxpass, prep("of"), pobj) to fire structural
+decomposition — E (relational-noun complement), F (passive-agent voice), G
+(relative-clause bridge, with Form-2 "L" handling a relative-pronoun subject),
+and H (chained-attribution). Two regex pre-empts run earlier in `classify()`
+on closed-class English markers: I (boolean conjunction "Are X and Y both P?")
+and J (implicit bridge "another [noun]"). A structural-comparison router
+(coordinated NER entities under an interrogative determiner) routes the
+remaining comparison forms into the parallel comparison decomposer. (Earlier
+Patterns C, D and the string-shape Pattern K were removed in the 2026-05-15
+audit because they keyed on surface phrasing rather than parse structure.)
+These cite linguistic literature: Quirk et al. 1985; Bresnan 1982;
+Karttunen 1976/1977; Partee 1995; Barker 1995; Levin 1993.
 
 **Secondary mechanism — `MULTI_HOP_PATTERNS` (regex pre-screen):**
 Before structural patterns fire, a set of surface-level regex patterns
@@ -1515,6 +1550,152 @@ top-2 RRF immunity into a floor and engages only for full candidate
 sets, so it does not force-keep noise in already-small inputs. The
 no-usable-entity case is made observable (logged + flagged) rather than
 silently passing all chunks unfiltered.
+
+### 11.16 Evaluation-rigor audit (2026-05-24/25)
+
+Seven decisions surfaced and validated during an end-to-end audit of the
+evaluation path. Each is empirically grounded — the n=100 retrieval-only
+and n=40 full-pipeline A/Bs that justify them are reproducible from
+`evaluation_results/` and from `src/thesis_evaluations/benchmark_datasets.py`.
+
+**11.16.1 Verifier cap-by-RRF-first contract.** The verifier's
+`_reorder_by_question_relevance` (§4.3, §11.13) now operates **inside**
+the already-selected `max_docs` window — the cap is applied to the
+Navigator's RRF order **before** the reorder runs. Previously the reorder
+sorted the entire post-filter context and the `[:max_docs]` slice ran on
+the reordered list, which let a lexical-overlap heuristic *evict* a
+high-RRF answer chunk that happened to be sparse in question terms
+(observed regression: a Navigator-rank-#1 chunk demoted out of the
+LLM-visible window). The revised contract separates *selection*
+(retrieval-score-based, RRF; Cormack et al. 2009) from *presentation
+order* (within-window only, to mitigate small-LLM positional bias; Liu
+et al. 2023, *Lost in the Middle*, TACL/arXiv:2307.03172). The reorder
+can no longer change set membership.
+
+**11.16.2 Per-anchor fairness merge for parallel decompositions.** When
+the planner emits ≥2 parallel sub-queries (the comparison and intersection
+paths emit one per anchor with `depends_on=[]`), the Navigator's final
+cap interleaves the per-sub-query rankings round-robin (strongest anchor
+first each round) rather than taking a purely global top-k. This
+guarantees each anchor a fair share of the `max_context_chunks` budget so
+a high-degree entity cannot monopolize it and crowd out the second
+entity's gold paragraph. Single-hop is unchanged (no-op when only one
+sub-query is active). Coverage of every decomposed aspect is the
+defining requirement of a HotpotQA comparison question (Yang et al. 2018,
+EMNLP); fair list interleaving follows team-draft interleaving (Radlinski
+et al. 2008, CIKM).
+
+**11.16.3 Structural-comparison classifier router (Phase 3.6).** The
+classifier (§4.1, §11.8) gained a Phase-3.6 pre-empt that routes a query
+with **coordinated NER entities under an interrogative determiner**
+(SpaCy `conj` dependency between two entity heads + wh-word) into the
+`COMPARISON` decomposer, regardless of whether a comparative-morphology
+keyword fired. Without it, "Ronald Reagan and George H. W. Bush both held
+which position?" scored MULTI_HOP via Phase-3 entity density alone and
+was decomposed by `_decompose_multi_hop`, which mangled the coordinate
+structure into a subject-less hop. The pre-empt is gated by an
+INTERSECTION precedence check (defers when "both X and Y" / "in common"
+fired, so joint-property questions still route correctly) and a bridge-cue
+precision guard (defers when a relational/attribution cue is present, so
+coordinated pairs inside bridge questions stay MULTI_HOP). Refs:
+HotpotQA's two official question types are *bridge* and *comparison*
+(Yang et al. 2018), and comparison is ≈ 20 % of the distribution;
+coordination linguistics: Quirk et al. (1985) §13.
+
+**11.16.4 `create_pipeline` settings-wiring fix.** The evaluation pipeline
+(`benchmark_datasets.create_pipeline`) previously hand-built
+`RetrievalConfig` with only `mode` and `similarity_threshold` — every
+other `rag.*` / `vector_store.*` / `graph.*` key fell back to the
+dataclass default. The dataclass defaults for `vector_top_k` and
+`bm25_top_k` are both 10, while `settings.yaml` documents 20 (deliberate
+2026-05-06 audit). Evaluation runs were therefore using **half the
+documented retrieval funnel widths**. The fix calls the canonical
+settings-reading factory `create_hybrid_retriever(...)` and then overrides
+`mode` only for the per-config ablation. After the fix, every retrieval
+knob — `vector_top_k`, `bm25_top_k`, `rrf_k`, `cross_source_boost`,
+`enable_bm25`, `graph.max_hops`, `graph.top_k_entities`, `graph.enable_hop3`,
+`graph.hub_mention_cap`, `rag.vector_weight` / `graph_weight` /
+`bm25_weight` — is honoured in evaluation. Single-source-of-truth (§3.5)
+is now enforced end-to-end for the retrieval layer.
+
+**11.16.5 `_REQUIRED_SETTINGS` 7 → 35 (reproducibility guard).**
+`src/logic_layer/_settings.py::_validate_settings` validates a tuple of
+required keys at load time and emits a `WARNING` (not a fatal error) when
+any is missing — a silent dataclass-default fallback is treated as a
+reproducibility risk. The list grew from 7 keys to 35, covering every
+parameter that meaningfully affects EM or SF metrics: LLM context budget,
+embeddings, vector store, graph (incl. `hub_mention_cap`, `enable_hop3`),
+RAG fusion + BM25, the entire Navigator filter chain, Verifier validation
+thresholds, agent pipeline flags, entity extraction, ingestion, and the
+benchmark Soft-EM threshold. This is the guard that would have caught
+the §11.16.4 bug. The expansion is purely defensive — the check only
+WARNs and never alters runtime behaviour.
+
+**11.16.6 Delivery-loss instrumentation and Soft-EM verdict.** The
+per-question evaluation record now carries two complementary correctness
+checkpoints that separate retrieval-stage loss from delivery-stage loss
+from the SLM ceiling:
+
+- `all_gold_retrieved` — gold present in the Navigator's filter-chain
+  output (≤ `max_context_chunks=8`).
+- `gold_in_final_context` — gold present in the post-`max_docs`
+  LLM-visible window (top-5). The gap is **delivery loss** — gold the
+  pipeline retrieved but discarded before the model saw it.
+
+The aggregator reports `final_context_recall_rate` and
+`delivery_loss_rate` alongside the existing SF metrics. Measured on
+n=100 retrieval-only at audit time: SF-Recall 65 %, gold-in-LLM-window
+29 %, delivery loss 36 %.
+
+The headline answer-correctness metric is **Soft-EM**: token-F1 ≥
+`benchmark.answer_f1_threshold` (default 0.6, configurable). Strict EM
+systematically under-counts correct answers that differ from gold only
+by a missing trailing category word (`"Teach the Controversy"` vs gold
+`'"Teach the Controversy" campaign'` — F1=0.8, Soft-EM=True). Both EM
+and Soft-EM are reported. `diagnose_verbose.py` reads the same threshold
+from `settings.yaml`, so per-trace verdicts agree with the aggregate
+evaluation.
+
+**11.16.7 Negative results preserved (no-op changes that were tested and
+rejected).** Four hypotheses for closing the 35 % retrieval-loss /
+36 % delivery-loss bottlenecks were implemented, A/B-validated, and
+**reverted** when the data did not support them. They are documented
+here so the artifact contains the evidence trail and the discussion
+chapter can cite them as honest stress-tests:
+
+- **`graph.enable_hop3=true`** (3-hop graph traversal) — flat SF-Recall
+  (64 % vs 65 %). The "missing second gold paragraph" failures (e.g.
+  Sachin Warrier → TCS, Alfred Balk → Rockefeller) are not reachable by
+  a third graph hop either; the edges do not exist in the graph
+  (completeness limit, not depth limit).
+- **`max_docs` widening 5 → 8** + `max_context_chars` 3500 → 6000 (full
+  pipeline, n=40) — **delivery loss fully recovered** (32.5 % → 0 %) but
+  Soft-EM *dropped* (35.0 % → 32.5 %) and per-question latency rose
+  35× (39 s → 1384 s). The 1.5 B Q4 SLM uses additional context
+  *worse*, not better — consistent with Liu et al. (2023). `max_docs=5`
+  is therefore the correct setting under the edge-deployment constraint.
+- **Rank-fusion reranker** (replace pure cross-encoder sort with RRF
+  fusion of CE-rank and RRF-rank; n=100 retrieval-only) — `gold-in-LLM-
+  window` unchanged at 29 %. The gold chunks landing at navigator
+  rank 6–8 are ranked low by **both** RRF and the cross-encoder; rank
+  fusion cannot lift what neither signal favours.
+- **Phase 3.7 structural-bridge classifier router** (rescue bridge
+  questions from `temporal`/`single_hop` collapse on weak cues; n=100
+  retrieval-only) — bridge SF-Recall rose +2.5 pp **but** comparison
+  dropped −4.8 pp, `gold-in-LLM-window` dropped 4 pp and delivery loss
+  worsened 5 pp. The rescued plans run hop-2 retrieval, which adds
+  chunks to the Navigator output, which pushes some gold further down
+  the ranking, which the `max_docs=5` cap then cuts.
+
+The common pattern across all four: cheap algorithmic levers for the
+retrieval/delivery bottlenecks hit a downstream wall — either the SLM
+ceiling, the cap, or both. Together with §11.16.6's measured 50 %
+SoftEM | all-gold-retrieved, this establishes the **SLM as the
+binding constraint** for further EM improvements on HotpotQA at the
+1.5 B Q4 scale; further pipeline-side gains would require a larger
+verifier or a tool-augmented verification channel
+(CRITIC-style — Gou et al. 2024, ICLR, arXiv:2305.11738) and are
+documented as future work.
 
 ---
 

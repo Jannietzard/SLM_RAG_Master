@@ -576,6 +576,36 @@ class TestQuestionRelevanceReorder:
         )
         assert out[0] == entity_chunk
 
+    def test_reorder_does_not_evict_high_rrf_answer_chunk(self, minimal_cfg):
+        """Membership invariant (idx143 regression): an answer chunk the
+        Navigator ranked #1 by RRF survives the max_docs cap even when
+        query-echoing distractors out-score it in the question-relevance
+        reorder. The production call site caps by RRF order FIRST, then reorders
+        only within the kept window — so the lexical heuristic can reorder but
+        never evict. Mirrors the verifier.process() composition."""
+        v = create_verifier(cfg=minimal_cfg)
+        v.config.max_docs = 2
+        query = "Which musician of the rock band was incarcerated?"
+        # RRF rank #1 = the answer chunk, but it shares NO content word with the
+        # query ("singer"!="musician", "imprisoned"!="incarcerated").
+        answer = "Ian David Karslake Watkins was a Welsh singer who was imprisoned."
+        # Distractors heavily echo the query terms "rock band" / "musician".
+        d1 = "The rock band musician rock band musician played rock band music."
+        d2 = "A rock band musician in a rock band; the musician toured widely."
+        d3 = "Rock band musicians are musicians who perform in a rock band nightly."
+        rrf_order = [answer, d1, d2, d3]
+
+        # New (fixed) path: cap by RRF order, then reorder within the window.
+        selected = rrf_order[: v.config.max_docs]
+        reordered = v._reorder_by_question_relevance(query, selected)
+        formatted = v._format_context(reordered, query=query)
+        assert "Ian David Karslake Watkins" in formatted
+
+        # Old (buggy) path: reorder the full list, then cap — evicts the answer.
+        old_reordered = v._reorder_by_question_relevance(query, rrf_order)
+        old_formatted = v._format_context(old_reordered, query=query)
+        assert "Ian David Karslake Watkins" not in old_formatted
+
     def test_f2_sentence_truncation_keeps_answer_in_tail(self, minimal_cfg):
         """F2: when a doc exceeds the per-doc budget, the query-relevant
         sentence in the TAIL survives (head-truncation would drop it)."""

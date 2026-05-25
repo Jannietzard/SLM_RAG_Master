@@ -1,9 +1,9 @@
 """
-benchmark_datasets.py - Multi-Dataset Benchmark System (UPDATED)
+benchmark_datasets.py - Multi-Dataset Benchmark System
 
-Version: 4.1.0 - Adapted to new project structure
+Version: 4.3.0
 Author: Edge-RAG Research Project
-Last Modified: 2026-01-30
+Last Modified: 2026-05-23
 
 IMPORTANT - Scientifically correct evaluation:
 ═══════════════════════════════════════════════════════════════════════
@@ -12,6 +12,14 @@ During evaluation ONLY the corresponding store is used.
 → No cross-dataset data leakage!
 ═══════════════════════════════════════════════════════════════════════
 
+Changes v4.3.0:
+- ✅ Soft-EM correctness verdict (token-F1 ≥ benchmark.answer_f1_threshold,
+     default 0.6) reported alongside strict EM and mean F1. Configurable via
+     settings.yaml or the `--answer-f1-threshold` CLI flag.
+- ✅ Question selection: random `--samples` (default 20, seed auto-logged),
+     reproducible `--seed`, deterministic `--range START-END`.
+- ✅ Per-source RRF weighting flags `--vector-weight` / `--graph-weight`.
+- ✅ SF-title capture fix (retriever exposed as `hybrid_retriever`).
 Changes v4.1.0:
 - ✅ Removed: main_agentic.py (no longer exists)
 - ✅ Uses: src.pipeline.agent_pipeline.AgentPipeline
@@ -19,18 +27,18 @@ Changes v4.1.0:
 - ✅ Uses: src.data_layer.ingestion.DocumentIngestionPipeline (fallback)
 - ✅ Correct import paths for all modules
 
-Usage:
+Usage (run as a module from the project root; -X utf8 required on Windows):
     # Ingest single dataset
-    python benchmark_datasets.py ingest --dataset hotpotqa --samples 500
+    python -X utf8 -m src.thesis_evaluations.benchmark_datasets ingest --dataset hotpotqa --samples 500
 
     # Ingest all datasets (separate stores)
-    python benchmark_datasets.py ingest --dataset all --samples 500
+    python -X utf8 -m src.thesis_evaluations.benchmark_datasets ingest --dataset all --samples 500
 
     # Full ablation study
-    python benchmark_datasets.py ablation --samples 100
+    python -X utf8 -m src.thesis_evaluations.benchmark_datasets ablation --samples 100
 
     # Self-test
-    python benchmark_datasets.py test
+    python -X utf8 -m src.thesis_evaluations.benchmark_datasets test
 
 Evaluate — question selection (the `evaluate` sub-command):
     The evaluator picks which questions to run in one of two ways. By default
@@ -40,23 +48,23 @@ Evaluate — question selection (the `evaluate` sub-command):
     1) Random sample (default). `--samples N` draws N random questions. A seed
        is auto-generated and logged ("Question sample seed: 12345 …") so any
        run can be reproduced exactly with `--seed`.
-         python benchmark_datasets.py evaluate --dataset hotpotqa
-         python benchmark_datasets.py evaluate --dataset hotpotqa --samples 20
+         python -X utf8 -m src.thesis_evaluations.benchmark_datasets evaluate --dataset hotpotqa
+         python -X utf8 -m src.thesis_evaluations.benchmark_datasets evaluate --dataset hotpotqa --samples 20
 
     2) Reproducible random sample. Pass `--seed` to fix the random draw — same
        seed + same `--samples` → identical question set across runs (use this
        to compare two code versions on the *same* random questions).
-         python benchmark_datasets.py evaluate --dataset hotpotqa --samples 20 --seed 42
+         python -X utf8 -m src.thesis_evaluations.benchmark_datasets evaluate --dataset hotpotqa --samples 20 --seed 42
 
     3) First N (deterministic, the pre-2026-05 behaviour). Use `--range 0-N` to
        take questions in index order from the start — handy for a stable smoke
        test or to reproduce older results.
-         python benchmark_datasets.py evaluate --dataset hotpotqa --range 0-20
+         python -X utf8 -m src.thesis_evaluations.benchmark_datasets evaluate --dataset hotpotqa --range 0-20
 
     4) Defined slice. `--range START-END` takes questions[START:END] in order
        (separators '-', '_' or ':' all work). Use this to run a specific band,
        e.g. questions 10 through 30, or to shard a 500-question run.
-         python benchmark_datasets.py evaluate --dataset hotpotqa --range 10-30
+         python -X utf8 -m src.thesis_evaluations.benchmark_datasets evaluate --dataset hotpotqa --range 10-30
 
     Notes:
       * `--range` overrides `--samples` when both are given (range is explicit).
@@ -150,7 +158,9 @@ STORAGE_AVAILABLE = False
 try:
     from src.data_layer.storage import HybridStore, StorageConfig
     from src.data_layer.embeddings import BatchedOllamaEmbeddings
-    from src.data_layer.hybrid_retriever import HybridRetriever, RetrievalConfig, RetrievalMode
+    from src.data_layer.hybrid_retriever import (
+        HybridRetriever, RetrievalConfig, RetrievalMode, create_hybrid_retriever,
+    )
     STORAGE_AVAILABLE = True
 except ImportError:
     pass
@@ -273,6 +283,11 @@ class EvalResult:
     dataset: str
     question_type: str
 
+    # Soft correctness verdict: token-F1 >= ANSWER_F1_THRESHOLD. The fair
+    # headline metric — strict exact_match under-credits formal-vs-common
+    # name variants (see ANSWER_F1_THRESHOLD docstring).
+    answer_correct: bool = False
+
     # Retrieval quality (independent of LLM)
     gold_titles: List[str] = field(default_factory=list)
     retrieved_titles: List[str] = field(default_factory=list)
@@ -280,6 +295,13 @@ class EvalResult:
     retrieval_precision: float = 0.0
     sf_f1: float = 0.0
     all_gold_retrieved: bool = False
+    # Delivery check: are ALL gold paragraphs still present in the chunks the
+    # Verifier actually forwards to the LLM (top max_docs of filtered_context)?
+    # all_gold_retrieved counts the Navigator output (<=max_context_chunks);
+    # this counts the post-cap LLM-visible window. The gap between the two is
+    # "delivery loss" — gold retrieved by the pipeline but cut by the max_docs
+    # cap before the model ever sees it (e.g. idx43 Battle of Adwa).
+    gold_in_final_context: bool = False
 
     # Failure-mode separation
     llm_error: bool = False
@@ -314,11 +336,19 @@ class ConfigResult:
     f1_score: float
     avg_time_ms: float
     coverage: float
+    # Soft-EM: fraction with token-F1 >= ANSWER_F1_THRESHOLD (fair headline
+    # answer-correctness metric; strict exact_match kept above for transparency).
+    soft_em: float = 0.0
     by_type: Dict[str, Dict] = field(default_factory=dict)
 
     # Retrieval-level aggregates (pipeline correctness)
     avg_sf_f1: float = 0.0
     sf_recall_rate: float = 0.0          # fraction of Qs where all gold retrieved
+    # fraction of Qs where all gold survives into the LLM-visible window
+    final_context_recall_rate: float = 0.0
+    # fraction of Qs where gold WAS retrieved but did NOT reach the LLM (cut by
+    # the max_docs cap) — isolates "delivery loss" from "retrieval loss".
+    delivery_loss_rate: float = 0.0
     retrieval_only_em: float = 0.0       # EM among Qs where all gold retrieved
     llm_error_rate: float = 0.0
     pipeline_failed_rate: float = 0.0    # gold not fully retrieved
@@ -902,6 +932,17 @@ def run_ingestion(
 # EVALUATION METRICS
 # ============================================================================
 
+# Token-F1 threshold above which an answer counts as "correct" for the
+# headline answer-quality verdict (Soft-EM). Strict Exact Match is too brittle
+# for HotpotQA's frequent formal-vs-common name variants — gold
+# 'Gerard "Gerry" Adams' vs predicted 'Gerry Adams' is EM=0 but F1=0.8 and is
+# unambiguously correct. F1 (the official HotpotQA answer metric) is reported
+# alongside strict EM; a chunk that overlaps the gold by >= this fraction of
+# tokens is treated as a correct answer. 0.6 admits partial/middle-name and
+# nickname variants while excluding answers that share only one token.
+ANSWER_F1_THRESHOLD: float = 0.6
+
+
 def normalize_answer(text: str) -> str:
     """Normalize answer for comparison."""
     text = text.lower().strip()
@@ -1068,19 +1109,17 @@ def create_pipeline(
         retrieval_mode = RetrievalMode.HYBRID
 
     # Wrap HybridStore in HybridRetriever (Navigator needs .retrieve()).
-    # NOTE: vector_weight / graph_weight were removed from RetrievalConfig in the
-    # 2026-05-06 cleanup audit (never read by production code — weighted-fusion
-    # ablation is done via `mode`). The weights are still used above to pick the
-    # RetrievalMode; they are not forwarded to the config.
-    retrieval_config = RetrievalConfig(
-        mode=retrieval_mode,
-        similarity_threshold=vector_config.get("similarity_threshold", 0.3),
-    )
-    retriever = HybridRetriever(
-        hybrid_store=hybrid_store,
-        embeddings=embeddings,
-        config=retrieval_config,
-    )
+    # Build the RetrievalConfig from settings.yaml via the canonical factory so
+    # every retrieval knob — vector_store.top_k_vectors, rag.bm25_top_k,
+    # rag.rrf_k, rag.cross_source_boost, graph.max_hops/top_k_entities/
+    # enable_hop3/hub_mention_cap, rag.vector/graph/bm25_weight — is honoured
+    # (single source of truth). Previously this path hand-built RetrievalConfig
+    # with only mode+similarity_threshold, so those keys silently fell back to
+    # dataclass defaults (e.g. top_k_vectors/bm25_top_k=10 instead of the
+    # settings value 20). The per-config ablation `mode` (derived from the
+    # vector/graph weights above) overrides rag.retrieval_mode afterwards.
+    retriever = create_hybrid_retriever(hybrid_store, embeddings, pipeline_config)
+    retriever.config.mode = retrieval_mode
 
     # Create pipeline using factory
     pipeline = create_full_pipeline(
@@ -1101,6 +1140,29 @@ def create_pipeline(
     logger.info(f"Pipeline created for {dataset} (v={vector_weight}, g={graph_weight})")
 
     return pipeline
+
+
+def _close_pipeline(pipeline) -> None:
+    """Release a pipeline's KuzuDB file lock promptly.
+
+    Called from the ablation loop's `finally` so the lock is freed even when a
+    config raises mid-run — otherwise the next config cannot open the same
+    graph (KuzuDB holds an exclusive C++ file lock). Closing is best-effort:
+    the store is reached via the retriever (`pipeline.hybrid_retriever.store`),
+    which exposes HybridStore.close() → KuzuGraphStore.close().
+    """
+    if pipeline is None:
+        return
+    try:
+        retriever = getattr(pipeline, "hybrid_retriever", None)
+        store = getattr(retriever, "store", None) if retriever is not None else None
+        if store is not None and hasattr(store, "close"):
+            store.close()
+    except Exception as exc:
+        logger.warning(f"    Pipeline cleanup (store.close) failed: {exc}")
+    finally:
+        import gc
+        gc.collect()
 
 # ============================================================================
 # EVALUATION RUNNER — pipeline vs. LLM failure separation
@@ -1342,6 +1404,18 @@ def evaluate_dataset(
     _TEXT_TO_TITLE.clear()
     original_retrieve = _install_retriever_title_capture(pipeline)
 
+    # Verifier's per-query chunk cap (max_docs) — the LLM-visible window size.
+    # Used to compute gold_in_final_context (delivery check). Read from the live
+    # pipeline's verifier config; default to 5 if unreachable.
+    _verifier_max_docs = 5
+    try:
+        _v = getattr(pipeline, "verifier", None)
+        _vc = getattr(_v, "config", None) if _v is not None else None
+        if _vc is not None and getattr(_vc, "max_docs", None):
+            _verifier_max_docs = int(_vc.max_docs)
+    except Exception:
+        pass
+
     # Optional: disable verifier for retrieval-only evaluation.
     saved_enable_verifier = None
     if retrieval_only and hasattr(pipeline, "enable_verifier"):
@@ -1359,11 +1433,13 @@ def evaluate_dataset(
 
                 # ── Answer-level metrics (LLM correctness) ───────────────
                 if retrieval_only:
-                    em, f1 = False, 0.0
+                    em, f1, ans_correct = False, 0.0, False
                     predicted = ""
                 else:
                     em = compute_exact_match(result.answer, q.answer)
                     f1 = compute_f1(result.answer, q.answer)
+                    # Soft correctness: strict EM OR token-F1 >= threshold.
+                    ans_correct = bool(em) or f1 >= ANSWER_F1_THRESHOLD
                     predicted = result.answer
 
                 # ── Retrieval-level metrics (pipeline correctness) ───────
@@ -1377,6 +1453,15 @@ def evaluate_dataset(
                 gold_titles = _gold_titles_from_supporting_facts(q.supporting_facts)
                 retrieved_titles = _retrieved_titles_for_chunks(filtered_chunks)
                 sf_p, sf_r, sf_f1, all_gold = _compute_sf_metrics(retrieved_titles, gold_titles)
+
+                # Delivery check: the Verifier forwards only the top `max_docs`
+                # of filtered_context to the LLM (membership owned by RRF order;
+                # the reorder runs within that window). Recompute gold presence
+                # against that post-cap window to separate delivery loss from
+                # retrieval loss.
+                final_chunks = filtered_chunks[:_verifier_max_docs]
+                final_titles = _retrieved_titles_for_chunks(final_chunks)
+                _, _, _, gold_in_final = _compute_sf_metrics(final_titles, gold_titles)
 
                 # ── Failure-mode separation ──────────────────────────────
                 llm_err, llm_err_type = (False, "") if retrieval_only else _classify_llm_error(predicted)
@@ -1402,6 +1487,7 @@ def evaluate_dataset(
                     predicted_answer=predicted,
                     exact_match=em,
                     f1_score=f1,
+                    answer_correct=ans_correct,
                     retrieval_count=retrieval_count,
                     time_ms=elapsed,
                     dataset=q.dataset,
@@ -1412,6 +1498,7 @@ def evaluate_dataset(
                     retrieval_precision=sf_p,
                     sf_f1=sf_f1,
                     all_gold_retrieved=all_gold,
+                    gold_in_final_context=gold_in_final,
                     llm_error=llm_err,
                     llm_error_type=llm_err_type,
                     pipeline_succeeded_llm_failed=pipeline_ok_llm_failed,
@@ -1462,16 +1549,24 @@ def evaluate_dataset(
     # ── Aggregate metrics ────────────────────────────────────────────────
     n = len(results)
     em_rate = sum(1 for r in results if r.exact_match) / n
+    soft_em_rate = sum(1 for r in results if r.answer_correct) / n
     avg_f1 = sum(r.f1_score for r in results) / n
     avg_time = sum(r.time_ms for r in results) / n
     coverage = sum(1 for r in results if r.retrieval_count > 0) / n
 
-    # Retrieval-level aggregates
+    # Retrieval-level aggregates. "retrieval_only_em" uses the fair (soft)
+    # correctness verdict so model accuracy isn't understated by strict EM.
     avg_sf_f1 = sum(r.sf_f1 for r in results) / n
     n_all_gold = sum(1 for r in results if r.all_gold_retrieved)
     sf_recall_rate = n_all_gold / n
+    # Delivery: gold survives into the LLM-visible window (post max_docs cap).
+    final_context_recall_rate = sum(1 for r in results if r.gold_in_final_context) / n
+    # Delivery loss: retrieved by the pipeline but cut before the LLM saw it.
+    delivery_loss_rate = sum(
+        1 for r in results if r.all_gold_retrieved and not r.gold_in_final_context
+    ) / n
     retrieval_only_em = (
-        sum(1 for r in results if r.all_gold_retrieved and r.exact_match) / n_all_gold
+        sum(1 for r in results if r.all_gold_retrieved and r.answer_correct) / n_all_gold
         if n_all_gold > 0 else 0.0
     )
     llm_error_rate = sum(1 for r in results if r.llm_error) / n
@@ -1479,16 +1574,16 @@ def evaluate_dataset(
     # Failure decomposition (mutually exclusive buckets, sum to 1.0):
     #   pipeline_failed       : not all_gold_retrieved
     #   pipeline_ok_llm_failed : all_gold AND llm error (timeout/etc.)
-    #   pipeline_ok_llm_wrong  : all_gold AND no llm error AND not EM
-    #   pipeline_ok_llm_ok     : all_gold AND EM
+    #   pipeline_ok_llm_wrong  : all_gold AND no llm error AND not correct
+    #   pipeline_ok_llm_ok     : all_gold AND correct (soft verdict, F1>=thr)
     pipeline_failed = sum(1 for r in results if not r.all_gold_retrieved) / n
     ok_llm_failed = sum(1 for r in results if r.all_gold_retrieved and r.llm_error) / n
     ok_llm_wrong = sum(
         1 for r in results
-        if r.all_gold_retrieved and not r.llm_error and not r.exact_match
+        if r.all_gold_retrieved and not r.llm_error and not r.answer_correct
     ) / n
     ok_llm_ok = sum(
-        1 for r in results if r.all_gold_retrieved and r.exact_match
+        1 for r in results if r.all_gold_retrieved and r.answer_correct
     ) / n
 
     # By question type
@@ -1499,6 +1594,7 @@ def evaluate_dataset(
         by_type[qtype] = {
             "count": tn,
             "exact_match": sum(1 for r in type_results if r.exact_match) / tn,
+            "soft_em": sum(1 for r in type_results if r.answer_correct) / tn,
             "f1": sum(r.f1_score for r in type_results) / tn,
             "sf_f1": sum(r.sf_f1 for r in type_results) / tn,
             "sf_recall_rate": sum(1 for r in type_results if r.all_gold_retrieved) / tn,
@@ -1513,11 +1609,14 @@ def evaluate_dataset(
         n_questions=n,
         exact_match=em_rate,
         f1_score=avg_f1,
+        soft_em=soft_em_rate,
         avg_time_ms=avg_time,
         coverage=coverage,
         by_type=by_type,
         avg_sf_f1=avg_sf_f1,
         sf_recall_rate=sf_recall_rate,
+        final_context_recall_rate=final_context_recall_rate,
+        delivery_loss_rate=delivery_loss_rate,
         retrieval_only_em=retrieval_only_em,
         llm_error_rate=llm_error_rate,
         pipeline_failed_rate=pipeline_failed,
@@ -1629,9 +1728,21 @@ def cmd_ingest(args, config: Dict, store_manager: StoreManager):
 
 def cmd_evaluate(args, config: Dict, store_manager: StoreManager):
     """Evaluate command."""
-    
+
+    # Soft-EM threshold is configurable via settings.yaml (benchmark.
+    # answer_f1_threshold). Override the module default if present, with a
+    # CLI flag (--answer-f1-threshold) taking final precedence.
+    global ANSWER_F1_THRESHOLD
+    cfg_thr = (config.get("benchmark", {}) or {}).get("answer_f1_threshold")
+    if cfg_thr is not None:
+        ANSWER_F1_THRESHOLD = float(cfg_thr)
+    cli_thr = getattr(args, "answer_f1_threshold", None)
+    if cli_thr is not None:
+        ANSWER_F1_THRESHOLD = float(cli_thr)
+    logger.info("Soft-EM answer-correctness threshold: F1 >= %.2f", ANSWER_F1_THRESHOLD)
+
     dataset = args.dataset
-    
+
     if not store_manager.dataset_exists(dataset):
         logger.error(f"Dataset not ingested: {dataset}")
         logger.error(f"Run: python benchmark_datasets.py ingest --dataset {dataset}")
@@ -1722,31 +1833,35 @@ def cmd_evaluate(args, config: Dict, store_manager: StoreManager):
         logger.info(f"\n{'─'*70}")
         logger.info("RESULTS" + (" [retrieval-only]" if retrieval_only else ""))
         logger.info(f"{'─'*70}")
-        logger.info(f"  Exact Match:           {result.exact_match:.2%}")
-        logger.info(f"  F1 Score:              {result.f1_score:.3f}")
+        logger.info(f"  Answer F1:             {result.f1_score:.3f}   (primary answer-quality metric)")
+        logger.info(f"  Soft-EM (F1>={ANSWER_F1_THRESHOLD:g}):     {result.soft_em:.2%}   (correct incl. name variants)")
+        logger.info(f"  Exact Match (strict):  {result.exact_match:.2%}")
         logger.info(f"  Coverage:              {result.coverage:.2%}")
         logger.info(f"  Avg Time:              {result.avg_time_ms:.0f}ms")
         logger.info("")
         logger.info("  Pipeline (S_P + S_N) — retrieval quality:")
         logger.info(f"    Supporting-fact F1:  {result.avg_sf_f1:.3f}")
-        logger.info(f"    All gold retrieved:  {result.sf_recall_rate:.2%}")
+        logger.info(f"    All gold retrieved (Navigator output): {result.sf_recall_rate:.2%}")
+        logger.info(f"    All gold in LLM window (post max_docs): {result.final_context_recall_rate:.2%}")
+        logger.info(f"    Delivery loss (retrieved but cut):      {result.delivery_loss_rate:.2%}")
         if not retrieval_only:
             logger.info("")
             logger.info("  Failure decomposition (sum to 100%):")
             logger.info(f"    Pipeline failed:           {result.pipeline_failed_rate:.2%}  (gold not fully retrieved)")
             logger.info(f"    Pipeline ok, LLM failed:   {result.pipeline_ok_llm_failed_rate:.2%}  (timeout/api error)")
             logger.info(f"    Pipeline ok, LLM wrong:    {result.pipeline_ok_llm_wrong_rate:.2%}")
-            logger.info(f"    Pipeline ok, LLM ok (EM):  {result.pipeline_ok_llm_ok_rate:.2%}")
+            logger.info(f"    Pipeline ok, LLM ok:       {result.pipeline_ok_llm_ok_rate:.2%}  (F1>={ANSWER_F1_THRESHOLD:g})")
             logger.info("")
             logger.info(f"  LLM error rate:        {result.llm_error_rate:.2%}")
-            logger.info(f"  EM | all-gold-retrieved: {result.retrieval_only_em:.2%}  "
+            logger.info(f"  Correct | all-gold-retrieved: {result.retrieval_only_em:.2%}  "
                         f"(model accuracy when retrieval succeeds)")
 
         if result.by_type:
             logger.info(f"\n  By Question Type:")
             for qtype, stats in result.by_type.items():
                 logger.info(
-                    f"    {qtype}: EM={stats['exact_match']:.2%} F1={stats['f1']:.3f} "
+                    f"    {qtype}: SoftEM={stats.get('soft_em', 0.0):.2%} "
+                    f"F1={stats['f1']:.3f} EM={stats['exact_match']:.2%} "
                     f"SF-F1={stats.get('sf_f1', 0.0):.3f} "
                     f"SF-Recall={stats.get('sf_recall_rate', 0.0):.2%} "
                     f"LLM-err={stats.get('llm_error_rate', 0.0):.2%}"
@@ -1837,6 +1952,7 @@ def cmd_ablation(args, config: Dict, store_manager: StoreManager):
             run_name = f"{cfg_name}_{model_name}"
             logger.info(f"\n  [Retrieval] {run_name} (v={vector_weight}, g={graph_weight})")
 
+            pipeline = None
             try:
                 pipeline = create_pipeline(
                     dataset, config, store_manager,
@@ -1846,7 +1962,8 @@ def cmd_ablation(args, config: Dict, store_manager: StoreManager):
                 )
 
                 jsonl_path = jsonl_dir / (
-                    f"{dataset}_{model_name.replace(':','-')}_{run_name}_{run_ts}.jsonl"
+                    f"{dataset}_{model_name.replace(':','-')}_"
+                    f"{run_name.replace(':','-')}_{run_ts}.jsonl"
                 )
                 if jsonl_path.exists():
                     jsonl_path.unlink()
@@ -1870,12 +1987,10 @@ def cmd_ablation(args, config: Dict, store_manager: StoreManager):
                         f"Latency: {result.avg_time_ms:.0f}ms"
                     )
 
-                del pipeline
-                import gc
-                gc.collect()
-
             except Exception as e:
                 logger.error(f"    Failed: {e}")
+            finally:
+                _close_pipeline(pipeline)
 
         # ── Component ablation (optional) ─────────────────────────────────
         if do_component:
@@ -1887,6 +2002,7 @@ def cmd_ablation(args, config: Dict, store_manager: StoreManager):
                 logger.info(f"\n  [Component] {run_name} "
                             f"(planner={enable_p}, verifier={enable_v}, iter={max_iter})")
 
+                pipeline = None
                 try:
                     pipeline = create_pipeline(
                         dataset, config, store_manager,
@@ -1898,7 +2014,8 @@ def cmd_ablation(args, config: Dict, store_manager: StoreManager):
                     )
 
                     jsonl_path = jsonl_dir / (
-                        f"{dataset}_{model_name.replace(':','-')}_{run_name}_{run_ts}.jsonl"
+                        f"{dataset}_{model_name.replace(':','-')}_"
+                        f"{run_name.replace(':','-')}_{run_ts}.jsonl"
                     )
                     if jsonl_path.exists():
                         jsonl_path.unlink()
@@ -1922,11 +2039,10 @@ def cmd_ablation(args, config: Dict, store_manager: StoreManager):
                             f"Latency: {result.avg_time_ms:.0f}ms"
                         )
 
-                    del pipeline
-                    gc.collect()
-
                 except Exception as e:
                     logger.error(f"    Failed: {e}")
+                finally:
+                    _close_pipeline(pipeline)
 
         all_results[dataset] = dataset_results
 
@@ -2247,6 +2363,12 @@ def main():
              "'-', '_' or ':'). Use '0-20' for the FIRST 20 questions (old "
              "default behaviour), or '10-30' for a defined band. Overrides "
              "--samples random sampling when set.",
+    )
+    eval_p.add_argument(
+        "--answer-f1-threshold", type=float, default=None, metavar="F1",
+        help="Token-F1 threshold for the Soft-EM correctness verdict "
+             "(default from settings.yaml benchmark.answer_f1_threshold, 0.6). "
+             "Set 1.0 to fall back to strict exact-match.",
     )
     eval_p.add_argument("--vector-weight", type=float, default=0.7)
     eval_p.add_argument("--graph-weight", type=float, default=0.3)

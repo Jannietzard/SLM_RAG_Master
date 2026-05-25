@@ -44,7 +44,7 @@ graph TD
     %% ============================================================
     subgraph PIPE["▶ Pipeline Layer · Orchestration"]
         AP["<b>AgentPipeline</b><br/>━━━━━━━━━━━━━━━━━━━<br/>Single-pass S_P → S_N → S_V chain<br/>Lazy agent instantiation on first process()<br/>Per-stage wall-clock timing tracking<br/>process(query) → PipelineResult<br/><i>No outer retry loop · self-correction lives in S_V</i>"]
-        AC["<b>AgenticController</b> · alt orchestrator<br/>━━━━━━━━━━━━━━━━━━━<br/>LangGraph StateGraph (sequential fallback if absent)<br/>AgentState (TypedDict) carries shared state<br/><b>Iterative multi-hop:</b> activates when any HopStep.depends_on is set<br/>Bridge entity extraction (surname-anchor regex, ≤3/step)"]
+        AC["<b>AgenticController</b> · stateless helper namespace<br/>━━━━━━━━━━━━━━━━━━━<br/>LangGraph removed (B7 cleanup) — no orchestration state<br/>Bridge-entity extraction + Fix-F query rewrite helpers<br/><b>Iterative multi-hop now lives in</b> AgentPipeline._iterative_navigate<br/>which calls these helpers between dependent hops"]
         IP["<b>IngestionPipeline</b><br/>━━━━━━━━━━━━━━━━━━━<br/>Documents → Chunks → Entities → Vectors → Stores<br/>Multi-format DocumentLoader: TXT · JSON · JSONL · MD · PDF<br/>IngestionMetrics(chunks_added, entities_added, relations_added, time_ms)"]
         FIFO[("FIFO Result Cache<br/>SHA-256(query) keyed<br/>cache_max_size=1000<br/><i>oldest evicted first</i>")]
     end
@@ -53,7 +53,7 @@ graph TD
     %% LOGIC LAYER · Artifact B (3 reasoning agents)
     %% ============================================================
     subgraph LOGIC["🧠 Logic Layer · Artifact B"]
-        SP{{"<b>S_P · Planner</b> (rule-based · &lt;10 ms)<br/>━━━━━━━━━━━━━━━━━━━<br/>1. Classify query type:<br/>  SINGLE_HOP · MULTI_HOP · COMPARISON ·<br/>  TEMPORAL · AGGREGATE · INTERSECTION<br/>2. Extract entities (SpaCy NER · conf ≥ 0.7)<br/>3. Decompose multi-hop:<br/>  · Pattern C: 'for a/an [film|movie|show]'<br/>  · Pattern D: '[role] with [qualif] co-wrote/directed'<br/>  · Pattern E: 'the [role] of [Entity]' (relational anchor)<br/>4. Strategy selection: VECTOR_ONLY · GRAPH_ONLY · HYBRID<br/>→ <b>RetrievalPlan</b>{type, strategy, entities, hop_sequence[]}"}}
+        SP{{"<b>S_P · Planner</b> (rule-based · &lt;10 ms)<br/>━━━━━━━━━━━━━━━━━━━<br/>1. Classify query type:<br/>  SINGLE_HOP · MULTI_HOP · COMPARISON ·<br/>  TEMPORAL · AGGREGATE · INTERSECTION<br/>2. Extract entities (SpaCy NER · conf ≥ 0.7)<br/>3. Decompose multi-hop (SpaCy parse-based):<br/>  · Pattern E: relational-noun complement ('the [role] of [Entity]')<br/>  · Pattern F: passive-agent voice<br/>  · Pattern G (+L): relative-clause bridge<br/>  · Pattern H: chained attribution<br/>  · pre-empts: I (boolean conj) · J (implicit bridge)<br/>  · structural-comparison router → parallel decomposer<br/>4. Strategy selection: VECTOR_ONLY · GRAPH_ONLY · HYBRID<br/>→ <b>RetrievalPlan</b>{type, strategy, entities, hop_sequence[]}"}}
         SN{{"<b>S_N · Navigator</b> (~120–280 ms incl. all 3 lanes)<br/>━━━━━━━━━━━━━━━━━━━<br/>For each sub-query: dispatch to HybridRetriever<br/>RRF fusion across sub-queries (cross-query corroboration boost)<br/>━━ <b>Stage 2.5 · Cross-encoder rerank</b> (opt) ━━<br/><b>6-stage filter chain:</b><br/>1. Relevance: rrf_score ≥ 0.6 × max_score<br/>2. Redundancy: Jaccard token-set < 0.8<br/>3. Contradiction: numeric (overlap>0.3 · ratio>2.0 · min≥100)<br/>4. Entity-overlap pruning: drop strict-subset chunks<br/>5. Entity-mention: ≥1 query entity (multi-word: ≥8 chars · single: ≥5)<br/>6. Context shrinkage: ≤800 chars/chunk · sentence-aware<br/>→ <b>NavigatorResult</b>{filtered_context, scores, metadata}"}}
         SV{{"<b>S_V · Verifier</b> (~200 ms – 60 s · LLM-bound)<br/>━━━━━━━━━━━━━━━━━━━<br/><b>Pre-validation:</b><br/>· Entity-path coverage ≥ 0.34 (KuzuDB multi-hop · substring fallback)<br/>· Numeric contradiction (NLI cross-encoder disabled by default · 270 MB)<br/>· Source credibility = 0.4·xref + 0.3·entity_freq + 0.3·provenance<br/><b>Question-relevance reorder</b> (counters position bias of small LLMs)<br/><b>Build context</b>: ≤5 docs · ≤3500 chars · ≤800 chars/doc<br/><b>Generate</b> @ qwen2:1.5b · temp=0.0 · max_tokens=200<br/>Self-correction loop: max_iterations=1 (opt-in to ≥2 for ablation)<br/>→ <b>VerificationResult</b>{answer, confidence: HIGH|MEDIUM|LOW, sources}"}}
     end
@@ -109,7 +109,7 @@ graph TD
     %% ============================================================
     subgraph OBS["📡 Observability · Cross-cutting"]
         LOG["<b>logging.getLogger(__name__)</b><br/>format + level from settings.yaml → logging<br/>file: ./logs/edge_rag.log"]
-        FBW["<b>FALLBACK ACTIVE warnings</b><br/>· GLiNER → SpaCy/regex<br/>· LangGraph absent → sequential controller<br/>· Ollama unreachable → wrapped RuntimeError<br/>· LangChain absent → minimal Document shim"]
+        FBW["<b>FALLBACK ACTIVE warnings</b><br/>· GLiNER → SpaCy/regex<br/>· Ollama unreachable → wrapped RuntimeError<br/>· LangChain absent → minimal Document shim"]
         MET2["<b>Metrics surfaces</b><br/>RetrievalMetrics (per-lane counts + timings)<br/>EmbeddingMetrics (cache hit rate, batch count)<br/>PipelineResult.stage_timings · AgentState.stage_timings"]
     end
 
@@ -124,10 +124,9 @@ graph TD
     SV -->|"<b>VerificationResult</b><br/>{answer, confidence,<br/>iterations, sources}"| AP
     AP -->|"<b>PipelineResult</b> (JSON)<br/>{answer, per-stage timings,<br/>cached_result}"| USER
 
-    %% Alt orchestrator
-    AC -.->|"alt entry point<br/>iterative bridge resolution"| SP
-    AC -.->|"_iterative_navigator_node"| SN
-    AC -.-> SV
+    %% Iterative multi-hop helpers (AgenticController is a stateless namespace)
+    AP -.->|"_iterative_navigate:<br/>between dependent hops"| AC
+    AC -.->|"bridge entities + rewritten sub-query"| SN
 
     %% Data layer wiring
     SN -->|"retrieve(sub_query,<br/>entity_hints=List[str])"| HR
@@ -296,13 +295,13 @@ sequenceDiagram
             SP->>SP: _decompose_comparison()<br/>via _ATTR_MAP regex table
             Note right of SP: Eight rewrite patterns:<br/>"same nationality" → 2 sub-queries:<br/>"What is the nationality of {entity}?"<br/>per entity. The redundant 3rd<br/>"Were both ..." sub-query is intentionally<br/>NOT generated (would embed near-identical<br/>and waste context budget).
 
-        else query_type == MULTI_HOP & Pattern C matches
-            SP->>SP: split on "for a/an/the [film|movie|show|...]"<br/>HopStep[0].is_bridge = True<br/>HopStep[1].depends_on = [0]
-            Note right of SP: Bridge is the work, retrieved first.<br/>HopStep[0] surface form names the bridge work.
+        else query_type == MULTI_HOP & Pattern G matches (relative-clause bridge)
+            SP->>SP: detect relcl/acl bridge via dependency parse<br/>(Form 2 / "L": relative-pronoun subject)<br/>HopStep[0].is_bridge = True<br/>HopStep[1].depends_on = [0]
+            Note right of SP: Bridge entity sits in a relative clause.<br/>Anchor resolved from the NER span inside the relcl.
 
-        else query_type == MULTI_HOP & Pattern D matches
-            SP->>SP: split on "[role] with [qualif] co-wrote/directed/..."<br/>HopStep[0].is_bridge = True
-            Note right of SP: Bridge is the work, not the person<br/>(qualifier disambiguates the role).
+        else query_type == MULTI_HOP & Pattern H matches (chained attribution)
+            SP->>SP: detect passive ROOT + agent by-phrase + acl<br/>attribution → 3-hop chain (Entity→work→agent)<br/>HopStep depends_on chains 0→1→2
+            Note right of SP: Agent participle taken verbatim from the query<br/>(no verb-inflection table). Parse-confidence gated.
 
         else query_type == MULTI_HOP & Pattern E (relational anchor)
             SP->>SP: detect "the [role] of [Entity]"<br/>HopStep[0]: "Who is the {role} of {anchor}?"<br/>HopStep[1]: original query, depends_on = [0]
@@ -442,9 +441,11 @@ Every conditional branch in the diagram, mapped to the configuration key or runt
 | `agent.enable_caching = true` AND SHA-256(query) in FIFO | **cache HIT** | Skip pipeline entirely; return cached PipelineResult in < 1 ms |
 | `agent.enable_planner = false` | passthrough plan | A trivial RetrievalPlan(HYBRID, MULTI_HOP) is used; S_P is bypassed |
 | `query_type == COMPARISON` | `_decompose_comparison()` | Two factual sub-queries via `_ATTR_MAP`; the redundant rephrased original is intentionally omitted |
-| Pattern C regex matches | bridge decomposition C | `for a/an/the [film\|movie\|...]` — bridge is the work |
-| Pattern D regex matches | bridge decomposition D | `[role] with [qualif] co-wrote/directed` — bridge is the work, not the person |
-| Pattern E regex matches (after C, D fail) | relational-anchor decomposition | `the [role] of [Entity]` → `"Who is the {role} of {anchor}?"` |
+| Pattern G parse matches (relcl/acl bridge) | relative-clause decomposition | bridge entity sits in a relative clause; Form-2 "L" handles a relative-pronoun subject |
+| Pattern H parse matches (passive + agent + acl) | chained-attribution decomposition | 3-hop chain `Entity→work→agent`; agent participle verbatim from query |
+| Pattern E parse matches (relational anchor) | relational-anchor decomposition | `the [role] of [Entity]` → `"Who is the {role} of {anchor}?"` |
+| Pattern F parse matches (passive-agent) | passive-voice decomposition | `was [verb]ed by [who]` → bridge on the agent |
+| Coordinated NER entities + interrogative (no bridge cue) | structural-comparison router | routed into the parallel comparison decomposer |
 | All decomposition patterns fail | single-hop fallback | `hop_sequence = [HopStep(0, query, depends_on=[])]` |
 | Any `HopStep.depends_on` non-empty AND `len(hops) > 1` | **iterative path** | Sequential hops; bridge entity extraction between hops |
 | `step.is_bridge == True` after retrieval | bridge entity extraction | Surname-anchor regex → multi-word capitalised regex; ≤ 3 entities added to hints |
@@ -619,7 +620,7 @@ graph LR
 | Logic (B) | `Planner (S_P)` | Query classification · entity extraction · plan generation | SpaCy |
 | Logic (B) | `Navigator (S_N)` | Hybrid orchestration · RRF fusion · 6-stage filter chain | SpaCy (filters) |
 | Logic (B) | `Verifier (S_V)` | Pre-validation · LLM generation · self-correction (opt-in) | Ollama (`qwen2:1.5b`) |
-| Logic (B) | `AgenticController` | LangGraph state machine · iterative bridge resolution | LangGraph (optional) |
+| Logic (B) | `AgenticController` | Stateless helper namespace (LangGraph removed) · bridge-entity extraction + query-rewrite helpers used by `AgentPipeline._iterative_navigate` | — |
 | Data (A) | `HybridRetriever` | 3-lane retrieval orchestration | — |
 | Data (A) | `RRFFusion` | Rank-based result fusion · cross-source boost | — |
 | Data (A) | `BatchedOllamaEmbeddings` | Batched embedding API · SQLite cache | Ollama (`nomic-embed-text`) |

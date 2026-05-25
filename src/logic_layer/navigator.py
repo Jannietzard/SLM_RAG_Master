@@ -23,7 +23,7 @@ high-quality evidence chunks to S_V.  Per thesis section 3.3:
    Cross-source corroboration: chunks appearing in multiple sub-query result
    lists receive a multiplicative boost (configurable weights in settings.yaml).
 
-3. PRE-GENERATIVE FILTERING (six sequential filters)
+3. PRE-GENERATIVE FILTERING (six sequential filters + final cap)
    a) Relevance filter    — dynamic threshold: relevance_factor × max_rrf_score
    b) Redundancy filter   — Jaccard deduplication above redundancy_threshold
    c) Contradiction filter — numeric heuristic (original contribution)
@@ -31,9 +31,20 @@ high-quality evidence chunks to S_V.  Per thesis section 3.3:
    e) Entity-mention filter  — require query entity presence (original contribution)
    f) Context shrinkage      — sentence-level trimming for edge CPU (original)
 
-The full S_P → S_N → S_V pipeline orchestrator lives in controller.py
-(AgenticController).  Configuration shared between Navigator and the
-controller is defined in ControllerConfig (this file).
+   Final cap to `max_context_chunks` uses per-anchor fairness
+   (`_fair_cap_by_subquery`, §11.16.2) for parallel decompositions
+   (comparison / intersection plans with ≥2 sub-queries): the per-
+   sub-query rankings are round-robin interleaved so no single anchor
+   monopolises the budget. Single-hop is a no-op (pure global top-k).
+   Refs: Radlinski et al. (2008, CIKM) team-draft interleaving;
+   coverage requirement from HotpotQA (Yang et al. 2018).
+
+The full S_P → S_N → S_V pipeline orchestrator lives in
+``src.pipeline.agent_pipeline.AgentPipeline``. ``AgenticController``
+(controller.py) is a namespace of stateless helpers used by
+AgentPipeline's iterative multi-hop path; it does not orchestrate.
+Configuration shared between Navigator and AgentPipeline is defined in
+ControllerConfig (src/logic_layer/_config.py).
 
 ===============================================================================
 ARCHITECTURE
@@ -56,14 +67,6 @@ ARCHITECTURE
                              │Filter   │
                              └─────────┘
 
-===============================================================================
-
-Review History:
-    Last Reviewed:  2026-04-21
-    Review Result:  0 CRITICAL, 6 IMPORTANT, 4 RECOMMENDED
-    Reviewer:       Code Review Prompt v2.1
-    Next Review:    After applying action items (smoke test fix, type annotations,
-                    logger cleanup, stale docstrings, dead code removal)
 ===============================================================================
 """
 
@@ -384,8 +387,13 @@ class Navigator:
         )
         result.metadata["after_entity_mention_filter"] = len(mention_filtered)
 
-        # Cap at max_context_chunks
-        top_results = mention_filtered[:self.config.max_context_chunks]
+        # Cap at max_context_chunks. With multiple parallel sub-queries
+        # (comparison / intersection), cap with per-anchor fairness so a
+        # high-degree entity cannot monopolise the budget and crowd out the
+        # second entity's gold paragraph; single-hop is unchanged (no-op).
+        top_results = self._fair_cap_by_subquery(
+            mention_filtered, self.config.max_context_chunks, n_parallel,
+        )
 
         # Filter 6: Context shrinkage (edge optimization: fewer input tokens)
         shrunk_results = self._context_shrinkage(top_results)
@@ -528,6 +536,56 @@ class Navigator:
         fused.sort(key=lambda x: x["rrf_score"], reverse=True)
 
         return fused
+
+    def _fair_cap_by_subquery(
+        self,
+        results: List[Dict[str, Any]],
+        budget: int,
+        n_parallel: int,
+    ) -> List[Dict[str, Any]]:
+        """Per-anchor fairness cap for parallel (comparison/intersection) plans.
+
+        A purely global top-k lets a high-degree entity's many chunks monopolise
+        the context budget and crowd out the second entity's (often single) gold
+        paragraph — observed when one comparison conjunct dominates retrieval.
+        With multiple parallel sub-queries this interleaves the per-sub-query
+        rankings round-robin (strongest anchor first each round) so every anchor
+        is represented before any one anchor's surplus fills the remaining slots.
+
+        Coverage of each decomposed aspect is the defining requirement of a
+        comparison question — both supporting paragraphs are needed (Yang et al.
+        2018, EMNLP); balanced interleaving of result lists follows team-draft
+        interleaving (Radlinski et al. 2008, CIKM). Chunks carry the
+        ``_best_sub_query`` tag set by ``_rrf_fusion``.
+
+        Single sub-query (or a single distinct anchor present) → identical to
+        ``results[:budget]``; this method is a no-op outside parallel plans.
+        """
+        if n_parallel <= 1 or budget >= len(results):
+            return results[:budget]
+        # Group preserving the global rrf-descending order within each anchor.
+        from collections import OrderedDict
+        groups: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
+        for r in results:
+            groups.setdefault(r.get("_best_sub_query", ""), []).append(r)
+        if len(groups) <= 1:
+            return results[:budget]
+        # Strongest anchor (by its best chunk) leads each round.
+        ordered = sorted(groups.values(), key=lambda g: g[0]["rrf_score"], reverse=True)
+        selected: List[Dict[str, Any]] = []
+        cursors = [0] * len(ordered)
+        while len(selected) < budget:
+            progressed = False
+            for gi, g in enumerate(ordered):
+                if cursors[gi] < len(g):
+                    selected.append(g[cursors[gi]])
+                    cursors[gi] += 1
+                    progressed = True
+                    if len(selected) >= budget:
+                        break
+            if not progressed:
+                break
+        return selected
 
     def _relevance_filter(
         self,
@@ -870,7 +928,7 @@ class Navigator:
         _FALLBACK_TOKEN_MIN = 8
         _SPECIFIC_SINGLE_MIN = 8   # P-4: single-token entity counts as "specific" iff ≥8 chars
 
-        compiled: List[Any] = []   # (phrase_lower, tokens, token_patterns, is_specific)
+        compiled: List[Any] = []   # (phrase_lower, tokens, token_patterns, and_patterns, is_specific)
         for name in entity_names:
             tokens = name.split()
             min_tok = _FALLBACK_TOKEN_MIN if len(tokens) >= 2 else _SINGLE_TOKEN_MIN
@@ -878,8 +936,22 @@ class Navigator:
                 re.compile(r"\b" + re.escape(t.lower()) + r"\b")
                 for t in tokens if len(t) >= min_tok
             ]
+            # Variant-name (all-tokens-co-occur) match for multi-word entities.
+            # Recovers chunks that open with a full legal name
+            # ("Ian David Karslake Watkins" for entity "Ian Watkins") where the
+            # contiguous phrase is absent AND no single token reaches the ≥8-char
+            # distinctive-token bar, so neither the full-phrase nor the
+            # single-token fallback fires. Requiring ALL content tokens (≥3 chars,
+            # non-stopword) to co-occur as whole words keeps this high-precision:
+            # two co-occurring name tokens are a reliable signal, not noise.
+            and_patterns = (
+                [re.compile(r"\b" + re.escape(t.lower()) + r"\b")
+                 for t in tokens
+                 if len(t) >= 3 and t.lower() not in self._QUERY_STOPWORDS]
+                if len(tokens) >= 2 else []
+            )
             is_specific = len(tokens) >= 2 or len(name) >= _SPECIFIC_SINGLE_MIN
-            compiled.append((name.lower(), tokens, token_patterns, is_specific))
+            compiled.append((name.lower(), tokens, token_patterns, and_patterns, is_specific))
 
         # Content words of the query (P-11 overlap fallback): everything in the
         # sub-queries that isn't a stopword and isn't part of an entity string
@@ -903,7 +975,7 @@ class Navigator:
             overlap, 2 = neither."""
             text_lower = text.lower()
             matched_generic = False
-            for name_lower, tokens, token_patterns, is_specific in compiled:
+            for name_lower, tokens, token_patterns, and_patterns, is_specific in compiled:
                 hit = False
                 if len(tokens) >= 2:
                     if name_lower in text_lower:
@@ -913,6 +985,11 @@ class Navigator:
                             if pat.search(text_lower):
                                 hit = True
                                 break
+                        # Variant-name match: all content tokens co-occur.
+                        if not hit and and_patterns and all(
+                            p.search(text_lower) for p in and_patterns
+                        ):
+                            hit = True
                 else:
                     for pat in token_patterns:
                         if pat.search(text_lower):

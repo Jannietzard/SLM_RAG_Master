@@ -1,59 +1,89 @@
 """
-Data Layer — Artifact A of the Edge-RAG System.
+Data Layer -- Artifact A of the Edge-RAG System.
 
-================================================================================
-ARCHITECTURAL OVERVIEW
-================================================================================
+This package encapsulates all data operations for the three-agent
+(Planner -> Navigator -> Verifier) Edge-RAG pipeline. It is a thin
+re-export shim: every symbol here is implemented in a submodule, and
+the symbol-to-submodule mapping is the public stable contract that
+downstream layers (logic_layer, pipeline, thesis_evaluations) import
+against.
 
-This package encapsulates all data operations for the Edge-RAG pipeline:
+Public submodules (in dependency order)
+---------------------------------------
+storage.py
+    HybridStore facade over LanceDB (vector) and KuzuDB (graph),
+    plus the StorageConfig dataclass and the per-store adapters.
+embeddings.py
+    BatchedOllamaEmbeddings with SQLite-backed cache; nomic-embed-text
+    via the local Ollama daemon.
+entity_extraction.py
+    EntityExtractionPipeline (GLiNER NER + REBEL relation extraction)
+    and the canonical normalize_entity_name() used by both ingestion
+    and query-time entity matching.
+chunking.py
+    SpacySentenceChunker is the production chunker; SemanticChunker /
+    FixedSizeChunker / RecursiveChunker are kept as internal variants
+    consumed only by ingestion.py for ablation studies.
+graph_quality.py
+    Post-ingestion graph audit, co-occurrence edge construction,
+    cleanup pipeline, and embedding-based entity linking.
+hybrid_retriever.py
+    HybridRetriever with RRF fusion of dense + sparse (BM25) + graph;
+    consumed by both AgentPipeline (production) and benchmark_datasets
+    (evaluation).
+ingestion.py
+    DocumentIngestionPipeline orchestrates chunking -> embeddings ->
+    entity extraction -> storage with per-phase checkpointing.
+coreference.py, svo_extraction.py
+    Optional pipeline stages. Each module handles its own dependency
+    availability internally and exposes is_available() so the rest of
+    the pipeline degrades gracefully if the optional packages are
+    absent.
 
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │  chunking.py        Document segmentation (SpaCy + semantic + utils) │
-  │  embeddings.py      Batched Ollama embeddings with SQLite cache       │
-  │  entity_extraction.py  GLiNER NER + REBEL relation extraction         │
-  │  storage.py         HybridStore façade: LanceDB + KuzuDB              │
-  │  hybrid_retriever.py  HybridRetriever, RRF fusion, pre-gen filter    │
-  │  ingestion.py       DocumentIngestionPipeline (chunking orchestration)│
-  └──────────────────────────────────────────────────────────────────────┘
+Data flow
+---------
+Ingestion: raw text -> ingestion.py -> chunking.py -> embeddings.py
+                    -> entity_extraction.py -> storage.py
+Query:     query -> hybrid_retriever.py -> (embeddings.py + storage.py)
+                 -> RetrievalResult[]
 
-Ingestion data flow:
-  raw text → ingestion.py → chunking.py → embeddings.py → storage.py
+Required local services (no cloud dependency)
+---------------------------------------------
+- Ollama at http://localhost:11434 serving `nomic-embed-text` and
+  `qwen2:1.5b` (LLM consumed by the logic layer).
+- SpaCy `en_core_web_sm` (`python -m spacy download en_core_web_sm`).
+- GLiNER `urchade/gliner_small-v2.1` (auto-downloaded by HuggingFace
+  on first use; cached under HF_HOME).
 
-Query data flow:
-  query → hybrid_retriever.py → (embeddings.py + storage.py) → results
+Reproducibility note
+--------------------
+This file is a stable public interface. The 35 settings keys that
+parameterise these submodules are validated at startup by
+src/logic_layer/_settings.py against config/settings.yaml; importing
+this package does not silently fall back on defaults.
 
-================================================================================
-REQUIRED EXTERNAL SERVICES (all local, no cloud dependency)
-================================================================================
-
-  * Ollama (http://localhost:11434) — nomic-embed-text + phi3
-  * SpaCy model en_core_web_sm  → python -m spacy download en_core_web_sm
-  * GLiNER urchade/gliner_small-v2.1 (auto-downloaded by HuggingFace)
-
-================================================================================
-COMMON IMPORT PATTERNS
-================================================================================
-
-Retrieval (Logic Layer / Navigator):
+Common import patterns
+----------------------
+Retrieval (logic_layer.navigator, benchmark_datasets):
     from src.data_layer import HybridRetriever, RetrievalConfig
     from src.data_layer import HybridStore, StorageConfig
 
-Ingestion (Pipeline Layer):
+Ingestion (local_importingestion.py, pipeline layer):
     from src.data_layer import DocumentIngestionPipeline, IngestionConfig
     from src.data_layer import create_ingestion_config
     from src.data_layer import BatchedOllamaEmbeddings
     from src.data_layer import EntityExtractionPipeline
 
-Chunking (direct use):
+Chunking (direct use, tests):
     from src.data_layer import SpacySentenceChunker, create_sentence_chunker
 
-================================================================================
+Last reviewed: 2026-05-25 (audit pass, project version 5.4).
 """
 
-__version__ = "4.0.0"
-__author__ = "Edge-RAG Research Project"
+__version__ = "5.4.0"
+__author__ = "Jan Nietzard"
 
-# ── Storage ───────────────────────────────────────────────────────────────────
+# ---- Storage ---------------------------------------------------------------
 from .storage import (
     HybridStore,
     StorageConfig,
@@ -62,10 +92,10 @@ from .storage import (
     create_storage_config,
 )
 
-# ── Embeddings ────────────────────────────────────────────────────────────────
+# ---- Embeddings ------------------------------------------------------------
 from .embeddings import BatchedOllamaEmbeddings, create_embeddings
 
-# ── Retrieval ─────────────────────────────────────────────────────────────────
+# ---- Retrieval -------------------------------------------------------------
 from .hybrid_retriever import (
     HybridRetriever,
     RetrievalConfig,
@@ -75,7 +105,7 @@ from .hybrid_retriever import (
     ImprovedQueryEntityExtractor,
 )
 
-# ── Entity Extraction ─────────────────────────────────────────────────────────
+# ---- Entity Extraction -----------------------------------------------------
 from .entity_extraction import (
     EntityExtractionPipeline,
     ExtractionConfig,
@@ -83,7 +113,7 @@ from .entity_extraction import (
     normalize_entity_name,
 )
 
-# ── Chunking ──────────────────────────────────────────────────────────────────
+# ---- Chunking --------------------------------------------------------------
 # Public API: SpacySentenceChunker and create_sentence_chunker.
 # SemanticChunker / FixedSizeChunker / RecursiveChunker / SentenceChunker are
 # internal implementation details consumed only by ingestion.py.
@@ -94,7 +124,7 @@ from .chunking import (
     create_sentence_chunker,
 )
 
-# ── Ingestion Pipeline ────────────────────────────────────────────────────────
+# ---- Ingestion Pipeline ----------------------------------------------------
 from .ingestion import (
     DocumentIngestionPipeline,
     IngestionConfig,
@@ -103,7 +133,7 @@ from .ingestion import (
     create_data_layer_pipeline,
 )
 
-# ── Graph Quality (post-ingestion analysis + cleanup) ─────────────────────────
+# ---- Graph Quality (post-ingestion analysis + cleanup) ---------------------
 from .graph_quality import (
     canonical_form,
     compute_graph_baseline,
@@ -116,7 +146,9 @@ from .graph_quality import (
     DEFAULT_STOPLIST,
 )
 
-# ── Optional pipeline stages (coreference, SVO) ─────────────────────────────
+# ---- Optional pipeline stages (coreference, SVO) ---------------------------
+# Both modules handle their own optional-dependency fallbacks internally and
+# expose is_available() so callers can branch without try/except at import.
 from .coreference import (
     resolve_coreferences,
     is_available as coreference_available,
@@ -148,14 +180,11 @@ __all__ = [
     "ExtractionConfig",
     "create_extraction_pipeline",
     "normalize_entity_name",
-    # Chunking — public API
+    # Chunking (public API only -- internal variants are not re-exported)
     "SpacySentenceChunker",
     "SentenceChunkingConfig",
     "SentenceChunk",
     "create_sentence_chunker",
-    # SemanticChunker, SentenceChunker, FixedSizeChunker, RecursiveChunker,
-    # SentenceInfo, create_semantic_chunker are internal implementation details
-    # used only by ingestion.py — not part of the public API.
     # Ingestion pipeline
     "DocumentIngestionPipeline",
     "IngestionConfig",
@@ -178,4 +207,3 @@ __all__ = [
     "extract_svo_relations",
     "svo_available",
 ]
-

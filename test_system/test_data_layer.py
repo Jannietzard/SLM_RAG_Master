@@ -1326,6 +1326,25 @@ class TestB1SpanNormalization:
         from src.data_layer.hybrid_retriever import _strip_leading_function_word
         assert _strip_leading_function_word("Are") == "Are"
 
+    def test_strip_leading_correlative_quantifier(self) -> None:
+        """B1a: 'both/either/neither' absorbed by the NER tagger are stripped
+        ('Both Truth in Science' → 'Truth in Science')."""
+        from src.data_layer.hybrid_retriever import _strip_leading_function_word
+        assert _strip_leading_function_word("Both Truth in Science") == "Truth in Science"
+        assert _strip_leading_function_word("Either Roberta Vinci") == "Roberta Vinci"
+        assert _strip_leading_function_word("Neither Coke nor Pepsi") == "Coke nor Pepsi"
+
+    def test_preserve_all_each_titles(self) -> None:
+        """'all'/'each' are NOT stripped — they begin legitimate names."""
+        from src.data_layer.hybrid_retriever import _strip_leading_function_word
+        assert _strip_leading_function_word("All Saints") == "All Saints"
+        assert _strip_leading_function_word("Each Tear") == "Each Tear"
+
+    def test_bare_quantifier_unchanged(self) -> None:
+        """A bare quantifier token is never trimmed (would empty the span)."""
+        from src.data_layer.hybrid_retriever import _strip_leading_function_word
+        assert _strip_leading_function_word("Both") == "Both"
+
     def test_split_interior_year(self) -> None:
         """'National 1993 Baseball Hall of Fame' → anchor + year 1993."""
         from src.data_layer.hybrid_retriever import _strip_embedded_year

@@ -1214,7 +1214,40 @@ def main():
     em = pred_n == gold_n or (
         gold_n and bool(re.search(r'\b' + re.escape(gold_n) + r'\b', pred_n))
     )
-    print(f"\n  Result: {bold(green('OK CORRECT') if em else red('XX WRONG'))}")
+
+    # Soft-EM (token-F1 >= threshold) — the headline correctness verdict the
+    # benchmark uses. Mirrored here so per-trace diagnostics agree with the
+    # aggregate eval; otherwise the diagnostic shows "WRONG" on answers the
+    # benchmark counts as correct (e.g. predicted "Teach the Controversy" vs
+    # gold "Teach the Controversy campaign" — F1=0.8, soft-EM True). Threshold
+    # read from settings.yaml (benchmark.answer_f1_threshold, default 0.6).
+    def _token_f1(p_norm: str, g_norm: str) -> float:
+        p_toks, g_toks = p_norm.split(), g_norm.split()
+        if not p_toks or not g_toks:
+            return 0.0
+        from collections import Counter
+        common = Counter(p_toks) & Counter(g_toks)
+        n_common = sum(common.values())
+        if n_common == 0:
+            return 0.0
+        prec = n_common / len(p_toks)
+        rec  = n_common / len(g_toks)
+        return 2 * prec * rec / (prec + rec)
+
+    try:
+        from src.logic_layer._settings import _load_settings
+        _f1_threshold = float(
+            _load_settings().get("benchmark", {}).get("answer_f1_threshold", 0.6)
+        )
+    except Exception:
+        _f1_threshold = 0.6
+    f1 = _token_f1(pred_n, gold_n)
+    soft_em = bool(em) or f1 >= _f1_threshold
+
+    field("Token F1",   f"{f1:.3f}")
+    field("Strict EM",  "yes" if em else "no")
+    field("Soft-EM",    f"yes (F1>={_f1_threshold:g})" if soft_em else f"no (F1<{_f1_threshold:g})")
+    print(f"\n  Result: {bold(green('OK CORRECT') if soft_em else red('XX WRONG'))}")
 
     print(f"\n{bold('═' * 72)}\n")
 

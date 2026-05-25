@@ -56,6 +56,63 @@ class TestQueryClassification:
         plan = planner.plan("What is the capital of the country where Albert Einstein was born?")
         assert plan.query_type == QueryType.MULTI_HOP
 
+    def test_structural_comparison_wh_both(self, planner):
+        """Phase 3.6: coordinated NER entities + interrogative determiner route
+        to COMPARISON even without a comparative-morphology keyword. Otherwise
+        the entity-density heuristic forces MULTI_HOP and the parallel
+        comparison decomposer is never reached (idx440)."""
+        plan = planner.plan(
+            "Ronald Reagan and George H. W. Bush both held which position?"
+        )
+        assert plan.query_type == QueryType.COMPARISON, (
+            f"Expected COMPARISON, got {plan.query_type.value}"
+        )
+        # Routed into the parallel decomposer → one anchored sub-query per entity.
+        assert len(plan.sub_queries) == 2, (
+            f"Expected 2 parallel sub-queries, got {plan.sub_queries}"
+        )
+
+    def test_structural_comparison_precision_guard(self, planner):
+        """Precision guard: a coordinated entity pair INSIDE a bridge question
+        (bridge-relation cue 'directed'/'starring' present) must stay MULTI_HOP,
+        not be stolen by the structural-comparison router."""
+        plan = planner.plan(
+            "Who directed the film starring Tom Hanks and Tim Allen?"
+        )
+        assert plan.query_type == QueryType.MULTI_HOP, (
+            f"Expected MULTI_HOP (bridge cue present), got {plan.query_type.value}"
+        )
+
+
+
+class TestSubqueryWellFormedness:
+    """Item 4: a sub-query must be a usable retrieval target (named entity,
+    NP subject, or wh-word) — bare fragments are rejected by
+    `_subquery_is_well_formed` so the connector-split falls back to an
+    entity-seeded plan instead of emitting a subject-less fragment."""
+
+    def _pg(self):
+        from src.logic_layer.planner import PlanGenerator
+        return PlanGenerator()
+
+    def test_bare_predicate_is_malformed(self):
+        pg = self._pg()
+        assert pg._subquery_is_well_formed("was released by the distributor", []) is False
+        assert pg._subquery_is_well_formed("of the same year", []) is False
+
+    def test_wh_word_is_well_formed(self):
+        pg = self._pg()
+        assert pg._subquery_is_well_formed("which film won the award", []) is True
+
+    def test_named_entity_is_well_formed(self):
+        pg = self._pg()
+        assert pg._subquery_is_well_formed("won an Oscar", ["Tom Hanks"]) is True
+
+    def test_np_subject_is_well_formed(self):
+        pg = self._pg()
+        # "the cat" is an nsubj of "sat" — retrievable without entity or wh-word.
+        assert pg._subquery_is_well_formed("the cat sat on the mat", []) is True
+
 
 # ── Sub-query quality ──────────────────────────────────────────────────────────
 

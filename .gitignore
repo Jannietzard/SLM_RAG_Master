@@ -96,3 +96,21 @@ Zusatz/
 examples/output/
 nul
 graph_preview.html
+
+# Diagnostic + ablation scratch (root-only) — regenerable artifacts;
+# do not commit. See diagnose_verbose.py / ab_*.py / ablation runs.
+/trace_idx*.txt
+/ab_*.py
+/ab_*.log
+/change1_*.log
+/ablation_n*.log
+/evaluate_delivery_*.log
+/*_validation_n*.log
+
+# Per-question evaluation output (one JSONL per benchmark run).
+# Redundant with the `evaluation_results/` directory rule above, kept
+# explicit so the intent is visible to readers.
+evaluation_results/*.jsonl
+
+# Editor backup files.
+*.bak

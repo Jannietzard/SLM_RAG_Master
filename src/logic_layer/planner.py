@@ -23,11 +23,18 @@ The planner is composed of three stages:
      short syntactic patterns (SpaCy Matcher; Honnibal & Montani 2017).
    - Output labels: SINGLE_HOP, MULTI_HOP, COMPARISON, TEMPORAL,
      AGGREGATE, INTERSECTION.
-   - Two deterministic pre-empts run before the scoring classifier for
-     constructions that closed-class English markers identify
-     unambiguously: distributive predication with floating "both"
-     (COMPARISON pre-empt) and anaphoric "another" introducing an
-     unnamed referent (MULTI_HOP pre-empt).
+   - Three deterministic pre-empts route closed-class English
+     constructions before/around the scoring classifier:
+     (a) Pattern I (Phase 0) — distributive predication with floating
+         "both" ("Are X and Y both P?") → COMPARISON.
+     (b) Pattern J (Phase 0.5) — anaphoric "another" introducing an
+         unnamed referent → MULTI_HOP.
+     (c) Phase 3.6 — structural-comparison router: two NER entities in
+         a coordinate (`conj`) relation under an interrogative
+         determiner with no bridge-relation cue → COMPARISON (Yang et
+         al. 2018 EMNLP; Quirk et al. 1985 §13). Gated to defer to
+         INTERSECTION when its more specific "both X and Y" / "in
+         common" signal has fired.
 
 2. ENTITY EXTRACTION
    - SpaCy NER restricted to the OntoNotes-5 named-entity inventory
@@ -810,6 +817,32 @@ class QueryClassifier:
             scores[QueryType.MULTI_HOP] = scores[QueryType.TEMPORAL]
 
         # ─────────────────────────────────────────────────────────────────────
+        # PHASE 3.6: Structural comparison routing
+        # ─────────────────────────────────────────────────────────────────────
+        # Coordinated named entities ("X and Y …", "between X and Y …") under an
+        # interrogative determiner are the grammatical signature of a HotpotQA
+        # comparison question (Yang et al. 2018 EMNLP; Quirk et al. 1985 §13).
+        # The Phase-3 entity-density heuristic otherwise forces any ≥2-entity
+        # query to MULTI_HOP, starving the parallel comparison decomposer
+        # (_decompose_comparison) which emits one anchored sub-query per entity.
+        # The detector keys on dependency structure, not surface phrasing, and
+        # is gated to DEFER to MULTI_HOP whenever a bridge-relation cue is
+        # present (precision guard — a coordinated pair inside a bridge question
+        # such as "the film starring A and B that …" must stay multi-hop).
+        # Defer to INTERSECTION when its more specific signal has fired
+        # ("both X and Y" / "in common" — a JOINT-property question, e.g.
+        # "Which movies star both A and B?"). Structural comparison targets the
+        # per-entity-attribute form ("A and B both held which position?") where
+        # INTERSECTION scores zero.
+        if scores[QueryType.INTERSECTION] == 0 and self._is_structural_comparison(doc, query):
+            scores[QueryType.COMPARISON] = max(scores.values()) + 1.0
+            self._last_preempt = "preempt_structural_comparison"
+            logger.debug(
+                "classify: structural-comparison routing for '%s' → COMPARISON",
+                query[:80],
+            )
+
+        # ─────────────────────────────────────────────────────────────────────
         # PHASE 4: Determine final query type
         # ─────────────────────────────────────────────────────────────────────
 
@@ -845,6 +878,49 @@ class QueryClassifier:
         # against floating-point edge cases.
         logger.debug("classify: priority exhausted for '%s' → SINGLE_HOP", query[:80])
         return QueryType.SINGLE_HOP, self.config.classifier_fallback_confidence
+
+    # Interrogative determiners that, combined with coordinated entities, mark a
+    # comparison question ("which/who … X and Y"). Closed class (Quirk et al.
+    # 1985 §11.14), so this is structure recognition, not phrase matching.
+    _WH_DETERMINERS = frozenset({"which", "who", "whom", "whose", "what"})
+
+    def _is_structural_comparison(self, doc: Any, query: str) -> bool:
+        """True iff the query is a comparison by GRAMMATICAL STRUCTURE: two or
+        more named entities standing in a coordinate (conj) relation, under an
+        interrogative determiner, with NO bridge-relation cue present.
+
+        Recognises both "X and Y …" and "between X and Y …" (the second
+        entity is a conjunct of the first in the dependency parse either way).
+        Gated by the bridge-cue check so a coordinated pair embedded in a bridge
+        question (e.g. "the film starring A and B that won an Oscar?") is left to
+        the MULTI_HOP path. SpaCy-dependent; returns False when no parse exists.
+
+        Refs: Yang et al. (2018, EMNLP) HotpotQA bridge/comparison taxonomy;
+        Quirk et al. (1985) §13 coordinated noun phrases.
+        """
+        if doc is None:
+            return False
+        ents = list(doc.ents)
+        if len(ents) < 2:
+            return False
+        # Interrogative determiner present.
+        if not any(t.lower_ in self._WH_DETERMINERS for t in doc):
+            return False
+        # Precision guard: a bridge-relation cue defers to MULTI_HOP.
+        for pat in self._compiled_patterns[QueryType.MULTI_HOP]:
+            if pat.search(query):
+                return False
+        # Two named-entity heads in a coordinate relation.
+        ent_roots = {e.root for e in ents}
+        for e in ents:
+            root = e.root
+            if root.dep_ == "conj" and root.head in ent_roots and root.head is not root:
+                return True
+            for conj in root.conjuncts:
+                if conj in ent_roots and conj is not root:
+                    return True
+        return False
+
 
 
 # =============================================================================
@@ -2361,6 +2437,40 @@ class PlanGenerator:
             logger.debug("_attribute_over_entity_signal failed: %s", exc)
             return False
 
+    # Interrogative words that make a fragment a usable retrieval target on
+    # their own (a wh-question is well-formed even without a named subject).
+    _WH_WORDS = frozenset(
+        {"which", "who", "whom", "whose", "what", "where", "when", "why", "how"}
+    )
+
+    def _subquery_is_well_formed(self, text: str, part_entities: List[str]) -> bool:
+        """Well-formedness invariant for an emitted sub-query (Item 4).
+
+        A sub-query can anchor retrieval iff it contains at least one of:
+          (a) a named entity,
+          (b) a noun-phrase subject (SpaCy `nsubj`/`nsubjpass`), or
+          (c) an interrogative wh-word.
+        A fragment with none of these — a bare predicate or connector residue
+        such as "was released by the distributor" or "of the same year" — is
+        not a retrievable query and is rejected so the caller can fall back to
+        an entity-seeded plan. This is a precondition guarantee, not a
+        heuristic: it never makes a hop worse than the malformed fragment it
+        replaces.
+        """
+        if part_entities:
+            return True
+        lowered = text.lower()
+        if any(tok in self._WH_WORDS for tok in re.findall(r"\b\w+\b", lowered)):
+            return True
+        if NLP is not None:
+            try:
+                doc = NLP(text)
+                if any(tok.dep_ in ("nsubj", "nsubjpass") for tok in doc):
+                    return True
+            except Exception as exc:  # pragma: no cover - parser robustness
+                logger.debug("_subquery_is_well_formed parse failed: %s", exc)
+        return False
+
     def _decompose_multi_hop(
         self,
         query: str,
@@ -2600,7 +2710,26 @@ class PlanGenerator:
                 self._last_matched_pattern = "F_passive_agent"
                 return hop_sequence, [bridge_q, query]
 
-        if len(parts) > 1:
+        # Item 4 well-formedness gate: every connector-split part must be a
+        # usable retrieval target (named entity, NP subject, or wh-word). If any
+        # part is a bare subject-less/entity-less fragment, the split is not
+        # safe to emit — abandon it and fall through to the entity-seeded
+        # consistency fallback below, which retrieves on the detected entities
+        # and answers the original query rather than a broken fragment.
+        connector_split_usable = len(parts) > 1
+        if connector_split_usable:
+            for part in parts:
+                part_ents = [e.text for e in entities if e.text.lower() in part.lower()]
+                if not self._subquery_is_well_formed(part, part_ents):
+                    connector_split_usable = False
+                    logger.debug(
+                        "_decompose_multi_hop: connector-split rejected — malformed "
+                        "part %r (no entity / NP subject / wh-word); using "
+                        "entity-seeded fallback", part[:60],
+                    )
+                    break
+
+        if connector_split_usable:
             # P1-fix: the generic connector-split path is the baseline algorithm
             # described in the methodology ("split at bridge connectors, reverse,
             # enrich"). Tagged distinctly so per-pattern analysis can separate

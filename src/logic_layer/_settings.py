@@ -1,12 +1,24 @@
 """
 Shared utilities for the logic layer.
 
-Internal module — not part of the public API.  Imported by planner.py,
+Internal module — not part of the public API. Imported by planner.py,
 navigator.py, controller.py, and verifier.py.
 
 Exports:
     _load_settings()      — load config/settings.yaml from the project root.
-    _validate_settings()  — warn when required keys are absent (reproducibility guard).
+    _validate_settings()  — warn when required keys are absent. Backed by
+                            the 35-key ``_REQUIRED_SETTINGS`` tuple covering
+                            every parameter that meaningfully affects EM/SF
+                            metrics (LLM context budget, embeddings, vector
+                            store, graph, RAG fusion + BM25, the Navigator
+                            filter chain, Verifier validation thresholds,
+                            agent pipeline flags, entity extraction,
+                            ingestion, benchmark Soft-EM threshold). A
+                            missing key emits a WARNING and the system
+                            silently falls back to the dataclass default —
+                            this is the reproducibility guard that catches
+                            single-source-of-truth violations (see
+                            TECHNICAL_ARCHITECTURE.md §11.16.5).
     _PROPER_NOUN_RE       — compiled regex for multi-word capitalized phrases.
 """
 
@@ -75,14 +87,61 @@ def _load_settings() -> Dict[str, Any]:
 
 # Keys that must be present for reproducible thesis evaluation.
 # Format: tuple of nested keys, e.g. ("llm", "temperature") → cfg["llm"]["temperature"].
+#
+# Every parameter listed here MEANINGFULLY affects EM/SF metrics. If any one is
+# missing from settings.yaml the system silently falls back to a hardcoded
+# dataclass default, which can change results without notice (precise case: the
+# 2026-05-24 audit found vector_store.top_k_vectors was silently 10 — the
+# dataclass default — instead of the documented settings value 20, halving the
+# vector retrieval funnel during evaluation). Growing this list is the
+# reproducibility guard that catches that class of bug.
 _REQUIRED_SETTINGS: tuple = (
+    # ── LLM / Verifier prompt context budget ──────────────────────────
     ("llm", "model_name"),
-    ("llm", "temperature"),
     ("llm", "base_url"),
+    ("llm", "temperature"),
+    ("llm", "max_tokens"),
+    ("llm", "timeout"),
+    ("llm", "max_docs"),
+    ("llm", "max_context_chars"),
+    ("llm", "max_chars_per_doc"),
+    # ── Embeddings ────────────────────────────────────────────────────
     ("embeddings", "model_name"),
+    # ── Vector store ──────────────────────────────────────────────────
+    ("vector_store", "top_k_vectors"),
+    ("vector_store", "similarity_threshold"),
+    ("vector_store", "distance_metric"),
+    # ── Graph ─────────────────────────────────────────────────────────
+    ("graph", "max_hops"),
+    ("graph", "top_k_entities"),
+    ("graph", "hub_mention_cap"),
+    ("graph", "enable_hop3"),
+    # ── RAG / retrieval fusion ────────────────────────────────────────
+    ("rag", "retrieval_mode"),
+    ("rag", "rrf_k"),
+    ("rag", "cross_source_boost"),
+    ("rag", "enable_bm25"),
+    ("rag", "bm25_top_k"),
+    # ── Navigator filter chain ────────────────────────────────────────
+    ("navigator", "relevance_threshold_factor"),
+    ("navigator", "redundancy_threshold"),
+    ("navigator", "max_context_chunks"),
+    ("navigator", "top_k_per_subquery"),
     ("navigator", "rrf_k"),
+    ("navigator", "enable_reranker"),
+    ("navigator", "contradiction_min_value"),
+    # ── Verifier validation ───────────────────────────────────────────
+    ("verifier", "entity_coverage_threshold"),
+    ("verifier", "confidence_high_threshold"),
+    # ── Agent pipeline ────────────────────────────────────────────────
+    ("agent", "max_verification_iterations"),
+    ("agent", "enable_verifier"),
+    # ── Entity extraction (ingestion + query-time) ────────────────────
     ("entity_extraction", "gliner", "confidence_threshold"),
+    # ── Ingestion ─────────────────────────────────────────────────────
     ("ingestion", "sentences_per_chunk"),
+    # ── Benchmark (Soft-EM verdict threshold) ─────────────────────────
+    ("benchmark", "answer_f1_threshold"),
 )
 
 

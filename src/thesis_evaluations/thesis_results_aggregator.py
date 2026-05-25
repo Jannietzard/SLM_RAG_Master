@@ -66,11 +66,21 @@ logging.basicConfig(
 EVAL_ROOT_DEFAULT = Path("./evaluation_results")
 
 
-def _latest_dir(root: Path, prefix: str) -> Optional[Path]:
-    """Return the most recently modified directory matching `<prefix>_*`."""
+def _latest_dir(root: Path, prefix: str, dataset: Optional[str] = None) -> Optional[Path]:
+    """Return the most recently modified directory matching the prefix.
+
+    When ``dataset`` is given, match ``<prefix>_<dataset>_*`` exactly so a
+    stale or cross-dataset run cannot pollute the per-dataset bundle. Old
+    legacy dirs of the form ``<prefix>_<ts>`` (no dataset segment) are
+    excluded in dataset mode — they belong to the pre-multidataset era.
+
+    When ``dataset`` is None, falls back to ``<prefix>_*`` (legacy behaviour,
+    used by the historical timestamped-bundle mode).
+    """
     if not root.exists():
         return None
-    candidates = [p for p in root.iterdir() if p.is_dir() and p.name.startswith(prefix)]
+    full_prefix = f"{prefix}_{dataset}_" if dataset else f"{prefix}_"
+    candidates = [p for p in root.iterdir() if p.is_dir() and p.name.startswith(full_prefix)]
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
@@ -393,6 +403,160 @@ def build_latency_table(summary: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# One-page human-readable overview — the single file a reviewer scans first
+# ---------------------------------------------------------------------------
+
+def build_overview_md(
+    qsweep: Optional[Dict[str, Any]],
+    ablation: Optional[Dict[str, Any]],
+    latency: Optional[Dict[str, Any]],
+    coverage_ok: bool,
+    coverage_missing: List[str],
+    dataset: Optional[str],
+    ts: str,
+) -> str:
+    """Single-page Markdown overview consolidating every metric in the bundle.
+
+    Designed for at-a-glance scanning by the author + the reviewer. Each
+    section guards against missing data so a partial bundle still renders.
+    """
+    def pct(v: Optional[float]) -> str:
+        if v is None: return "—"
+        return f"{v * 100:.1f}%" if isinstance(v, float) and 0 <= v <= 1 else f"{v}"
+    def num(v: Optional[float], digits: int = 0) -> str:
+        if v is None: return "—"
+        try: return f"{float(v):.{digits}f}"
+        except Exception: return "—"
+
+    L: List[str] = []
+    L.append(f"# Thesis Results Overview — {dataset or 'all datasets'}")
+    L.append("")
+    L.append(f"**Refreshed:** {ts}    **Coverage:** "
+             f"{'ALL CLAIMS COVERED ✓' if coverage_ok else 'INCOMPLETE ✗'}")
+    if not coverage_ok and coverage_missing:
+        L.append("")
+        L.append(f"**Missing:** {', '.join(coverage_missing)} — run the "
+                 f"corresponding tier-1 script to fill.")
+    L.append("")
+
+    # ── Headline (from ablation full-pipeline row, if present) ──────────
+    L.append("## Headline (full pipeline)")
+    L.append("")
+    if ablation and ablation.get("rows"):
+        rows = ablation["rows"]
+        # The most-complete row is the one with the most components enabled —
+        # use the last row of the ablation table (row5 / row4 depending on what
+        # the user ran).
+        headline = rows[-1]
+        L.append(f"_Source: agentic_ablation row **{headline.get('label', '?')}** "
+                 f"(model: {ablation.get('model', '?')}, n={ablation.get('n_samples', '?')})_")
+        L.append("")
+        L.append("| Metric | Value |")
+        L.append("|---|---|")
+        L.append(f"| EM | **{pct(headline.get('em'))}** |")
+        L.append(f"| F1 | {num(headline.get('f1'), 3)} |")
+        L.append(f"| SF-F1 | {num(headline.get('sf_f1'), 3)} |")
+        L.append(f"| SF-Recall | {pct(headline.get('sf_recall'))} |")
+        L.append(f"| EM \\| retrieval-ok | {pct(headline.get('em_given_retrieval_ok'))} ← SLM ceiling |")
+    else:
+        L.append("_(no ablation summary yet — run `agentic_ablation.py`)_")
+    L.append("")
+
+    # ── Cross-model (quantization sweep) ────────────────────────────────
+    L.append("## Cross-model comparison (quantization sweep)")
+    L.append("")
+    if qsweep and qsweep.get("rows"):
+        L.append(f"_Source: quantization_sweep, n={qsweep.get('n_samples', '?')}_")
+        L.append("")
+        L.append("| Model | EM | F1 | SF-F1 | SF-Recall | EM\\|retr.ok | Latency (ms) | Peak RSS (MB) |")
+        L.append("|---|---|---|---|---|---|---|---|")
+        for r in qsweep["rows"]:
+            L.append(
+                f"| `{r.get('model','—')}` | "
+                f"{pct(r.get('em'))} | "
+                f"{num(r.get('f1'), 3)} | "
+                f"{num(r.get('sf_f1'), 3)} | "
+                f"{pct(r.get('sf_recall'))} | "
+                f"{pct(r.get('em_given_retrieval_ok'))} | "
+                f"{num(r.get('avg_time_ms'), 0)} | "
+                f"{num(r.get('peak_rss_mb'), 0)} |"
+            )
+    else:
+        L.append("_(no quantization sweep yet — run `quantization_sweep.py`)_")
+    L.append("")
+
+    # ── Component contribution (ablation) ───────────────────────────────
+    L.append("## Component contribution (agentic ablation)")
+    L.append("")
+    if ablation and ablation.get("rows"):
+        L.append("| Configuration | EM | ΔEM | F1 | SF-F1 | EM\\|retr.ok |")
+        L.append("|---|---|---|---|---|---|")
+        prev_em = None
+        for r in ablation["rows"]:
+            em = r.get("em")
+            delta = "—"
+            if prev_em is not None and em is not None:
+                delta = f"{(em - prev_em) * 100:+.1f} pp"
+            prev_em = em
+            L.append(
+                f"| {r.get('label', '—')} | "
+                f"{pct(em)} | "
+                f"{delta} | "
+                f"{num(r.get('f1'), 3)} | "
+                f"{num(r.get('sf_f1'), 3)} | "
+                f"{pct(r.get('em_given_retrieval_ok'))} |"
+            )
+    else:
+        L.append("_(no ablation summary yet)_")
+    L.append("")
+
+    # ── Resource profile (latency / memory) ─────────────────────────────
+    L.append("## Resource profile (edge feasibility)")
+    L.append("")
+    if latency:
+        L.append(f"_Source: latency_memory_profile, n={latency.get('n_queries', '?')}, "
+                 f"budget {latency.get('budget_seconds', 60):.0f}s_")
+        L.append("")
+        L.append("| Stage | Mean (ms) | Median (ms) | P95 (ms) | Max (ms) |")
+        L.append("|---|---|---|---|---|")
+        for key, name in [("planner_ms", "S_P (Planner)"),
+                          ("navigator_ms", "S_N (Navigator)"),
+                          ("verifier_ms", "S_V (Verifier)"),
+                          ("total_ms", "**Total**")]:
+            s = latency.get(key, {}) or {}
+            L.append(
+                f"| {name} | {num(s.get('mean'), 0)} | "
+                f"{num(s.get('median'), 0)} | "
+                f"{num(s.get('p95'), 0)} | "
+                f"{num(s.get('max'), 0)} |"
+            )
+        rss = latency.get("peak_rss_mb", {}) or {}
+        wb = latency.get("within_budget_rate")
+        L.append("")
+        L.append(f"- **Within {latency.get('budget_seconds', 60):.0f}s budget**: "
+                 f"{pct(wb) if wb is not None else '—'}")
+        L.append(f"- **Peak RSS**: mean {num(rss.get('mean'), 0)} MB / "
+                 f"max {num(rss.get('max'), 0)} MB")
+    else:
+        L.append("_(no latency profile yet — run `latency_memory_profile.py`)_")
+    L.append("")
+
+    # ── Pointers ────────────────────────────────────────────────────────
+    L.append("## Files in this bundle")
+    L.append("")
+    L.append("- `table_quantization.tex` / `table_ablation.tex` / `table_latency.tex` — LaTeX, paste into thesis.")
+    L.append("- `table_ablation_significance.tex` + `significance_report.md` — paired-bootstrap CIs.")
+    L.append("- `figure_pareto.png` / `figure_ablation_waterfall.png` / `figure_stage_breakdown.png` — plots.")
+    L.append("- `coverage_report.md` — claim-by-claim coverage map.")
+    L.append("- `README_HOW_TO_USE.md` — paste-into-thesis instructions.")
+    L.append("")
+    L.append("_Generated by `thesis_results_aggregator.py`. Re-run any tier-1 "
+             "script to refresh this overview._")
+
+    return "\n".join(L)
+
+
+# ---------------------------------------------------------------------------
 # Plots (matplotlib, lazy import)
 # ---------------------------------------------------------------------------
 
@@ -546,16 +710,31 @@ def main() -> None:
                         default=str(EVAL_ROOT_DEFAULT))
     parser.add_argument("--output", "-o", type=str,
                         default="./evaluation_results/thesis_final")
+    parser.add_argument(
+        "--latest", action="store_true",
+        help="Write to `<output>` (no timestamp suffix), overwriting any "
+             "prior bundle. Used by the auto-bundle hook on tier-1 scripts "
+             "so the canonical bundle always reflects the latest results.",
+    )
+    parser.add_argument(
+        "--dataset", "-d", type=str, default=None,
+        help="Restrict aggregation to one dataset. When given, only run dirs "
+             "matching `<script>_<dataset>_*` are considered (so multi-dataset "
+             "runs do not pollute each other) and in --latest mode the output "
+             "is `<output>/<dataset>/`. When omitted, behaviour is legacy: "
+             "newest dir of each script regardless of dataset.",
+    )
     args = parser.parse_args()
 
     eval_root = Path(args.eval_root)
     q_dir = Path(args.quantization_dir) if args.quantization_dir \
-        else _latest_dir(eval_root, "quantization_sweep")
+        else _latest_dir(eval_root, "quantization_sweep", args.dataset)
     a_dir = Path(args.ablation_dir) if args.ablation_dir \
-        else _latest_dir(eval_root, "agentic_ablation")
+        else _latest_dir(eval_root, "agentic_ablation", args.dataset)
     l_dir = Path(args.latency_dir) if args.latency_dir \
-        else _latest_dir(eval_root, "latency_memory")
+        else _latest_dir(eval_root, "latency_memory", args.dataset)
 
+    logger.info("Dataset filter         : %s", args.dataset or "(none — legacy)")
     logger.info("Quantization sweep dir : %s", q_dir or "(missing)")
     logger.info("Agentic ablation dir   : %s", a_dir or "(missing)")
     logger.info("Latency profile dir    : %s", l_dir or "(missing)")
@@ -565,7 +744,15 @@ def main() -> None:
     latency = _read_summary_json(l_dir) if l_dir else None
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"{args.output}_{ts}")
+    # --latest mode: overwrite a fixed canonical bundle directory (no
+    # timestamp suffix). When --dataset is also given, the bundle becomes
+    # `<output>/<dataset>/` so each dataset has its own subdirectory and
+    # parallel datasets cannot overwrite each other. Default (legacy) mode
+    # timestamps each run so historical bundles are kept.
+    if args.latest:
+        output_dir = Path(args.output) / args.dataset if args.dataset else Path(args.output)
+    else:
+        output_dir = Path(f"{args.output}_{ts}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Tables ──────────────────────────────────────────────────────────
@@ -620,6 +807,24 @@ def main() -> None:
                       else "**Some thesis claims lack supporting data.** Run the "
                            "missing scripts before finalising the manuscript."))
 
+    # ── Single-page overview — the file you scan first ──────────────────
+    # Consolidates headline + cross-model + ablation + latency in one
+    # markdown view so the author and a reviewer can see the whole picture
+    # without opening every .tex / .json. Re-rendered on every aggregation,
+    # so opening it always shows the current state.
+    missing_sources: List[str] = []
+    if not qsweep: missing_sources.append("quantization_sweep")
+    if not ablation: missing_sources.append("agentic_ablation")
+    if not latency: missing_sources.append("latency_memory_profile")
+    overview_md = build_overview_md(
+        qsweep, ablation, latency,
+        coverage_ok=all_present,
+        coverage_missing=missing_sources,
+        dataset=args.dataset,
+        ts=ts,
+    )
+    (output_dir / "overview.md").write_text(overview_md, encoding="utf-8")
+
     # ── How-to-use README ──────────────────────────────────────────────
     readme_lines = [
         "# Thesis results bundle",
@@ -628,6 +833,7 @@ def main() -> None:
         "",
         "## Files in this directory",
         "",
+        "- **`overview.md` — single-page human-readable summary of every metric in this bundle. Read this first.**",
         "- `table_quantization.tex` — paste into Chapter 5 §5.X (Quantization).",
         "- `table_ablation.tex` — paste into Chapter 6 §6.X (Agentic Verification).",
         "- `table_ablation_significance.tex` — paste alongside the ablation table; "
@@ -664,6 +870,48 @@ def main() -> None:
     logger.info("Coverage: %s",
                 "ALL CLAIMS COVERED" if all_present else "INCOMPLETE — see coverage_report.md")
     logger.info("=" * 70)
+
+
+def update_bundle(
+    output: str = "./evaluation_results/thesis_bundle_latest",
+    dataset: Optional[str] = None,
+) -> Optional[Path]:
+    """Refresh the canonical thesis bundle in-place.
+
+    Convenience entry-point called at the end of each tier-1 evaluation
+    script's main() so the bundle at ``output`` always reflects the latest
+    results. Idempotent (auto-discovers the latest of each tier-1 run dir
+    under ``./evaluation_results/``) and safe to call repeatedly.
+
+    When ``dataset`` is given, the bundle is written to ``<output>/<dataset>/``
+    and only run dirs matching ``<script>_<dataset>_*`` are considered —
+    parallel datasets get parallel subdirectories and cannot overwrite each
+    other. When ``dataset`` is None, legacy single-bundle behaviour applies.
+
+    Failures are caught and logged at WARNING level — an aggregation
+    failure must never break the eval that just produced the data.
+
+    Returns:
+        The bundle path on success, ``None`` on failure.
+    """
+    import sys as _sys
+    old_argv = _sys.argv
+    argv = [
+        "thesis_results_aggregator",
+        "--output", output,
+        "--latest",
+    ]
+    if dataset:
+        argv.extend(["--dataset", dataset])
+    _sys.argv = argv
+    try:
+        main()
+        return Path(output) / dataset if dataset else Path(output)
+    except Exception as exc:  # broad: aggregator failure must not break evals
+        logger.warning("update_bundle: aggregation failed (%s)", exc)
+        return None
+    finally:
+        _sys.argv = old_argv
 
 
 if __name__ == "__main__":

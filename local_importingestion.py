@@ -881,7 +881,6 @@ def ingest_knowledge_graph(
             triples = extract_svo_relations(
                 text=text,
                 name_to_id=name_to_id,
-                chunk_id=chunk_id,
                 canonical_form_fn=canonical_form,
             )
             for subj_id, verb_lemma, obj_id, conf in triples:

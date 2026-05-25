@@ -44,8 +44,30 @@ The Verifier (S_V) is the final stage of the three-agent RAG pipeline
 
 2. GENERATION WITH A QUANTISED SLM
    Phi-3-Mini (or any Ollama-hosted model) is prompted with a compact
-   context budget tuned for edge hardware (<16 GB RAM).  Context limits
+   context budget tuned for edge hardware (<16 GB RAM). Context limits
    are set in config/settings.yaml under the ``llm`` block.
+
+   Between pre-validation and generation, two passes shape the prompt
+   (`§11.13` + `§11.16.1`):
+
+   - The verifier caps the Navigator's context to ``max_docs`` (default
+     5) **by RRF order first**, then ``_reorder_by_question_relevance``
+     reorders only **within that kept window**. Selection (set
+     membership) is owned by the retrieval-score signal; the reorder
+     mitigates small-LLM positional bias (Liu et al. 2023, *Lost in the
+     Middle*, TACL/arXiv:2307.03172). The reorder cannot evict a chunk.
+   - The reorder scoring combines IDF-weighted query-term overlap
+     (Spärck Jones 1972), sqrt-length normalisation, and a
+     structural-coverage floor that protects distinctive-entity chunks
+     from demotion (Robertson 2004).
+
+   The headline answer-correctness verdict applied downstream by the
+   evaluator is **Soft-EM** (token-F1 ≥ `benchmark.answer_f1_threshold`,
+   default 0.6) — strict EM systematically under-counts answers that
+   differ from gold only by a trailing category word. The Verifier
+   itself does not compute it; it lives in
+   ``src.thesis_evaluations.benchmark_datasets`` and is mirrored by
+   ``diagnose_verbose.py``.
 
 3. SELF-CORRECTION LOOP
    Iterative refinement following the Self-Refine paradigm:
@@ -1368,11 +1390,18 @@ Please provide a partial answer based on the available evidence, clearly indicat
         query appear first in the LLM prompt.
 
         Rationale (§12.27): small LLMs tend to latch onto the first plausible
-        entity in the context. For multi-hop questions the answer chunk often
-        has a lower Navigator RRF score than distractor chunks (because RRF
-        rewards broad entity overlap, not question-specific term overlap).
-        By positioning the most answer-relevant chunk first, the LLM is
-        exposed to the fact it needs before encountering distractors.
+        entity in the context (positional bias; Liu et al. 2023, "Lost in the
+        Middle", arXiv:2307.03172). By positioning the most answer-relevant
+        chunk first, the LLM is exposed to the fact it needs before encountering
+        distractors.
+
+        Contract (revised): this method reorders ONLY the chunks already
+        selected for the prompt — it operates on PRESENTATION ORDER, never on
+        SET MEMBERSHIP. The caller caps the context to ``max_docs`` by the
+        Navigator's fused RRF ranking BEFORE calling this method, so the
+        retrieval signal (Cormack et al. 2009) decides which chunks survive the
+        cap and this lexical-overlap heuristic cannot evict a high-RRF answer
+        chunk that happens to be sparse in question terms (regression: idx143).
 
         Scoring combines three terms:
         1. IDF-weighted query-term overlap (F1a) — a query term occurring in
@@ -1903,8 +1932,17 @@ Please provide a partial answer based on the available evidence, clearly indicat
                 confidence_medium_threshold=self.config.confidence_medium_threshold,
             )
 
+        # §12.27 contract (revised): the Navigator's fused RRF ranking owns SET
+        # MEMBERSHIP — which chunks survive the max_docs cap — while the
+        # question-relevance reorder owns only PRESENTATION ORDER within that
+        # window, to mitigate LLM positional bias (Liu et al. 2023, "Lost in the
+        # Middle", arXiv:2307.03172). Selecting by lexical query-overlap let a
+        # distractor that merely echoes the question evict a question-term-sparse
+        # answer chunk that the retriever had ranked #1 (observed idx143). Cap by
+        # RRF order first, then reorder only inside the kept window.
+        selected = working_context[: self.config.max_docs]
         working_context = self._reorder_by_question_relevance(
-            query, working_context, entities=entities,
+            query, selected, entities=entities,
         )
         formatted_context = self._format_context(working_context, query=query)
 

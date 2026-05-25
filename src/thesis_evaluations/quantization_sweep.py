@@ -296,7 +296,7 @@ def main() -> None:
         return
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"{args.output}_{ts}")
+    output_dir = Path(f"{args.output}_{args.dataset}_{ts}")
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Output directory: %s", output_dir)
 
@@ -329,6 +329,13 @@ def main() -> None:
         encoding="utf-8",
     )
     logger.info("Done. Inspect: %s/summary.md", output_dir)
+    # Auto-refresh the canonical thesis bundle for THIS dataset. Safe-wrapped:
+    # a bundling failure must never break the eval that just produced the data.
+    try:
+        from .thesis_results_aggregator import update_bundle
+        update_bundle(dataset=args.dataset)
+    except Exception:
+        logger.debug("Auto-bundle skipped", exc_info=True)
 
 
 if __name__ == "__main__":

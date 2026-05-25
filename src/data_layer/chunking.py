@@ -1,107 +1,137 @@
 """
-Chunking Module: Document Segmentation for the Edge-RAG System
+Chunking Module: Document Segmentation for the Edge-RAG System.
 
-Version: 4.3.0
-Last Modified: 2026-04-08
+Architectural role
+------------------
+Sits between raw document intake and the vector/graph storage layer.
+Produces LangChain Document objects consumed by `ingestion.py` and the
+downstream `HybridStore` (LanceDB + KuzuDB).
 
-================================================================================
-ARCHITECTURAL ROLE
-================================================================================
+Three production paths
+----------------------
+1. SENTENCE-BASED CHUNKING (`SpacySentenceChunker`) -- primary strategy.
+   3-sentence sliding window with 1-sentence overlap (thesis section 2.2).
+   The overlap preserves entity bridges across chunk boundaries, which
+   matters for multi-hop bridge questions where the bridging entity may
+   span adjacent sentences. Sensitivity of retrieval recall to the
+   (window, overlap) tuple is characterised in `chunking_ablation.py`.
+   Reference: Lewis et al. (2020), "Retrieval-Augmented Generation for
+   Knowledge-Intensive NLP Tasks", NeurIPS 2020.
 
-This module implements the document segmentation stage of Artifact A (Data
-Layer). It sits between raw document intake and the vector/graph storage layer,
-producing LangChain Document objects consumed by ingestion.py → HybridStore
-(LanceDB + KuzuDB).
+2. SEMANTIC CHUNKING (`SemanticChunker`) -- alternative for structured
+   documents. Combines TF-IDF importance scoring (Salton & Buckley,
+   1988) with Shannon-entropy quality filtering (Shannon, 1948) and
+   section-header-aware boundary detection. Designed for thesis-style
+   inputs with numbered section hierarchies. IDF uses log(N/df) with no
+   add-one smoothing; a term occurring in all N chunks receives IDF=0,
+   correctly down-weighting universal terms that survived the stopword
+   filter.
 
-Two complementary strategies are provided:
+3. UTILITY CHUNKERS (`SentenceChunker`, `FixedSizeChunker`,
+   `RecursiveChunker`) -- back the "sentence", "fixed", and "recursive"
+   values of the `ChunkingStrategy` enum (see `ingestion.py`). Invoked
+   only when those strategies are selected for ablation studies; not
+   intended for general use. The production path is the SpaCy sentence
+   chunker above.
 
-1. SENTENCE-BASED CHUNKING (SpacySentenceChunker) — primary strategy
-   Implements the 3-sentence sliding-window approach specified in Thesis
-   Section 2.2. Produces overlapping context windows that preserve entity
-   bridges across chunk boundaries, which is critical for multi-hop retrieval
-   in HotpotQA-style queries.
+Public API
+----------
+Only `SpacySentenceChunker`, `SentenceChunkingConfig`, `SentenceChunk`,
+and `create_sentence_chunker` are re-exported from the package
+`__init__.py`. Everything else in this module is an implementation
+detail consumed only by `ingestion.py`. The `__all__` declaration below
+enforces this contract for `from chunking import *`.
 
-2. SEMANTIC CHUNKING (SemanticChunker) — alternative for structured documents
-   Segments documents at structural and statistical boundaries using TF-IDF
-   importance scoring and Shannon-entropy-based quality filtering. Designed for
-   thesis-style documents with numbered section hierarchies.
+Sentence-segmentation backends
+------------------------------
+Three sentence-segmentation routines exist in this file, each used in a
+distinct context:
 
-================================================================================
-DESIGN DECISIONS
-================================================================================
+  * `SpacySentenceSegmenter._spacy_segment` -- production path used by
+    `SpacySentenceChunker` when SpaCy is installed.
+  * `SpacySentenceSegmenter._regex_segment` -- internal fallback used by
+    `SpacySentenceChunker` when SpaCy or the requested SpaCy model
+    cannot be loaded. Reference: Kiss & Strunk (2006), "Unsupervised
+    multilingual sentence boundary detection."
+  * `SentenceChunker` (Part 3) -- standalone regex chunker invoked when
+    `ChunkingStrategy.SENTENCE` is selected in settings.yaml. Independent
+    of the SpaCy chunker; preserved for ablation symmetry.
 
-3-Sentence Window:
-    The production configuration uses 3-sentence sliding windows with 1-sentence
-    overlap. The overlap prevents entity-bridge fragmentation at chunk boundaries,
-    which is critical for multi-hop retrieval where the bridging entity may span
-    adjacent sentences. Sensitivity of retrieval recall to this parameter is
-    characterised in chunking_ablation.py (configurations 3:1, 5:1, 7:1).
-    Reference: Lewis, P. et al. (2020). "Retrieval-Augmented Generation for
-    Knowledge-Intensive NLP Tasks." NeurIPS 2020.
+Deterministic chunk identifiers
+-------------------------------
+All chunk IDs are SHA-256 hashes truncated to a 20-character hex prefix
+(80 bits, collision-resistant for corpora up to ~10^8 chunks under the
+birthday bound):
 
-Quality Filtering (Semantic Chunker):
-    Chunks pass the quality gate only if they satisfy all of: minimum length,
-    lexical diversity (type-token ratio), information density (Shannon entropy),
-    and absence of transcript/whitespace artifacts. Thresholds are configurable
-    via settings.yaml (ingestion.quality_filter.*).
+  * Sentence chunks: SHA-256(source_doc + position + text_prefix).
+  * Semantic chunks: SHA-256(source_doc + chunk_index + text_prefix).
 
-Deterministic Chunk IDs (sentence-based chunker):
-    Sentence-chunk identifiers are derived from SHA-256(source_doc + position +
-    text prefix). This ensures that re-ingestion produces identical KuzuDB node
-    IDs, preserving graph integrity across runs.
-    Semantic-chunk identifiers use SHA-256(source_doc + chunk_index + text
-    prefix) for the same guarantee.
+Determinism guarantees that re-ingestion produces identical KuzuDB
+node IDs, preserving cross-table foreign-key references and incremental-
+update correctness.
 
-TF-IDF Importance Scoring:
-    Chunk importance is the mean TF-IDF score over all non-stopword content
-    terms, normalised by total term count. Stopwords are excluded from both TF
-    and DF to prevent high-frequency function words from dominating.
-    IDF uses the standard log(N/df) formula (no add-one smoothing); a term
-    present in all N chunks receives IDF=0, correctly down-weighting universal
-    function terms that survived the stopword filter.
-    Reference: Salton, G. & Buckley, C. (1988). "Term-weighting approaches in
-    automatic text retrieval." Information Processing & Management, 24(5),
-    513-523.
+Design constants vs configurable parameters
+-------------------------------------------
+The following thresholds are FIXED design constants empirically tuned on
+the thesis corpus and intentionally NOT exposed in `config/settings.yaml`.
+Changing them would invalidate the chunking-ablation calibration:
 
-================================================================================
-CONFIGURATION
-================================================================================
+  * `SemanticBoundaryDetector.min_boundary_distance = 200` -- minimum
+    inter-boundary distance for the semantic boundary detector.
+  * `AutomaticQualityFilter.TRANSCRIPT_RATIO_THRESHOLD = 0.3` -- dialog-
+    label-density threshold for transcript-artifact detection.
+  * `AutomaticQualityFilter.WHITESPACE_RATIO_THRESHOLD = 0.4` -- whitespace-
+    fraction threshold for layout-artifact detection.
+  * `SpacySentenceSegmenter.MIN_SENTENCE_CHARS = 5` -- minimum token-span
+    length for a SpaCy sentence; shorter spans are sentencizer artifacts.
 
-All tunable parameters originate from config/settings.yaml. Defaults in this
-file serve as documented emergency fallbacks only.
+The stopword lists `ENGLISH_STOPWORDS` and `GERMAN_STOPWORDS` are a
+project-internal curation derived from the NLTK 3.x stopword set with
+project-specific additions for academic-text TF-IDF scoring. They are
+embedded literally so this module has no NLTK dependency.
 
-  ingestion.sentences_per_chunk          → SpacySentenceChunker.sentences_per_chunk (3)
-  ingestion.sentence_overlap             → SpacySentenceChunker.sentence_overlap (1)
-  ingestion.min_chunk_size               → SentenceChunkingConfig.min_chunk_chars (50)
-  ingestion.max_chunk_chars              → SentenceChunkingConfig.max_chunk_chars (2000)
-  ingestion.word_boundary_factor         → SemanticBoundaryDetector.word_boundary_factor (0.8)
-  ingestion.spacy_model                  → SentenceChunkingConfig.spacy_model ("en_core_web_sm")
-  ingestion.entity_aware_chunking        → SpacySentenceChunker.entity_aware (false)
-  ingestion.min_lexical_diversity        → AutomaticQualityFilter.min_lexical_diversity (0.3)
-  ingestion.min_information_density      → AutomaticQualityFilter.min_information_density (2.0)
-  ingestion.quality_filter.min_length    → AutomaticQualityFilter.min_length (100)
-  ingestion.quality_filter.min_words     → AutomaticQualityFilter.min_words (15)
-  ingestion.transcript_ratio_threshold   → AutomaticQualityFilter.TRANSCRIPT_RATIO_THRESHOLD (0.3)
-  ingestion.whitespace_ratio_threshold   → AutomaticQualityFilter.WHITESPACE_RATIO_THRESHOLD (0.4)
-  chunking.chunk_size                    → SemanticChunker.max_chunk_size (1024)
-  chunking.chunk_overlap                 → SemanticChunker.overlap (128)
-  chunking.semantic.min_chunk_size       → SemanticChunker.min_chunk_size (200)
+Settings.yaml mapping (verified against config/settings.yaml)
+-------------------------------------------------------------
+All tunable parameters originate from `config/settings.yaml` and are
+validated against `_REQUIRED_SETTINGS` in `src/logic_layer/_settings.py`
+at startup. The defaults in this file are emergency fallbacks only.
 
-================================================================================
-USAGE
-================================================================================
+  ingestion.sentences_per_chunk          -> SpacySentenceChunker.sentences_per_chunk (3)
+  ingestion.sentence_overlap             -> SpacySentenceChunker.sentence_overlap (1)
+  ingestion.min_chunk_size               -> SentenceChunkingConfig.min_chunk_chars (50)
+  ingestion.max_chunk_chars              -> SentenceChunkingConfig.max_chunk_chars (2000)
+  ingestion.word_boundary_factor         -> SemanticBoundaryDetector.word_boundary_factor (0.8)
+  ingestion.spacy_model                  -> SentenceChunkingConfig.spacy_model ("en_core_web_sm")
+  ingestion.entity_aware_chunking        -> SpacySentenceChunker.entity_aware (false; see note)
+  ingestion.min_lexical_diversity        -> AutomaticQualityFilter.min_lexical_diversity (0.3)
+  ingestion.min_information_density      -> AutomaticQualityFilter.min_information_density (2.0)
+  ingestion.quality_filter.min_length    -> AutomaticQualityFilter.min_length (100)
+  ingestion.quality_filter.min_words     -> AutomaticQualityFilter.min_words (15)
+  chunking.chunk_size                    -> SemanticChunker.max_chunk_size (1024)
+  chunking.chunk_overlap                 -> SemanticChunker.overlap (128)
+  chunking.semantic.min_chunk_size       -> SemanticChunker.min_chunk_size (200)
 
-Sentence-Based Chunking (primary):
+Note on `entity_aware_chunking`: the flag is preserved in the public API
+for `settings.yaml` compatibility but is currently a no-op. Setting
+`entity_aware=True` emits a `logger.warning` at construction time
+documenting that no entity-boundary-aware adjustment is applied. The
+calibrated 1-sentence overlap already preserves bridges across
+boundaries in practice; replacing the heuristic would require its own
+ablation study.
+
+Usage
+-----
+Sentence-based chunking (production):
     from src.data_layer.chunking import create_sentence_chunker
     chunker = create_sentence_chunker(sentences_per_chunk=3, sentence_overlap=1)
     chunks = chunker.chunk_text(text, source_doc="document.txt")
 
-Semantic Chunking (structured documents):
+Semantic chunking (structured documents):
     from src.data_layer.chunking import create_semantic_chunker
     chunker = create_semantic_chunker(chunk_size=1024, chunk_overlap=128)
     chunks = chunker.chunk_document(document)
 
-================================================================================
+Last reviewed: 2026-05-25 (audit pass, project version 5.4).
 """
 
 import hashlib
@@ -118,6 +148,16 @@ if TYPE_CHECKING:
     from spacy.language import Language
 
 logger = logging.getLogger(__name__)
+
+# Public API. Everything else in this module is an implementation detail
+# consumed only by `ingestion.py` (utility chunkers behind the
+# `ChunkingStrategy` enum) or internal to the chunker classes themselves.
+__all__ = [
+    "SpacySentenceChunker",
+    "SentenceChunkingConfig",
+    "SentenceChunk",
+    "create_sentence_chunker",
+]
 
 # ─── LangChain ────────────────────────────────────────────────────────────────
 
@@ -426,7 +466,11 @@ class SemanticBoundaryDetector:
     boundary exceeds word_boundary_factor * max_chunk_size AND exceeds
     min_boundary_distance, preventing excessively short chunks.
 
-    word_boundary_factor maps to settings.yaml: ingestion.word_boundary_factor (0.8)
+    word_boundary_factor maps to settings.yaml: ingestion.word_boundary_factor (0.8).
+    min_boundary_distance is a FIXED design constant (default 200) intentionally
+    not exposed in settings.yaml; see module docstring "Design constants vs
+    configurable parameters" for the rationale. Override is supported in code
+    for ablation only.
     """
 
     BOUNDARY_PATTERNS = [
@@ -438,7 +482,7 @@ class SemanticBoundaryDetector:
 
     def __init__(
         self,
-        min_boundary_distance: int = 200,   # settings.yaml: ingestion.min_boundary_distance
+        min_boundary_distance: int = 200,   # fixed design constant (see class docstring)
         word_boundary_factor: float = 0.8,  # settings.yaml: ingestion.word_boundary_factor
     ) -> None:
         self.min_boundary_distance = min_boundary_distance
@@ -485,17 +529,19 @@ class AutomaticQualityFilter:
     of ascending computational cost). Thresholds map to settings.yaml under
     ingestion.quality_filter.*
 
-    Class-level ratio thresholds are documented design constants derived from
-    empirical evaluation on the thesis corpus:
+    Class-level ratio thresholds are FIXED design constants derived from
+    empirical evaluation on the thesis corpus and intentionally NOT exposed in
+    settings.yaml (see module docstring "Design constants vs configurable
+    parameters"):
       TRANSCRIPT_RATIO_THRESHOLD:  dialog-label density above which text is
                                    classified as a dialog transcript artifact.
-                                   (settings.yaml: ingestion.transcript_ratio_threshold)
       WHITESPACE_RATIO_THRESHOLD:  whitespace fraction above which text is
                                    classified as a layout/table artifact.
-                                   (settings.yaml: ingestion.whitespace_ratio_threshold)
+    Subclassing is supported for ablation; downstream production code does not
+    override these.
     """
 
-    # Empirically tuned on thesis corpus; configurable via settings.yaml
+    # Empirically tuned on the thesis corpus; fixed design constants.
     TRANSCRIPT_RATIO_THRESHOLD: float = 0.3
     WHITESPACE_RATIO_THRESHOLD: float = 0.4
 
@@ -1142,10 +1188,17 @@ class SpacySentenceChunker:
         )
 
         self.segmenter = SpacySentenceSegmenter(self.config)
-        # entity_aware is reserved for future entity-boundary-aware window
-        # adjustment; the required logic is not yet implemented.  The flag is
-        # accepted to maintain API compatibility with settings.yaml.
-        _ = entity_aware  # acknowledged; no additional model load needed
+        # entity_aware is accepted to maintain API compatibility with
+        # settings.yaml (`ingestion.entity_aware_chunking`) but is currently
+        # a no-op. Warn loudly so a user who flips the setting expecting an
+        # effect does not get silent acceptance. The 1-sentence overlap
+        # already preserves entity bridges across boundaries in practice.
+        if entity_aware:
+            logger.warning(
+                "SpacySentenceChunker: entity_aware=True requested but is a "
+                "no-op in this release; no entity-boundary-aware adjustment "
+                "is applied. See chunking.py module docstring for rationale."
+            )
 
         logger.info(
             "SpacySentenceChunker initialized: %d-sentence windows, overlap=%d",
@@ -1411,11 +1464,6 @@ class SentenceChunker:
         return chunks
 
 
-#: Backward-compatibility alias — use SentenceChunker instead.
-#: Deprecated since v4.4.0; will be removed in a future version.
-RegexSentenceChunker = SentenceChunker
-
-
 class FixedSizeChunker:
     """
     Fixed-size chunking with configurable overlap and word-boundary snapping.
@@ -1515,7 +1563,7 @@ class RecursiveChunker:
                 )
             else:
                 logger.warning(
-                    "⚠ FALLBACK ACTIVE: LangChain not available — "
+                    "FALLBACK ACTIVE: LangChain not available -- "
                     "RecursiveChunker using simple fixed-size fallback. "
                     "Install with: pip install langchain-text-splitters"
                 )
@@ -1594,7 +1642,7 @@ def _main() -> None:
                 "SemanticChunk score=%.3f  %.70s",
                 c.metadata.get("importance_score", 0), c.page_content,
             )
-    except Exception as exc:  # noqa: BLE001
+    except (ImportError, OSError, RuntimeError, ValueError, AttributeError) as exc:
         logger.warning("Semantic chunker smoke demo skipped: %s", exc)
 
     logger.info("Smoke demo passed.")

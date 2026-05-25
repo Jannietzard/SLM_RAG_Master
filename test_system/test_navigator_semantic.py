@@ -100,6 +100,40 @@ class TestRRFFusion:
         assert score_k10 > score_k60
 
 
+class TestFairCapBySubquery:
+    """_fair_cap_by_subquery: per-anchor fairness for parallel comparison plans."""
+
+    def _fused(self, text, score, sub_query):
+        return {"text": text, "rrf_score": score, "_best_sub_query": sub_query}
+
+    def test_low_degree_anchor_not_crowded_out(self, nav):
+        """A high-degree anchor (anchor A, many high-score chunks) must not
+        monopolise the budget: anchor B's single gold chunk survives the cap
+        via round-robin interleaving, where a global top-k would have cut it."""
+        results = [
+            self._fused("A1", 0.99, "qA"),
+            self._fused("A2", 0.98, "qA"),
+            self._fused("A3", 0.97, "qA"),
+            self._fused("A4", 0.96, "qA"),
+            self._fused("B_gold", 0.40, "qB"),  # lower score, would be cut globally
+        ]
+        capped = nav._fair_cap_by_subquery(results, budget=4, n_parallel=2)
+        texts = [r["text"] for r in capped]
+        assert "B_gold" in texts, f"low-degree anchor crowded out: {texts}"
+        assert len(capped) == 4
+
+    def test_single_subquery_is_global_topk(self, nav):
+        """n_parallel == 1 → identical to results[:budget] (single-hop no-op)."""
+        results = [self._fused(f"c{i}", 1.0 - i * 0.1, "q") for i in range(6)]
+        capped = nav._fair_cap_by_subquery(results, budget=3, n_parallel=1)
+        assert [r["text"] for r in capped] == ["c0", "c1", "c2"]
+
+    def test_budget_exceeds_results_returns_all(self, nav):
+        results = [self._fused("a", 0.9, "qA"), self._fused("b", 0.8, "qB")]
+        capped = nav._fair_cap_by_subquery(results, budget=8, n_parallel=2)
+        assert len(capped) == 2
+
+
 # ---------------------------------------------------------------------------
 # 2. Relevance Filter
 # ---------------------------------------------------------------------------
@@ -353,6 +387,39 @@ class TestEntityMentionFilter:
         # 'Scott' is 5 chars — should match via token pattern fallback
         filtered = nav._entity_mention_filter(results, ["Scott Derrickson"])
         assert any("Scott" in r["text"] for r in filtered)
+
+    def test_variant_name_all_tokens_cooccur(self, nav):
+        """Plan A: a chunk that opens with a full legal name
+        ('Ian David Karslake Watkins') is kept for entity 'Ian Watkins' even
+        though the contiguous phrase is absent and neither token reaches the
+        ≥8-char single-token bar. Requires ALL content tokens (≥3 chars) to
+        co-occur as whole words — so a chunk with only 'Ian' is dropped.
+
+        3 chunks so the noise distractor is at index 2 (outside top-2 RRF
+        immunity) and the filter still drops it.
+        """
+        results = [
+            self._r("Ian David Karslake Watkins (born 30 July 1977) fronted Lostprophets.", score=0.9),
+            self._r("Josey Scott was the vocalist of Saliva.", score=0.8),
+            self._r("Bananas are a popular tropical fruit.", score=0.3),
+        ]
+        filtered = nav._entity_mention_filter(results, ["Josey Scott", "Ian Watkins"])
+        assert any("Karslake" in r["text"] for r in filtered)
+        assert not any("Bananas" in r["text"] for r in filtered)
+
+    def test_variant_name_partial_token_not_matched(self, nav):
+        """Plan A precision guard: a chunk mentioning only 'Ian' (not 'Watkins')
+        is NOT matched by the all-tokens-co-occur rule, because not every
+        content token is present. Placed at rank 3 (outside top-2 immunity)
+        so the drop is observable."""
+        results = [
+            self._r("Ian Watkins fronted the band Lostprophets.", score=0.9),
+            self._r("Ian Watkins later faced criminal charges.", score=0.8),
+            self._r("Ian went to the market this morning.", score=0.3),
+        ]
+        filtered = nav._entity_mention_filter(results, ["Ian Watkins"])
+        assert any("Lostprophets" in r["text"] for r in filtered)
+        assert not any("market" in r["text"] for r in filtered)
 
 
 # ---------------------------------------------------------------------------
