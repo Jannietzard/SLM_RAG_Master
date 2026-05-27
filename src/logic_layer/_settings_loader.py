@@ -1,77 +1,91 @@
 """
-Shared utilities for the logic layer.
+Project-wide settings loader for ``config/settings.yaml``.
+
+This module is the single canonical entry point for opening, parsing, and
+validating the project settings file. All other modules — logic_layer,
+data_layer, pipeline, evaluation scripts — go through ``_load_settings()``
+instead of calling ``yaml.safe_load`` directly. Centralising the load:
+
+  1. Resolves the YAML path relative to the project root, not the current
+     working directory, so a script launched from any subdirectory behaves
+     identically.
+  2. Runs ``_validate_settings()`` automatically — a missing required key
+     warns once and the caller falls back to its dataclass default. This
+     is the reproducibility guard that catches the silent-default bug
+     class (TECHNICAL_ARCHITECTURE.md §11.16.5).
+  3. Returns ``{}`` on any I/O or parse error so callers never crash on
+     a malformed YAML — they exercise their dataclass defaults instead.
 
 Internal module — not part of the public API. Imported by planner.py,
-navigator.py, controller.py, and verifier.py.
+navigator.py, controller.py, verifier.py, the ingestion pipeline, and the
+evaluation scripts that need the full settings dict.
 
-Exports:
-    _load_settings()      — load config/settings.yaml from the project root.
-    _validate_settings()  — warn when required keys are absent. Backed by
-                            the 35-key ``_REQUIRED_SETTINGS`` tuple covering
-                            every parameter that meaningfully affects EM/SF
-                            metrics (LLM context budget, embeddings, vector
-                            store, graph, RAG fusion + BM25, the Navigator
-                            filter chain, Verifier validation thresholds,
-                            agent pipeline flags, entity extraction,
-                            ingestion, benchmark Soft-EM threshold). A
-                            missing key emits a WARNING and the system
-                            silently falls back to the dataclass default —
-                            this is the reproducibility guard that catches
-                            single-source-of-truth violations (see
-                            TECHNICAL_ARCHITECTURE.md §11.16.5).
-    _PROPER_NOUN_RE       — compiled regex for multi-word capitalized phrases.
+Exports
+-------
+    _load_settings(settings_path=None) -> Dict[str, Any]
+        Load the canonical (or a caller-supplied) settings YAML, run the
+        required-key validator, and return the parsed dict.
+    _validate_settings(cfg) -> None
+        Emit a ``WARNING`` for every missing required key in ``cfg``.
+        Backed by the 35-key ``_REQUIRED_SETTINGS`` tuple covering every
+        parameter that meaningfully affects EM/SF metrics (LLM context
+        budget, embeddings, vector store, graph, RAG fusion + BM25,
+        Navigator filter chain, Verifier validation thresholds, agent
+        pipeline flags, entity extraction, ingestion, benchmark Soft-EM
+        threshold).
+
+Dependencies
+------------
+    PyYAML        (parse YAML)
+    stdlib only otherwise (pathlib, logging, warnings, typing).
+
+Last reviewed: 2026-05-26 (audit pass, project version 5.4).
 """
 
 import logging
-import re
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Shared regex — multi-word capitalized proper-noun proxy.
-#
-# Matches: "Ed Wood", "Scott Derrickson", "New York", "Eiffel Tower"
-# Misses:  ALL-CAPS acronyms (NATO), names with lowercase particles
-#          (Tower of London).  These known gaps are acceptable for a
-#          heuristic that avoids loading a second NER model at inference.
-#
-# Used by:
-#   planner.py      — EntityExtractor.ENTITY_PATTERNS (regex NER fallback)
-#   navigator.py    — _entity_overlap_pruning(), _extract_bridge_entities()
-#   controller.py   — _extract_bridge_entities()
-#   verifier.py     — Verifier._MULTI_PROPER_NOUN_RE (claim verification)
-# ---------------------------------------------------------------------------
-_PROPER_NOUN_RE: re.Pattern = re.compile(
-    r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b"
-)
+# Project root = three levels up: this file -> logic_layer -> src -> root.
+_PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent.parent
+_DEFAULT_SETTINGS_PATH: Path = _PROJECT_ROOT / "config" / "settings.yaml"
 
 
-def _load_settings() -> Dict[str, Any]:
+def _load_settings(settings_path: Optional[Path] = None) -> Dict[str, Any]:
     """
-    Load config/settings.yaml from the project root.
+    Load and validate ``config/settings.yaml``.
 
-    Path is resolved relative to this file's location so the function works
-    regardless of the current working directory.  Returns {} if the file is
-    missing or unparseable so callers can still fall back to their dataclass
-    defaults.
+    Path is resolved relative to this file's location, so the function works
+    regardless of the current working directory. Callers that load a
+    non-default settings file (e.g., a held-out evaluation config) may pass
+    ``settings_path`` explicitly. Returns ``{}`` if the file is missing or
+    unparseable so callers can still fall back to their dataclass defaults.
 
-    Returns:
-        Parsed settings dict, or {} on any error.
+    Parameters
+    ----------
+    settings_path : Optional[Path]
+        Override path to a settings YAML. ``None`` (default) → load the
+        project's canonical ``config/settings.yaml``.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Parsed settings dict, or ``{}`` on any I/O or parse error.
     """
     import yaml  # PyYAML is a required dependency (see requirements.txt)
 
-    settings_path = Path(__file__).parent.parent.parent / "config" / "settings.yaml"
-    if not settings_path.exists():
+    path = Path(settings_path) if settings_path is not None else _DEFAULT_SETTINGS_PATH
+    if not path.exists():
         logger.warning(
             "_load_settings: settings.yaml not found at %s — "
             "config dataclass defaults will be used as emergency fallbacks.",
-            settings_path,
+            path,
         )
         return {}
     try:
-        with open(settings_path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             cfg = yaml.safe_load(fh) or {}
         _validate_settings(cfg)
         return cfg
@@ -79,14 +93,14 @@ def _load_settings() -> Dict[str, Any]:
         logger.error(
             "_load_settings: failed to parse %s (%s) — "
             "config dataclass defaults will be used as emergency fallbacks.",
-            settings_path,
+            path,
             exc,
         )
         return {}
 
 
 # Keys that must be present for reproducible thesis evaluation.
-# Format: tuple of nested keys, e.g. ("llm", "temperature") → cfg["llm"]["temperature"].
+# Format: tuple of nested keys, e.g. ("llm", "temperature") -> cfg["llm"]["temperature"].
 #
 # Every parameter listed here MEANINGFULLY affects EM/SF metrics. If any one is
 # missing from settings.yaml the system silently falls back to a hardcoded
@@ -95,7 +109,7 @@ def _load_settings() -> Dict[str, Any]:
 # dataclass default — instead of the documented settings value 20, halving the
 # vector retrieval funnel during evaluation). Growing this list is the
 # reproducibility guard that catches that class of bug.
-_REQUIRED_SETTINGS: tuple = (
+_REQUIRED_SETTINGS: Tuple[Tuple[str, ...], ...] = (
     # ── LLM / Verifier prompt context budget ──────────────────────────
     ("llm", "model_name"),
     ("llm", "base_url"),
@@ -150,17 +164,29 @@ def _validate_settings(cfg: Dict[str, Any]) -> None:
     Warn when required settings.yaml keys are absent.
 
     A missing key means the system silently falls back to a hardcoded
-    dataclass default — a reproducibility risk for thesis evaluation.
-    This function emits a WARNING (not an error) so missing keys never
+    dataclass default — a reproducibility risk for thesis evaluation. This
+    function emits a ``WARNING`` (not an error) so missing keys never
     prevent the system from starting, but are always visible in the logs.
 
-    Args:
-        cfg: Parsed settings dict returned by yaml.safe_load().
+    Channel asymmetry
+    -----------------
+    Missing keys are reported on *both* the Python ``warnings`` channel
+    (per-key, so a reviewer running `python -W error::UserWarning` can
+    promote any missing key to a hard error during a reproducibility
+    audit) AND the ``logging`` channel (also per-key). Parse errors and
+    missing-file events in ``_load_settings`` go to ``logging`` only
+    because they are unique, terminal events for that load — promoting
+    them to ``warnings`` would not give a reviewer per-key resolution.
+
+    Parameters
+    ----------
+    cfg : Dict[str, Any]
+        Parsed settings dict returned by ``yaml.safe_load()``.
     """
     import warnings as _warnings
 
     for key_path in _REQUIRED_SETTINGS:
-        node = cfg
+        node: Any = cfg
         found = True
         for key in key_path:
             if not isinstance(node, dict) or key not in node:
@@ -169,10 +195,16 @@ def _validate_settings(cfg: Dict[str, Any]) -> None:
             node = node[key]
         if not found:
             dotted = ".".join(key_path)
+            # stacklevel=4 surfaces the warning at the user's call site
+            # rather than inside this loader. Frame budget:
+            #   1: warnings.warn itself
+            #   2: this function (_validate_settings)
+            #   3: _load_settings (the wrapper)
+            #   4: caller of _load_settings  ← surfaced here
             _warnings.warn(
-                "settings.yaml: key %r is missing — hardcoded dataclass default "
-                "will be used instead. Evaluation results may not be reproducible. "
-                "Check config/settings.yaml." % dotted,
+                f"settings.yaml: key {dotted!r} is missing — hardcoded "
+                f"dataclass default will be used instead. Evaluation "
+                f"results may not be reproducible. Check config/settings.yaml.",
                 stacklevel=4,
             )
             logger.warning(

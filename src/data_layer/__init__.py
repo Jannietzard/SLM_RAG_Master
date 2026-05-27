@@ -59,7 +59,7 @@ Reproducibility note
 --------------------
 This file is a stable public interface. The 35 settings keys that
 parameterise these submodules are validated at startup by
-src/logic_layer/_settings.py against config/settings.yaml; importing
+src/logic_layer/_settings_loader.py against config/settings.yaml; importing
 this package does not silently fall back on defaults.
 
 Common import patterns

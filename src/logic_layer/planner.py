@@ -4,133 +4,66 @@ S_P: Rule-Based Query Planner
 ===============================================================================
 
 Master's Thesis: "Enhancing Reasoning Fidelity in Quantized SLMs on Edge"
-Artifact B: Agent-Based Query Processing
+Artifact B: Agent-Based Query Processing.
 
-===============================================================================
-OVERVIEW
-===============================================================================
+Role in the pipeline
+--------------------
+S_P is the first agent of the S_P → S_N → S_V pipeline. It transforms a
+natural-language question into a structured RetrievalPlan: a classified
+query type, an ordered hop sequence of sub-queries, the named entities
+relevant to retrieval, and any temporal / comparative constraints. The
+plan is consumed by the Navigator (S_N).
 
-The Planner (S_P) is the first stage of the Agentic RAG pipeline. It
-transforms a natural-language question into a structured retrieval plan
-consisting of: a classified query type, an ordered hop sequence of
-sub-queries, the named entities relevant to retrieval, and any temporal or
-comparative constraints.
+Three stages
+------------
+1. Query classification — rule-based, over closed-class English function
+   words and short SpaCy-Matcher syntactic patterns. Labels: SINGLE_HOP,
+   MULTI_HOP, COMPARISON, TEMPORAL, AGGREGATE, INTERSECTION. Three
+   deterministic pre-empts (Pattern I distributive "both"; Pattern J
+   anaphoric "another"; structural-comparison routing) run before/around
+   the scoring classifier and can be disabled via
+   ``enable_classifier_preempts``.
+2. Entity extraction — SpaCy NER restricted to the OntoNotes-5 inventory,
+   with per-label confidence estimation and a multi-hop bridge-entity
+   heuristic. Regex fallback when SpaCy is unavailable.
+3. Plan generation — dependency-parse decomposition (relative-clause,
+   passive-agent, relational-noun, and chained-attribution bridges) with a
+   connector-split baseline fallback, plus a closed-class attribute-noun
+   rewrite table (_ATTR_MAP) for attribute-comparison questions.
 
-The planner is composed of three stages:
+All recognisers key on SpaCy dependency labels and the OntoNotes NER
+inventory; no surface-form question phrasings are matched. All classifier
+weights and thresholds are read from PlannerConfig (settings.yaml).
 
-1. QUERY CLASSIFICATION
-   - Rule-based classifier over closed-class English function words and
-     short syntactic patterns (SpaCy Matcher; Honnibal & Montani 2017).
-   - Output labels: SINGLE_HOP, MULTI_HOP, COMPARISON, TEMPORAL,
-     AGGREGATE, INTERSECTION.
-   - Three deterministic pre-empts route closed-class English
-     constructions before/around the scoring classifier:
-     (a) Pattern I (Phase 0) — distributive predication with floating
-         "both" ("Are X and Y both P?") → COMPARISON.
-     (b) Pattern J (Phase 0.5) — anaphoric "another" introducing an
-         unnamed referent → MULTI_HOP.
-     (c) Phase 3.6 — structural-comparison router: two NER entities in
-         a coordinate (`conj`) relation under an interrogative
-         determiner with no bridge-relation cue → COMPARISON (Yang et
-         al. 2018 EMNLP; Quirk et al. 1985 §13). Gated to defer to
-         INTERSECTION when its more specific "both X and Y" / "in
-         common" signal has fired.
+Exports
+-------
+    QueryType, RetrievalStrategy, EntityInfo, HopStep, RetrievalPlan,
+    PlannerConfig                                   — data classes / enums
+    QueryClassifier, EntityExtractor, PlanGenerator — pipeline stages
+    Planner                                         — orchestrator
+    create_planner(cfg=None)                        — factory
 
-2. ENTITY EXTRACTION
-   - SpaCy NER restricted to the OntoNotes-5 named-entity inventory
-     (Weischedel et al. 2013, LDC2013T19).
-   - Per-label confidence estimation (see EntityExtractor._LABEL_CONFIDENCE).
-   - For MULTI_HOP queries, a bridge-entity heuristic identifies which
-     extracted entity is the intermediate referent linking the hops.
+References (structural anchors)
+-------------------------------
+    Honnibal & Montani (2017). spaCy 2. arXiv:1802.04016.
+    Quirk, Greenbaum, Leech, Svartvik (1985). A Comprehensive Grammar of
+        the English Language. Longman. (§13 coordination; §17.7-15
+        relative clauses; §11.14 interrogative determiners — the closed-
+        class structures the recognisers key on.)
+    Weischedel et al. (2013). OntoNotes Release 5.0. LDC2013T19.
+        (The NER label inventory.)
+    Yang et al. (2018). HotpotQA. EMNLP. (Evaluation benchmark only — no
+        planner component is dataset-specific.)
+    Khattab et al. (2022). Demonstrate-Search-Predict. arXiv:2212.14024.
+        (Motivation for structured query decomposition in RAG.)
 
-3. PLAN GENERATION
-   - Hop-sequence decomposition for queries that are not single-hop.
-   - Two generalisable mechanisms produce the hop sequence:
+Dependencies
+------------
+    spacy + en_core_web_sm (optional — regex fallbacks throughout when
+    unavailable). stdlib otherwise (re, time, json, logging, typing,
+    dataclasses, enum).
 
-     (a) Dependency-parse decomposition: recognises four English
-         constructions structurally — relative-clause bridges
-         (Quirk et al. 1985 §17.7-15), passive voice with by-phrase agents
-         (Bresnan 1982, "The Passive in Lexical Theory"), relational-noun
-         complements with `of`-PP (Partee 1995; Barker 1995), and chained
-         attribution clauses (Levin 1993, "English Verb Classes").
-         Each recogniser keys on SpaCy dependency labels and the OntoNotes
-         NER inventory; no surface-form vocabulary lists are consulted.
-
-     (b) Connector-split baseline: when the dep-parse decomposer does not
-         match, the query is split at bridge connectors ("that", "which",
-         "who", "of the") and the resulting fragments are re-ordered so
-         the bridge sub-query precedes the final sub-query.
-
-   - A small set of comparison rewrites maps closed-class English
-     attribute nouns (nationality, birthplace, profession, genre, age,
-     country, religion) onto factual-lookup templates so that
-     attribute-comparison questions retrieve biographical chunks via the
-     attribute predicate rather than the comparison phrasing.
-
-===============================================================================
-ARCHITECTURE
-===============================================================================
-
-    User Query
-        │
-        ▼
-    ┌─────────────────────────────────────────────────────┐
-    │                    S_P (PLANNER)                     │
-    │                                                      │
-    │   ┌──────────────┐    ┌──────────────┐              │
-    │   │  SpaCy NLP   │───▶│   Query      │              │
-    │   │  Processing  │    │   Classifier │              │
-    │   └──────────────┘    └──────────────┘              │
-    │          │                    │                      │
-    │          ▼                    ▼                      │
-    │   ┌──────────────┐    ┌──────────────┐              │
-    │   │   Entity &   │    │   Bridge     │              │
-    │   │   NER Extract│    │   Detection  │              │
-    │   └──────────────┘    └──────────────┘              │
-    │          │                    │                      │
-    │          └────────┬───────────┘                      │
-    │                   ▼                                  │
-    │          ┌──────────────┐                            │
-    │          │  Retrieval   │                            │
-    │          │  Plan Gen    │                            │
-    │          └──────────────┘                            │
-    │                   │                                  │
-    └───────────────────┼──────────────────────────────────┘
-                        ▼
-                Retrieval Plan (JSON)
-                   → Navigator (S_N)
-
-===============================================================================
-ACADEMIC REFERENCES
-===============================================================================
-
-- Honnibal, M., & Montani, I. (2017). "spaCy 2: Natural language understanding
-  with Bloom embeddings, convolutional neural networks and incremental parsing."
-  Unpublished; arXiv:1802.04016.
-- Quirk, R., Greenbaum, S., Leech, G., & Svartvik, J. (1985). "A Comprehensive
-  Grammar of the English Language." Longman.
-- Bresnan, J. (1982). "The Passive in Lexical Theory." In Bresnan ed.,
-  The Mental Representation of Grammatical Relations, MIT Press.
-- Karttunen, L. (1977). "Syntax and Semantics of Questions." Linguistics
-  and Philosophy 1(1).
-- Higginbotham, J. (1993). "Interrogatives." In Hale & Keyser eds.,
-  The View from Building 20, MIT Press.
-- Partee, B. (1995). "Lexical Semantics and Compositionality." In Gleitman
-  & Liberman eds., An Invitation to Cognitive Science: Language, MIT Press.
-- Barker, C. (1995). "Possessive Descriptions." CSLI Publications.
-- Levin, B. (1993). "English Verb Classes and Alternations: A Preliminary
-  Investigation." University of Chicago Press.
-- Karttunen, L. (1976). "Discourse Referents." In McCawley ed.,
-  Syntax and Semantics 7: Notes from the Linguistic Underground,
-  Academic Press.
-- Weischedel, R., et al. (2013). "OntoNotes Release 5.0." LDC2013T19.
-- Yang, Z., et al. (2018). "HotpotQA: A Dataset for Diverse, Explainable
-  Multi-hop Question Answering." EMNLP 2018. (Evaluation benchmark only —
-  no planner component is dataset-specific.)
-- Khattab, O., et al. (2022). "Demonstrate-Search-Predict: Composing retrieval
-  and language models for knowledge-intensive NLP." arXiv:2212.14024.
-  (Motivation for structured query decomposition in RAG pipelines.)
-
+Last reviewed: 2026-05-27 (audit pass, project version 5.4).
 ===============================================================================
 """
 
@@ -145,7 +78,8 @@ import json
 logger = logging.getLogger(__name__)
 
 
-from ._settings import _load_settings, _PROPER_NOUN_RE
+from ._settings_loader import _load_settings
+from ._text_utils import _PROPER_NOUN_RE
 
 
 # =============================================================================
@@ -322,14 +256,14 @@ class RetrievalPlan:
         constraints:     Additional constraints (temporal, comparison, etc.).
         estimated_hops:  Estimated number of retrieval hops.
         confidence:      Query classification confidence.
-        matched_pattern: P1-fix (2026-05-15). Identifier of the decomposition
-            pattern that produced this plan (e.g. "G_form1", "H", "E",
+        matched_pattern: Identifier of the decomposition pattern that
+            produced this plan (e.g. "G_form1", "H", "E",
             "comparison_attr_map", "fallback_generic_2hop", "single_hop").
             None when the field has not been set. Surfaces in the per-question
             JSONL so the eval harness can compute per-pattern hit-rates and
             SF-F1 deltas without parsing debug logs.
-        classifier_preempt: P2-fix (2026-05-15). Identifier of the Phase 0 /
-            Phase 0.5 classifier pre-empt that fired, if any
+        classifier_preempt: Identifier of the Phase 0 / Phase 0.5 classifier
+            pre-empt that fired, if any
             ("preempt_pattern_I_boolean_conjunction", "preempt_pattern_J_implicit_bridge").
             None when no pre-empt fired (i.e. normal Phase 1-4 scoring path).
             Lets reviewers audit pre-empt false-positive rates without
@@ -378,14 +312,14 @@ class RetrievalPlan:
             "constraints": self.constraints,
             "estimated_hops": self.estimated_hops,
             "confidence": self.confidence,
-            # P1/P2-fix (2026-05-15): surface the matched pattern + any classifier
-            # pre-empt so the per-question JSONL contains a greppable identifier
-            # for downstream analysis. Both keys are always present (possibly
+            # Surface the matched pattern + any classifier pre-empt so the
+            # per-question JSONL contains a greppable identifier for
+            # downstream analysis. Both keys are always present (possibly
             # None) so consumers can rely on the schema.
             "matched_pattern": self.matched_pattern,
             "classifier_preempt": self.classifier_preempt,
-            # P8-fix: surface metadata so future debug fields are reachable from
-            # the JSONL without another schema change. Empty dict by default.
+            # Surface metadata so future debug fields are reachable from the
+            # JSONL without another schema change. Empty dict by default.
             "metadata": self.metadata,
         }
 
@@ -451,10 +385,29 @@ class PlannerConfig:
     classifier_confidence_base: float = 0.6  # settings.yaml: planner.classifier_confidence_base
     classifier_confidence_scale: float = 0.15  # settings.yaml: planner.classifier_confidence_scale
     classifier_confidence_cap: float = 0.95  # settings.yaml: planner.classifier_confidence_cap
-    # P9-fix (2026-05-15): default lowered 0.8 → 0.5 so no-pattern-match
-    # confidence falls strictly below any single-pattern match
-    # (base 0.60 + scale 0.15 × 1 = 0.75).
+    # No-pattern-match fallback confidence is deliberately below any
+    # single-pattern match (base 0.60 + scale 0.15 × 1 = 0.75) so an
+    # unclassified query never outranks one with a real signal.
     classifier_fallback_confidence: float = 0.5  # settings.yaml: planner.classifier_fallback_confidence
+
+    # Classifier pre-empt settings (Pattern I / Pattern J / structural
+    # comparison). The pre-empts route closed-class English constructions
+    # before/around the 4-phase scoring classifier. Set to False to ablate
+    # them and fall back to pure scoring. The confidence/boost values were
+    # chosen by inspection on the development split (the thesis methodology
+    # section reports the dev-vs-test partition).
+    enable_classifier_preempts: bool = True   # settings.yaml: planner.enable_classifier_preempts
+    preempt_comparison_confidence: float = 0.90   # Pattern I (boolean conjunction)
+    preempt_multihop_confidence: float = 0.80     # Pattern J (implicit bridge)
+    structural_comparison_boost: float = 1.0      # Phase 3.6 score boost
+
+    # NER confidence estimation (EntityExtractor._estimate_confidence).
+    # SpaCy does not expose per-entity confidence, so it is estimated from
+    # the per-label table plus a length bonus. Values derived by inspection
+    # from en_core_web_sm reliability on OntoNotes-5 (Weischedel 2013).
+    ner_default_confidence: float = 0.7           # label absent from _LABEL_CONFIDENCE
+    ner_length_bonus_cap: float = 0.1             # max length bonus
+    ner_length_bonus_per_token: float = 0.03      # bonus per whitespace token
 
     @classmethod
     def from_yaml(cls, config: Dict[str, Any]) -> "PlannerConfig":
@@ -489,6 +442,13 @@ class PlannerConfig:
             classifier_confidence_scale=planner.get("classifier_confidence_scale", 0.15),
             classifier_confidence_cap=planner.get("classifier_confidence_cap", 0.95),
             classifier_fallback_confidence=planner.get("classifier_fallback_confidence", 0.5),
+            enable_classifier_preempts=planner.get("enable_classifier_preempts", True),
+            preempt_comparison_confidence=planner.get("preempt_comparison_confidence", 0.90),
+            preempt_multihop_confidence=planner.get("preempt_multihop_confidence", 0.80),
+            structural_comparison_boost=planner.get("structural_comparison_boost", 1.0),
+            ner_default_confidence=planner.get("ner_default_confidence", 0.7),
+            ner_length_bonus_cap=planner.get("ner_length_bonus_cap", 0.1),
+            ner_length_bonus_per_token=planner.get("ner_length_bonus_per_token", 0.03),
         )
 
 
@@ -540,9 +500,9 @@ class QueryClassifier:
         r"\b(older|younger|taller|shorter|bigger|smaller|larger|higher|lower|richer|poorer)\b.{0,60}\bor\b",
     )
 
-    # Option A audit (2026-05-15): three regex-classifier patterns previously
-    # listed here were removed because they recognised specific question
-    # phrasings rather than linguistic structure:
+    # Three regex-classifier patterns previously listed here were removed
+    # because they recognised specific question phrasings rather than
+    # linguistic structure:
     #
     #   - "Which X, A or B, …?" form (`,\s*[^,?]+\s+\bor\b\s+[^,?]+[,?]`)
     #     replaced by `_decompose_select_between`, which uses SpaCy NER to
@@ -603,6 +563,24 @@ class QueryClassifier:
         r"\bwhat\s+(are|were)\s+the\b",
     )
 
+    # ── Pre-empt regexes (compiled once at class load) ────────────────────────
+    # Pattern I — Boolean-conjunction pre-empt: "Are/Did/Were X and Y both P?"
+    # is a parallel yes/no comparison, never a bridge chain. Must fire before
+    # Phase 1 so the "both"/"and" tokens cannot boost MULTI_HOP / INTERSECTION
+    # past COMPARISON.
+    _BOOL_CONJ_PRE = re.compile(
+        r'^\s*(are|is|were|was|did|do|does|have|has)\b.+\band\b.+\bboth\b',
+        re.IGNORECASE,
+    )
+    # Pattern J — Implicit-bridge pre-empt: "X and another [noun] that …"
+    # requires first resolving the anaphoric "another" then following it. The
+    # AGGREGATE pattern "how many" would otherwise misclassify it as a
+    # single-pass aggregate.
+    _IMPLICIT_BRIDGE_PRE = re.compile(
+        r'\banother\s+\w+\b',
+        re.IGNORECASE,
+    )
+
     def __init__(self, config: Optional[PlannerConfig] = None):
         """
         Initialise the Query Classifier.
@@ -624,7 +602,7 @@ class QueryClassifier:
         # SpaCy Matcher for syntactic patterns
         self._setup_spacy_matcher()
 
-        # P2-fix: per-call cache for the pre-empt identifier (if any). Set by
+        # Per-call cache for the pre-empt identifier (if any). Set by
         # classify() when Phase 0 / Phase 0.5 fires; read by Planner.plan() into
         # RetrievalPlan.classifier_preempt. None means the classification took
         # the normal Phase 1-4 scoring path.
@@ -715,46 +693,35 @@ class QueryClassifier:
         query = query.strip()
         scores = {qt: 0.0 for qt in QueryType}
 
-        # P2-fix: reset pre-empt marker for this call.
+        # Reset the pre-empt marker for this call.
         self._last_preempt = None
 
         # ─────────────────────────────────────────────────────────────────────
         # PHASE 0: Boolean-conjunction pre-empt (Pattern I)
         # "Are/Did/Were X and Y both P?" — parallel yes/no, never a bridge chain.
-        # Must run before Phase 1 so the "both" and "and" tokens cannot boost
-        # MULTI_HOP or INTERSECTION scores past COMPARISON.
+        # Runs before Phase 1 so the "both"/"and" tokens cannot boost MULTI_HOP
+        # or INTERSECTION scores past COMPARISON. The pre-empt identifier is
+        # recorded on self._last_preempt so the per-question JSONL can audit
+        # how often it fires (the four-phase scoring path leaves it None).
         # ─────────────────────────────────────────────────────────────────────
-        _BOOL_CONJ_PRE = re.compile(
-            r'^\s*(are|is|were|was|did|do|does|have|has)\b.+\band\b.+\bboth\b',
-            re.IGNORECASE,
-        )
-        if _BOOL_CONJ_PRE.match(query):
+        if self.config.enable_classifier_preempts and self._BOOL_CONJ_PRE.match(query):
             logger.debug("classify: Boolean conjunction pre-empt for '%s' → COMPARISON", query[:80])
-            # P2-fix: record the pre-empt so the per-question JSONL can audit
-            # how often it fires and on what queries. Methodology gap (D3) — the
-            # documented four-phase pipeline does not describe pre-empts.
             self._last_preempt = "preempt_pattern_I_boolean_conjunction"
-            return QueryType.COMPARISON, 0.90
+            return QueryType.COMPARISON, self.config.preempt_comparison_confidence
 
         # ─────────────────────────────────────────────────────────────────────
         # PHASE 0.5: Implicit bridge pre-empt (Pattern J)
         # "X and another [noun] that …" — the answer requires first resolving
-        # the bridge ("which corporation is the 'another'?") then following it.
-        # The AGGREGATE pattern r"\bhow\s+many\b" fires on "how many countries"
-        # and would otherwise classify this as AGGREGATE (single-pass).
+        # the anaphoric "another" then following it. The AGGREGATE pattern
+        # "how many" would otherwise classify this as a single-pass aggregate.
         # ─────────────────────────────────────────────────────────────────────
-        _IMPLICIT_BRIDGE_PRE = re.compile(
-            r'\banother\s+\w+\b',
-            re.IGNORECASE,
-        )
-        if _IMPLICIT_BRIDGE_PRE.search(query):
+        if self.config.enable_classifier_preempts and self._IMPLICIT_BRIDGE_PRE.search(query):
             logger.debug(
                 "classify: implicit-bridge pre-empt (Pattern J) for '%s' → MULTI_HOP",
                 query[:80],
             )
-            # P2-fix: record the pre-empt for false-positive auditing.
             self._last_preempt = "preempt_pattern_J_implicit_bridge"
-            return QueryType.MULTI_HOP, 0.80
+            return QueryType.MULTI_HOP, self.config.preempt_multihop_confidence
 
         # ─────────────────────────────────────────────────────────────────────
         # PHASE 1: Regex pattern matching
@@ -799,7 +766,7 @@ class QueryClassifier:
                 scores[QueryType.MULTI_HOP] += self.config.classifier_entity_boost
 
         # ─────────────────────────────────────────────────────────────────────
-        # PHASE 3.5: Multi-hop override (Bug 1)
+        # PHASE 3.5: Multi-hop override
         # ─────────────────────────────────────────────────────────────────────
         # Bridge questions that contain a year/"founded"/"when" token
         # (e.g. "What year was the university where John studied founded?")
@@ -834,8 +801,12 @@ class QueryClassifier:
         # "Which movies star both A and B?"). Structural comparison targets the
         # per-entity-attribute form ("A and B both held which position?") where
         # INTERSECTION scores zero.
-        if scores[QueryType.INTERSECTION] == 0 and self._is_structural_comparison(doc, query):
-            scores[QueryType.COMPARISON] = max(scores.values()) + 1.0
+        if (
+            self.config.enable_classifier_preempts
+            and scores[QueryType.INTERSECTION] == 0
+            and self._is_structural_comparison(doc, query)
+        ):
+            scores[QueryType.COMPARISON] = max(scores.values()) + self.config.structural_comparison_boost
             self._last_preempt = "preempt_structural_comparison"
             logger.debug(
                 "classify: structural-comparison routing for '%s' → COMPARISON",
@@ -960,7 +931,7 @@ class EntityExtractor:
     ENTITY_PATTERNS = (
         (r'"([^"]+)"',                             "QUOTED"),  # double-quoted strings
         (r"'([^']+)'",                             "QUOTED"),  # single-quoted strings
-        (_PROPER_NOUN_RE.pattern,                   "PROPN"),   # multi-word proper nouns (shared from _settings)
+        (_PROPER_NOUN_RE.pattern,                   "PROPN"),   # multi-word proper nouns (shared from _text_utils)
         (r"\b([A-Z][a-z]{2,})\b",                  "PROPN"),   # single proper nouns
         (r"\b(\d{4})\b",                           "DATE"),    # four-digit years
     )
@@ -977,12 +948,15 @@ class EntityExtractor:
     })
 
     # Per-label confidence estimates.
-    # Values are approximate — SpaCy does not expose per-entity confidence scores.
-    # Derived from label-level reliability observed in SpaCy documentation and
-    # en_core_web_sm evaluation on OntoNotes 5 (Weischedel et al., 2013):
-    # high-precision labels (DATE, PERSON, GPE) receive higher base confidence
-    # than ambiguous labels (WORK_OF_ART) which are frequently mis-categorised.
-    # Length bonus (up to +0.1, at +0.03 per token) rewards unambiguous multi-word spans.
+    # SpaCy does not expose per-entity confidence scores, so these are
+    # approximate values chosen by inspection from label-level reliability in
+    # the SpaCy documentation and en_core_web_sm evaluation on OntoNotes-5
+    # (Weischedel et al., 2013): high-precision labels (DATE, PERSON, GPE)
+    # receive higher base confidence than ambiguous labels (WORK_OF_ART),
+    # which are frequently mis-categorised. The length bonus (cap and
+    # per-token increment are PlannerConfig fields) rewards unambiguous
+    # multi-word spans. These per-label values are a fixed table; extending
+    # or retuning them is a code change.
     _LABEL_CONFIDENCE: Dict[str, float] = {
         "PERSON":     0.9,
         "ORG":        0.85,
@@ -1085,10 +1059,12 @@ class EntityExtractor:
 
         # ─────────────────────────────────────────────────────────────────────
         # POST-PROCESSING: remove substring-duplicate entities
-        # e.g. remove "Scott" when "Scott Derrickson" is already in the list;
-        # remove "Wood" when "Ed Wood" is in the list.
-        # Also filter out PROPN-labelled single tokens shorter than 5 chars to
-        # avoid spurious hits like "Were", "Wood" from the regex fallback.
+        # Drop a single-token entity whose surface form is a substring of a
+        # multi-token entity already in the list (the multi-token form is
+        # always the more specific reference). Also drop PROPN-labelled
+        # single tokens shorter than 5 chars — those are usually spurious
+        # hits from the regex fallback (sentence-initial capitalised
+        # function words such as auxiliaries or determiners).
         # ─────────────────────────────────────────────────────────────────────
         all_texts_lower = [e.text.lower() for e in entities]
         filtered: List[EntityInfo] = []
@@ -1128,9 +1104,10 @@ class EntityExtractor:
     # the two entity spans in the original query text.
     #
     # IMPORTANT: "and"/"&" are deliberately EXCLUDED — a conjunction between two
-    # distinct named entities ("Scott Derrickson and Ed Wood") must not be merged
-    # into one span, or comparison decomposition breaks. Likewise "a"/"an" are
-    # excluded (too generic). Only genuine title-internal connectors are kept.
+    # distinct named entities (PersonA and PersonB, in coordinated NPs) must not
+    # be merged into one span, or comparison-pattern decomposition breaks.
+    # Likewise "a"/"an" are excluded (too generic). Only genuine title-internal
+    # connectors (prepositions and Romance/Germanic nobiliary particles) are kept.
     _SPAN_CONNECTORS: frozenset = frozenset({
         "to", "of", "on", "in", "the", "for", "at", "de",
         "von", "van", "del", "della", "di", "le", "la",
@@ -1276,8 +1253,11 @@ class EntityExtractor:
         Returns:
             Estimated confidence in [0.0, 1.0].
         """
-        base = self._LABEL_CONFIDENCE.get(ent.label_, 0.7)
-        length_bonus = min(0.1, len(ent.text.split()) * 0.03)
+        base = self._LABEL_CONFIDENCE.get(ent.label_, self.config.ner_default_confidence)
+        length_bonus = min(
+            self.config.ner_length_bonus_cap,
+            len(ent.text.split()) * self.config.ner_length_bonus_per_token,
+        )
         return min(1.0, base + length_bonus)
 
     def _is_stopword(self, text: str) -> bool:
@@ -1443,7 +1423,7 @@ class PlanGenerator:
          "When was {entity} born?"),
     )
 
-    # Option A audit (2026-05-15): Pattern C was removed. It matched the
+    # Pattern C was removed. It matched the
     # surface form "for a/an/the <CATEGORY> <desc>" where CATEGORY enumerated
     # a fixed list of creative-work nouns. The list was example-derived and
     # the surrounding regex was a string-shape match, not a structural
@@ -1470,7 +1450,7 @@ class PlanGenerator:
     # (e.g. "the choreographer of X", "the librettist of Y") provided the
     # parser produces the same dependency structure.
 
-    # Option A audit (2026-05-15): Pattern D was removed for the same reason
+    # Pattern D was removed for the same reason
     # as Pattern C — its verb slot was a fixed enumeration of attribution
     # verbs (co-wrote / wrote / directed / produced / starred / co-directed)
     # and the role slot was a `\w+` shape match, not a syntactic recogniser.
@@ -1493,9 +1473,9 @@ class PlanGenerator:
     #
     # The previous implementation used a fixed regex over 14 attribution
     # verbs and a hand-written past-participle → infinitive lookup table.
-    # Both were retired in the Option A audit (2026-05-15): the regex was
-    # surface-form fitted, and the lookup table reimplemented the SpaCy
-    # lemmatiser. Detection is now in _find_passive_agent_bridge.
+    # Both were retired: the regex was surface-form fitted, and the lookup
+    # table reimplemented the SpaCy lemmatiser. Detection is now in
+    # _find_passive_agent_bridge.
 
     # Pre-compiled regexes for _form_sub_query (called on every multi-hop step)
     _STRIP_LEADING_CONJ = re.compile(
@@ -1557,7 +1537,7 @@ class PlanGenerator:
             config: Planner configuration.
         """
         self.config = config or PlannerConfig()
-        # P1-fix: per-call cache for the pattern that produced the current
+        # Per-call cache for the pattern that produced the current
         # hop sequence. Set by _generate_hops / _decompose_* methods immediately
         # before returning; read by generate() into RetrievalPlan.matched_pattern.
         # Reset to None at the start of each generate() call so a stale value
@@ -1583,7 +1563,7 @@ class PlanGenerator:
         Returns:
             Complete RetrievalPlan.
         """
-        # P1-fix: reset the pattern marker before this call so stale state from
+        # Reset the pattern marker before this call so stale state from
         # a previous plan() invocation cannot bleed in.
         self._last_matched_pattern = None
 
@@ -1702,7 +1682,7 @@ class PlanGenerator:
                 is_bridge=False,
             ))
             sub_queries = [query]
-            # P1-fix: mark this path explicitly so the JSONL distinguishes
+            # Mark this path explicitly so the JSONL distinguishes
             # "classifier decided SINGLE_HOP" from "no pattern matched, fell back".
             self._last_matched_pattern = "single_hop"
 
@@ -2516,7 +2496,7 @@ class PlanGenerator:
         #         the bridge entity now materialised in context)
         imb = self._find_implicit_bridge(query, entities)
         if imb:
-            # P1-fix: tag before delegating so the marker survives the return.
+            # Tag before delegating so the marker survives the return.
             self._last_matched_pattern = "J_implicit_bridge"
             return self._decompose_implicit_bridge(query, imb, entities)
 
@@ -2557,7 +2537,7 @@ class PlanGenerator:
             logger.debug(
                 "_decompose_multi_hop: Pattern G (%s) → %r", form, bridge_q[:60]
             )
-            # P1-fix: mark which Pattern G variant fired ("G_form1" or "G_form2")
+            # Mark which Pattern G variant fired ("G_form1" or "G_form2")
             # so the JSONL can distinguish them in per-pattern analysis.
             self._last_matched_pattern = f"G_{form}"
             return hop_sequence, [bridge_q, query]
@@ -2571,7 +2551,7 @@ class PlanGenerator:
         # fail-safe — worst case it falls through to the patterns below.
         ac = self._find_attribution_chain(query, entities)
         if ac:
-            # P1-fix: tag Pattern H (chained-attribution, 3-hop chain).
+            # Tag Pattern H (chained-attribution, 3-hop chain).
             self._last_matched_pattern = "H_attribution_chain"
             return self._decompose_attribution_chain(query, ac, entities)
 
@@ -2621,7 +2601,7 @@ class PlanGenerator:
                 )
                 parts = [parts[0], parts[-1]]
 
-        # Patterns C and D were removed in the Option A audit (2026-05-15).
+        # Patterns C and D were removed (surface-form recognisers).
         # See the class-level note for the rationale. The connector-split
         # baseline above and the dep-parse patterns (G, H, F) below cover the
         # structural cases; the surface-form regexes for "for a/an/the
@@ -2730,7 +2710,7 @@ class PlanGenerator:
                     break
 
         if connector_split_usable:
-            # P1-fix: the generic connector-split path is the baseline algorithm
+            # The generic connector-split path is the baseline algorithm
             # described in the methodology ("split at bridge connectors, reverse,
             # enrich"). Tagged distinctly so per-pattern analysis can separate
             # "patterns added on top" from "the baseline did this".
@@ -2816,7 +2796,7 @@ class PlanGenerator:
                     "_decompose_multi_hop: no pattern matched for %r "
                     "— generic 2-hop fallback (anchor=%r)", query[:80], anchor
                 )
-                # P1-fix: classification-decomposition consistency fallback.
+                # Classification-decomposition consistency fallback.
                 # Distinct from the connector split because no real decomposition
                 # happened — we only fabricated a hop-0 "Who is X?" to keep the
                 # plan multi-hop. Surfacing this lets the eval report
@@ -2882,7 +2862,7 @@ class PlanGenerator:
                         is_bridge=False,
                     ))
                     sub_queries = [query]
-                    # P1-fix: failure marker. The classifier said MULTI_HOP but
+                    # Failure marker. The classifier said MULTI_HOP but
                     # NOTHING worked. Surfacing this is essential — without it,
                     # the eval cannot distinguish "we solved this" from "we
                     # silently gave up".
@@ -2910,6 +2890,12 @@ class PlanGenerator:
         r'^\s*(are|is|were|was|did|do|does|have|has)\b.+\band\b.+\bboth\b',
         re.IGNORECASE,
     )
+    # Conjunction / quantifier locators used to split "[AUX] X and Y both P?".
+    _AND_RE = re.compile(r'\band\b', re.IGNORECASE)
+    _BOTH_RE = re.compile(r'\bboth\b', re.IGNORECASE)
+    _LEADING_AUX_RE = re.compile(
+        r'^\s*(are|is|were|was|did|do|does|have|has)\s+', re.IGNORECASE,
+    )
 
     def _decompose_boolean_conjunction(
         self,
@@ -2935,16 +2921,11 @@ class PlanGenerator:
         # This bypasses SpaCy NER entirely for entity identification in this
         # pattern, avoiding MONEY/CARDINAL misclassification of address-like
         # strings such as "888 7th Avenue".
-        _and_re = re.compile(r'\band\b', re.IGNORECASE)
-        _both_re = re.compile(r'\bboth\b', re.IGNORECASE)
-        both_m = _both_re.search(query)
-        and_m  = _and_re.search(query)
+        both_m = self._BOTH_RE.search(query)
+        and_m  = self._AND_RE.search(query)
         if both_m and and_m and and_m.start() < both_m.start():
             # Strip the leading auxiliary verb to get ent_a text
-            after_aux = re.sub(
-                r'^\s*(are|is|were|was|did|do|does|have|has)\s+',
-                '', query, count=1, flags=re.IGNORECASE,
-            )
+            after_aux = self._LEADING_AUX_RE.sub('', query, count=1)
             raw_a = after_aux[:and_m.start() - (len(query) - len(after_aux))].strip()
             raw_b = query[and_m.end():both_m.start()].strip().rstrip(',').strip()
             if raw_a and raw_b:
@@ -3047,7 +3028,7 @@ class PlanGenerator:
         # that this is a parallel yes/no check, not a selection-between-two-options.
         bool_conj = self._decompose_boolean_conjunction(query, entities)
         if bool_conj is not None:
-            # P1-fix: tag before returning so the marker survives the call.
+            # Tag before returning so the marker survives the call.
             self._last_matched_pattern = "I_boolean_conjunction"
             return bool_conj
 
@@ -3097,7 +3078,7 @@ class PlanGenerator:
                 depends_on=[],
                 is_bridge=False,
             ))
-            # P1-fix: comparison was classified but no entities found —
+            # Comparison was classified but no entities found —
             # surfaces a measurable failure mode in the eval.
             self._last_matched_pattern = "comparison_no_entities"
             return hop_sequence, [query]
@@ -3147,7 +3128,7 @@ class PlanGenerator:
         if rewritten:
             sub_query_templates = rewritten
 
-        # P1-fix: tag the comparison sub-variant we actually emit. Distinguishes
+        # Tag the comparison sub-variant we actually emit. Distinguishes
         # _ATTR_MAP-rewritten comparisons from plain per-entity comparisons in
         # the per-pattern eval table.
         self._last_matched_pattern = (
@@ -3457,7 +3438,7 @@ class Planner:
             entities=entities,
         )
 
-        # P2-fix: surface any classifier pre-empt that fired so the JSONL can
+        # Surface any classifier pre-empt that fired so the JSONL can
         # audit pre-empt false-positive rates. None when classification took
         # the normal Phase 1-4 scoring path.
         plan.classifier_preempt = getattr(self.classifier, "_last_preempt", None)
@@ -3475,10 +3456,9 @@ class Planner:
 
         return plan
 
-    # P10 (2026-05-15): decompose_query() removed. It was a legacy wrapper
-    # around plan() returning only sub_queries. Production code never used it
-    # (the pipeline reads plan.sub_queries directly). External callers should
-    # migrate to:
+    # decompose_query() was removed — it was a legacy wrapper around plan()
+    # returning only sub_queries. Production code reads plan.sub_queries
+    # directly. External callers should use:
     #     plan = planner.plan(query)
     #     sub_queries = plan.sub_queries
 

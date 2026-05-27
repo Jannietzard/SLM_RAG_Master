@@ -94,12 +94,18 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 
 ABLATION_ROWS = [
-    # name, label, enable_planner, enable_verifier, max_iterations, llm_only
-    ("row1_llm_only",      "LLM-only (no retrieval)",  False, False, 1, True),
-    ("row2_rag_no_agent",  "RAG (no agent)",           False, True,  1, False),
-    ("row3_planner",       "+Planner",                 True,  True,  1, False),
-    ("row4_verifier",      "+Verifier (1 iter)",       True,  True,  1, False),
-    ("row5_self_correct",  "+SelfCorrect (2 iter)",    True,  True,  2, False),
+    # name, label, enable_planner, enable_verifier, max_iterations, llm_only, enable_pre_validation
+    # Fix 2b (2026-05-26): added enable_pre_validation column so row3 ("+Planner")
+    # and row4 ("+Verifier") produce distinct configurations. Previously both
+    # rows had identical settings (Δ=0pp was structural, not measurement).
+    # Now row3 = Planner + LLM generation but NO pre-validation checks; row4 =
+    # row3 + the three pre-validation filters (entity-path / contradiction /
+    # credibility). This makes the +Verifier row a real ablation.
+    ("row1_llm_only",      "LLM-only (no retrieval)",  False, False, 1, True,  False),
+    ("row2_rag_no_agent",  "RAG (no agent)",           False, True,  1, False, False),
+    ("row3_planner",       "+Planner (no pre-val)",    True,  True,  1, False, False),
+    ("row4_verifier",      "+Verifier (1 iter)",       True,  True,  1, False, True),
+    ("row5_self_correct",  "+SelfCorrect (2 iter)",    True,  True,  2, False, True),
 ]
 
 
@@ -239,12 +245,14 @@ def run_pipeline_row(
     config: Dict[str, Any],
     store_manager: StoreManager,
     output_dir: Path,
+    enable_pre_validation: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Run one ablation row through the full evaluate_dataset() pipeline."""
     logger.info("=" * 70)
-    logger.info("ROW: %s — %s", row_name, label)
-    logger.info("  planner=%s verifier=%s iter=%d",
-                enable_planner, enable_verifier, max_iterations)
+    logger.info("ROW: %s -- %s", row_name, label)
+    logger.info("  planner=%s verifier=%s iter=%d pre_val=%s",
+                enable_planner, enable_verifier, max_iterations,
+                enable_pre_validation)
     logger.info("=" * 70)
 
     pipeline = create_pipeline(
@@ -254,6 +262,7 @@ def run_pipeline_row(
         enable_planner=enable_planner,
         enable_verifier=enable_verifier,
         max_iterations=max_iterations,
+        enable_pre_validation=enable_pre_validation,
     )
 
     jsonl_path = output_dir / f"{row_name}.jsonl"
@@ -297,6 +306,100 @@ def run_pipeline_row(
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint / resume helpers (2026-05-27)
+# ---------------------------------------------------------------------------
+# Granularity = one ABLATION row. A row whose per-row JSONL already holds
+# `n_questions` lines is treated as DONE and skipped on resume; its metrics
+# are recomputed from the JSONL so the summary still includes it. This lets
+# you run a few rows, stop (Ctrl+C), and re-run with --resume to continue
+# from the first incomplete row. Partial rows are NOT resumed mid-question:
+# they are re-run from scratch (the row runner deletes the partial JSONL),
+# because the slow agentic rows write append-only and a clean restart avoids
+# duplicate-question records.
+
+def _jsonl_line_count(path: Path) -> int:
+    """Number of JSONL records in `path` (0 if absent/unreadable)."""
+    if not path.exists():
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return sum(1 for line in fh if line.strip())
+    except OSError:
+        return 0
+
+
+def _aggregate_row_from_jsonl(
+    jsonl_path: Path, row_name: str, label: str, is_llm_only: bool
+) -> Optional[Dict[str, Any]]:
+    """
+    Rebuild a row's summary dict from a completed per-row JSONL, so a
+    checkpoint-skipped row still appears in the aggregate summary without
+    re-running it. Mirrors the metric set produced by run_pipeline_row /
+    run_llm_only_row.
+    """
+    records: List[Dict[str, Any]] = []
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Checkpoint read failed for %s: %s", jsonl_path, exc)
+        return None
+    n = len(records)
+    if n == 0:
+        return None
+
+    def _rate(pred) -> float:
+        return sum(1 for r in records if pred(r)) / n
+
+    em = _rate(lambda r: r.get("exact_match"))
+    f1 = sum(r.get("f1_score", 0.0) for r in records) / n
+    sf_f1 = sum(r.get("sf_f1", 0.0) for r in records) / n
+    sf_recall = _rate(lambda r: r.get("all_gold_retrieved"))
+    llm_err = _rate(lambda r: r.get("llm_error"))
+    avg_time = sum(r.get("time_ms", 0.0) for r in records) / n
+    retr_ok = [r for r in records if r.get("all_gold_retrieved")]
+    em_retr_ok = (
+        sum(1 for r in retr_ok if r.get("exact_match")) / len(retr_ok)
+        if retr_ok else 0.0
+    )
+
+    row: Dict[str, Any] = {
+        "row_name": row_name,
+        "label": label,
+        "n_questions": n,
+        "em": em,
+        "f1": f1,
+        "sf_f1": sf_f1,
+        "sf_recall": sf_recall,
+        "em_given_retrieval_ok": em_retr_ok,
+        "llm_error_rate": llm_err,
+        "avg_time_ms": avg_time,
+    }
+    if not is_llm_only:
+        # Pipeline-stage breakdown (matches run_pipeline_row's extra fields).
+        row["pipeline_failed_rate"] = _rate(
+            lambda r: not r.get("all_gold_retrieved")
+        )
+        row["pipeline_ok_llm_failed_rate"] = _rate(
+            lambda r: bool(r.get("pipeline_succeeded_llm_failed"))
+        )
+        row["pipeline_ok_llm_wrong_rate"] = _rate(
+            lambda r: r.get("all_gold_retrieved")
+            and not r.get("llm_error")
+            and not r.get("exact_match")
+        )
+        row["pipeline_ok_llm_ok_rate"] = _rate(
+            lambda r: r.get("all_gold_retrieved")
+            and not r.get("llm_error")
+            and r.get("exact_match")
+        )
+    return row
+
+
+# ---------------------------------------------------------------------------
 # Summary writer with marginal-delta computation
 # ---------------------------------------------------------------------------
 
@@ -307,9 +410,20 @@ def write_summary(rows: List[Dict[str, Any]], output_dir: Path) -> None:
         return
 
     csv_path = output_dir / "summary.csv"
-    fieldnames = list(rows[0].keys())
+    # Union of all row keys in first-seen order. Different row builders
+    # (run_llm_only_row vs run_pipeline_row) emit different field sets;
+    # the LLM-only baseline has no pipeline_*_rate fields, the pipeline
+    # rows do. DictWriter writes empty for any missing key on a per-row
+    # basis, so the resulting CSV is sparse but correct.
+    fieldnames: List[str] = []
+    seen: set = set()
+    for r in rows:
+        for k in r.keys():
+            if k not in seen:
+                fieldnames.append(k)
+                seen.add(k)
     with open(csv_path, "w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
     logger.info("Summary CSV: %s", csv_path)
@@ -385,6 +499,13 @@ def main() -> None:
     parser.add_argument("--skip-llm-only", action="store_true",
                         help="Skip row 1 (parametric baseline). Useful for "
                              "fast re-runs of rows 2–5.")
+    parser.add_argument(
+        "--resume", nargs="?", const="__latest__", default=None, metavar="DIR",
+        help="Resume an interrupted run. Pass a run directory to continue it, "
+             "or use --resume with no value to auto-continue the most recent "
+             "{output}_{dataset}_* directory. Rows whose JSONL already has all "
+             "N questions are skipped; the first incomplete row is re-run.",
+    )
     args = parser.parse_args()
 
     config = load_config_file()
@@ -400,13 +521,63 @@ def main() -> None:
         return
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"{args.output}_{args.dataset}_{ts}")
+    # Resume logic: reuse an existing run directory instead of starting a fresh
+    # timestamped one. --resume DIR uses that dir; --resume (no value) finds the
+    # most recent {output}_{dataset}_* dir; absent -> new timestamped dir.
+    if args.resume:
+        if args.resume == "__latest__":
+            base = Path(args.output)
+            pattern = f"{base.name}_{args.dataset}_*"
+            candidates = sorted(
+                base.parent.glob(pattern),
+                key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            )
+            if candidates:
+                output_dir = candidates[-1]
+                logger.info("Resuming most recent run: %s", output_dir)
+            else:
+                output_dir = Path(f"{args.output}_{args.dataset}_{ts}")
+                logger.info("No prior run to resume; starting fresh: %s", output_dir)
+        else:
+            output_dir = Path(args.resume)
+            if not output_dir.exists():
+                logger.error("--resume directory does not exist: %s", output_dir)
+                return
+            logger.info("Resuming run: %s", output_dir)
+    else:
+        output_dir = Path(f"{args.output}_{args.dataset}_{ts}")
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Model: %s | Questions: %d | Output: %s",
                 model_name, len(questions), output_dir)
 
     rows: List[Dict[str, Any]] = []
-    for row_name, label, p, v, iters, is_llm_only in ABLATION_ROWS:
+    n_expected = len(questions)
+    for row_name, label, p, v, iters, is_llm_only, pre_val in ABLATION_ROWS:
+        # Checkpoint: skip a row whose JSONL already holds all N questions.
+        # Its metrics are recomputed from the JSONL so the summary is complete.
+        row_jsonl = output_dir / f"{row_name}.jsonl"
+        done = _jsonl_line_count(row_jsonl)
+        if done >= n_expected:
+            cached = _aggregate_row_from_jsonl(row_jsonl, row_name, label, is_llm_only)
+            if cached:
+                rows.append(cached)
+                logger.info(
+                    "CHECKPOINT: %s already complete (%d/%d) — skipped, "
+                    "metrics loaded from JSONL (EM=%.1f%%)",
+                    row_name, done, n_expected, cached["em"] * 100,
+                )
+                continue
+            logger.warning(
+                "CHECKPOINT: %s JSONL complete but unreadable — re-running",
+                row_name,
+            )
+        elif done > 0:
+            logger.info(
+                "CHECKPOINT: %s partial (%d/%d) — re-running this row from "
+                "scratch (mid-row resume not supported)",
+                row_name, done, n_expected,
+            )
+
         if is_llm_only:
             if args.skip_llm_only:
                 logger.info("Skipping %s (--skip-llm-only)", row_name)
@@ -414,7 +585,7 @@ def main() -> None:
             try:
                 row = run_llm_only_row(
                     model_name, config, questions,
-                    jsonl_out=output_dir / f"{row_name}.jsonl",
+                    jsonl_out=row_jsonl,
                 )
                 if row:
                     rows.append(row)
@@ -429,6 +600,7 @@ def main() -> None:
                 dataset=args.dataset, model_name=model_name,
                 questions=questions, config=config,
                 store_manager=store_manager, output_dir=output_dir,
+                enable_pre_validation=pre_val,
             )
             if row:
                 rows.append(row)

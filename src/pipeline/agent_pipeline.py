@@ -71,7 +71,7 @@ USAGE
         graph_store=store.graph_store,
         config=yaml_config,
     )
-    result = pipeline.process("Who directed Inception?")
+    result = pipeline.process("What is the capital of France?")
     print(result.answer, result.confidence)
 
 ================================================================================
@@ -179,11 +179,28 @@ class AgentPipelineConfig:
             normalised query string (FIFO eviction).
         cache_max_size: Maximum number of cached entries before the oldest
             is evicted.
+        enable_confidence_gate: Architecture A (2026-05-27). When True, the
+            pipeline runs a cheap single-pass baseline retrieval first and,
+            if retrieval confidence is HIGH, answers directly from the
+            baseline -- skipping the Planner's iterative decomposition. Only
+            escalates to the full agentic retrieval path when confidence is
+            not HIGH. Default False (opt-in) so existing behaviour is
+            unchanged. Refs: Geifman & El-Yaniv 2019 (selective prediction,
+            NeurIPS); Asai et al. 2024 (Self-RAG adaptive retrieval, ICLR).
+        confidence_score_gap_threshold: top1/top2 RRF-score ratio above which
+            the top chunk is considered "dominant" (Signal A).
+        confidence_require_signals: number of the 3 confidence signals
+            (score-gap / multi-source / entity-coverage) that must fire for
+            a HIGH verdict.
     """
     enable_planner: bool = True
     enable_verifier: bool = True
     enable_caching: bool = True
     cache_max_size: int = 1000
+    # Architecture A — confidence gate (opt-in)
+    enable_confidence_gate: bool = False
+    confidence_score_gap_threshold: float = 1.5
+    confidence_require_signals: int = 2
 
     @classmethod
     def from_yaml(cls, config: Dict[str, Any]) -> "AgentPipelineConfig":
@@ -203,6 +220,11 @@ class AgentPipelineConfig:
             enable_verifier=agent.get("enable_verifier", True),
             enable_caching=agent.get("enable_caching", True),
             cache_max_size=agent.get("cache_max_size", 1000),
+            enable_confidence_gate=agent.get("enable_confidence_gate", False),
+            confidence_score_gap_threshold=agent.get(
+                "confidence_score_gap_threshold", 1.5
+            ),
+            confidence_require_signals=agent.get("confidence_require_signals", 2),
         )
 
 
@@ -336,6 +358,12 @@ class AgentPipeline:
         _pipeline_cfg = AgentPipelineConfig.from_yaml(self.config)
         self.enable_planner: bool = _pipeline_cfg.enable_planner
         self.enable_verifier: bool = _pipeline_cfg.enable_verifier
+        # Architecture A — confidence gate flags
+        self.enable_confidence_gate: bool = _pipeline_cfg.enable_confidence_gate
+        self._conf_score_gap_threshold: float = (
+            _pipeline_cfg.confidence_score_gap_threshold
+        )
+        self._conf_require_signals: int = _pipeline_cfg.confidence_require_signals
 
         # Agent instances (injected or lazy-created on first process() call)
         self.planner: Optional["Planner"] = planner
@@ -407,6 +435,76 @@ class AgentPipeline:
             )
             logger.info("Verifier (S_V) lazy-initialised")
 
+    def _compute_retrieval_confidence(
+        self, nav_result: Any, query_entities: List[str]
+    ) -> str:
+        """
+        Architecture A: classify single-pass retrieval confidence as
+        'high' / 'medium' / 'low' from ranking features.
+
+        Used by the confidence gate to decide whether to answer directly
+        from the cheap baseline retrieval (HIGH) or escalate to the full
+        agentic decomposition path (MEDIUM / LOW).
+
+        Signals (all derived from the existing NavigatorResult -- no new
+        compute):
+          A. score_gap     scores[0] / scores[1] >= threshold -> a dominant
+                           top chunk (clear winner vs a tied field).
+          B. multi_source  the top chunk was produced by >=2 retrieval lanes
+                           (vector + BM25 + graph), surfaced by the Navigator
+                           as metadata["top_chunk_methods"][0] == "hybrid".
+          C. entity_cov    all query entities appear in the top-3 chunks.
+
+        A HIGH verdict requires >= self._conf_require_signals signals to fire
+        (default 2 of 3). MEDIUM = exactly 1. LOW = 0.
+
+        Refs: Geifman & El-Yaniv 2019 (selective prediction, NeurIPS);
+              Asai et al. 2024 (Self-RAG adaptive retrieval, ICLR).
+        """
+        scores = getattr(nav_result, "scores", None) or []
+        ctx = getattr(nav_result, "filtered_context", None) or []
+        if len(scores) < 2 or len(ctx) < 1:
+            # Too little signal to judge -> treat as not-confident.
+            return "low"
+
+        # Signal A: dominant top chunk.
+        gap_ok = (scores[0] / max(scores[1], 1e-6)) >= self._conf_score_gap_threshold
+
+        # Signal B: top chunk hit by >=2 retrieval lanes (vector/bm25/graph).
+        # The Navigator surfaces per-chunk provenance as
+        # metadata["chunk_retrieval_methods"] (list-of-lists aligned with
+        # filtered_context; B2-fix). The top chunk is "multi-source" when its
+        # lane list has >=2 entries.
+        meta = getattr(nav_result, "metadata", {}) or {}
+        methods_per_chunk = (
+            meta.get("chunk_retrieval_methods", []) if isinstance(meta, dict) else []
+        )
+        multi_source = bool(methods_per_chunk) and len(methods_per_chunk[0]) >= 2
+
+        # Signal C: every query entity present in the top-3 chunks.
+        top3 = " ".join(ctx[:3]).lower()
+        entity_cov = bool(query_entities) and all(
+            (e or "").lower() in top3 for e in query_entities
+        )
+
+        n_strong = int(gap_ok) + int(multi_source) + int(entity_cov)
+        if n_strong >= self._conf_require_signals:
+            verdict = "high"
+        elif n_strong >= 1:
+            # Some signal fired but below the HIGH threshold. MEDIUM and LOW
+            # both escalate to the agentic path today (only HIGH short-circuits
+            # to baseline); the distinction is retained for diagnostics.
+            verdict = "medium"
+        else:
+            verdict = "low"
+        logger.debug(
+            "[Gate] confidence=%s (gap=%s multi_source=%s entity_cov=%s "
+            "n_strong=%d/%d)",
+            verdict, gap_ok, multi_source, entity_cov,
+            n_strong, self._conf_require_signals,
+        )
+        return verdict
+
     def _iterative_navigate(self, plan: Any, original_query: str) -> Any:
         """
         §12.37: iterative multi-hop navigation with bridge-entity propagation.
@@ -460,10 +558,15 @@ class AgentPipeline:
         seen_raw: set = set()
         seen_filtered: set = set()
         merged_scores: List[float] = []
+        # Fix 2a (2026-05-26): track which hop each chunk came from so the
+        # post-loop cap can allocate a FAIR share per hop instead of a pure
+        # score sort (which systematically evicted hop-1 chunks because hop-0
+        # chunks score higher against the original query).
+        chunk_hop_index: List[int] = []
         merged_metadata: Dict[str, Any] = {}
         last_result: Optional[NavigatorResult] = None
 
-        for hop in hops:
+        for hop_idx, hop in enumerate(hops):
             sub_query = hop.sub_query
 
             # §12.37 Fix F: inject resolved bridge entities into this hop's
@@ -498,6 +601,7 @@ class AgentPipeline:
                     accumulated_filtered.append(chunk)
                     seen_filtered.add(chunk)
                     merged_scores.append(score)
+                    chunk_hop_index.append(hop_idx)
 
             # After a bridge hop: extract bridges and remember them.
             if hop.is_bridge and nav_result.filtered_context:
@@ -518,6 +622,76 @@ class AgentPipeline:
             return NavigatorResult(
                 filtered_context=[], raw_context=[], scores=[], metadata={},
             )
+
+        # Fix 2a (2026-05-26): per-hop FAIR cap replaces the previous score-
+        # only cap. The score-only variant systematically evicted hop-1
+        # chunks because hop-0 chunks naturally score higher against the
+        # original query (the rewriter only injects bridge entities for
+        # hop>=1, so hop-0's sub_query is closer to the surface query in
+        # the cross-encoder reranker's input). Empirically that caused 4
+        # of the 9 retrieval_miss cases in the 2026-05-26 50-q row3.
+        #
+        # Fair-cap allocates an equal base_quota per hop, then redistributes
+        # the remainder by best score across all hops, then fills any
+        # leftover budget from hops that had fewer chunks than their quota.
+        # Refs: Radlinski 2008 source fairness; Diaz & Croft 2012 federated IR.
+        total_cap = getattr(self.navigator.config, "max_context_chunks", 8)
+        if len(accumulated_filtered) > total_cap and chunk_hop_index:
+            from collections import defaultdict as _dd
+
+            # Group (original_index, chunk, score) by hop_index.
+            by_hop: Dict[int, List[Tuple[int, str, float]]] = _dd(list)
+            for idx, (chunk, score, h) in enumerate(
+                zip(accumulated_filtered, merged_scores, chunk_hop_index)
+            ):
+                by_hop[h].append((idx, chunk, score))
+
+            num_hops = max(1, len(by_hop))
+            base_quota = total_cap // num_hops
+            remainder = total_cap - base_quota * num_hops
+
+            kept_indices: set = set()
+            leftovers: List[Tuple[int, str, float]] = []
+
+            # Pass 1: take top base_quota chunks per hop (by score)
+            for h in sorted(by_hop):
+                ranked = sorted(by_hop[h], key=lambda t: -t[2])
+                for i, (orig_idx, _c, _s) in enumerate(ranked):
+                    if i < base_quota:
+                        kept_indices.add(orig_idx)
+                    else:
+                        leftovers.append((orig_idx, _c, _s))
+
+            # Pass 2: distribute remainder across hops by next-best score
+            if remainder > 0 and leftovers:
+                leftovers.sort(key=lambda t: -t[2])
+                for orig_idx, _c, _s in leftovers[:remainder]:
+                    kept_indices.add(orig_idx)
+                leftovers = leftovers[remainder:]
+
+            # Pass 3: if a hop had fewer chunks than its quota, the budget
+            # is under total_cap; fill from highest-score remaining leftovers.
+            while len(kept_indices) < total_cap and leftovers:
+                leftovers.sort(key=lambda t: -t[2])
+                orig_idx, _c, _s = leftovers.pop(0)
+                kept_indices.add(orig_idx)
+
+            # Restore original insertion order (Navigator RRF order within
+            # each hop is preserved). The Verifier's §12.27 reorder then
+            # operates on this stable input.
+            kept_order = sorted(kept_indices)
+            new_filtered = [accumulated_filtered[i] for i in kept_order]
+            new_scores   = [merged_scores[i]        for i in kept_order]
+            new_hops     = [chunk_hop_index[i]      for i in kept_order]
+            per_hop_kept = {h: sum(1 for hh in new_hops if hh == h) for h in by_hop}
+            logger.info(
+                "[AgentPipeline iterative] fair-cap: %d -> %d chunks "
+                "(per-hop quotas: %s)",
+                len(accumulated_filtered), len(new_filtered), per_hop_kept,
+            )
+            accumulated_filtered = new_filtered
+            merged_scores = new_scores
+            chunk_hop_index = new_hops
 
         return NavigatorResult(
             filtered_context=accumulated_filtered,
@@ -611,6 +785,53 @@ class AgentPipeline:
                 logger.info("S_P skipped (enable_planner=False)")
             planner_time = (time.time() - planner_start) * 1000
 
+            # Fix 2c + Tier 1.5 extension (2026-05-26): gate over-decomposing
+            # patterns to single-pass when their decompositions are likely to
+            # confuse the SLM more than they help retrieval. Three rules:
+            #
+            #   1. `fallback_generic_2hop` (10/50 in diagnostic): the catch-all
+            #      when classifier said multi_hop but no pattern matched.
+            #      Unconditionally gate -- the diagnostic confirms these are
+            #      the dominant over-decomposition source.
+            #
+            #   2. `connector_split` with short halves (Tier 1.5): the
+            #      connector-split pattern aggressively splits on "and"/"or"
+            #      connectors. When BOTH halves are <=4 content words, the
+            #      result is two near-trivial sub-queries the single-pass
+            #      retriever handles just as well, without the cross-hop
+            #      context dilution cost. Long halves still get the split.
+            #
+            #   3. (Future) `comparison_parallel` same-source: deferred --
+            #      requires runtime check of entity source_file overlap.
+            if self.enable_planner and plan.hop_sequence:
+                _matched = getattr(plan, "matched_pattern", "") or ""
+
+                _gate_reason: Optional[str] = None
+                if _matched == "fallback_generic_2hop":
+                    _gate_reason = "fallback_generic_2hop"
+                elif _matched == "connector_split":
+                    # Word-count check on each hop's sub_query
+                    halves_short = all(
+                        len((getattr(h, "sub_query", "") or "").split()) <= 4
+                        for h in plan.hop_sequence
+                    )
+                    if halves_short:
+                        _gate_reason = "connector_split_short_halves"
+
+                if _gate_reason is not None:
+                    logger.info(
+                        "[Pipeline] over-decomposition gate fired (%s) for "
+                        "query=%.60s -- routing to single-pass retrieval",
+                        _gate_reason, query,
+                    )
+                    plan = _create_passthrough_plan(query)
+                    planner_result = {
+                        **(planner_result if isinstance(planner_result, dict) else {}),
+                        "fallback_gate_triggered": True,
+                        "original_matched_pattern": _matched,
+                        "gate_reason": _gate_reason,
+                    }
+
             # ── Stage 2: S_N (Navigator) ──────────────────────────────────────
             # Extract sub-queries from the planner's hop_sequence. For single-hop
             # queries or passthrough plans the hop_sequence is empty, so the
@@ -649,10 +870,53 @@ class AgentPipeline:
             )
 
             navigator_start = time.time()
-            if has_bridge_deps:
-                nav_result = self._iterative_navigate(plan, query)
+            confidence_route = "agentic"   # default route, recorded in metadata
+
+            # Architecture A (2026-05-27): confidence gate. Run a cheap
+            # single-pass baseline retrieval first; if retrieval confidence is
+            # HIGH, answer directly from it and skip the Planner's iterative
+            # decomposition (which the ablation shows is a net cost when the
+            # answer is already cleanly retrievable). Only escalate to the
+            # agentic path when confidence is not HIGH.
+            #
+            # The gate only engages when the Planner is on AND the plan would
+            # otherwise take the multi-subquery / iterative path -- there is
+            # nothing to gate on a passthrough single-hop plan (it is already
+            # the baseline). Refs: Geifman & El-Yaniv 2019; Asai et al. 2024.
+            gate_applies = (
+                self.enable_confidence_gate
+                and self.enable_planner
+                and bool(plan.hop_sequence)
+                and len(sub_queries) > 1
+            )
+            if gate_applies:
+                baseline_nav = self.navigator.navigate(plan, [query])
+                query_entities = [
+                    e.text for e in (getattr(plan, "entities", None) or [])
+                ]
+                confidence = self._compute_retrieval_confidence(
+                    baseline_nav, query_entities
+                )
+                if confidence == "high":
+                    confidence_route = "baseline_confident"
+                    nav_result = baseline_nav
+                    logger.info(
+                        "[Gate] HIGH retrieval confidence -> baseline path "
+                        "(skipping Planner decomposition) for query=%.60s",
+                        query,
+                    )
+                else:
+                    confidence_route = "agentic_escalated"
+                    if has_bridge_deps:
+                        nav_result = self._iterative_navigate(plan, query)
+                    else:
+                        nav_result = self.navigator.navigate(plan, sub_queries)
             else:
-                nav_result = self.navigator.navigate(plan, sub_queries)
+                # Gate disabled or not applicable -> existing routing logic.
+                if has_bridge_deps:
+                    nav_result = self._iterative_navigate(plan, query)
+                else:
+                    nav_result = self.navigator.navigate(plan, sub_queries)
             navigator_time = (time.time() - navigator_start) * 1000
 
             # asdict() performs a deep copy and recursively converts nested
@@ -663,6 +927,14 @@ class AgentPipeline:
             # explicit Enum→str conversion here (see verifier_result handling
             # below for the pattern).
             navigator_result = asdict(nav_result)
+            # Architecture A: record which route the gate chose so the
+            # benchmark / diagnostic can stratify EM by route.
+            if isinstance(navigator_result, dict):
+                _meta = navigator_result.get("metadata")
+                if not isinstance(_meta, dict):
+                    _meta = {}
+                _meta["confidence_route"] = confidence_route
+                navigator_result["metadata"] = _meta
             logger.debug(
                 "S_N completed: %d chunks (%.2fms)",
                 len(nav_result.filtered_context), navigator_time,
@@ -1070,9 +1342,9 @@ def _main() -> None:
 
     # ── Run smoke queries ─────────────────────────────────────────────────────
     queries = [
-        "Where was Einstein born?",
-        "Who directed Inception?",
-        "Where was Einstein born?",   # should be a cache hit
+        "What is the capital of France?",
+        "How tall is Mount Everest?",
+        "What is the capital of France?",   # should be a cache hit
     ]
     for i, q in enumerate(queries):
         result = pipeline.process(q)

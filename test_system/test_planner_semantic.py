@@ -950,7 +950,7 @@ class TestP9FallbackConfidenceOrdering:
     def test_yaml_fallback_below_min_pattern_confidence(self):
         """Loaded settings.yaml value also respects the ordering."""
         from src.logic_layer.planner import PlannerConfig
-        from src.logic_layer._settings import _load_settings
+        from src.logic_layer._settings_loader import _load_settings
         cfg = PlannerConfig.from_yaml(_load_settings())
         min_match_confidence = (
             cfg.classifier_confidence_base

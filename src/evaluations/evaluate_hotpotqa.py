@@ -29,12 +29,12 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime
 
 import numpy as np
-import yaml
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.evaluations.metrics import compute_exact_match, compute_f1
+from src.logic_layer._settings_loader import _load_settings
 
 # Seed all RNG sources for fully reproducible evaluation runs.
 random.seed(42)
@@ -117,8 +117,9 @@ class HotpotQAEvaluator:
         """Initialize the RAG pipeline with retriever and graph store."""
         self.logger.info(f"Setting up pipeline (mode={retrieval_mode})...")
 
-        with open(self.config_path, 'r', encoding='utf-8') as f:
-            self.config = yaml.safe_load(f)
+        # Route through the unified loader so the 35-key reproducibility
+        # validator in _settings_loader runs here too.
+        self.config = _load_settings(settings_path=self.config_path)
 
         self.config["rag"]["retrieval_mode"] = retrieval_mode
 

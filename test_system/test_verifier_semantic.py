@@ -701,6 +701,13 @@ class TestB1QueryTypePlumbing:
 
     def test_multi_hop_with_hop_sequence_selects_bridge_prompt(self, minimal_cfg, monkeypatch):
         v = create_verifier(cfg=minimal_cfg, enable_pre_validation=False)
+        # This test verifies PROMPT-SELECTION ROUTING (multi-hop → BRIDGE_PROMPT),
+        # not the bridge-exclusion retry path. The mocked LLM always returns the
+        # bridge entity "Inception", which would trigger the bounded
+        # bridge-exclusion retry and overwrite the captured prompt with the
+        # exclusion prompt. Disable that retry so the captured prompt is the
+        # initial bridge prompt under test.
+        v.config.enable_bridge_exclusion_retry = False
         captured = {}
 
         def fake_llm(self, prompt):

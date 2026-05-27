@@ -21,6 +21,8 @@ Note (B7, 2026-05-15):
     methods (run, __call__, _build_workflow, _run_simple_pipeline) and the
     AgentState TypedDict were removed in the B7 cleanup. The production
     entry point is AgentPipeline.process().
+
+Last reviewed: 2026-05-25 (audit pass, project version 5.4).
 """
 
 # =============================================================================
@@ -106,5 +108,5 @@ __all__ = [
     "AgenticController",
 ]
 
-__version__ = "4.0.0"
-__author__ = "Edge-RAG Research Project"
+__version__ = "5.4.0"
+__author__ = "Jan Nietzard"

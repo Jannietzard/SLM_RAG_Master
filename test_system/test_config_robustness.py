@@ -154,7 +154,7 @@ class TestConfigFileLoading:
     def test_malformed_yaml_returns_empty_dict_not_raises(self) -> None:
         """yaml.YAMLError during parse must return {} without propagating the exception."""
         import yaml
-        from src.logic_layer._settings import _load_settings
+        from src.logic_layer._settings_loader import _load_settings
         from unittest.mock import patch
         with patch("yaml.safe_load", side_effect=yaml.YAMLError("simulated bad yaml")):
             result = _load_settings()
@@ -166,7 +166,7 @@ class TestConfigFileLoading:
 
     def test_missing_settings_file_returns_empty_dict_not_raises(self) -> None:
         """When settings.yaml does not exist, _load_settings() must return {}."""
-        from src.logic_layer._settings import _load_settings
+        from src.logic_layer._settings_loader import _load_settings
         from unittest.mock import patch
         from pathlib import Path
         with patch.object(Path, "exists", return_value=False):

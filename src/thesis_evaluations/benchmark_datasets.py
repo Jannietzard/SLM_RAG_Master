@@ -59,8 +59,7 @@ Evaluate — question selection (the `evaluate` sub-command):
     3) First N (deterministic, the pre-2026-05 behaviour). Use `--range 0-N` to
        take questions in index order from the start — handy for a stable smoke
        test or to reproduce older results.
-         python -X utf8 -m src.thesis_evaluations.benchmark_datasets evaluate --dataset hotpotqa --range 0-20
-
+        
     4) Defined slice. `--range START-END` takes questions[START:END] in order
        (separators '-', '_' or ':' all work). Use this to run a specific band,
        e.g. questions 10 through 30, or to shard a 500-question run.
@@ -93,8 +92,9 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-import yaml
 import numpy as np
+
+from src.logic_layer._settings_loader import _load_settings
 
 try:
     from tqdm import tqdm
@@ -220,13 +220,22 @@ logger.info(f"  AblationModule:     {ABLATION_MODULE_AVAILABLE}")
 
 AVAILABLE_DATASETS = ["hotpotqa", "2wikimultihop", "strategyqa"]
 
+# Retrieval-lane ablation. 5-tuple: (name, vector_weight, graph_weight,
+# bm25_weight, enable_bm25). BM25 is a genuinely separate sparse-lexical lane
+# (rank_bm25, §12.29), NOT a vector approach, so it gets its own ablation
+# dimension. Architectural constraint: HybridRetriever fires BM25 only in
+# VECTOR/HYBRID mode (mode is set from vector/graph weights — see
+# create_pipeline), so a clean "BM25 alone" row is not separable; instead the
+# rows below let you read each lane's MARGINAL contribution:
+#   BM25  marginal = vector_bm25 − vector_only
+#   graph marginal = hybrid_all  − vector_bm25
+#   dense vs graph = vector_only  vs graph_only
 ABLATION_CONFIGS = [
-    ("vector_only", 1.0, 0.0),
-    #("hybrid_80_20", 0.8, 0.2),
-    #("hybrid_70_30", 0.7, 0.3),
-    ("hybrid_50_50", 0.5, 0.5),
-    #("hybrid_30_70", 0.3, 0.7),
-    ("graph_only", 0.0, 1.0),
+    # name,           vec,  graph, bm25, enable_bm25
+    ("vector_only",   1.0,  0.0,   0.0,  False),  # dense ANN alone
+    ("vector_bm25",   1.0,  0.0,   1.0,  True),   # dense + sparse (BM25 marginal)
+    ("graph_only",    0.0,  1.0,   0.0,  False),  # entity-path traversal alone
+    ("hybrid_all",    1.0,  1.0,   1.0,  True),   # all three lanes fused (RRF)
 ]
 
 # Component ablation: (name, enable_planner, enable_verifier, max_iterations)
@@ -323,6 +332,17 @@ class EvalResult:
     verifier_iterations: int = 0
     all_verified: bool = False
     confidence: str = ""
+    # Fix 2b (2026-05-26): pre-validation instrumentation. Surfaces the
+    # pre_validation.status enum value (e.g. PASSED / INSUFFICIENT_EVIDENCE)
+    # and the count of chunks dropped by pre-validation filters. Lets the
+    # diagnostic harness distinguish "pre-val fired but inert" from
+    # "pre-val dropped the gold chunk".
+    pre_validation_status: Optional[str] = None
+    pre_validation_chunks_in: int = 0
+    pre_validation_chunks_out: int = 0
+    # Fix 2c-A (2026-05-26): records whether the bridge-entity exclusion
+    # retry fired and whether it changed the final answer.
+    bridge_retry_fired: bool = False
 
 @dataclass
 class ConfigResult:
@@ -1024,10 +1044,13 @@ def create_pipeline(
     store_manager: StoreManager,
     vector_weight: float = 0.7,
     graph_weight: float = 0.3,
+    bm25_weight: float = 1.0,
     model_name: str = None,
     enable_planner: bool = True,
     enable_verifier: bool = True,
     max_iterations: int = 1,
+    enable_pre_validation: bool = True,
+    enable_bm25: Optional[bool] = None,
 ):
     """
     Create pipeline for specific dataset.
@@ -1062,11 +1085,47 @@ def create_pipeline(
     pipeline_config["agent"]["enable_verifier"] = enable_verifier
     pipeline_config["agent"]["max_verification_iterations"] = max_iterations
 
-    # Set retrieval weights
+    # Fix 2b (2026-05-26): pre-validation ablation toggle. When False, the
+    # three pre-validation checks (entity-path, contradiction, credibility)
+    # are forced off so the "+Verifier" ablation row produces a distinct
+    # configuration from the "+Planner" row. Without this override, row3
+    # and row4 of agentic_ablation are byte-identical settings -> Δ=0pp
+    # is structural, not informative.
+    pipeline_config["verifier"] = pipeline_config.get("verifier", {}).copy()
+    if not enable_pre_validation:
+        pipeline_config["verifier"]["enable_entity_path_validation"] = False
+        pipeline_config["verifier"]["enable_contradiction_detection"] = False
+        pipeline_config["verifier"]["enable_credibility_scoring"] = False
+        logger.info(
+            "create_pipeline: pre-validation DISABLED (entity-path / "
+            "contradiction / credibility all off)"
+        )
+
+    # Set per-lane RRF weights. The pipeline has THREE independent retrieval
+    # lanes fused via RRF (Cormack et al. 2009):
+    #   - vector : dense ANN over nomic-embed-text embeddings (LanceDB)
+    #   - graph  : entity-path traversal (KuzuDB)
+    #   - bm25   : sparse lexical term-frequency ranking (rank_bm25, §12.29)
+    # BM25 is a genuinely separate lane (lexical, not embedding-based), so it
+    # gets its own ablation weight + on/off toggle just like vector and graph.
     pipeline_config["rag"] = pipeline_config.get("rag", {}).copy()
     pipeline_config["rag"]["vector_weight"] = vector_weight
     pipeline_config["rag"]["graph_weight"] = graph_weight
-    
+    pipeline_config["rag"]["bm25_weight"] = bm25_weight
+
+    # enable_bm25: when explicitly set, override settings.yaml. Needed for a
+    # clean single-lane ablation -- BM25 fires in VECTOR and HYBRID modes
+    # (HybridRetriever gates it by `enable_bm25 and mode in {VECTOR, HYBRID}`),
+    # so a "pure vector" row must set enable_bm25=False to silence the sparse
+    # lane. None = leave the settings.yaml value untouched (default behaviour).
+    if enable_bm25 is not None:
+        pipeline_config["rag"]["enable_bm25"] = bool(enable_bm25)
+
+    # RetrievalMode selects the vector/graph lanes. NOTE: BM25 is orthogonal —
+    # it is controlled by enable_bm25/bm25_weight above, not by this mode. In
+    # GRAPH mode the BM25 lane does not fire (HybridRetriever restricts it to
+    # VECTOR/HYBRID). So "graph only" = graph_weight>0, vector_weight=0; "vector
+    # only (no sparse)" = vector_weight>0, graph_weight=0, enable_bm25=False.
     if graph_weight == 0:
         pipeline_config["rag"]["retrieval_mode"] = "vector"
     elif vector_weight == 0:
@@ -1374,6 +1433,32 @@ def _extract_verifier_diagnostics(verifier_result: Dict[str, Any]) -> Tuple[int,
     return iters, allv, conf
 
 
+def _extract_pre_validation_diagnostics(
+    verifier_result: Dict[str, Any],
+) -> Tuple[Optional[str], int, int]:
+    """
+    Fix 2b: extract (status, chunks_in, chunks_out) from the pre_validation
+    nested dict produced by Verifier.generate_and_verify().
+
+    Returns (None, 0, 0) when verifier_result is missing or pre_validation
+    was not run (enable_verifier=False).
+    """
+    if not isinstance(verifier_result, dict):
+        return None, 0, 0
+    pre = verifier_result.get("pre_validation") or {}
+    if not isinstance(pre, dict):
+        return None, 0, 0
+    status = pre.get("status")
+    if status is not None and not isinstance(status, str):
+        # ValidationStatus enum -> str via asdict serialization
+        status = getattr(status, "value", str(status))
+    filtered = pre.get("filtered_context", []) or []
+    details = pre.get("details", {}) or {}
+    chunks_in = int(details.get("input_chunk_count", 0) or 0) if isinstance(details, dict) else 0
+    chunks_out = len(filtered) if isinstance(filtered, list) else 0
+    return (str(status) if status is not None else None, chunks_in, chunks_out)
+
+
 # ============================================================================
 # EVALUATION RUNNER
 # ============================================================================
@@ -1479,6 +1564,10 @@ def evaluate_dataset(
                 v_iters, v_verified, v_conf = _extract_verifier_diagnostics(
                     getattr(result, "verifier_result", {}) or {}
                 )
+                # Fix 2b: pre-validation status + chunk-flow instrumentation.
+                pv_status, pv_in, pv_out = _extract_pre_validation_diagnostics(
+                    getattr(result, "verifier_result", {}) or {}
+                )
 
                 eval_result = EvalResult(
                     question_id=q.id,
@@ -1510,6 +1599,9 @@ def evaluate_dataset(
                     verifier_iterations=v_iters,
                     all_verified=v_verified,
                     confidence=v_conf,
+                    pre_validation_status=pv_status,
+                    pre_validation_chunks_in=pv_in,
+                    pre_validation_chunks_out=pv_out,
                 )
                 results.append(eval_result)
 
@@ -1948,9 +2040,13 @@ def cmd_ablation(args, config: Dict, store_manager: StoreManager):
         jsonl_dir = Path("./evaluation_results")
 
         # ── Retrieval-weight ablation ──────────────────────────────────────
-        for cfg_name, vector_weight, graph_weight in ABLATION_CONFIGS:
+        for cfg_name, vector_weight, graph_weight, bm25_weight, enable_bm25 in ABLATION_CONFIGS:
             run_name = f"{cfg_name}_{model_name}"
-            logger.info(f"\n  [Retrieval] {run_name} (v={vector_weight}, g={graph_weight})")
+            logger.info(
+                f"\n  [Retrieval] {run_name} "
+                f"(v={vector_weight}, g={graph_weight}, "
+                f"bm25={bm25_weight}, enable_bm25={enable_bm25})"
+            )
 
             pipeline = None
             try:
@@ -1958,6 +2054,8 @@ def cmd_ablation(args, config: Dict, store_manager: StoreManager):
                     dataset, config, store_manager,
                     vector_weight=vector_weight,
                     graph_weight=graph_weight,
+                    bm25_weight=bm25_weight,
+                    enable_bm25=enable_bm25,
                     model_name=model_name,
                 )
 
@@ -2294,11 +2392,15 @@ def cmd_test(args, config: Dict, store_manager: StoreManager):
 # ============================================================================
 
 def load_config_file(config_path: Path = Path("./config/settings.yaml")) -> Dict:
-    """Load configuration from YAML."""
+    """Load configuration from YAML.
+
+    Routes through the unified ``_load_settings`` so the 35-key reproducibility
+    validator runs here too. The hardcoded fallback dict below is kept as a
+    last-resort emergency default if the path does not exist at all.
+    """
     if config_path.exists():
-        with open(config_path, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f) or {}
-    
+        return _load_settings(settings_path=config_path) or {}
+
     logger.warning(f"Config not found: {config_path}, using defaults")
     return {
         "embeddings": {

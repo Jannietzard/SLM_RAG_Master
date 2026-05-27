@@ -1,9 +1,7 @@
 """
-Document Ingestion Pipeline — Configurable Chunking Strategies
+Document Ingestion Pipeline -- Configurable Chunking Strategies
 
-Version: 4.0.0
-Author: Edge-RAG Research Project
-Last Modified: 2026-04-08
+Author: Jan Nietzard
 
 ================================================================================
 OVERVIEW
@@ -51,6 +49,8 @@ USAGE
     pipeline = create_data_layer_pipeline(strategy="sentence_spacy")
 
 ================================================================================
+
+Last reviewed: 2026-05-25 (audit pass, project version 5.4).
 """
 
 import logging
@@ -62,6 +62,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Public API. All five symbols are re-exported via src/data_layer/__init__.py
+# and consumed by tests + src/pipeline/ingestion_pipeline.py.
+__all__ = [
+    "DocumentIngestionPipeline",
+    "IngestionConfig",
+    "ChunkingStrategy",
+    "create_ingestion_config",
+    "create_data_layer_pipeline",
+]
 
 
 # ============================================================================
@@ -105,7 +115,7 @@ try:
     _CHUNKING_AVAILABLE = True
 except ImportError as _chunking_err:
     logger.warning(
-        "⚠ FALLBACK AKTIV: chunking module not available (%s). "
+        "FALLBACK ACTIVE: chunking module not available (%s). "
         "Only the built-in SentenceChunker (regex) will work. "
         "Install SpaCy: pip install spacy && python -m spacy download en_core_web_sm",
         _chunking_err,
@@ -260,11 +270,8 @@ def create_ingestion_config(cfg: Dict[str, Any]) -> IngestionConfig:
 
     Example
     -------
-        import yaml
-        from pathlib import Path
-        settings_path = Path(__file__).parent.parent.parent / "config" / "settings.yaml"
-        with open(settings_path, encoding="utf-8") as f:
-            settings = yaml.safe_load(f)
+        from src.logic_layer._settings_loader import _load_settings
+        settings = _load_settings()
         config = create_ingestion_config(settings.get("ingestion", {}))
     """
     ingestion = cfg.get("ingestion", cfg)   # accept either full settings or sub-dict
@@ -350,7 +357,7 @@ class DocumentIngestionPipeline:
                     )
                 except (ImportError, OSError, ValueError, RuntimeError) as exc:
                     logger.warning(
-                        "⚠ FALLBACK AKTIV: SpaCy sentence chunker init failed (%s). "
+                        "FALLBACK ACTIVE: SpaCy sentence chunker init failed (%s). "
                         "Falling back to regex SentenceChunker. "
                         "Ensure SpaCy is installed: pip install spacy && "
                         "python -m spacy download %s",
@@ -358,7 +365,7 @@ class DocumentIngestionPipeline:
                     )
             else:
                 logger.warning(
-                    "⚠ FALLBACK AKTIV: sentence_spacy requested but SpaCy unavailable. "
+                    "FALLBACK ACTIVE: sentence_spacy requested but SpaCy unavailable. "
                     "Falling back to regex SentenceChunker.",
                 )
             return SentenceChunker(
@@ -379,13 +386,13 @@ class DocumentIngestionPipeline:
                     )
                 except (ImportError, OSError, ValueError, RuntimeError) as exc:
                     logger.warning(
-                        "⚠ FALLBACK AKTIV: semantic chunker init failed (%s). "
+                        "FALLBACK ACTIVE: semantic chunker init failed (%s). "
                         "Falling back to RecursiveChunker.",
                         exc,
                     )
             else:
                 logger.warning(
-                    "⚠ FALLBACK AKTIV: semantic strategy requested but chunking "
+                    "FALLBACK ACTIVE: semantic strategy requested but chunking "
                     "module unavailable. Falling back to RecursiveChunker.",
                 )
             return RecursiveChunker(
@@ -403,7 +410,7 @@ class DocumentIngestionPipeline:
                     word_boundary_factor=self.config.word_boundary_factor,
                 )
             logger.warning(
-                "⚠ FALLBACK AKTIV: fixed strategy requested but chunking module "
+                "FALLBACK ACTIVE: fixed strategy requested but chunking module "
                 "unavailable. Falling back to SentenceChunker.",
             )
             return SentenceChunker(
@@ -419,7 +426,7 @@ class DocumentIngestionPipeline:
                     min_chunk_size=self.config.min_chunk_size,
                 )
             logger.warning(
-                "⚠ FALLBACK AKTIV: recursive strategy requested but chunking "
+                "FALLBACK ACTIVE: recursive strategy requested but chunking "
                 "module unavailable. Falling back to SentenceChunker.",
             )
             return SentenceChunker(
@@ -571,10 +578,6 @@ def create_data_layer_pipeline(
         **kwargs,
     )
     return DocumentIngestionPipeline(config)
-
-
-#: Backward-compatibility alias — use create_data_layer_pipeline instead.
-create_pipeline = create_data_layer_pipeline
 
 
 # ============================================================================

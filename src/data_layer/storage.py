@@ -1,9 +1,7 @@
 """
 Hybrid Storage Module: Vector Store (LanceDB) + Knowledge Graph (KuzuDB)
 
-Version: 4.0.0
 Author: Jan Nietzard
-Last Modified: 2026-04-24
 
 ===============================================================================
 OVERVIEW
@@ -62,16 +60,7 @@ USAGE
     store.add_documents(documents)
     results = store.vector_search(query_embedding, top_k=5)
 
-===============================================================================
-REVIEW HISTORY
-===============================================================================
-
-    Last Reviewed:  2026-04-19
-    Review Result:  0 CRITICAL, 4 IMPORTANT, 3 RECOMMENDED
-    Reviewer:       Code Review Prompt v2.1
-    Next Review:    After schema changes or graph backend refactoring
-
-===============================================================================
+Last reviewed: 2026-05-25 (audit pass, project version 5.4).
 """
 
 import json
@@ -122,6 +111,18 @@ if KUZU_AVAILABLE and hasattr(kuzu, "Error"):
 
 if not KUZU_AVAILABLE:
     logger.warning("KuzuDB not available. Install with: pip install kuzu")
+
+
+# Public API. Module-internal helpers (_entity_name_variants,
+# _get_hub_entity_names, _is_graph_worthy_entity, _STORAGE_ERRORS,
+# _HUB_NAMES_CACHE) remain accessible by direct-name import for tests.
+__all__ = [
+    "HybridStore",
+    "StorageConfig",
+    "VectorStoreAdapter",
+    "KuzuGraphStore",
+    "create_storage_config",
+]
 
 
 # ============================================================================
@@ -433,21 +434,20 @@ def _entity_name_variants(name: str) -> List[str]:
     Build a prioritised list of name variants for alias-tolerant entity lookup.
 
     Priority order (most → least specific):
-      1. Full name                     "Giuseppe Arimondi"
-      2. Last token (surname)          "Arimondi"          — skipped if ≤4 chars
+      1. Full name                     "Marie Curie"
+      2. Last token (surname)          "Curie"             — skipped if ≤4 chars
       3. Individual tokens ≥7 chars    (middle names, long first names)
 
     Tokens ≤6 chars are excluded from single-token fallbacks because short
-    given names like "Giuseppe" or "Scott" match unrelated hub entities
-    (Giuseppe Verdi, Scott …) and flood results before the correct surname hit.
+    given names match unrelated hub entities of the same first name and
+    flood results before the correct surname hit reaches the top-K cap.
     The only exception is step 1 (full name always tried first).
 
     Examples:
-      "Giuseppe Arimondi" → ["Giuseppe Arimondi", "Arimondi"]
-      "Ed Wood"           → ["Ed Wood", "Wood"]
-      "Scott Derrickson"  → ["Scott Derrickson", "Derrickson"]
-      "Carlo Rovelli"     → ["Carlo Rovelli", "Rovelli"]
-      "Masakazu Katsura"  → ["Masakazu Katsura", "Katsura", "Masakazu"]
+      "Marie Curie"        → ["Marie Curie", "Curie"]
+      "Albert Einstein"    → ["Albert Einstein", "Einstein"]
+      "Leonardo da Vinci"  → ["Leonardo da Vinci", "Vinci"]
+      "Akira Kurosawa"     → ["Akira Kurosawa", "Kurosawa", "Akira"]
     """
     variants: List[str] = [name]
     tokens = name.split()
@@ -538,7 +538,7 @@ def _get_hub_entity_names(conn, mention_cap: int) -> List[str]:
         logger.info("Hub-entity cache built: %d names with mention-degree > %d",
                     len(names), mention_cap)
         return names
-    except Exception as exc:
+    except (RuntimeError, ValueError, AttributeError, ConnectionError) as exc:
         logger.warning("Hub-entity cache build failed (%s) — proceeding "
                        "without hub filter (graph quality may degrade)", exc)
         # Cache empty list so we don't retry the failing query every call.
@@ -637,13 +637,13 @@ class KuzuGraphStore:
             if getattr(self, "conn", None) is not None:
                 del self.conn
                 self.conn = None  # type: ignore[assignment]
-        except Exception:
+        except (RuntimeError, AttributeError, ReferenceError):
             pass
         try:
             if getattr(self, "db", None) is not None:
                 del self.db
                 self.db = None  # type: ignore[assignment]
-        except Exception:
+        except (RuntimeError, AttributeError, ReferenceError):
             pass
 
     def _init_schema(self) -> None:
@@ -881,7 +881,7 @@ class KuzuGraphStore:
                 "MENTIONS relation failed (%s → %s): %s", chunk_id, entity_id, exc
             )
 
-    # ── Batch transaction helpers ─────────────────────────────────────────────
+    # -- Batch transaction helpers ---------------------------------------------
     # KuzuDB auto-commits every conn.execute() individually, which means one
     # fsync per statement.  Wrapping N inserts in a single BEGIN/COMMIT reduces
     # the fsync count from N to 1 and speeds up bulk imports by 10–30×.
@@ -906,7 +906,7 @@ class KuzuGraphStore:
         if self.conn is not None:
             try:
                 self.conn.execute("ROLLBACK")
-            except Exception:
+            except (RuntimeError, AttributeError):
                 pass
 
     def add_related_to_relation(
@@ -1031,7 +1031,7 @@ class KuzuGraphStore:
                 logger.warning("Bulk RELATED_TO batch failed at offset %d: %s", i, exc)
                 try:
                     self.conn.execute("ROLLBACK")
-                except Exception:
+                except (RuntimeError, AttributeError):
                     pass
         return written
 
@@ -1089,7 +1089,7 @@ class KuzuGraphStore:
                 )
                 try:
                     self.conn.execute("ROLLBACK")
-                except Exception:
+                except (RuntimeError, AttributeError):
                     pass
         return written
 
@@ -1149,7 +1149,7 @@ class KuzuGraphStore:
                 )
                 try:
                     self.conn.execute("ROLLBACK")
-                except Exception:
+                except (RuntimeError, AttributeError):
                     pass
         return written
 
@@ -1482,7 +1482,7 @@ class KuzuGraphStore:
                     return 0.3 * weight  # one-sided support — still some signal
                 base = min(1.0, math.log(1 + n) / math.log(10))
                 return base * weight
-        except Exception as exc:
+        except (RuntimeError, ValueError, AttributeError, ConnectionError) as exc:
             logger.debug("_triple_frequency_confidence failed: %s", exc)
         return 0.5
 
@@ -1506,9 +1506,10 @@ class KuzuGraphStore:
 
         This design enables bridge-entity reasoning as described in thesis
         section 2.4 (original architectural contribution): a query about
-        "Scott Derrickson" can reach chunks about "Ed Wood" via an
-        intermediate director-relation hop, without loading all document
-        text into memory (< 16 GB RAM constraint).
+        one entity can reach chunks about a second entity via an
+        intermediate semantic relation in the graph (e.g. PersonA →
+        directed → MovieM ← directed ← PersonB), without loading all
+        document text into memory (< 16 GB RAM constraint).
 
         Args:
             entity_name: Entity name substring to match.
@@ -1552,8 +1553,10 @@ class KuzuGraphStore:
             #      — implemented as `e.name IN $substrings` where substrings
             #      are the multi-token prefixes/suffixes of the query.
             # I-3 (publication-recommended): bidirectional alias matching.
-            # Without (3), query "the King" cannot match stored entity
-            # "King George V"; only the reverse direction worked.
+            # Without direction (3), a query that uses a generic role noun
+            # ("the King", "the director") cannot match a stored entity
+            # whose name embeds the role token but with an additional
+            # proper-noun specifier; only the reverse direction worked.
             effective_name = entity_name  # will be updated on first hit
 
             # Pre-compute multi-token sub-phrases of the candidate for the
@@ -1923,6 +1926,17 @@ class HybridStore:
         if hasattr(self, "graph_store") and self.graph_store is not None:
             self.graph_store.close()
 
+    # ---- Context Manager Protocol ----------------------------------------
+    # Forgetting to call close() leaks the KuzuDB C++ file lock until garbage
+    # collection. Use `with HybridStore(...) as store:` to release it
+    # deterministically when leaving the scope.
+
+    def __enter__(self) -> "HybridStore":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
     def _init_entity_pipeline(self, config: StorageConfig) -> "Optional[EntityExtractionPipeline]":
         """
         Construct EntityExtractionPipeline from settings when not injected.
@@ -2285,7 +2299,7 @@ def run_diagnostics(config: StorageConfig, embeddings: Embeddings) -> Dict[str, 
     try:
         test_emb = embeddings.embed_query("diagnostic test")
         results["embedding_dim"] = len(test_emb)
-    except Exception as exc:
+    except (RuntimeError, ValueError, AttributeError, ConnectionError) as exc:
         results["issues"].append("Embedding failed: %s" % exc)
 
     if not KUZU_AVAILABLE:

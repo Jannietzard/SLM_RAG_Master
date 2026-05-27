@@ -35,9 +35,9 @@ Data flow:
   query string
     → ImprovedQueryEntityExtractor  (GLiNER → SpaCy → Regex NER chain)
     → HybridRetriever.retrieve()
-        ├── VectorStoreAdapter.vector_search()  (LanceDB ANN, top-K)
-        ├── BM25 lane (rank_bm25, third RRF lane; §12.29)
-        └── HybridStore.graph_search()          (KuzuDB 1-hop + 2-hop)
+        ├-- VectorStoreAdapter.vector_search()  (LanceDB ANN, top-K)
+        ├-- BM25 lane (rank_bm25, third RRF lane; §12.29)
+        └-- HybridStore.graph_search()          (KuzuDB 1-hop + 2-hop)
     → RRFFusion.fuse()              (RRF + cross-source boost)
     → List[RetrievalResult]
 
@@ -72,6 +72,8 @@ Scientific references:
            Bull. Soc. Vaudoise Sci. Nat. 37, 241-272.
 
 ===============================================================================
+
+Last reviewed: 2026-05-25 (audit pass, project version 5.4).
 """
 
 import logging
@@ -91,6 +93,23 @@ from .graph_quality import DEFAULT_STOPLIST, canonical_form
 from src.utils import jaccard_similarity
 
 logger = logging.getLogger(__name__)
+
+# Public API consumed by:
+#   - src/data_layer/__init__.py     (re-exports the 6 dataclasses + classes)
+#   - src/thesis_evaluations/benchmark_datasets.py (uses create_hybrid_retriever)
+#   - src/logic_layer/navigator.py   (HybridRetriever, RetrievalConfig)
+# Module-internal helpers (_bm25_tokenize, _normalize_query_entity, the B1
+# span-boundary functions, _get_gliner_model) stay accessible by direct-name
+# import for tests.
+__all__ = [
+    "HybridRetriever",
+    "RetrievalConfig",
+    "RetrievalMode",
+    "RetrievalResult",
+    "RetrievalMetrics",
+    "ImprovedQueryEntityExtractor",
+    "create_hybrid_retriever",
+]
 
 # ---------------------------------------------------------------------------
 # BM25 tokenisation
@@ -291,7 +310,7 @@ def _get_gliner_model(model_name: str = "urchade/gliner_small-v2.1"):
                         logger.info(
                             "GLiNER model loaded from local cache: %s", model_name
                         )
-                    except (ImportError, OSError, RuntimeError, Exception) as e2:
+                    except Exception as e2:  # noqa: BLE001 -- HF Hub raises non-stdlib exception types
                         logger.warning(
                             "FALLBACK ACTIVE: GLiNER offline load also failed (%s)"
                             " -> SpaCy/Regex extraction will be used.",
@@ -691,7 +710,7 @@ class ImprovedQueryEntityExtractor:
         3. Regex (last-resort fallback)
     """
 
-    # ── Junk-entity filter (Bug 2) ────────────────────────────────────────
+    # -- Junk-entity filter (Bug 2) ----------------------------------------
     # GLiNER over-extracts on question text and produces non-entities like
     # "what year", "third year", "this person" that pollute the graph
     # lookup and Verifier entity-path validation.  Combined with the
@@ -1079,7 +1098,7 @@ class HybridRetriever:
             try:
                 bm25_results = self._bm25_search(query, self.config.bm25_top_k)
                 logger.debug("BM25: %d results", len(bm25_results))
-            except Exception as _bm25_err:
+            except (RuntimeError, ValueError, AttributeError, IndexError, ImportError) as _bm25_err:
                 logger.debug("BM25 search failed: %s", _bm25_err)
 
         # 3. Graph retrieval
@@ -1171,7 +1190,7 @@ class HybridRetriever:
             self._bm25_corpus_rows = df.to_dict("records")
             self._bm25_index = BM25Okapi(corpus)
             logger.info("BM25 index built: %d chunks", len(corpus))
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError, IndexError, ImportError) as e:
             logger.warning("BM25 index build failed: %s", e)
             self._bm25_index = None
 
@@ -1209,7 +1228,7 @@ class HybridRetriever:
             row = self._bm25_corpus_rows[idx]
             try:
                 meta = _json.loads(row.get("metadata", "{}"))
-            except Exception:
+            except (_json.JSONDecodeError, TypeError, ValueError):
                 meta = {}
             results.append({
                 "document_id": str(row.get("document_id", "")),
@@ -1308,20 +1327,38 @@ def create_hybrid_retriever(
     cfg: Optional[Dict[str, Any]] = None,
 ) -> "HybridRetriever":
     """
-    Factory for HybridRetriever.  Reads all parameters from a settings dict
+    Factory for HybridRetriever. Reads all parameters from a settings dict
     (typically loaded from config/settings.yaml).
 
     Args:
         hybrid_store: Initialised HybridStore instance.
         embeddings: Embedding model.
-        cfg: Full settings dictionary.  Keys used:
-            rag.retrieval_mode, rag.rrf_k, rag.cross_source_boost,
-            vector_store.top_k_vectors, vector_store.similarity_threshold,
-            graph.top_k_entities, graph.max_hops,
-            ingestion.spacy_model,
-            entity_extraction.gliner.confidence_threshold,
-            entity_extraction.gliner.entity_types,
+        cfg: Full settings dictionary. Settings keys read (all 17 verified
+            present in config/settings.yaml):
+
+            rag.retrieval_mode       -> RetrievalMode
+            rag.rrf_k                -> RRF constant (default 60)
+            rag.cross_source_boost   -> cross-source bonus factor (default 1.2)
+            rag.enable_bm25          -> toggle BM25 lane (default True)
+            rag.bm25_top_k           -> BM25 candidates per query (default 10)
+            rag.vector_weight        -> I-1 per-source RRF weight (default 1.0)
+            rag.graph_weight         -> I-1 per-source RRF weight (default 1.0)
+            rag.bm25_weight          -> I-1 per-source RRF weight (default 1.0)
+            vector_store.top_k_vectors        -> vector_top_k / final_top_k
+            vector_store.similarity_threshold -> dense filter floor (default 0.3)
+            graph.top_k_entities     -> graph_top_k
+            graph.max_hops           -> graph traversal depth (default 2)
+            graph.enable_hop3        -> I-2 opt-in 2-bridge hop (default False)
+            graph.hub_mention_cap    -> I-3 hub-entity exclusion threshold
+                                       (mutates hybrid_store.graph_store.HUB_MENTION_CAP
+                                       on this instance only)
+            ingestion.spacy_model    -> SpaCy fallback model for query NER
+            entity_extraction.gliner.confidence_threshold
+                                     -> query_ner_confidence (default 0.15)
+            entity_extraction.gliner.entity_types
+                                     -> query_entity_types (None = use defaults)
             entity_extraction.gliner.model_name
+                                     -> GLiNER model identifier
 
     Returns:
         Configured HybridRetriever instance.

@@ -807,9 +807,11 @@ def patch_verifier(verifier) -> None:
     # ── _call_llm ─────────────────────────────────────────────────────────────
     orig_call_llm = verifier._call_llm
 
-    def _wrap_call_llm(prompt: str):
+    def _wrap_call_llm(prompt: str, *args, **kwargs):
+        # Forward *args/**kwargs so the wrapper tracks the real _call_llm
+        # signature (e.g. the structured-CoT path passes max_tokens=...).
         prompt_block(prompt)
-        answer, latency_ms = orig_call_llm(prompt)
+        answer, latency_ms = orig_call_llm(prompt, *args, **kwargs)
         answer_block(answer, latency_ms)
         return answer, latency_ms
 
@@ -1235,7 +1237,7 @@ def main():
         return 2 * prec * rec / (prec + rec)
 
     try:
-        from src.logic_layer._settings import _load_settings
+        from src.logic_layer._settings_loader import _load_settings
         _f1_threshold = float(
             _load_settings().get("benchmark", {}).get("answer_f1_threshold", 0.6)
         )

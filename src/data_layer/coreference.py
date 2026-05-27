@@ -7,14 +7,13 @@ Applied per-article BEFORE chunking so that GLiNER (Phase 2) and the graph
 the mention or classifying the pronoun as PERSON.
 
 Worked example:
-    Before:  "Christopher Nolan was born in London. He directed Inception."
-             -> Phase 2 extracts: Christopher Nolan, London, Inception, "He" (PERSON)
-             -> "He" is dropped by the stoplist; the link Nolan -> Inception
+    Before:  "<PERSON> was born in <CITY>. He directed <WORK>."
+             -> Phase 2 extracts: <PERSON>, <CITY>, <WORK>, "He" (PERSON)
+             -> "He" is dropped by the stoplist; the link <PERSON> -> <WORK>
                 is lost.
-    After:   "Christopher Nolan was born in London. Christopher Nolan
-              directed Inception."
-             -> Phase 2 extracts: Christopher Nolan (twice), London, Inception
-             -> Cooccurrence captures Nolan-London and Nolan-Inception
+    After:   "<PERSON> was born in <CITY>. <PERSON> directed <WORK>."
+             -> Phase 2 extracts: <PERSON> (twice), <CITY>, <WORK>
+             -> Cooccurrence captures <PERSON>-<CITY> and <PERSON>-<WORK>
                 in the same paragraph.
 
 The magnitude of the effect on the final graph (entity count, mention count,

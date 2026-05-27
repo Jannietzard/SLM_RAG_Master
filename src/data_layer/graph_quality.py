@@ -21,9 +21,11 @@ in standalone diagnostics:
      entities, drop generic hubs that pollute graph retrieval, and merge
      duplicate entities sharing a canonical surface form.
 
-All mutating Cypher uses the same patterns as `KuzuGraphStore.clear()` —
-edges deleted before nodes, no DETACH DELETE — so it works on every Kuzu
+All mutating Cypher uses the same patterns as `KuzuGraphStore.clear()` --
+edges deleted before nodes, no DETACH DELETE -- so it works on every Kuzu
 version that the existing codebase already targets.
+
+Last reviewed: 2026-05-25 (audit pass, project version 5.4).
 """
 
 from __future__ import annotations
@@ -36,10 +38,31 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Public API consumed by:
+#   - src/data_layer/__init__.py  (re-exports 9 symbols)
+#   - local_importingestion.py   (Phase 3c.5 + 3f direct imports of the
+#     drop_subsumed_cooccurrence_edges / drop_isolated_entities pair)
+# Module-internal helpers (_fetch_all, _delete_entity_safely, _redirect_*,
+# _drop_*, _merge_*) stay accessible by direct-name import for tests.
+__all__ = [
+    "canonical_form",
+    "compute_graph_baseline",
+    "format_baseline_report",
+    "assert_graph_invariants",
+    "GraphQualityViolation",
+    "DEFAULT_THRESHOLDS",
+    "build_cooccurrence_edges",
+    "cleanup_graph",
+    "DEFAULT_STOPLIST",
+    "link_entities_by_embedding",
+    "drop_subsumed_cooccurrence_edges",
+    "drop_isolated_entities",
+]
 
-# ─────────────────────────────────────────────────────────────────────────────
+
+# -----------------------------------------------------------------------------
 # CANONICAL SURFACE-FORM NORMALISATION
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 # Strip a trailing parenthetical disambiguator ("Local H (band)" → "Local H").
 _PARENTHETICAL_RE = re.compile(r"\s*\([^)]*\)\s*$")
@@ -56,8 +79,8 @@ _HONORIFIC_RE = re.compile(
 
 # Strip trailing ACADEMIC credentials (PhD, MD, Esq) only.
 # Generation suffixes (Jr., Sr., II, III, IV, V) are deliberately kept —
-# they distinguish father/son and same-name family members ("Ed Wood Sr."
-# vs. "Ed Wood" must NOT collapse into one graph node).
+# they distinguish father/son and same-name family members (a "Person X Sr."
+# entity must NOT collapse into the same graph node as a "Person X" entity).
 _TITLE_SUFFIX_RE = re.compile(
     r"[,]?\s+(?:PhD|Ph\.D|MD|M\.D|Esq)\.?\s*$",
     re.IGNORECASE,
@@ -86,11 +109,11 @@ def canonical_form(name: str) -> str:
     it is irreversibly lossy. Use the original surface form for rendering.
 
     Examples:
-        "Ed Wood (filmmaker)"        -> "ed wood"
-        "Dr. Christopher Nolan"      -> "christopher nolan"
-        "Edward Davis Wood Jr."      -> "edward davis wood"
-        "Nolan's"                    -> "nolan"
-        "Beyoncé "                   -> "beyonce"   (after NFKC + casefold)
+        "Marie Curie (chemist)"      -> "marie curie"
+        "Dr. Albert Einstein"        -> "albert einstein"
+        "Leonardo da Vinci Jr."      -> "leonardo da vinci"
+        "Curie's"                    -> "curie"
+        "Citroën "                   -> "citroen"   (after NFKC + casefold)
     """
     if not name:
         return ""
@@ -99,17 +122,18 @@ def canonical_form(name: str) -> str:
     s = _HONORIFIC_RE.sub("", s)
     s = _TITLE_SUFFIX_RE.sub("", s)
     s = _POSSESSIVE_RE.sub("", s)
-    # Strip a trailing period so "Ed Wood Sr." and "Ed Wood Sr" collapse to
-    # the same canonical form while both staying distinct from "Ed Wood".
+    # Strip a trailing period so "<Name> Sr." and "<Name> Sr" collapse to
+    # the same canonical form while both staying distinct from "<Name>"
+    # (the unsuffixed family member — a separate graph node).
     if s.endswith("."):
         s = s[:-1].rstrip()
     s = _WHITESPACE_RE.sub(" ", s).strip()
     return s.casefold()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # BASELINE METRICS (read-only)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def compute_graph_baseline(graph_store) -> Dict[str, Any]:
     """
@@ -170,7 +194,7 @@ def _fetch_all(graph_store, query: str, params: Optional[Dict] = None) -> List[T
     """Drain a Cypher query into a list of tuples. Defensive against empty results."""
     try:
         result = graph_store.conn.execute(query, params or {})
-    except Exception as exc:
+    except (RuntimeError, ValueError, AttributeError) as exc:
         logger.warning("Cypher fetch failed (%s): %s", query.split()[0], exc)
         return []
     rows: List[Tuple] = []
@@ -245,9 +269,9 @@ def format_baseline_report(metrics: Dict[str, Any]) -> str:
     dup = metrics["duplicates"]
 
     lines: List[str] = []
-    lines.append("─" * 70)
+    lines.append("-" * 70)
     lines.append("  GRAPH QUALITY BASELINE")
-    lines.append("─" * 70)
+    lines.append("-" * 70)
     lines.append(f"  Chunks:     {t['chunks']:>8,}")
     lines.append(
         f"  Entities:   {t['entities']:>8,}    "
@@ -290,13 +314,13 @@ def format_baseline_report(metrics: Dict[str, Any]) -> str:
                 f"    {hub['mention_count']:>4} chunks  ·  "
                 f"{hub['type']:<14}  ·  {hub['name']}"
             )
-    lines.append("─" * 70)
+    lines.append("-" * 70)
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # INVARIANTS
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 class GraphQualityViolation(RuntimeError):
     """Raised by `assert_graph_invariants(strict=True)` on threshold violation."""
@@ -349,9 +373,9 @@ def assert_graph_invariants(
     return violations
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # CO-OCCURRENCE EDGES
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def build_cooccurrence_edges(
     graph_store,
@@ -395,7 +419,7 @@ def build_cooccurrence_edges(
     all_pairs: List[Tuple[str, str, str, float, str]] = []   # (e1, e2, rel_type, conf, src_str)
     truncated_chunks = 0
 
-    # ── Phase 1: collect all unique pairs (fast — no DB writes) ──────────────
+    # -- Phase 1: collect all unique pairs (fast — no DB writes) --------------
     results_list = list(extraction_results)
     chunk_iter = (
         _tqdm(results_list, desc="Co-occurrence pairs", unit="chunk")
@@ -441,7 +465,7 @@ def build_cooccurrence_edges(
         len(all_pairs), len(results_list), truncated_chunks, max_entities_per_chunk,
     )
 
-    # ── Phase 2: bulk-insert via transactional batches ────────────────────────
+    # -- Phase 2: bulk-insert via transactional batches ------------------------
     # Use add_related_to_relations_bulk (500 edges/commit) when available;
     # fall back to the single-edge method for HybridStore / mock stores.
     BATCH = 500
@@ -474,16 +498,16 @@ def build_cooccurrence_edges(
                     source_chunks=[src_str] if src_str else None,
                 )
                 written += 1
-            except Exception as exc:
+            except (RuntimeError, ValueError, AttributeError) as exc:
                 logger.debug("CO_OCCURS edge failed (%s, %s): %s", e1, e2, exc)
 
     logger.info("Co-occurrence edges written: %d / %d pairs", written, len(all_pairs))
     return written
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # POST-INGESTION CLEANUP
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 # Surface forms that GLiNER frequently misclassifies as PERSON or GPE entities.
 # These are pronouns, nationality adjectives, and other generic tokens that
@@ -615,7 +639,7 @@ def _delete_entity_safely(graph_store, entity_id: str) -> None:
     for cypher in cypher_steps:
         try:
             graph_store.conn.execute(cypher, {"eid": entity_id})
-        except Exception as exc:
+        except (RuntimeError, ValueError, AttributeError) as exc:
             logger.debug("delete step failed for %s: %s", entity_id, exc)
 
 
@@ -711,9 +735,9 @@ def _merge_duplicate_entities(graph_store, dry_run: bool = False) -> int:
     return merged
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # EMBEDDING-BASED ENTITY LINKING (alias resolution beyond canonical_form)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def link_entities_by_embedding(
     graph_store,
@@ -730,9 +754,9 @@ def link_entities_by_embedding(
     Merge entity nodes whose embedded names are sufficiently similar within type.
 
     Solves the alias problem that `canonical_form` cannot:
-        "Ed Wood"               <-> "Edward Davis Wood Jr."
-        "Christopher Nolan"     <-> "Chris Nolan"
-        "United States"         <-> "U.S. of America"
+        common nickname  <->  expanded full name           (e.g. Bob / Robert)
+        full name        <->  initialism + surname         (e.g. J. R. Smith)
+        long country     <->  abbreviated form              (e.g. United States / U.S. of America)
 
     Algorithm:
       1. Group all entities by canonical type (PERSON, GPE, WORK_OF_ART, ...).
@@ -862,7 +886,7 @@ def link_entities_by_embedding(
         # the whole phase.
         try:
             embeds_raw = embedder.embed_documents(names)
-        except Exception as exc:
+        except (RuntimeError, ConnectionError, ValueError) as exc:
             logger.warning(
                 "Embed-link: embedder failed for type=%s (%s); "
                 "issuing warm-up probe and retrying once...",
@@ -877,7 +901,7 @@ def link_entities_by_embedding(
                 logger.info(
                     "Embed-link: warm-up retry succeeded for type=%s", etype,
                 )
-            except Exception as exc2:
+            except (RuntimeError, ConnectionError, ValueError) as exc2:
                 logger.warning(
                     "Embed-link: embedder still failing for type=%s after "
                     "warm-up (%s); skipping bucket. Restart Ollama and "
@@ -1003,7 +1027,7 @@ def _redirect_entity_edges_bulk(
         return
     old_ids = list(redirect_map.keys())
 
-    # ── 1. MENTIONS: chunk -> old  ⇒  chunk -> new ───────────────────────
+    # -- 1. MENTIONS: chunk -> old  ⇒  chunk -> new -----------------------
     mention_rows = _fetch_all(
         graph_store,
         """
@@ -1031,7 +1055,7 @@ def _redirect_entity_edges_bulk(
         graph_store.add_mentions_relations_bulk(redirected_mentions,
                                                  batch_size=500)
 
-    # ── 2. RELATED_TO outgoing: (old)->o  ⇒  (new)->o ────────────────────
+    # -- 2. RELATED_TO outgoing: (old)->o  ⇒  (new)->o --------------------
     out_rows = _fetch_all(
         graph_store,
         """
@@ -1043,7 +1067,7 @@ def _redirect_entity_edges_bulk(
         {"old_ids": old_ids},
     )
 
-    # ── 3. RELATED_TO incoming: o->(old)  ⇒  o->(new) ────────────────────
+    # -- 3. RELATED_TO incoming: o->(old)  ⇒  o->(new) --------------------
     in_rows = _fetch_all(
         graph_store,
         """
@@ -1094,7 +1118,7 @@ def _redirect_entity_edges_bulk(
             redirected_rels, batch_size=500, use_create=True,
         )
 
-    # ── 4. Delete the old entities. KuzuDB cascades incident edges. ──────
+    # -- 4. Delete the old entities. KuzuDB cascades incident edges. ------
     # Single transactional batch — same fsync-amortisation as the writes.
     logger.info("Embed-link redirect: deleting %d old entities (bulk)…",
                 len(old_ids))
@@ -1109,14 +1133,14 @@ def _redirect_entity_edges_bulk(
                         "MATCH (e:Entity {entity_id: $eid}) DETACH DELETE e",
                         {"eid": oid},
                     )
-                except Exception as exc:
+                except (RuntimeError, ValueError, AttributeError) as exc:
                     logger.debug("delete entity %s failed: %s", oid, exc)
             graph_store.conn.execute("COMMIT")
-        except Exception as exc:
+        except (RuntimeError, ValueError, AttributeError) as exc:
             logger.warning("Bulk delete batch %d failed: %s", i // BATCH, exc)
             try:
                 graph_store.conn.execute("ROLLBACK")
-            except Exception:
+            except (RuntimeError, AttributeError):
                 pass
 
 
@@ -1141,7 +1165,7 @@ def _redirect_entity_edges(graph_store, old_id: str, new_id: str) -> None:
     ):
         try:
             graph_store.add_mentions_relation(chunk_id=chunk_id, entity_id=new_id)
-        except Exception as exc:
+        except (RuntimeError, ValueError, AttributeError) as exc:
             logger.debug("redirect MENTIONS failed (%s -> %s): %s", chunk_id, new_id, exc)
 
     # RELATED_TO outgoing: old -> other becomes new -> other
@@ -1161,7 +1185,7 @@ def _redirect_entity_edges(graph_store, old_id: str, new_id: str) -> None:
                 entity2_id=other_id,
                 relation_type=rel_type or "related",
             )
-        except Exception as exc:
+        except (RuntimeError, ValueError, AttributeError) as exc:
             logger.debug("redirect RELATED_TO out failed: %s", exc)
 
     # RELATED_TO incoming: other -> old becomes other -> new
@@ -1181,13 +1205,13 @@ def _redirect_entity_edges(graph_store, old_id: str, new_id: str) -> None:
                 entity2_id=new_id,
                 relation_type=rel_type or "related",
             )
-        except Exception as exc:
+        except (RuntimeError, ValueError, AttributeError) as exc:
             logger.debug("redirect RELATED_TO in failed: %s", exc)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # SUBSUMPTIVE CO-OCCURRENCE CLEANUP
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Background: build_cooccurrence_edges() writes a RELATED_TO{cooccurs} edge for
 # every entity pair sharing a chunk. Some of those pairs also have a SEMANTIC
 # RELATED_TO edge from REBEL/SVO. For those, the cooccurs edge is redundant
@@ -1284,7 +1308,7 @@ def drop_subsumed_cooccurrence_edges(
             while result.has_next():
                 row = tuple(result.get_next())
                 to_delete.append((row[0], row[1]))
-        except Exception as exc:
+        except (RuntimeError, ValueError, AttributeError) as exc:
             logger.debug("subsumed-pair lookup (forward) failed: %s", exc)
         # Direction 2: b -> a
         try:
@@ -1300,7 +1324,7 @@ def drop_subsumed_cooccurrence_edges(
             while result.has_next():
                 row = tuple(result.get_next())
                 to_delete.append((row[0], row[1]))
-        except Exception as exc:
+        except (RuntimeError, ValueError, AttributeError) as exc:
             logger.debug("subsumed-pair lookup (reverse) failed: %s", exc)
 
     if dry_run:
@@ -1327,7 +1351,7 @@ def drop_subsumed_cooccurrence_edges(
                 {"cooccurs": cooccurs_relation_type, "a_ids": a_ids, "b_ids": b_ids},
             )
             deleted += len(batch)
-        except Exception as exc:
+        except (RuntimeError, ValueError, AttributeError) as exc:
             logger.warning("subsumed-pair delete batch %d failed: %s", i // batch_size, exc)
 
     logger.info(
@@ -1338,9 +1362,9 @@ def drop_subsumed_cooccurrence_edges(
     return deleted
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # ISOLATED-ENTITY DROP (post-linking)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Background: After Phase 3d.5 (`link_entities_by_embedding`), some Entity
 # nodes end up with MENTIONS edges but ZERO RELATED_TO edges in either
 # direction. They are reachable from chunks but contribute nothing to graph

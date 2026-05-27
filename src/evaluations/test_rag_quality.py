@@ -9,10 +9,9 @@ This script helps you:
 
 Usage (from any directory):
     python src/evaluations/test_rag_quality.py
-    python src/evaluations/test_rag_quality.py --query "Who directed Inception?"
+    python src/evaluations/test_rag_quality.py --query "What is the capital of France?"
 """
 
-import yaml
 import logging
 import argparse
 from pathlib import Path
@@ -25,6 +24,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.data_layer.embeddings import BatchedOllamaEmbeddings
 from src.data_layer.storage import HybridStore, StorageConfig
 from src.data_layer.hybrid_retriever import HybridRetriever, RetrievalConfig, RetrievalMode
+from src.logic_layer._settings_loader import _load_settings
 
 
 def load_and_verify_config(config_path: Path = None):
@@ -37,8 +37,9 @@ def load_and_verify_config(config_path: Path = None):
     print("="*70)
     print(f"  Config: {config_path}")
 
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+    # Route through the unified loader so the 35-key reproducibility
+    # validator in _settings_loader runs here too.
+    config = _load_settings(settings_path=config_path)
     
     # Check critical values
     print(f"\n✓ Embedding Dimension: {config['embeddings']['embedding_dim']}")
@@ -398,10 +399,13 @@ def main():
     test_german_queries(retriever)
     
     # 4. Calculate metrics
+    # Generic smoke queries — chosen NOT to overlap with any benchmark
+    # gold question, so this diagnostic does not leak test-set context
+    # into manual debugging runs.
     default_queries = [
-        "Were Scott Derrickson and Ed Wood of the same nationality?",
         "What is the capital of France?",
-        "Who directed the movie Inception?",
+        "How tall is Mount Everest?",
+        "Who painted the Mona Lisa?",
     ]
     test_queries = [args.query] if args.query else default_queries
 

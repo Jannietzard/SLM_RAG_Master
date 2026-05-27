@@ -93,7 +93,7 @@ embedded literally so this module has no NLTK dependency.
 Settings.yaml mapping (verified against config/settings.yaml)
 -------------------------------------------------------------
 All tunable parameters originate from `config/settings.yaml` and are
-validated against `_REQUIRED_SETTINGS` in `src/logic_layer/_settings.py`
+validated against `_REQUIRED_SETTINGS` in `src/logic_layer/_settings_loader.py`
 at startup. The defaults in this file are emergency fallbacks only.
 
   ingestion.sentences_per_chunk          -> SpacySentenceChunker.sentences_per_chunk (3)

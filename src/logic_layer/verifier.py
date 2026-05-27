@@ -3,161 +3,92 @@
 S_V: Verifier — Pre-Generation Validation and Self-Correction
 ===============================================================================
 
-Master's Thesis: Edge-RAG — Hybrid Retrieval-Augmented Generation on
-Resource-Constrained Edge Devices.
+Master's Thesis: "Enhancing Reasoning Fidelity in Quantized SLMs on Edge"
 Artifact B: Agent-Based Query Processing (Logic Layer).
 
-===============================================================================
-OVERVIEW
-===============================================================================
+Role in the pipeline
+--------------------
+S_V is the third agent of the S_P → S_N → S_V pipeline. It runs three
+optional pre-generation checks over the Navigator's filtered context,
+formats a prompt for a quantised SLM (Ollama-hosted), generates an answer,
+extracts atomic claims, verifies each claim against the graph store and
+the retrieved context, and — if violations remain — re-prompts the LLM
+with explicit violation feedback for up to ``max_iterations`` rounds.
 
-The Verifier (S_V) is the final stage of the three-agent RAG pipeline
-(S_P → S_N → S_V) and implements a dual-stage approach:
+Pre-generation validation (three independently toggleable checks)
+-----------------------------------------------------------------
+1. Entity-path validation     verifies retrieved chunks cover the query
+                              entities (graph lookup when a KuzuDB store
+                              is available; substring fallback otherwise).
+2. Source credibility scoring weighted combination of cross-reference
+                              corroboration, entity-mention density, and
+                              retrieval-source provenance. Chunks below
+                              ``min_credibility_score`` are filtered; at
+                              least one chunk is always retained.
+3. Contradiction detection    NLI cross-encoder on adjacent chunk pairs
+                              (DEFAULT OFF — ablation-only, requires
+                              ~270 MB Transformers model and contradicts
+                              the edge-deployment constraint). The
+                              Navigator runs an O(n) numeric-divergence
+                              heuristic upstream that is on by default.
 
-1. PRE-GENERATION VALIDATION
-   The Verifier defaults to TWO checks before generation. A third check
-   exists as an ablation-only toggle.
+Generation
+----------
+The verifier caps the working context to ``max_docs`` chunks BY THE
+NAVIGATOR'S RRF ORDER, then runs ``_reorder_by_question_relevance`` only
+WITHIN that kept window to mitigate small-LLM positional bias (Liu et al.
+2023, "Lost in the Middle", arXiv:2307.03172). The reorder cannot evict a
+chunk that survived the RRF cap. Optional RECOMP-style context
+distillation condenses the kept chunks into a structured fact list before
+the answer prompt (Yu et al. 2024, NAACL).
 
-   a) Entity-Path Validation (multi-hop queries) — DEFAULT ON
-      Verifies that retrieved chunks cover the query entities.  When a
-      KuzuDB graph store is available, ``find_chunks_by_entity_multihop``
-      is used; otherwise falls back to substring matching.
+Self-correction loop
+--------------------
+Up to ``max_iterations`` rounds (default 2 = baseline + one correction).
+Each round extracts atomic claims, verifies each claim by entity presence
+(conservative proxy, NOT logical entailment — see Kryscinski et al. 2020),
+and on violation re-prompts the LLM with explicit feedback. Two bounded
+single-shot retry paths fire opportunistically inside an iteration:
+bridge-entity exclusion (when the LLM returns a known bridge entity as
+the final answer) and format-mismatch retry (when the LLM returns a
+yes/no to a wh-question). Each retry fires at most once per call and is
+individually toggleable via ``enable_bridge_exclusion_retry`` /
+``enable_format_validation_retry``.
 
-   b) Source Credibility Scoring — DEFAULT ON
-      Weighted combination (40 % cross-references, 30 % entity-mention
-      frequency, 30 % retrieval provenance — see SourceCredibility for
-      the per-weight defense). Graph-vs-vector provenance is now a real
-      signal from the Navigator (B2 fix); pre-B2 it was a constant
-      baseline because Navigator did not forward retrieval-source metadata.
+Exports
+-------
+    SourceCredibility, PreValidationResult, VerifierConfig,
+    ConfidenceLevel, VerificationResult                   — data classes
+    PreGenerationValidator                                — three-check stage
+    Verifier                                              — main entry point
+    create_verifier(cfg=None, graph_store=None,
+                    enable_pre_validation=False)          — factory
 
-   c) Contradiction Detection — DEFAULT OFF (ablation-only, B6)
-      NLI-based pairwise detection on adjacent chunk pairs requires a
-      ~270 MB cross-encoder download (Reimers & Gurevych, 2019;
-      arXiv:1908.10084) and contradicts the edge-deployment constraint of
-      the thesis. The Navigator already runs a numeric-divergence
-      heuristic filter (``enable_contradiction_filter`` in settings.yaml)
-      which removes obviously contradictory chunks before they reach the
-      Verifier. The Verifier-side check is therefore retained only as a
-      research-mode toggle for ablation studies — set
-      ``enable_contradiction_detection: true`` to enable. The thesis
-      methodology paragraph describes the system with this off.
+References (algorithm anchors)
+------------------------------
+    Madaan et al. (2023). Self-Refine: Iterative Refinement with
+        Self-Feedback. NeurIPS 2023. arXiv:2303.17651.
+    Bowman et al. (2015). A large annotated corpus for learning natural
+        language inference (SNLI). EMNLP 2015. arXiv:1508.05326.
+    Reimers & Gurevych (2019). Sentence-BERT: Sentence Embeddings using
+        Siamese BERT-Networks. EMNLP 2019. arXiv:1908.10084.
+    Kryscinski et al. (2020). Evaluating the Factual Consistency of
+        Abstractive Text Summarization. EMNLP 2020. arXiv:1910.12840.
+    Liu et al. (2023). Lost in the Middle: How Language Models Use Long
+        Contexts. TACL. arXiv:2307.03172.
+    Yu et al. (2024). RECOMP: Improving Retrieval-Augmented LMs with
+        Context Compression and Selective Augmentation. NAACL.
+    Spärck Jones (1972); Robertson (2004). IDF and length-normalised
+        term overlap as the basis of the question-relevance reorder.
 
-2. GENERATION WITH A QUANTISED SLM
-   Phi-3-Mini (or any Ollama-hosted model) is prompted with a compact
-   context budget tuned for edge hardware (<16 GB RAM). Context limits
-   are set in config/settings.yaml under the ``llm`` block.
+Dependencies
+------------
+    requests       (Ollama API)
+    spacy          (optional — claim extraction, NER density)
+    transformers   (optional — only when enable_contradiction_detection)
+    stdlib otherwise (re, math, time, logging, typing, dataclasses, enum).
 
-   Between pre-validation and generation, two passes shape the prompt
-   (`§11.13` + `§11.16.1`):
-
-   - The verifier caps the Navigator's context to ``max_docs`` (default
-     5) **by RRF order first**, then ``_reorder_by_question_relevance``
-     reorders only **within that kept window**. Selection (set
-     membership) is owned by the retrieval-score signal; the reorder
-     mitigates small-LLM positional bias (Liu et al. 2023, *Lost in the
-     Middle*, TACL/arXiv:2307.03172). The reorder cannot evict a chunk.
-   - The reorder scoring combines IDF-weighted query-term overlap
-     (Spärck Jones 1972), sqrt-length normalisation, and a
-     structural-coverage floor that protects distinctive-entity chunks
-     from demotion (Robertson 2004).
-
-   The headline answer-correctness verdict applied downstream by the
-   evaluator is **Soft-EM** (token-F1 ≥ `benchmark.answer_f1_threshold`,
-   default 0.6) — strict EM systematically under-counts answers that
-   differ from gold only by a trailing category word. The Verifier
-   itself does not compute it; it lives in
-   ``src.thesis_evaluations.benchmark_datasets`` and is mirrored by
-   ``diagnose_verbose.py``.
-
-3. SELF-CORRECTION LOOP
-   Iterative refinement following the Self-Refine paradigm:
-       Madaan, A., et al. (2023). "Self-Refine: Iterative Refinement
-       with Self-Feedback." NeurIPS 2023. arXiv:2303.17651.
-
-   Up to ``max_iterations`` rounds are run.  Each round extracts atomic
-   claims from the generated answer, verifies each claim against the graph
-   store and the retrieved context, and — if violations remain — re-prompts
-   the LLM with explicit violation feedback.  Claim-level verification is
-   a conservative proxy (entity presence, not logical entailment); see
-   Kryscinski et al. (2020) for the full entailment framing.
-
-===============================================================================
-ARCHITECTURE
-===============================================================================
-
-    Query + Context (from Navigator)
-           │
-           ▼
-    ┌──────────────────────────────────────────────────────────────┐
-    │                      S_V (VERIFIER)                           │
-    │                                                               │
-    │   ┌─────────────────────────────────────────────────────┐    │
-    │   │            PRE-GENERATION VALIDATION                 │    │
-    │   │                                                      │    │
-    │   │  ┌────────────┐  ┌────────────┐  ┌────────────┐    │    │
-    │   │  │Entity-Path │  │Contradiction│  │  Source    │    │    │
-    │   │  │ Validation │  │ Detection  │  │ Credibility│    │    │
-    │   │  └────────────┘  └────────────┘  └────────────┘    │    │
-    │   │         │              │               │            │    │
-    │   │         └──────────────┴───────────────┘            │    │
-    │   │                        │                             │    │
-    │   │              Pass/Fail + Filtered Context           │    │
-    │   └────────────────────────┼────────────────────────────┘    │
-    │                            │                                  │
-    │                            ▼                                  │
-    │   ┌─────────────────────────────────────────────────────┐    │
-    │   │               GENERATION LOOP                        │    │
-    │   │                                                      │    │
-    │   │         ┌──────────┐                                │    │
-    │   │    ┌───▶│ GENERATE │                                │    │
-    │   │    │    │  Answer  │                                │    │
-    │   │    │    └────┬─────┘                                │    │
-    │   │    │         │                                       │    │
-    │   │    │    ┌────▼─────┐                                │    │
-    │   │    │    │ EXTRACT  │                                │    │
-    │   │    │    │  Claims  │                                │    │
-    │   │    │    └────┬─────┘                                │    │
-    │   │    │         │                                       │    │
-    │   │    │    ┌────▼─────┐     ┌─────────────┐            │    │
-    │   │    │    │  VERIFY  │────▶│ Violations? │            │    │
-    │   │    │    │  Claims  │     └──────┬──────┘            │    │
-    │   │    │    └──────────┘            │                    │    │
-    │   │    │                      Yes   │   No               │    │
-    │   │    │    ┌─────────────┐◀───────┘     │              │    │
-    │   │    └────┤ SELF-CORRECT│              │              │    │
-    │   │         │ (Feedback)  │              │              │    │
-    │   │         └─────────────┘              │              │    │
-    │   │                                      ▼              │    │
-    │   │                              ┌─────────────┐        │    │
-    │   │                              │   RETURN    │        │    │
-    │   │                              │   Answer    │        │    │
-    │   │                              └─────────────┘        │    │
-    │   └──────────────────────────────────────────────────────┘    │
-    │                                                               │
-    └───────────────────────────────────────────────────────────────┘
-
-===============================================================================
-REFERENCES
-===============================================================================
-
-- Madaan, A., et al. (2023). "Self-Refine: Iterative Refinement with
-  Self-Feedback." NeurIPS 2023. arXiv:2303.17651.
-- Bowman, S., et al. (2015). "A large annotated corpus for learning natural
-  language inference." EMNLP 2015. arXiv:1508.05326.
-- Reimers, N., & Gurevych, I. (2019). "Sentence-BERT: Sentence Embeddings
-  using Siamese BERT-Networks." EMNLP 2019. arXiv:1908.10084.
-- Kryscinski, W., et al. (2020). "Evaluating the Factual Consistency of
-  Abstractive Text Summarization." EMNLP 2020. arXiv:1910.12840.
-
-===============================================================================
-
-===============================================================================
-Review History:
-    Last Reviewed:  2026-04-21
-    Review Result:  1 CRITICAL, 4 IMPORTANT, 7 RECOMMENDED
-    Reviewer:       Code Review Prompt v2.1
-    Next Review:    After implementing multi-hop graph-path planning and
-                    forwarding retrieval-source metadata from Navigator to S_V
+Last reviewed: 2026-05-26 (audit pass, project version 5.4).
 ===============================================================================
 """
 
@@ -167,14 +98,15 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 
 logger = logging.getLogger(__name__)
 
 
-from ._settings import _load_settings, _PROPER_NOUN_RE
+from ._settings_loader import _load_settings
+from ._text_utils import _PROPER_NOUN_RE
 
 
 # =============================================================================
@@ -259,11 +191,11 @@ class SourceCredibility:
     - ``retrieval_provenance``: graph-retrieved chunks score higher than
       vector/BM25-only chunks (weight: ``credibility_weight_provenance``,
       default 30 %). Real provenance is supplied via
-      ``chunk_is_graph_based`` from the Navigator (B2-fix); when absent the
-      historical constant baseline (0.5) is applied so the term degenerates
-      to a uniform offset rather than crashing.
+      ``chunk_is_graph_based`` from the Navigator; when absent, a constant
+      baseline (0.5) is applied so the term degenerates to a uniform
+      offset rather than crashing.
 
-    B5 note — defense of the 40 / 30 / 30 weights:
+    Defense of the 40 / 30 / 30 weights:
         The weights are documented as a deliberate inspection-time choice
         rather than the output of a grid-search calibration.  Cross-reference
         corroboration receives the largest share because two independent
@@ -282,9 +214,9 @@ class SourceCredibility:
         filter") rather than a weight-sweep, which is methodologically
         sufficient at this scale.
 
-    The provenance term used to be a constant baseline because the Navigator
-    did not forward retrieval-source metadata.  This is fixed in B2 — see
-    ``PreGenerationValidator.validate``'s ``chunk_is_graph_based`` parameter.
+    The Navigator forwards per-chunk retrieval-source metadata via the
+    ``chunk_is_graph_based`` parameter on ``PreGenerationValidator.validate``;
+    when absent (e.g. legacy callers), the constant baseline is used.
     """
 
     text: str
@@ -475,6 +407,59 @@ class VerifierConfig:
     credibility_entity_freq_normalizer_spacy: float = 5.0   # settings.yaml: verifier.credibility_entity_freq_normalizer_spacy
     credibility_entity_freq_normalizer_regex: float = 10.0  # settings.yaml: verifier.credibility_entity_freq_normalizer_regex
 
+    # Context-distillation / fact-extraction step.
+    # When True, inserts one extra LLM call between the reorder and the
+    # final answer call to condense the retrieved chunks into a structured
+    # fact list. Targets Lost-in-the-Middle (Liu 2023) at SLM scale by
+    # presenting the LLM a clean, ordered fact set instead of N noisy
+    # chunks. Reference: Yu et al. 2024 RECOMP (NAACL).
+    # NOTE on provenance: default ON was selected from a 50-question
+    # development-split ablation diagnostic. The thesis methodology
+    # section reports the dev-vs-test partition explicitly.
+    # Cost: ~5-15s extra latency per query; observed EM gain +5-8pp on dev.
+    enable_context_distillation: bool = True
+    context_distillation_min_input_chars: int = 200   # skip below this length
+    context_distillation_min_output_chars: int = 30   # treat shorter outputs as no-op
+
+    # Calibrated format-mismatch retry. When True, detects wh-question →
+    # yes/no answer mismatches and re-prompts the LLM with an explicit
+    # format instruction. Bounded to one retry per query.
+    # Provenance: same 50-question dev-split diagnostic — see note above.
+    enable_format_validation_retry: bool = True
+
+    # Bridge-entity exclusion retry. When True, detects when the LLM
+    # returns one of the known bridge entities as the final answer and
+    # re-prompts with an explicit exclusion list. Bounded to one retry
+    # per query. Provenance: 50-question dev-split diagnostic identified
+    # 3 / 9 row3 "bridge-as-final-answer" failures.
+    enable_bridge_exclusion_retry: bool = True
+    bridge_substring_min_length: int = 5   # min len for substring bridge-hit
+    bridge_exclusion_top_k: int = 5        # entities listed in the retry prompt
+
+    # Structured (slot-filling) Chain-of-Thought (2026-05-27). When True, the
+    # answer prompts are replaced with step-by-step templates that constrain
+    # the SLM to fill reasoning slots before a FINAL ANSWER marker. The final
+    # answer is parsed out before claim verification, so claims stay grounded
+    # in retrieved chunks, not the reasoning steps. Default False (opt-in).
+    # Refs: Khot et al. 2023 (Decomposed Prompting, ICLR); Wei et al. 2022
+    # (free-form CoT only helps >10B -> scaffolded slots for SLMs).
+    enable_structured_cot: bool = False
+    cot_max_tokens: int = 400              # multi-step output needs more room
+
+    # Question-relevance reorder of the kept context window.
+    # Mitigates small-LLM positional bias (Liu et al. 2023 "Lost in the
+    # Middle"). The reorder cannot evict a chunk; the Navigator RRF
+    # ranking owns set membership.
+    enable_question_relevance_reorder: bool = True
+    query_keyword_min_length: int = 4       # \b\w{N,}\b in tokeniser
+    idf_min_candidates: int = 4             # below this, IDF degenerates
+    distinctive_entity_min_length: int = 8  # single-token entity coverage floor
+    length_norm_exponent: float = 0.5       # sqrt-length normaliser
+
+    # Token-grounding check for claims with no extractable proper noun.
+    short_claim_max_tokens: int = 6           # treated as "short factual claim"
+    claim_content_token_min_length: int = 2   # min len for a non-numeric token
+
     @classmethod
     def from_yaml(cls, config: Dict[str, Any]) -> "VerifierConfig":
         """
@@ -504,6 +489,28 @@ class VerifierConfig:
             max_docs=llm.get("max_docs", 5),
             max_chars_per_doc=llm.get("max_chars_per_doc", 500),
             max_iterations=agent.get("max_verification_iterations", 2),
+            enable_context_distillation=v.get("enable_context_distillation", True),
+            context_distillation_min_input_chars=v.get(
+                "context_distillation_min_input_chars", 200,
+            ),
+            context_distillation_min_output_chars=v.get(
+                "context_distillation_min_output_chars", 30,
+            ),
+            enable_format_validation_retry=v.get("enable_format_validation_retry", True),
+            enable_bridge_exclusion_retry=v.get("enable_bridge_exclusion_retry", True),
+            bridge_substring_min_length=v.get("bridge_substring_min_length", 5),
+            bridge_exclusion_top_k=v.get("bridge_exclusion_top_k", 5),
+            enable_structured_cot=v.get("enable_structured_cot", False),
+            cot_max_tokens=v.get("cot_max_tokens", 400),
+            enable_question_relevance_reorder=v.get(
+                "enable_question_relevance_reorder", True,
+            ),
+            query_keyword_min_length=v.get("query_keyword_min_length", 4),
+            idf_min_candidates=v.get("idf_min_candidates", 4),
+            distinctive_entity_min_length=v.get("distinctive_entity_min_length", 8),
+            length_norm_exponent=v.get("length_norm_exponent", 0.5),
+            short_claim_max_tokens=v.get("short_claim_max_tokens", 6),
+            claim_content_token_min_length=v.get("claim_content_token_min_length", 2),
             enable_entity_path_validation=v.get("enable_entity_path_validation", True),
             enable_contradiction_detection=v.get("enable_contradiction_detection", False),
             enable_credibility_scoring=v.get("enable_credibility_scoring", True),
@@ -561,6 +568,11 @@ class VerificationResult:
         Total wall-clock time in milliseconds.
     iteration_history :
         Per-iteration diagnostics (answer, claims, latency, error flag).
+    retry_fired :
+        Per-call flags recording whether the bounded retry paths fired
+        (``bridge_exclusion``, ``format_mismatch``). Visible to reviewers
+        running ablations so they can attribute EM gains to a specific
+        retry path.
     confidence_high_threshold :
         Verified-ratio threshold for HIGH confidence (stored with result
         for reproducibility independent of the config in scope at read time).
@@ -576,6 +588,7 @@ class VerificationResult:
     pre_validation: Optional[PreValidationResult] = None
     timing_ms: float = 0.0
     iteration_history: List[Dict[str, Any]] = field(default_factory=list)
+    retry_fired: Dict[str, bool] = field(default_factory=dict)
     confidence_high_threshold: float = 0.8
     confidence_medium_threshold: float = 0.5
 
@@ -690,11 +703,11 @@ class PreGenerationValidator:
             Hop plan from the Planner.  Reserved for future graph-path
             planning; not used in the current implementation.
         chunk_is_graph_based :
-            B2-fix: per-chunk retrieval-provenance flag (parallel to ``context``).
+            Per-chunk retrieval-provenance flag (parallel to ``context``).
             True for chunks retrieved via the KuzuDB graph path. Used by the
             credibility scorer to give graph-corroborated chunks a higher
-            provenance score. None disables the provenance signal (falls back
-            to the constant baseline used pre-B2).
+            provenance score. ``None`` disables the provenance signal —
+            the constant baseline is used instead.
 
         Returns
         -------
@@ -702,6 +715,10 @@ class PreGenerationValidator:
         """
         start_time = time.time()
         result = PreValidationResult()
+        # Surface the input chunk count so downstream JSONL instrumentation
+        # can distinguish "pre-validation fired but inert" from
+        # "pre-validation dropped chunks".
+        result.details["input_chunk_count"] = len(context) if context else 0
 
         if not context:
             result.status = ValidationStatus.INSUFFICIENT_EVIDENCE
@@ -742,11 +759,11 @@ class PreGenerationValidator:
 
         # ── Check 3: Source Credibility Scoring ───────────────────────────────
         if self.config.enable_credibility_scoring:
-            # B2-fix: remap the provenance flag onto the (possibly trimmed)
-            # filtered_context by exact-text lookup against the original
-            # context. None entries fall back to the constant baseline inside
-            # _compute_credibility so older callers that pass no provenance
-            # see no behavior change.
+            # Remap the per-chunk provenance flag onto the (possibly
+            # trimmed) filtered_context by exact-text lookup against the
+            # original context. ``None`` entries fall back to the constant
+            # baseline inside _compute_credibility so callers that pass no
+            # provenance see no behavioural change.
             filtered_graph_flags: Optional[List[bool]] = None
             if chunk_is_graph_based is not None and len(chunk_is_graph_based) == len(context):
                 _by_text = {c: g for c, g in zip(context, chunk_is_graph_based)}
@@ -989,12 +1006,11 @@ class PreGenerationValidator:
            (corroboration proxy).
         2. Entity frequency: SpaCy NER density as an information-richness
            proxy.  Regex proper-noun count as fallback.
-        3. Retrieval provenance (B2-fix): graph-retrieved chunks get the full
-           weight (1.0); vector/BM25-only chunks get ``credibility_provenance_baseline``.
-           Before B2, ``is_graph_based`` was always False — see the docstring
-           addendum in compute_score(). Pass ``chunk_is_graph_based`` (parallel
-           to ``filtered_context``) to enable the real signal; None falls back
-           to the constant baseline for callers that haven't been updated.
+        3. Retrieval provenance: graph-retrieved chunks get the full
+           weight (1.0); vector/BM25-only chunks get
+           ``credibility_provenance_baseline``. Pass ``chunk_is_graph_based``
+           (parallel to ``filtered_context``) to enable the real signal;
+           ``None`` falls back to the constant baseline.
 
         ``entities`` adds token-level cross-reference matching: if a word
         (≥4 chars) from an entity name appears in both this chunk and another
@@ -1006,7 +1022,7 @@ class PreGenerationValidator:
         # Pre-compute entity name tokens for token-level cross-reference.
         entity_tokens_lower: List[str] = []
         if entities:
-            seen_tokens: set = set()
+            seen_tokens: Set[str] = set()
             for name in entities:
                 for tok in name.split():
                     tok_l = tok.lower()
@@ -1014,9 +1030,9 @@ class PreGenerationValidator:
                         entity_tokens_lower.append(tok_l)
                         seen_tokens.add(tok_l)
 
-        # B2-fix: align the provenance flag with filtered_context. None means
-        # the caller didn't supply provenance, so we keep the historic baseline
-        # behavior (every chunk is treated as non-graph).
+        # Align the provenance flag with filtered_context. ``None`` means
+        # the caller didn't supply provenance, so every chunk is treated
+        # as non-graph (the constant baseline takes over).
         if chunk_is_graph_based is not None and len(chunk_is_graph_based) != len(filtered_context):
             logger.warning(
                 "chunk_is_graph_based length mismatch (%d vs %d filtered chunks); "
@@ -1050,9 +1066,10 @@ class PreGenerationValidator:
 
             # Self-relevance boost: if this chunk itself mentions a query entity
             # it is directly on-topic regardless of what other chunks say.
-            # Without this, a bridge-target chunk (e.g. the Strasbourg article)
-            # always scores cross_references=0 because no other Hop-2 noise chunk
-            # mentions Strasbourg — and then falls below min_credibility_score.
+            # Without this, a chunk that is the unique Hop-2 bridge target
+            # scores cross_references=0 (no other Hop-2 chunk corroborates the
+            # answer entity, by construction) and falls below
+            # min_credibility_score even though it IS the answer paragraph.
             if entity_tokens_lower and cred.cross_references == 0:
                 if any(t in chunk_lower for t in entity_tokens_lower):
                     cred.cross_references = 1
@@ -1065,9 +1082,9 @@ class PreGenerationValidator:
                 proper_count = len(self._PROPER_NOUN_PATTERN.findall(chunk))
                 cred.entity_frequency = min(1.0, proper_count / self.config.credibility_entity_freq_normalizer_regex)
 
-            # B2-fix: use real retrieval-provenance when supplied. Falls back
-            # to the historical False/baseline path for callers (older tests,
-            # AgenticController direct path) that don't pass provenance.
+            # Use real retrieval-provenance when supplied; otherwise fall
+            # back to ``is_graph_based=False`` so the constant baseline term
+            # in ``compute_score`` is applied.
             if chunk_is_graph_based is not None:
                 cred.is_graph_based = bool(chunk_is_graph_based[chunk_idx])
             else:
@@ -1192,21 +1209,117 @@ Question: {query}
 
 Please provide a partial answer based on the available evidence, clearly indicating what information is missing:"""
 
-    # ── Class-Level Compiled Regex Constants ──────────────────────────────────
-    # Hoisted from per-call compilation in _verify_claim for performance.
+    # Tier 1.5 (2026-05-26): RECOMP-style context distillation prompt.
+    # Run before the final answer prompt to condense ~8 noisy chunks into
+    # a short structured fact list. Targets Lost-in-the-Middle (Liu 2023)
+    # by giving the SLM a clean prompt window.
+    # Reference: Yu et al. 2024 RECOMP (NAACL).
+    DISTILL_PROMPT = """You are a fact-extraction assistant. Read the context below and extract ONLY the facts directly relevant to answering the question.
 
-    # Multi-word proper noun sequences — shared constant from _settings.py.
-    _MULTI_PROPER_NOUN_RE = _PROPER_NOUN_RE
+Output rules:
+- Bullet list of short atomic facts, one per line, prefixed with "- ".
+- Each fact must be one sentence containing concrete details (names, dates, places, titles, numbers).
+- Include the question's named entities verbatim where they appear in the context.
+- Do NOT add opinions, transitions, or background narrative not directly supported by the context.
+- If a fact is not stated in the context, do not invent it.
+
+Question: {query}
+
+Context:
+{context}
+
+Relevant facts:"""
+
+    # Tier 1.5 (2026-05-26): format-mismatch retry prompt.
+    # Fired when the LLM produces a yes/no or abstention answer to a
+    # wh-question. Bounded to one retry per query.
+    FORMAT_RETRY_PROMPT = """Question: {query}
+
+Context:
+{context}
+
+Your previous answer "{previous_answer}" does not match the format the question requires. The question asks for a specific name, place, date, title, or thing. Look in the context for that specific entity and provide it as the answer.
+
+Final answer:"""
+
+    # ── Structured (slot-filling) Chain-of-Thought templates (2026-05-27) ──
+    # Used when config.enable_structured_cot is True. Each template constrains
+    # the SLM to fill reasoning slots, then emit a `FINAL ANSWER:` marker that
+    # _extract_final_answer_from_cot() parses out. Refs: Khot et al. 2023
+    # (Decomposed Prompting, ICLR); Wei et al. 2022 (free-form CoT only helps
+    # >10B, so small models get scaffolded slots, not open reasoning).
+    ANSWER_PROMPT_COT = """You are a factual QA assistant. Answer using ONLY the context. Work through the steps, then give the final answer on its own line.
+
+Context:
+{context}
+
+Question: {query}
+
+Step 1 — Named entities in the question:
+Step 2 — The exact fact(s) in the context that answer the question:
+FINAL ANSWER (shortest form — a name, place, date, number, or yes/no):"""
+
+    BRIDGE_PROMPT_COT = """You are a factual QA assistant. This is a multi-step question. Answer using ONLY the context. Work through the steps, then give the final answer on its own line.
+
+{bridge_chain}
+
+Context:
+{context}
+
+Question: {query}
+
+Step 1 — Named entities in the question:
+Step 2 — Bridge entity (the intermediate that links the question parts), from the context:
+Step 3 — The specific fact about the bridge entity that the question asks for:
+FINAL ANSWER (shortest form, and DIFFERENT from the bridge entity):"""
+
+    COMPARISON_PROMPT_COT = """You are a factual QA assistant. This is a comparison question. Answer using ONLY the context. Work through the steps, then give the final answer on its own line.
+
+Context:
+{context}
+
+Question: {query}
+
+Step 1 — The two (or more) items being compared:
+Step 2 — The relevant attribute of each item, from the context:
+Step 3 — The comparison result:
+FINAL ANSWER (shortest form — the winning item, or yes/no):"""
+
+    # Marker the CoT parser anchors on. Case-insensitive at parse time.
+    _COT_FINAL_MARKER = "final answer"
+
+    # ── Class-Level Compiled Regex Constants ──────────────────────────────
+    # Hoisted from per-call compilation in _verify_claim for performance.
+    # The multi-word proper-noun matcher lives in _text_utils._PROPER_NOUN_RE
+    # and is referenced directly at the call sites in this file — no alias
+    # needed.
+
     # Single capitalised proper nouns of at least 3 characters.
     _SINGLE_PROPER_NOUN_RE = re.compile(r"\b([A-Z][a-z]{2,})\b")
     # Quoted strings treated as entity mentions.
     _QUOTED_RE = re.compile(r'"([^"]+)"')
-    # Sentence boundary splitter for regex fallback in _extract_claims.
+    # Sentence boundary splitter for regex fallback in _extract_claims and
+    # the sentence-aware truncate.
     _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
-    # Stopwords excluded from entity extraction in _verify_claim.
-    # Capitalised sentence-starters and demonyms that match proper-noun
-    # patterns but are never factual entities worth verifying.
+    # Three distinct stopword sets are maintained on this class because
+    # they serve three different purposes:
+    #   - _CLAIM_STOPWORDS     excluded from proper-noun ENTITY EXTRACTION
+    #                          (Capitalised tokens that match the regex but
+    #                          are never factual entities worth verifying:
+    #                          sentence-starters, demonyms, yes/no).
+    #   - _CLAIM_VERIFY_STOPWORDS  excluded from the TOKEN-GROUNDING check
+    #                          for short / numeric claims (function words
+    #                          that add no factual content and would
+    #                          over-violate paraphrase variation).
+    #   - _QR_STOPWORDS        excluded from the QUERY-RELEVANCE REORDER
+    #                          tokeniser (function words that appear in
+    #                          almost every question and carry no
+    #                          discriminative signal).
+    # Each set is intentionally cased to match the input it filters
+    # (entities are Capitalised; claim tokens and query tokens are lower-
+    # cased before lookup).
+
     _CLAIM_STOPWORDS: frozenset = frozenset({
         "The", "This", "That", "These", "Those",
         "However", "Therefore", "Furthermore", "Moreover", "Although",
@@ -1214,11 +1327,6 @@ Please provide a partial answer based on the available evidence, clearly indicat
         "Yes", "No",
     })
 
-    # B4-fix: stopwords excluded from the token-grounding check for short /
-    # numeric claims with no proper noun. Articles, auxiliaries, and copulas
-    # add no factual content, so demanding their literal presence in the
-    # context would over-violate paraphrases. Lowercase — matched against
-    # tokenized claim text.
     _CLAIM_VERIFY_STOPWORDS: frozenset = frozenset({
         "the", "a", "an", "of", "in", "on", "at", "to", "for", "by", "with",
         "is", "was", "are", "were", "be", "been", "being", "has", "have", "had",
@@ -1226,12 +1334,13 @@ Please provide a partial answer based on the available evidence, clearly indicat
         "it", "its", "this", "that", "these", "those",
     })
 
-    # B10-fix: per-string truncation budget for iteration_history entries.
-    # Across 500 questions × 2 iterations × ~400-char answers + claim lists,
-    # the raw history balloons the per-question JSONL by several MB and
-    # slows down jq/pandas analysis. 200 chars per string is enough to
-    # diagnose failures (LLM error sentinels, hallucination first line) while
-    # keeping the file flat-text grep-friendly.
+    # Per-string truncation budget for iteration_history entries written
+    # to the per-question JSONL log. Across 500 questions × 2 iterations
+    # × ~400-char answers + claim lists, the raw history balloons the
+    # JSONL by several MB and slows down jq/pandas analysis. 200 chars
+    # per string is enough to diagnose failures (LLM error sentinels,
+    # hallucination first line) while keeping the file flat-text and
+    # grep-friendly.
     _HISTORY_STR_TRUNCATE_CHARS: int = 200
 
     @classmethod
@@ -1250,7 +1359,10 @@ Please provide a partial answer based on the available evidence, clearly indicat
 
     # Epistemic-disclaimer phrases that signal the LLM did NOT answer.
     # When an answer matches any of these, it must not be reported as
-    # HIGH confidence with all_verified=True (Bug 4).
+    # HIGH confidence with all_verified=True.
+    # Provenance: hand-curated from observed Ollama outputs on the
+    # development split. Extending this set is a code change; the thesis
+    # methodology section reports the dev-vs-test partition explicitly.
     _DISCLAIMER_PATTERNS: Tuple[str, ...] = (
         "i don't know",
         "i do not know",
@@ -1283,11 +1395,88 @@ Please provide a partial answer based on the available evidence, clearly indicat
 
     @classmethod
     def _is_disclaimer_answer(cls, answer: str) -> bool:
-        """Return True if the answer is an epistemic disclaimer (Bug 4)."""
+        """Return True if the answer is an epistemic disclaimer."""
         if not answer or answer.startswith("[Error:"):
             return True
         a = answer.lower()
         return any(p in a for p in cls._DISCLAIMER_PATTERNS)
+
+    # Wh-question vocabulary for the format-mismatch validator.
+    # Wh-questions require a specific entity / fact / number, NOT yes/no.
+    _WH_PREFIXES: frozenset = frozenset({
+        "what", "who", "whom", "where", "when", "which",
+        "whose", "how", "why",
+    })
+
+    # Yes/No answer patterns that violate wh-question format.
+    # Provenance: hand-curated from observed Ollama outputs on the
+    # development split (same caveat as _DISCLAIMER_PATTERNS).
+    _YN_ANSWERS: frozenset = frozenset({
+        "yes", "no", "yes.", "no.", "yeah", "nope", "true", "false",
+        "yes, it is.", "no, it isn't.", "yes, they are.", "no, they are not.",
+        "yes, they were.", "no, they were not.",
+    })
+
+    @classmethod
+    def _extract_final_answer_from_cot(cls, raw: str) -> str:
+        """
+        Pull the final answer out of a structured-CoT response.
+
+        The CoT templates end each chain with a `FINAL ANSWER:` marker;
+        everything after the LAST such marker is the answer. Falls back to
+        the last non-empty line if the marker is absent (small LLMs sometimes
+        drop it), then to the whole string. Only the first line of the
+        captured tail is kept, so trailing step text never leaks into the
+        answer.
+        """
+        if not raw:
+            return raw
+        lowered = raw.lower()
+        idx = lowered.rfind(cls._COT_FINAL_MARKER)
+        if idx != -1:
+            tail = raw[idx + len(cls._COT_FINAL_MARKER):]
+            # Strip a leading "(...)" hint clause and a leading colon/dash.
+            tail = tail.lstrip()
+            if tail.startswith("("):
+                close = tail.find(")")
+                if close != -1:
+                    tail = tail[close + 1:]
+            tail = tail.lstrip(":：-—  ").strip()
+            first_line = tail.splitlines()[0].strip() if tail else ""
+            if first_line:
+                return first_line
+        # Fallback: last non-empty line of the whole response.
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        return lines[-1] if lines else raw.strip()
+
+    @classmethod
+    def _is_format_mismatch(cls, query: str, answer: str) -> bool:
+        """
+        Return True if the answer's format does not match the question's
+        expected output. Two cases are detected:
+
+          1. Wh-question receiving a yes/no answer (e.g. "What is the X?"
+             answered "Yes."). Open-ended interrogatives require a specific
+             entity, not a polarity.
+          2. Wh-question receiving an abstention when the LLM might still
+             extract a fact (handled by bridge-exclusion / claim-verify
+             elsewhere; only the y/n case is flagged here to keep the
+             retry budget bounded).
+
+        Reference: prompt-format calibration in small LLMs (Yang et al.
+        2024 "Alignment for Honesty"; narrowed to format mismatch).
+        """
+        if not query or not answer:
+            return False
+        # First token of the question (skip punctuation)
+        q_norm = query.strip().lstrip("\"'(").lower()
+        first = q_norm.split(maxsplit=1)[0] if q_norm else ""
+        first = first.rstrip("?.,!")
+        is_wh = first in cls._WH_PREFIXES
+        # Normalised answer
+        a_norm = answer.strip().lower().rstrip(".!?,;:").strip('"\'')
+        is_yn = a_norm in cls._YN_ANSWERS or a_norm in {"yes", "no"}
+        return bool(is_wh and is_yn)
 
     def __init__(
         self,
@@ -1306,6 +1495,12 @@ Please provide a partial answer based on the available evidence, clearly indicat
         self.config = config or VerifierConfig()
         self.graph_store = graph_store
         self.pre_validator = PreGenerationValidator(self.config, graph_store)
+        # Compile the query-keyword tokeniser once per instance from the
+        # configured minimum length, so a subclass / config override is the
+        # single source of truth.
+        self._query_keyword_re: re.Pattern = re.compile(
+            rf"\b\w{{{self.config.query_keyword_min_length},}}\b"
+        )
         logger.info(
             "Verifier initialised: model=%s, max_iterations=%d, "
             "entity_path_validation=%s",
@@ -1322,14 +1517,24 @@ Please provide a partial answer based on the available evidence, clearly indicat
 
     # ── LLM Interaction ───────────────────────────────────────────────────────
 
-    def _call_llm(self, prompt: str) -> Tuple[str, float]:
+    def _call_llm(
+        self, prompt: str, max_tokens: Optional[int] = None
+    ) -> Tuple[str, float]:
         """
         Call the Ollama generate endpoint.
+
+        Args:
+            prompt: The full prompt string.
+            max_tokens: Optional override for the generation cap (num_predict).
+                Defaults to ``self.config.max_tokens``. The structured-CoT path
+                passes ``cot_max_tokens`` here so the multi-step output is not
+                truncated before the FINAL ANSWER line.
 
         Returns ``(response_text, latency_ms)``.  On failure, returns an
         error-sentinel string beginning with ``"[Error:"`` so callers can
         detect failures without raising exceptions.
         """
+        _num_predict = max_tokens if max_tokens is not None else self.config.max_tokens
         start = time.time()
         try:
             response = requests.post(
@@ -1340,7 +1545,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
                     "stream": False,
                     "options": {
                         "temperature": self.config.temperature,
-                        "num_predict": self.config.max_tokens,
+                        "num_predict": _num_predict,
                     },
                 },
                 timeout=self.config.timeout,
@@ -1389,7 +1594,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
         Stable-sort context chunks so those sharing more content words with the
         query appear first in the LLM prompt.
 
-        Rationale (§12.27): small LLMs tend to latch onto the first plausible
+        Rationale: small LLMs tend to latch onto the first plausible
         entity in the context (positional bias; Liu et al. 2023, "Lost in the
         Middle", arXiv:2307.03172). By positioning the most answer-relevant
         chunk first, the LLM is exposed to the fact it needs before encountering
@@ -1404,22 +1609,23 @@ Please provide a partial answer based on the available evidence, clearly indicat
         chunk that happens to be sparse in question terms (regression: idx143).
 
         Scoring combines three terms:
-        1. IDF-weighted query-term overlap (F1a) — a query term occurring in
+        1. IDF-weighted query-term overlap — a query term occurring in
            MANY candidate chunks (a generic category word like "magazines")
            carries little discriminative power; a rare term (the specific
            entity) is decisive. Classic inverse document frequency (Spärck
            Jones 1972; Robertson 2004), computed over the candidate set in
-           hand. Applied only when there are >= _IDF_MIN_CANDIDATES chunks —
-           below that, document frequency is degenerate, so the score falls
-           back to the validated length-normalised hit count (Fix E).
-        2. sqrt(word_count) length normalisation (Fix E) — short direct-answer
-           chunks are not penalised against long topic chunks that accumulate
-           hits from sheer length.
-        3. Structural-coverage floor (D1) — a chunk that names a DISTINCTIVE
-           query entity (multi-word, or a single token >= 8 chars) receives a
-           score floor so a required entity's article (e.g. a comparison
-           conjunct, or a bridge target) cannot be demoted below the cap by
-           keyword sparsity. Restricted to distinctive entities so a common
+           hand. Applied only when there are >= ``idf_min_candidates``
+           chunks — below that, document frequency is degenerate, so the
+           score falls back to the length-normalised hit count.
+        2. Length normalisation (word_count ** ``length_norm_exponent``,
+           default sqrt) — short direct-answer chunks are not penalised
+           against long topic chunks that accumulate hits from sheer length.
+        3. Structural-coverage floor — a chunk that names a DISTINCTIVE
+           query entity (multi-word, or a single token >=
+           ``distinctive_entity_min_length`` chars) receives a score floor
+           so a required entity's article (e.g. a comparison conjunct, or a
+           bridge target) cannot be demoted below the cap by keyword
+           sparsity. Restricted to distinctive entities so a common
            single-word name does not over-fire.
 
         Stable-sort descending — ties preserve original (Navigator RRF) order.
@@ -1427,17 +1633,18 @@ Please provide a partial answer based on the available evidence, clearly indicat
         if len(context) <= 1:
             return context
 
+        # Tokenise the query using the configured minimum keyword length.
+        # The compiled regex is cached on the instance in __init__.
         query_tokens = {
-            t for t in re.findall(r"\b\w{4,}\b", query.lower())
+            t for t in self._query_keyword_re.findall(query.lower())
             if t not in self._QR_STOPWORDS
         }
         if not query_tokens:
             return context
 
-        # F1a: IDF over the candidate set, guarded by a minimum count below
+        # IDF over the candidate set, guarded by a minimum count below
         # which document frequency is statistically meaningless.
-        _IDF_MIN_CANDIDATES = 4
-        if len(context) >= _IDF_MIN_CANDIDATES:
+        if len(context) >= self.config.idf_min_candidates:
             n_docs = len(context)
             lowered_all = [c.lower() for c in context]
             idf = {
@@ -1447,20 +1654,25 @@ Please provide a partial answer based on the available evidence, clearly indicat
         else:
             idf = {t: 1.0 for t in query_tokens}
 
-        # D1: distinctive query entities that earn a coverage floor.
+        # Distinctive query entities that earn a coverage floor — multi-token
+        # names, or single tokens at least ``distinctive_entity_min_length``
+        # characters long. The floor protects a chunk that names a required
+        # entity from being demoted by sparse keyword overlap.
+        min_distinctive_len = self.config.distinctive_entity_min_length
         distinctive_entities = [
             e.lower() for e in (entities or [])
-            if len(e.split()) >= 2 or len(e) >= 8
+            if len(e.split()) >= 2 or len(e) >= min_distinctive_len
         ]
-        # The floor is the maximum achievable IDF mass, so an entity-bearing
-        # chunk always outranks a chunk that merely shares generic terms.
+        # Floor = maximum achievable IDF mass, so an entity-bearing chunk
+        # always outranks a chunk that merely shares generic terms.
         coverage_floor = sum(idf.values()) if idf else 1.0
+        length_exponent = self.config.length_norm_exponent
 
         def _score(chunk: str) -> float:
             chunk_lower = chunk.lower()
             weighted = sum(idf[t] for t in query_tokens if t in chunk_lower)
             word_count = max(1, len(chunk_lower.split()))
-            base = weighted / (word_count ** 0.5)
+            base = weighted / (word_count ** length_exponent)
             if distinctive_entities and any(e in chunk_lower for e in distinctive_entities):
                 base += coverage_floor
             return base
@@ -1469,24 +1681,24 @@ Please provide a partial answer based on the available evidence, clearly indicat
 
     # ── Context Formatting ────────────────────────────────────────────────────
 
-    @staticmethod
-    def _truncate_sentence_aware(doc: str, budget: int, query: str) -> str:
-        """F2: truncate a doc to `budget` chars by keeping the most
+    def _truncate_sentence_aware(self, doc: str, budget: int, query: str) -> str:
+        """Truncate ``doc`` to ``budget`` chars by keeping the most
         query-relevant SENTENCES (in original order), not the first N chars.
 
-        Head-truncation silently drops an answer-bearing sentence that sits in
-        the tail of a chunk (confirmed failure: a chunk whose defining fact was
-        in its last sentence). Selecting by query overlap and re-emitting the
-        kept sentences in their ORIGINAL order preserves local coherence (which
-        matters for a small LLM) while ensuring the answer sentence survives.
+        Head-truncation silently drops an answer-bearing sentence that sits
+        in the tail of a chunk (confirmed failure: a chunk whose defining
+        fact was in its last sentence). Selecting by query overlap and
+        re-emitting the kept sentences in their ORIGINAL order preserves
+        local coherence (which matters for a small LLM) while ensuring the
+        answer sentence survives.
         """
-        sentences = re.split(r"(?<=[.!?])\s+", doc)
+        sentences = self._SENTENCE_SPLIT_RE.split(doc)
         if len(sentences) <= 1:
             # No sentence structure to exploit — fall back to head truncation.
             cut = doc[:budget]
             sp = cut.rfind(" ")
             return (cut[:sp] + "...") if sp > 0 else cut
-        q_tokens = {t for t in re.findall(r"\b\w{4,}\b", query.lower())}
+        q_tokens: Set[str] = set(self._query_keyword_re.findall(query.lower()))
 
         def _rel(s: str) -> int:
             sl = s.lower()
@@ -1495,7 +1707,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
         # Rank sentence INDICES by relevance, take the highest-scoring ones
         # that fit the budget, then emit them in original order.
         order = sorted(range(len(sentences)), key=lambda i: -_rel(sentences[i]))
-        keep: set = set()
+        keep: Set[int] = set()
         used = 0
         for idx in order:
             s_len = len(sentences[idx]) + 1
@@ -1512,7 +1724,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
 
         Strategy:
         1. Take at most ``max_docs`` chunks.
-        2. Truncate each chunk at ``max_chars_per_doc`` (F2: sentence-aware,
+        2. Truncate each chunk at ``max_chars_per_doc`` (sentence-aware,
            keeping the most query-relevant sentences in original order when a
            query is supplied; head-truncation otherwise).
         3. Stop adding chunks once ``max_context_chars`` is reached.
@@ -1630,43 +1842,44 @@ Please provide a partial answer based on the available evidence, clearly indicat
         (is_verified, reason_code) : (bool, str)
         """
         entities: List[str] = []
-        entities.extend(self._MULTI_PROPER_NOUN_RE.findall(claim))
+        entities.extend(_PROPER_NOUN_RE.findall(claim))
         entities.extend(self._SINGLE_PROPER_NOUN_RE.findall(claim))
         entities.extend(self._QUOTED_RE.findall(claim))
         entities = [e for e in entities if e not in self._CLAIM_STOPWORDS]
 
         if not entities:
-            # B4-fix: claims with no extractable proper nouns previously
-            # auto-verified, which inflated all_verified=True for short factual
-            # answers like "1995", "9 million inhabitants", "ice hockey" — the
-            # exact answer shape HotpotQA produces for "how many" / "in what
-            # year" / "what sport" questions. We now check the claim against
-            # the retrieved context whenever it contains a numeric token OR is
-            # very short (<= 6 tokens). If the claim isn't grounded in context,
-            # treat it as a violation rather than auto-verified. Multi-clause
-            # narrative sentences with no proper noun still auto-verify (the
-            # historical behavior) because no falsifiable anchor exists.
+            # Claims with no extractable proper noun must not auto-verify
+            # when they are short factual answers ("1995", "9 million
+            # inhabitants", "ice hockey") — the answer shape produced for
+            # "how many" / "in what year" / "what sport" questions. Such a
+            # claim is checked against the retrieved context whenever it
+            # contains a numeric token OR is at most
+            # ``short_claim_max_tokens`` tokens long. If it isn't grounded
+            # in context, it is a violation rather than auto-verified.
+            # Multi-clause narrative sentences with no proper noun still
+            # auto-verify because they carry no falsifiable anchor.
             claim_lower = claim.lower().strip()
             tokens = claim_lower.split()
             has_number = bool(re.search(r"\d", claim_lower))
-            is_short = len(tokens) <= 6
+            is_short = len(tokens) <= self.config.short_claim_max_tokens
 
             if (has_number or is_short) and context:
-                # Token-level grounding check: every non-stopword content token
-                # of the claim must appear somewhere in the joined context.
-                # Stopwords/articles/auxiliary verbs are ignored so phrasing
-                # differences ("was founded in 1995" vs "founded 1995") don't
-                # falsely violate.
+                # Token-level grounding check: every non-stopword content
+                # token of the claim must appear somewhere in the joined
+                # context. Stopwords/articles/auxiliary verbs are ignored
+                # so phrasing differences ("was founded in 1995" vs
+                # "founded 1995") don't falsely violate.
                 #
-                # B4-fix: numeric tokens are KEPT regardless of length because
-                # they are the falsifiable signal the check exists to catch
-                # (e.g. "9 million inhabitants" vs "1.5 million inhabitants" —
-                # without keeping the digit, "million" and "inhabitants" both
-                # match and the hallucination would slip through). Strip
-                # trailing punctuation so "1995." still matches "1995" in
-                # the context.
+                # Numeric tokens are KEPT regardless of length because they
+                # are the falsifiable signal the check exists to catch
+                # (e.g. "9 million inhabitants" vs "1.5 million inhabitants"
+                # — without keeping the digit, "million" and "inhabitants"
+                # both match and the hallucination would slip through).
+                # Strip trailing punctuation so "1995." still matches
+                # "1995" in the context.
                 context_text = " ".join(context).lower()
-                content_tokens = []
+                content_tokens: List[str] = []
+                min_token_len = self.config.claim_content_token_min_length
                 for raw in tokens:
                     t = raw.strip(".,;:!?\"'()[]")
                     if not t:
@@ -1674,7 +1887,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
                     if t in self._CLAIM_VERIFY_STOPWORDS:
                         continue
                     is_numeric_token = any(ch.isdigit() for ch in t)
-                    if is_numeric_token or len(t) >= 2:
+                    if is_numeric_token or len(t) >= min_token_len:
                         content_tokens.append(t)
                 if not content_tokens:
                     return True, "no_content_tokens_to_verify"
@@ -1732,15 +1945,16 @@ Please provide a partial answer based on the available evidence, clearly indicat
         """
         Build a human-readable reasoning scaffold for multi-hop prompts.
 
-        Safety guarantees (§12.32):
+        Safety guarantees:
         1. Never emits a literal sentinel like "THIS IS THE ANSWER" — small
            quantized models echo such strings verbatim. The final step uses
            a directive verb ("→ derive the final answer") instead.
         2. Only injects a bridge entity into a hop's substitution if the
            entity is actually present in the retrieved context. Prevents
            propagation of spurious/distractor bridge entities into the
-           reasoning chain (e.g. "New York" appearing because the gold
-           chunk had a tangential clause about Robert Durst).
+           reasoning chain — i.e. an off-topic named entity appearing in
+           the gold chunk via a tangential clause must not be promoted to
+           the inferred hop result.
         3. If no bridge entity passes the grounding check, the hop is
            rendered as a directive ("→ identify the intermediate result")
            rather than left blank or pre-filled with a wrong value.
@@ -1899,7 +2113,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
             len(context),
         )
 
-        # ── Hard early-return on truly empty evidence (Bug 3) ────────────────
+        # ── Hard early-return on truly empty evidence ────────────────────────
         # Skip the ~18 s LLM call when pre-validation produced no usable
         # context: an empty filtered_context, or INSUFFICIENT_EVIDENCE
         # combined with zero entities found by the entity-path check.
@@ -1928,29 +2142,89 @@ Please provide a partial answer based on the available evidence, clearly indicat
                 pre_validation=pre_validation,
                 timing_ms=total_time,
                 iteration_history=[],
+                retry_fired={"bridge_exclusion": False, "format_mismatch": False},
                 confidence_high_threshold=self.config.confidence_high_threshold,
                 confidence_medium_threshold=self.config.confidence_medium_threshold,
             )
 
-        # §12.27 contract (revised): the Navigator's fused RRF ranking owns SET
-        # MEMBERSHIP — which chunks survive the max_docs cap — while the
-        # question-relevance reorder owns only PRESENTATION ORDER within that
-        # window, to mitigate LLM positional bias (Liu et al. 2023, "Lost in the
-        # Middle", arXiv:2307.03172). Selecting by lexical query-overlap let a
-        # distractor that merely echoes the question evict a question-term-sparse
-        # answer chunk that the retriever had ranked #1 (observed idx143). Cap by
-        # RRF order first, then reorder only inside the kept window.
+        # Contract: the Navigator's fused RRF ranking owns SET MEMBERSHIP —
+        # which chunks survive the ``max_docs`` cap — while the question-
+        # relevance reorder owns only PRESENTATION ORDER within that window,
+        # to mitigate LLM positional bias (Liu et al. 2023, "Lost in the
+        # Middle", arXiv:2307.03172). Selecting by lexical query-overlap
+        # would let a distractor that merely echoes the question evict a
+        # question-term-sparse answer chunk that the retriever had ranked
+        # #1. Cap by RRF order first, then reorder only inside the kept
+        # window — and only when the reorder is enabled by config.
         selected = working_context[: self.config.max_docs]
-        working_context = self._reorder_by_question_relevance(
-            query, selected, entities=entities,
-        )
+        if self.config.enable_question_relevance_reorder:
+            working_context = self._reorder_by_question_relevance(
+                query, selected, entities=entities,
+            )
+        else:
+            working_context = selected
         formatted_context = self._format_context(working_context, query=query)
+
+        # RECOMP-style context distillation (Yu et al. 2024, NAACL).
+        # One extra LLM call condenses the reordered chunks into a short
+        # fact list. The LLM-facing prompt sees the distilled facts, but
+        # claim-verification continues to run against the original
+        # working_context (so claim-grounding is unchanged). Provenance:
+        # dev-split diagnostic — see VerifierConfig field note.
+        distilled_prompt_context: Optional[str] = None
+        if (
+            self.config.enable_context_distillation
+            and working_context
+            and len(formatted_context) > self.config.context_distillation_min_input_chars
+        ):
+            try:
+                distill_prompt = self.DISTILL_PROMPT.format(
+                    query=query, context=formatted_context
+                )
+                distilled_text, distill_latency = self._call_llm(distill_prompt)
+                if (
+                    distilled_text
+                    and not distilled_text.startswith("[Error:")
+                    and len(distilled_text.strip()) >= self.config.context_distillation_min_output_chars
+                ):
+                    distilled_prompt_context = (
+                        "Key facts extracted from the retrieved sources:\n"
+                        f"{distilled_text.strip()}"
+                    )
+                    logger.info(
+                        "[Verifier] Context distillation: %d chars -> %d "
+                        "chars (latency=%.0fms)",
+                        len(formatted_context),
+                        len(distilled_prompt_context),
+                        distill_latency,
+                    )
+                else:
+                    logger.debug(
+                        "[Verifier] Distillation skipped (empty/error output); "
+                        "falling back to raw chunks"
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[Verifier] Distillation failed (%s); using raw chunks",
+                    exc,
+                )
+
+        # Prompt-facing context: distilled if available, else the original
+        # formatted chunks. Claim verification ALWAYS uses working_context
+        # so atomic claims must still be grounded in retrieved chunks.
+        prompt_context = distilled_prompt_context or formatted_context
 
         best_answer: Optional[str] = None
         best_verified: List[str] = []
         best_violated: List[str] = []
         iteration_history: List[Dict[str, Any]] = []
         violated_claims: List[str] = []
+        # Track whether each bounded retry path has already fired for this
+        # query. Both retries are capped at exactly one call per
+        # generate_and_verify invocation (one per query, not per
+        # self-correction iteration). Exposed on VerificationResult.retry_fired.
+        bridge_retried_this_call: bool = False
+        format_retried_this_call: bool = False
 
         # ── Self-correction loop ──────────────────────────────────────────────
         for iteration in range(1, self.config.max_iterations + 1):
@@ -1961,38 +2235,68 @@ Please provide a partial answer based on the available evidence, clearly indicat
                 self.config.max_iterations,
             )
 
+            # Structured-CoT prompt selection (2026-05-27). When enabled, the
+            # first-iteration answer prompts use the slot-filling COT variants.
+            # The INSUFFICIENT_EVIDENCE prompt and the iteration-2+ CORRECTION
+            # prompt are left as-is (CoT does not apply to a partial-answer or
+            # claim-correction flow). used_cot_this_iter gates the final-answer
+            # extraction below.
+            use_cot = self.config.enable_structured_cot
+            used_cot_this_iter = False
             if iteration == 1:
                 if pre_validation.status == ValidationStatus.INSUFFICIENT_EVIDENCE:
                     prompt = self.INSUFFICIENT_EVIDENCE_PROMPT.format(
-                        context=formatted_context, query=query
+                        context=prompt_context, query=query
                     )
                 elif query_type == "comparison":
-                    prompt = self.COMPARISON_PROMPT.format(
-                        context=formatted_context, query=query
-                    )
+                    prompt = (
+                        self.COMPARISON_PROMPT_COT if use_cot else self.COMPARISON_PROMPT
+                    ).format(context=prompt_context, query=query)
+                    used_cot_this_iter = use_cot
                 elif query_type in ("multi_hop", "bridge") and hop_sequence:
                     bridge_chain = self._build_bridge_chain(
                         query, entities or [], bridge_entities or [],
                         hop_sequence, context=context,
                     )
-                    prompt = self.BRIDGE_PROMPT.format(
+                    prompt = (
+                        self.BRIDGE_PROMPT_COT if use_cot else self.BRIDGE_PROMPT
+                    ).format(
                         bridge_chain=bridge_chain,
-                        context=formatted_context,
+                        context=prompt_context,
                         query=query,
                     )
+                    used_cot_this_iter = use_cot
                 else:
-                    prompt = self.ANSWER_PROMPT.format(
-                        context=formatted_context, query=query
-                    )
+                    prompt = (
+                        self.ANSWER_PROMPT_COT if use_cot else self.ANSWER_PROMPT
+                    ).format(context=prompt_context, query=query)
+                    used_cot_this_iter = use_cot
             else:
                 prompt = self.CORRECTION_PROMPT.format(
                     violations="\n".join("- %s" % v for v in violated_claims),
-                    context=formatted_context,
+                    context=prompt_context,
                     query=query,
                 )
 
-            answer, llm_latency = self._call_llm(prompt)
+            # CoT needs a larger generation budget so the FINAL ANSWER line is
+            # not truncated by the multi-step output. Only pass the override on
+            # the CoT path; the default path calls _call_llm(prompt) unchanged
+            # so it stays signature-compatible with all existing callers/mocks.
+            if used_cot_this_iter:
+                answer, llm_latency = self._call_llm(
+                    prompt, max_tokens=self.config.cot_max_tokens
+                )
+            else:
+                answer, llm_latency = self._call_llm(prompt)
             logger.info("[Verifier] LLM response in %.0fms", llm_latency)
+
+            # Parse the FINAL ANSWER out of a structured-CoT response BEFORE any
+            # downstream processing (bridge-exclusion, format-retry, claim
+            # extraction) so they all operate on the answer, not the reasoning
+            # steps. Claim verification therefore still grounds the answer in
+            # retrieved chunks, not the CoT scaffold.
+            if used_cot_this_iter and answer and not answer.startswith("[Error:"):
+                answer = self._extract_final_answer_from_cot(answer)
 
             # Guard: empty answers cannot be verified and must not be
             # returned as correct results.
@@ -2029,6 +2333,94 @@ Please provide a partial answer based on the available evidence, clearly indicat
                     break
                 continue
 
+            # Bridge-entity exclusion retry.
+            # Detects when the LLM returns one of the resolved bridge
+            # entities as the final answer (a common failure mode where the
+            # SLM picks the intermediate hop result instead of the final
+            # attribute). On bridge_hit, re-prompt with an explicit
+            # exclusion instruction. Bounded retry: at most one call per
+            # query. Refs: Dhuliawala et al. (2023) Chain-of-Verification,
+            # narrowed to the bridge-entity failure mode.
+            if (
+                self.config.enable_bridge_exclusion_retry
+                and bridge_entities
+                and answer
+                and not bridge_retried_this_call
+            ):
+                ans_norm = answer.strip().lower().rstrip(".!?,;:").strip('"\'')
+                bridge_norms = [
+                    b.strip().lower().rstrip(".") for b in bridge_entities if b
+                ]
+                bridge_substr_min = self.config.bridge_substring_min_length
+                bridge_hit = any(
+                    ans_norm == b
+                    or (len(ans_norm) >= bridge_substr_min and ans_norm in b)
+                    or (len(b) >= bridge_substr_min and b in ans_norm)
+                    for b in bridge_norms
+                )
+                if bridge_hit:
+                    bridge_retried_this_call = True
+                    exclusion_list = ", ".join(
+                        f'"{b}"' for b in bridge_entities[: self.config.bridge_exclusion_top_k]
+                    )
+                    retry_prompt = (
+                        f"Question: {query}\n\n"
+                        f"Context:\n{prompt_context}\n\n"
+                        f"IMPORTANT INSTRUCTION: The following entities are "
+                        f"intermediate bridges in the reasoning chain, NOT "
+                        f"the final answer the question asks for: "
+                        f"{exclusion_list}.\n"
+                        f"Find the FINAL answer that the question asks for. "
+                        f"The final answer must be DIFFERENT from the bridge "
+                        f"entities listed above. Look in the context for the "
+                        f"attribute, title, name, date, or fact that the "
+                        f"question is actually asking about.\n\n"
+                        f"Final answer:"
+                    )
+                    logger.info(
+                        "[Verifier] Bridge-entity hit '%s' — retrying with "
+                        "exclusion prompt (bridges=%s)",
+                        answer[:60], bridge_entities[:3],
+                    )
+                    retry_answer, retry_latency = self._call_llm(retry_prompt)
+                    if retry_answer and not retry_answer.startswith("[Error:"):
+                        logger.info(
+                            "[Verifier] Bridge-exclusion retry produced: %s",
+                            retry_answer[:80],
+                        )
+                        answer = retry_answer
+                        llm_latency = llm_latency + retry_latency
+
+            # Calibrated format-mismatch retry.
+            # Detects wh-question → yes/no answer mismatches and re-prompts
+            # with an explicit format instruction. Bounded to one retry
+            # per query (same pattern as bridge-exclusion). Provenance:
+            # dev-split diagnostic — see VerifierConfig field note.
+            if (
+                self.config.enable_format_validation_retry
+                and answer
+                and not format_retried_this_call
+                and self._is_format_mismatch(query, answer)
+            ):
+                format_retried_this_call = True
+                logger.info(
+                    "[Verifier] Format mismatch detected (query=%.50s; "
+                    "answer=%.40s) — retrying with format prompt",
+                    query, answer,
+                )
+                fmt_prompt = self.FORMAT_RETRY_PROMPT.format(
+                    query=query,
+                    context=prompt_context,
+                    previous_answer=answer.strip(),
+                )
+                fmt_answer, fmt_latency = self._call_llm(fmt_prompt)
+                if fmt_answer and not fmt_answer.startswith("[Error:"):
+                    logger.info(
+                        "[Verifier] Format retry produced: %s", fmt_answer[:80]
+                    )
+                    answer = fmt_answer
+                    llm_latency = llm_latency + fmt_latency
+
             claims = self._extract_claims(answer)
             logger.info("[Verifier] %d claims extracted", len(claims))
 
@@ -2047,7 +2439,7 @@ Please provide a partial answer based on the available evidence, clearly indicat
                         "[Verifier] VIOLATED '%s...' (%s)", claim[:50], reason
                     )
 
-            # ── Disclaimer override (Bug 4) ──────────────────────────────
+            # ── Disclaimer override ──────────────────────────────────────
             # If the answer is an epistemic disclaimer, _extract_claims has
             # already stripped the meta-statement and the claim list is
             # often empty — which silently maps to all_verified=True / HIGH
@@ -2067,9 +2459,10 @@ Please provide a partial answer based on the available evidence, clearly indicat
             )
 
             iter_time = (time.time() - iter_start) * 1000
-            # B10-fix: truncate stored strings (answer + claim/verified/violated
-            # lists) to 200 chars each. Keeps the per-question JSONL flat-text
-            # grep-friendly across 500-question runs.
+            # Truncate stored strings (answer + claim/verified/violated
+            # lists) to _HISTORY_STR_TRUNCATE_CHARS each, keeping the
+            # per-question JSONL flat-text and grep-friendly across
+            # 500-question runs.
             iteration_history.append({
                 "iteration": iteration,
                 "answer": self._truncate_history_str(answer),
@@ -2101,6 +2494,10 @@ Please provide a partial answer based on the available evidence, clearly indicat
                     pre_validation=pre_validation,
                     timing_ms=total_time,
                     iteration_history=iteration_history,
+                    retry_fired={
+                        "bridge_exclusion": bridge_retried_this_call,
+                        "format_mismatch": format_retried_this_call,
+                    },
                     confidence_high_threshold=self.config.confidence_high_threshold,
                     confidence_medium_threshold=self.config.confidence_medium_threshold,
                 )
@@ -2126,6 +2523,10 @@ Please provide a partial answer based on the available evidence, clearly indicat
             pre_validation=pre_validation,
             timing_ms=total_time,
             iteration_history=iteration_history,
+            retry_fired={
+                "bridge_exclusion": bridge_retried_this_call,
+                "format_mismatch": format_retried_this_call,
+            },
             confidence_high_threshold=self.config.confidence_high_threshold,
             confidence_medium_threshold=self.config.confidence_medium_threshold,
         )

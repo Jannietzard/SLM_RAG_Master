@@ -4,75 +4,67 @@ Navigator (S_N) — Hybrid Retrieval, RRF Fusion & Pre-Generative Filtering
 ===============================================================================
 
 Master's Thesis: "Enhancing Reasoning Fidelity in Quantized SLMs on Edge"
-Artifact B: Agent-Based Query Processing — S_N Component
+Artifact B: Agent-Based Query Processing — S_N Component.
 
-The Navigator executes the RetrievalPlan produced by S_P and delivers
-high-quality evidence chunks to S_V.  Per thesis section 3.3:
+Role in the pipeline
+--------------------
+S_N is the second agent of the S_P → S_N → S_V pipeline. It executes the
+RetrievalPlan produced by S_P and delivers high-quality evidence chunks to
+S_V. Configuration shared with AgentPipeline is defined in ControllerConfig
+(src/logic_layer/_config.py).
 
-1. HYBRID RETRIEVAL ORCHESTRATION
-   - Vector retrieval (semantic search via LanceDB)
-   - Graph retrieval (relation-based via KuzuDB)
-   - Strategy selected from the RetrievalPlan
+1. Hybrid retrieval orchestration — vector (LanceDB) + graph (KuzuDB) +
+   BM25 paths, selected from the RetrievalPlan strategy.
+2. RRF fusion — Reciprocal Rank Fusion across sub-query result lists, with
+   a cross-source corroboration boost (configurable weights). Each chunk is
+   tagged with the sub-query where it ranked best, used by the reranker.
+   Reference: Cormack et al. (2009). SIGIR. DOI:10.1145/1571941.1572114.
+3. Optional cross-encoder reranking (Stage 2.5) — re-scores the top-k fused
+   chunks with a (query, chunk) cross-encoder; off by default.
+4. Pre-generative filtering — six sequential filters + a final fairness cap:
+     a) Relevance      dynamic threshold (relevance_factor × max RRF)
+     b) Redundancy     Jaccard deduplication
+     c) Contradiction  numeric-divergence heuristic (off by default)
+     d) Entity-overlap subset entity-set pruning            (original)
+     e) Entity-mention three-tier query-entity relevance     (original)
+     f) Context shrink sentence-level trim for edge CPU       (original)
+   The three original-contribution filters (d, e, f) each have an
+   ``enable_*`` toggle in ControllerConfig so the thesis section-3.3
+   per-filter ablation rows can be regenerated. The final cap uses
+   per-anchor fairness (_fair_cap_by_subquery) for parallel decompositions
+   so no single anchor monopolises the budget; single-hop is a pure global
+   top-k.
 
-2. RRF FUSION
-   Reciprocal Rank Fusion across sub-query result lists.
-   Reference: Cormack et al. (2009). "Reciprocal Rank Fusion outperforms
-   Condorcet and individual Rank Learning Methods." SIGIR 2009.
-   DOI: 10.1145/1571941.1572114
+Exports
+-------
+    RetrieverProtocol, NavigatorResult, Navigator.
+    ControllerConfig is re-exported from _config.py for import compatibility.
 
-   Cross-source corroboration: chunks appearing in multiple sub-query result
-   lists receive a multiplicative boost (configurable weights in settings.yaml).
+References (algorithm anchors)
+------------------------------
+    Cormack, Clarke, Büttcher (2009). Reciprocal Rank Fusion. SIGIR.
+    Radlinski, Kurup, Joachims (2008). Team-draft interleaving. CIKM.
+        (Basis of the per-anchor fairness cap.)
+    Yang et al. (2018). HotpotQA. EMNLP. (Coverage requirement for the
+        parallel-decomposition fairness cap.)
+    Reimers & Gurevych (2019). Sentence-BERT. arXiv:1908.10084.
+        (Cross-encoder reranker.)
 
-3. PRE-GENERATIVE FILTERING (six sequential filters + final cap)
-   a) Relevance filter    — dynamic threshold: relevance_factor × max_rrf_score
-   b) Redundancy filter   — Jaccard deduplication above redundancy_threshold
-   c) Contradiction filter — numeric heuristic (original contribution)
-   d) Entity overlap pruning — subset entity-set removal (original contribution)
-   e) Entity-mention filter  — require query entity presence (original contribution)
-   f) Context shrinkage      — sentence-level trimming for edge CPU (original)
+Dependencies
+------------
+    src.utils.jaccard_similarity; sentence-transformers (optional — only
+    when enable_reranker). stdlib otherwise (re, time, logging, typing,
+    dataclasses, collections). A RetrieverProtocol implementation is
+    injected at runtime.
 
-   Final cap to `max_context_chunks` uses per-anchor fairness
-   (`_fair_cap_by_subquery`, §11.16.2) for parallel decompositions
-   (comparison / intersection plans with ≥2 sub-queries): the per-
-   sub-query rankings are round-robin interleaved so no single anchor
-   monopolises the budget. Single-hop is a no-op (pure global top-k).
-   Refs: Radlinski et al. (2008, CIKM) team-draft interleaving;
-   coverage requirement from HotpotQA (Yang et al. 2018).
-
-The full S_P → S_N → S_V pipeline orchestrator lives in
-``src.pipeline.agent_pipeline.AgentPipeline``. ``AgenticController``
-(controller.py) is a namespace of stateless helpers used by
-AgentPipeline's iterative multi-hop path; it does not orchestrate.
-Configuration shared between Navigator and AgentPipeline is defined in
-ControllerConfig (src/logic_layer/_config.py).
-
-===============================================================================
-ARCHITECTURE
-===============================================================================
-
-    User Query
-        │
-        ▼
-    ┌─────────────┐         ┌─────────────┐         ┌─────────────┐
-    │     S_P     │────────▶│     S_N     │────────▶│     S_V     │
-    │   PLANNER   │         │  NAVIGATOR  │         │  VERIFIER   │
-    └─────────────┘         └─────────────┘         └─────────────┘
-                                  │
-                             ┌────▼────┐
-                             │Hybrid   │
-                             │Retrieval│
-                             │RRF      │
-                             │Fusion   │
-                             │Pre-Gen  │
-                             │Filter   │
-                             └─────────┘
-
+Last reviewed: 2026-05-27 (audit pass, project version 5.4).
 ===============================================================================
 """
 
 import logging
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
@@ -151,6 +143,43 @@ class Navigator:
        f) Context shrinkage: trim each chunk to relevant sentences
     """
 
+    # ── Class-level compiled regexes (compiled once at class load) ────────────
+    # Number token matcher for the contradiction filter (4-digit years first,
+    # then any integer/decimal).
+    _NUMBER_RE = re.compile(r"\b\d{4}\b|\b\d+(?:\.\d+)?\b")
+    # Capitalised-token sentence-priority proxy for context shrinkage.
+    _SHRINK_ENTITY_RE = re.compile(r"\b[A-Z][a-zA-Z]{2,}")
+    # Sentence-boundary splitter (shared by context shrinkage).
+    _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+    # Capitalised proper-noun proxy for entity-overlap pruning. Intentional
+    # variant of _text_utils._PROPER_NOUN_RE: [a-zA-Z] continuations (mixed
+    # case like "MacDonald") and * (includes single-word proper nouns).
+    _OVERLAP_ENTITY_RE = re.compile(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b")
+
+    # ── Closed lexical lists for contradiction-filter number classification ───
+    # Year-context words: a number near one of these is treated as a year
+    # regardless of magnitude ("year 3000").
+    _YEAR_CONTEXT_WORDS = (
+        "year", "born", "founded", "established", "released",
+        "published", "elected", "incorporated", "ad ", "bc ", "ce ",
+    )
+    # Count-context words: a number near one of these is treated as a
+    # count/population even inside the year range ("Population 2014").
+    _COUNT_CONTEXT_WORDS = (
+        "population", "people", "inhabitants", "residents",
+        "members", "employees", "employs", "employ", "staff",
+        "workers", "users", "subscribers",
+        "votes", "voters", "seats", "kilometers", "km",
+        "miles", "dollars", "euros", "pounds",
+        "versus", "vs",
+    )
+
+    # Minimum content-token lengths for the entity-mention filter's
+    # query-content overlap fallback and variant-name (all-tokens-co-occur)
+    # match. Tokenisation minutiae, not metric-ablation knobs.
+    _QUERY_CONTENT_MIN_LEN = 4
+    _AND_PATTERN_TOKEN_MIN = 3
+
     def __init__(self, config: ControllerConfig):
         """
         Initialise Navigator.
@@ -163,7 +192,7 @@ class Navigator:
         # Retriever is injected later via set_retriever()
         self.retriever: Optional[RetrieverProtocol] = None
 
-        # Cross-encoder reranker — lazy-loaded on first use (§12.29)
+        # Cross-encoder reranker — lazy-loaded on first use.
         # None = not yet attempted; False = load failed (skip future attempts)
         self._reranker: Optional[Any] = None
 
@@ -230,17 +259,18 @@ class Navigator:
         all_results = []
 
         # Entity hints from S_P passed to retriever so GLiNER is not re-run
-        # on short sub-query fragments (e.g. "What is the nationality of Ed Wood?")
-        # where it frequently fails to recognise the entity name.
+        # on short sub-query fragments (e.g. "What is the nationality of
+        # [Person]?") where it frequently fails to recognise an entity name
+        # that was confidently identified upstream from the full question.
         #
         # Priority: explicit entity_names arg > plan.entities > None (GLiNER re-runs).
         # Using plan entities as hints ensures all sub-queries share the same full
         # entity set, so the keyword entity fallback in HybridRetriever can inject
         # entity-specific chunks into every sub-query result list.  Without this,
-        # sub-queries that don't mention a target entity (e.g. "Are both Huernia
-        # described as a genus?" for query entity "Dictyosperma") produce no
-        # keyword hit for that entity, lowering its cross-query RRF score below the
-        # Relevance Filter threshold.
+        # a sub-query that names only one of two compared entities produces no
+        # keyword hit for the second entity, lowering its cross-query RRF score
+        # below the Relevance Filter threshold and dropping its supporting
+        # paragraph from the final context.
         if entity_names is not None:
             hints = entity_names
         elif retrieval_plan is not None and getattr(retrieval_plan, "entities", None):
@@ -264,7 +294,7 @@ class Navigator:
                         else 1.0
                     )
 
-                    # B2-fix: capture the retrieval method ("vector"/"graph"/
+                    # Capture the retrieval method ("vector"/"graph"/
                     # "bm25"/"hybrid") separately from source_doc so the Verifier
                     # credibility score can use real graph-provenance signal
                     # instead of a constant baseline.
@@ -310,7 +340,7 @@ class Navigator:
         result.metadata["fusion_time_ms"] = (time.time() - start_time) * 1000
 
         # ─────────────────────────────────────────────────────────────────────
-        # STAGE 2.5: CROSS-ENCODER RERANKING (optional, §12.29)
+        # STAGE 2.5: CROSS-ENCODER RERANKING (optional)
         # ─────────────────────────────────────────────────────────────────────
 
         original_query = (
@@ -364,14 +394,17 @@ class Navigator:
             contradiction_filtered = redundancy_filtered
         result.metadata["after_contradiction_filter"] = len(contradiction_filtered)
 
-        # Filter 4: Entity overlap pruning
-        entity_pruned = self._entity_overlap_pruning(contradiction_filtered)
+        # Filter 4: Entity overlap pruning (toggleable for ablation)
+        if self.config.enable_entity_overlap_pruning:
+            entity_pruned = self._entity_overlap_pruning(contradiction_filtered)
+        else:
+            entity_pruned = contradiction_filtered
         result.metadata["after_entity_overlap_pruning"] = len(entity_pruned)
 
         # Filter 5: Entity-Mention Filter — drop chunks with no query-entity reference.
         # entity_names param takes precedence (used when plan is reconstructed from state dict).
         # DATE/TIME/CARDINAL/ORDINAL labels are excluded: numeric/temporal tokens (e.g.
-        # "1992") match irrelevant chunks and produce false positives on HotpotQA.
+        # "1992") match irrelevant chunks and produce false positives.
         _SKIP_NER_LABELS = {"DATE", "TIME", "CARDINAL", "ORDINAL", "PERCENT", "MONEY", "QUANTITY"}
         if entity_names is not None:
             query_entity_names = entity_names
@@ -382,9 +415,12 @@ class Navigator:
                 if (retrieval_plan and retrieval_plan.entities)
                 else []
             )
-        mention_filtered = self._entity_mention_filter(
-            entity_pruned, query_entity_names, sub_queries=sub_queries
-        )
+        if self.config.enable_entity_mention_filter:
+            mention_filtered = self._entity_mention_filter(
+                entity_pruned, query_entity_names, sub_queries=sub_queries
+            )
+        else:
+            mention_filtered = entity_pruned
         result.metadata["after_entity_mention_filter"] = len(mention_filtered)
 
         # Cap at max_context_chunks. With multiple parallel sub-queries
@@ -395,17 +431,20 @@ class Navigator:
             mention_filtered, self.config.max_context_chunks, n_parallel,
         )
 
-        # Filter 6: Context shrinkage (edge optimization: fewer input tokens)
-        shrunk_results = self._context_shrinkage(top_results)
+        # Filter 6: Context shrinkage (edge optimization: fewer input tokens;
+        # toggleable for ablation)
+        if self.config.enable_context_shrinkage:
+            shrunk_results = self._context_shrinkage(top_results)
+        else:
+            shrunk_results = top_results
 
         result.filtered_context = [r["text"] for r in shrunk_results]
         result.scores = [r["rrf_score"] for r in shrunk_results]
 
-        # B2-fix: surface retrieval provenance per filtered chunk so the
-        # Verifier's credibility scorer can use a real graph-based signal
-        # (was always False/baseline before; see verifier._compute_credibility).
-        # A chunk is "graph-based" if at least one of the retrieval paths that
-        # produced it was the graph path.
+        # Surface retrieval provenance per filtered chunk so the Verifier's
+        # credibility scorer can use a real graph-based signal (see
+        # verifier._compute_credibility). A chunk is "graph-based" if at least
+        # one of the retrieval paths that produced it was the graph path.
         result.metadata["chunk_retrieval_methods"] = [
             list(r.get("retrieval_methods", [])) for r in shrunk_results
         ]
@@ -467,8 +506,8 @@ class Navigator:
                     "scores": [],
                     "sources": set(),
                     "sub_queries": set(),
-                    # B2-fix: track the retrieval methods that produced this
-                    # chunk (vector/graph/bm25). Used by the Verifier to set
+                    # Track the retrieval methods that produced this chunk
+                    # (vector/graph/bm25). Used by the Verifier to set
                     # is_graph_based for credibility scoring.
                     "retrieval_methods": set(),
                 }
@@ -525,10 +564,10 @@ class Navigator:
                 "query_count": query_count,
                 # Sub-query where this chunk ranked best — used by the cross-encoder
                 # reranker so bridge chunks are scored against the hop that retrieved
-                # them, not the surface query (§12.30).
+                # them, not the surface query.
                 "_best_sub_query": group.get("_best_sub_query", ""),
-                # B2-fix: propagate retrieval-method provenance so the Verifier
-                # can flag graph-retrieved chunks as more credible.
+                # Propagate retrieval-method provenance so the Verifier can flag
+                # graph-retrieved chunks as more credible.
                 "retrieval_methods": list(group.get("retrieval_methods", set())),
             })
 
@@ -564,7 +603,6 @@ class Navigator:
         if n_parallel <= 1 or budget >= len(results):
             return results[:budget]
         # Group preserving the global rrf-descending order within each anchor.
-        from collections import OrderedDict
         groups: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
         for r in results:
             groups.setdefault(r.get("_best_sub_query", ""), []).append(r)
@@ -689,49 +727,33 @@ class Navigator:
         overlap_threshold = self.config.contradiction_overlap_threshold
         ratio_threshold = self.config.contradiction_ratio_threshold
         min_value = self.config.contradiction_min_value
-
-        # Year-context words: when a number appears near one of these, treat
-        # it as a year regardless of magnitude. Handles "year 3000".
-        _YEAR_CONTEXT_WORDS = (
-            "year", "born", "founded", "established", "released",
-            "published", "elected", "incorporated", "ad ", "bc ", "ce ",
-        )
-        # Count-context words: when a number appears near one of these,
-        # treat it as a count/population even if it falls inside the year
-        # range [1000, 2100]. Handles "Population 1000 versus target."
-        # where 1000 is a plain count, not a year. Context words take
-        # priority over the magnitude heuristic to disambiguate ambiguous
-        # 4-digit numbers ("Population 2014" should be a count, not a year).
-        _COUNT_CONTEXT_WORDS = (
-            "population", "people", "inhabitants", "residents",
-            "members", "employees", "employs", "employ", "staff",
-            "workers", "users", "subscribers",
-            "votes", "voters", "seats", "kilometers", "km",
-            "miles", "dollars", "euros", "pounds",
-            "versus", "vs",
-        )
+        window_size = self.config.contradiction_number_context_window
+        year_min = float(self.config.contradiction_year_range_min)
+        year_max = float(self.config.contradiction_year_range_max)
 
         def _extract_numbers_with_context(text: str) -> List[Tuple[float, bool]]:
             """Return (number, is_year_in_context) for each number found.
 
-            Disambiguation strategy:
+            Disambiguation strategy (count-context words take priority over
+            year-context words, which take priority over the magnitude
+            heuristic [year_range_min, year_range_max]):
               1. If a count-context word appears near the number → count.
               2. Else, if a year-context word appears near → year.
-              3. Else, fall back to the magnitude heuristic [1000, 2100].
-            Context (1) overrides (3) so "Population 1000" is a count.
+              3. Else, fall back to the magnitude heuristic.
+            So "Population 1000" is a count even though 1000 looks like a year.
             """
             text_lower = text.lower()
             out: List[Tuple[float, bool]] = []
-            for m in re.finditer(r"\b\d{4}\b|\b\d+(?:\.\d+)?\b", text):
+            for m in self._NUMBER_RE.finditer(text):
                 val = float(m.group(0))
                 pos = m.start()
-                # Look in a ±25-char window around the number for context.
-                start = max(0, pos - 25)
-                end = min(len(text_lower), pos + len(m.group(0)) + 25)
+                # Look in a +/- window (chars) around the number for context.
+                start = max(0, pos - window_size)
+                end = min(len(text_lower), pos + len(m.group(0)) + window_size)
                 window = text_lower[start:end]
-                near_count = any(w in window for w in _COUNT_CONTEXT_WORDS)
-                near_year = any(w in window for w in _YEAR_CONTEXT_WORDS)
-                in_range = 1000.0 <= val <= 2100.0 and val == int(val)
+                near_count = any(w in window for w in self._COUNT_CONTEXT_WORDS)
+                near_year = any(w in window for w in self._YEAR_CONTEXT_WORDS)
+                in_range = year_min <= val <= year_max and val == int(val)
                 # Count context wins; year context next; magnitude last.
                 if near_count and not near_year:
                     is_year = False
@@ -802,9 +824,9 @@ class Navigator:
         Entity Overlap Pruning: drop chunks whose named-entity set is fully
         covered by a higher-ranked chunk.
 
-        Original contribution (thesis section 3.3); ablation results in
-        thesis Table 4.2 show a +0.8 EM improvement when this filter is active.
-        (Table number to be confirmed in final thesis draft.)
+        Original contribution (thesis section 3.3); see the per-filter
+        ablation in the thesis results section for its EM contribution
+        (toggle via config.enable_entity_overlap_pruning).
         If entities(Chunk_B) ⊆ entities(Chunk_A) and score(A) > score(B),
         Chunk_B is informationally redundant and is removed.
 
@@ -815,9 +837,7 @@ class Navigator:
             return results
 
         def extract_entities(text: str) -> set:
-            # Intentional variant of _PROPER_NOUN_RE: uses [a-zA-Z] (allows mixed-case
-            # continuations like "MacDonald") and * (includes single-word proper nouns).
-            tokens = re.findall(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b", text)
+            tokens = self._OVERLAP_ENTITY_RE.findall(text)
             return {t.lower() for t in tokens if len(t) > 2}
 
         entity_sets = [extract_entities(r["text"]) for r in results]
@@ -850,7 +870,7 @@ class Navigator:
 
         return kept if kept else results
 
-    # Content-word stopword set for the P-11 overlap fallback. Small and
+    # Content-word stopword set for the overlap fallback. Small and
     # query-oriented (function words + the WH/auxiliary scaffolding of a
     # question); proper-noun content is never on it.
     _QUERY_STOPWORDS: frozenset = frozenset({
@@ -883,7 +903,7 @@ class Navigator:
         but not any of the noisy SpaCy entities ("Which British", "World War").
         That chunk would be retrieved at RRF rank #1 (near-verbatim dense match)
         and then *deleted by this filter*, leaving the Verifier with strictly
-        worse context (FIX P-11).
+        worse context.
 
         New behaviour — three tiers, stable-sorted:
           tier 0  chunk mentions a *specific* query entity (multi-word phrase,
@@ -907,12 +927,12 @@ class Navigator:
         Regexes are pre-compiled before the chunk loop (Python's re cache is 512
         entries; many entities × tokens × chunks can overflow it).
         """
-        # Step 3 (B-plan): no usable query entities. Behaviour is unchanged
-        # (we cannot entity-gate without entities), but it is no longer SILENT —
-        # the prior bare `return results` hid the case where NER yielded only a
-        # non-anchorable phrase (e.g. a DATE) and 10 unfiltered noise chunks
-        # reached the verifier. Log + flag so it is observable and measurable;
-        # downstream ranking (RRF / reranker) carries relevance instead.
+        # No usable query entities. Behaviour is unchanged (we cannot
+        # entity-gate without entities), but it is not SILENT — a bare
+        # `return results` would hide the case where NER yielded only a
+        # non-anchorable phrase (e.g. a DATE) and unfiltered noise chunks
+        # reached the verifier. Log + flag so it is observable; downstream
+        # ranking (RRF / reranker) carries relevance instead.
         self._entity_filter_skipped = not bool(entity_names)
         if not entity_names:
             logger.warning(
@@ -922,53 +942,53 @@ class Navigator:
             )
             return results
 
-        # §12.28: per-token fallback raised to ≥8 chars for multi-word entities
-        # (distinctive surnames kept, common first names excluded).
-        _SINGLE_TOKEN_MIN = 5
-        _FALLBACK_TOKEN_MIN = 8
-        _SPECIFIC_SINGLE_MIN = 8   # P-4: single-token entity counts as "specific" iff ≥8 chars
+        # Token-length floors (config-driven). The per-token fallback bar is
+        # higher for multi-word entities so distinctive surnames are kept and
+        # common first names excluded.
+        single_token_min = self.config.entity_mention_single_token_min
+        fallback_token_min = self.config.entity_mention_fallback_token_min
+        specific_single_min = self.config.entity_mention_specific_single_min
 
         compiled: List[Any] = []   # (phrase_lower, tokens, token_patterns, and_patterns, is_specific)
         for name in entity_names:
             tokens = name.split()
-            min_tok = _FALLBACK_TOKEN_MIN if len(tokens) >= 2 else _SINGLE_TOKEN_MIN
+            min_tok = fallback_token_min if len(tokens) >= 2 else single_token_min
             token_patterns = [
                 re.compile(r"\b" + re.escape(t.lower()) + r"\b")
                 for t in tokens if len(t) >= min_tok
             ]
             # Variant-name (all-tokens-co-occur) match for multi-word entities.
-            # Recovers chunks that open with a full legal name
-            # ("Ian David Karslake Watkins" for entity "Ian Watkins") where the
-            # contiguous phrase is absent AND no single token reaches the ≥8-char
-            # distinctive-token bar, so neither the full-phrase nor the
-            # single-token fallback fires. Requiring ALL content tokens (≥3 chars,
-            # non-stopword) to co-occur as whole words keeps this high-precision:
-            # two co-occurring name tokens are a reliable signal, not noise.
+            # Recovers chunks that open with a full legal name (e.g. a four-token
+            # legal name for a two-token entity) where the contiguous phrase is
+            # absent AND no single token reaches the distinctive-token bar, so
+            # neither the full-phrase nor the single-token fallback fires.
+            # Requiring ALL content tokens (>= _AND_PATTERN_TOKEN_MIN chars,
+            # non-stopword) to co-occur as whole words keeps this high-precision.
             and_patterns = (
                 [re.compile(r"\b" + re.escape(t.lower()) + r"\b")
                  for t in tokens
-                 if len(t) >= 3 and t.lower() not in self._QUERY_STOPWORDS]
+                 if len(t) >= self._AND_PATTERN_TOKEN_MIN and t.lower() not in self._QUERY_STOPWORDS]
                 if len(tokens) >= 2 else []
             )
-            is_specific = len(tokens) >= 2 or len(name) >= _SPECIFIC_SINGLE_MIN
+            is_specific = len(tokens) >= 2 or len(name) >= specific_single_min
             compiled.append((name.lower(), tokens, token_patterns, and_patterns, is_specific))
 
-        # Content words of the query (P-11 overlap fallback): everything in the
+        # Content words of the query (overlap fallback): everything in the
         # sub-queries that isn't a stopword and isn't part of an entity string
         # (entities are handled by the exact-match path above).
         query_content: set = set()
         for q in (sub_queries or []):
             for w in self._WORD_RE.findall((q or "").lower()):
-                if len(w) >= 4 and w not in self._QUERY_STOPWORDS:
+                if len(w) >= self._QUERY_CONTENT_MIN_LEN and w not in self._QUERY_STOPWORDS:
                     query_content.add(w)
         # remove entity tokens — those are the entity path's job
         for name_lower, *_ in compiled:
             for tok in self._WORD_RE.findall(name_lower):
                 query_content.discard(tok)
-        # below this fraction of query content words present, "overlap" doesn't
-        # count as topical confirmation
-        _OVERLAP_MIN_FRACTION = 0.5
-        _OVERLAP_MIN_ABS = 2
+        # Below this fraction of query content words present, "overlap" does
+        # not count as topical confirmation.
+        overlap_min_fraction = self.config.entity_mention_overlap_min_fraction
+        overlap_min_abs = self.config.entity_mention_overlap_min_abs
 
         def tier_of(text: str) -> int:
             """0 = specific-entity match, 1 = generic-entity or strong content-word
@@ -1005,21 +1025,20 @@ class Navigator:
             if query_content:
                 chunk_words = set(self._WORD_RE.findall(text_lower))
                 shared = len(query_content & chunk_words)
-                if shared >= _OVERLAP_MIN_ABS and shared >= _OVERLAP_MIN_FRACTION * len(query_content):
+                if shared >= overlap_min_abs and shared >= overlap_min_fraction * len(query_content):
                     return 1
             return 2
 
-        # §12.33 Fix: top-K RRF immunity — the top 2 chunks by RRF score are
-        # never dropped by the entity-mention filter, regardless of entity match.
-        # Rationale: a chunk ranked #1 or #2 by a three-path RRF (dense + sparse
-        # + graph) is almost certainly topically relevant; if its entity happens
-        # to be the implicit bridge target (not in the Planner's entity list) the
-        # filter would otherwise destroy the answer chunk.  Two is the threshold:
-        # position #1 might be a Scott-Parkin biography that names both entities,
-        # position #2 might be the Halliburton article that contains the answer —
-        # both must survive.  Position #3 and beyond are still filtered normally.
-        _RRF_IMMUNE_TOP_K = 2
-        immune_indices: set = set(range(min(_RRF_IMMUNE_TOP_K, len(results))))
+        # Top-K RRF immunity — the top chunks by RRF score are never dropped by
+        # the entity-mention filter, regardless of entity match. Rationale: a
+        # chunk ranked in the top few by a three-path RRF (dense + sparse +
+        # graph) is almost certainly topically relevant; if its entity happens
+        # to be an implicit bridge target absent from the Planner's entity list
+        # the filter would otherwise destroy the answer chunk. The threshold is
+        # config-driven (entity_mention_rrf_immune_top_k); chunks beyond it are
+        # filtered normally.
+        rrf_immune_top_k = self.config.entity_mention_rrf_immune_top_k
+        immune_indices: set = set(range(min(rrf_immune_top_k, len(results))))
 
         tiers = [tier_of(r["text"]) for r in results]
         kept = [
@@ -1033,22 +1052,22 @@ class Navigator:
             logger.debug("[Navigator] Entity-mention filter: all chunks filtered — returning all")
             return results
 
-        # E2: survivor floor. When the retriever supplied a full candidate set
-        # (>= _SURVIVOR_FLOOR chunks) an over-specific entity match must not
+        # Survivor floor. When the retriever supplied a full candidate set
+        # (>= survivor_floor chunks) an over-specific entity match must not
         # leave the Verifier with too little context to tolerate a single
-        # retrieval error (observed: 10→2). If matching kept fewer than the
-        # floor, top up with the highest-RRF dropped chunks (results are in RRF
-        # rank order, so the lowest not-yet-kept indices are the strongest).
-        # The floor engages only for full candidate sets — small inputs are
-        # filtered normally (it does not force-keep noise in a 2-3 chunk set).
-        _SURVIVOR_FLOOR = 5
-        if len(results) >= _SURVIVOR_FLOOR and len(kept) < _SURVIVOR_FLOOR:
+        # retrieval error. If matching kept fewer than the floor, top up with
+        # the highest-RRF dropped chunks (results are in RRF rank order, so the
+        # lowest not-yet-kept indices are the strongest). The floor engages
+        # only for full candidate sets — small inputs are filtered normally
+        # (it does not force-keep noise in a 2-3 chunk set).
+        survivor_floor = self.config.entity_mention_survivor_floor
+        if len(results) >= survivor_floor and len(kept) < survivor_floor:
             kept_ranks = {rank for _, rank, _ in kept}
             for rank, r in enumerate(results):
                 if rank not in kept_ranks:
                     kept.append((tiers[rank], rank, r))
                     kept_ranks.add(rank)
-                    if len(kept) >= _SURVIVOR_FLOOR:
+                    if len(kept) >= survivor_floor:
                         break
             dropped = len(results) - len(kept)
 
@@ -1069,14 +1088,14 @@ class Navigator:
         entity_hints: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Optional cross-encoder reranking after RRF fusion (§12.29).
+        Optional cross-encoder reranking after RRF fusion.
 
         Re-scores the top `reranker_top_k` results with a (query, chunk) cross-
         encoder and sorts them by cross-encoder score.  The remaining chunks
         (beyond top_k) keep their RRF order and are appended unchanged.
 
-        §12.37 Fix E: when `entity_hints` is provided (Planner-extracted
-        entities + bridge entities resolved in earlier hops), the entity
+        Entity-hint conditioning: when `entity_hints` is provided (Planner-
+        extracted entities + bridge entities resolved in earlier hops), the entity
         names are appended to the query side of the (query, chunk) pair as
         a soft hint: "<query> [ENTITIES: A, B, C]". The cross-encoder
         learns to up-rank chunks that lexically contain the hinted entities.
@@ -1107,10 +1126,32 @@ class Navigator:
         if self._reranker is None:
             try:
                 from sentence_transformers import CrossEncoder
-                self._reranker = CrossEncoder(self.config.reranker_model)
+                # 2026-05-27: support a larger cross-encoder via explicit
+                # max_length + optional fp16. BGE rerankers (base ~278M /
+                # large ~560M) need max_length set; fp16 halves their memory
+                # footprint. The small ms-marco MiniLM default is unaffected
+                # (max_length=512, fp16=False == prior behaviour).
+                _ce_kwargs = {
+                    "max_length": getattr(self.config, "reranker_max_length", 512),
+                }
+                if getattr(self.config, "reranker_fp16", False):
+                    try:
+                        import torch
+                        _ce_kwargs["automodel_args"] = {"torch_dtype": torch.float16}
+                    except ImportError:
+                        logger.warning(
+                            "[Navigator] reranker_fp16 requested but torch "
+                            "unavailable; loading in fp32."
+                        )
+                self._reranker = CrossEncoder(
+                    self.config.reranker_model, **_ce_kwargs
+                )
                 logger.info(
-                    "[Navigator] Cross-encoder reranker loaded: %s",
+                    "[Navigator] Cross-encoder reranker loaded: %s "
+                    "(max_length=%d, fp16=%s)",
                     self.config.reranker_model,
+                    _ce_kwargs["max_length"],
+                    getattr(self.config, "reranker_fp16", False),
                 )
             except ImportError:
                 logger.warning(
@@ -1127,16 +1168,16 @@ class Navigator:
         candidates = results[: self.config.reranker_top_k]
         rest = results[self.config.reranker_top_k :]
 
-        # Score each chunk against the sub-query where it ranked best (§12.30).
+        # Score each chunk against the sub-query where it ranked best.
         # For single-hop queries _best_sub_query == the original query, so there
         # is no regression. For bridge/multi-hop queries this ensures that a
         # second-hop answer chunk (e.g. author bio) is scored against the hop
         # sub-query that retrieved it, not the surface question.
         #
-        # §12.37 Fix E: append entity hints to the query side. Cross-encoder
-        # treats this as "query talks about these entities", up-ranking chunks
-        # that lexically contain them. Capped at top-5 entity hints to keep
-        # the query short (cross-encoder context window).
+        # Append entity hints to the query side. The cross-encoder treats this
+        # as "query talks about these entities", up-ranking chunks that
+        # lexically contain them. Capped at top-5 entity hints to keep the
+        # query short (cross-encoder context window).
         def _query_with_hints(base_q: str) -> str:
             if not entity_hints:
                 return base_q
@@ -1177,10 +1218,10 @@ class Navigator:
         """
         Context Shrinkage: trim each chunk to its most relevant sentences.
 
-        Original contribution (thesis section 3.3); ablation results in
-        thesis Table 4.3 show a 34% reduction in S_V latency with no EM loss
-        (Table number to be confirmed in final thesis draft.)
-        (entity-containing sentences carry the key facts for HotpotQA).
+        Original contribution (thesis section 3.3); see the per-filter
+        ablation in the thesis results section for its S_V-latency reduction
+        (toggle via config.enable_context_shrinkage). Entity-containing
+        sentences carry the key facts.
         Edge optimization: smaller context = fewer input tokens = faster LLM
         inference on CPU. Directly reduces the LLM prompt size toward the 500-char
         budget set in llm.max_chars_per_doc.
@@ -1198,7 +1239,7 @@ class Navigator:
             return results
 
         def has_entity(s: str) -> bool:
-            return bool(re.search(r"\b[A-Z][a-zA-Z]{2,}", s))
+            return bool(self._SHRINK_ENTITY_RE.search(s))
 
         shrunk = []
         for r in results:
@@ -1207,7 +1248,7 @@ class Navigator:
                 shrunk.append(r)
                 continue
 
-            sentences = re.split(r"(?<=[.!?])\s+", text)
+            sentences = self._SENTENCE_SPLIT_RE.split(text)
             priority = [s for s in sentences if has_entity(s)]
             rest = [s for s in sentences if not has_entity(s)]
 
@@ -1300,8 +1341,8 @@ if __name__ == "__main__":
     for c in nav_result.filtered_context:
         print(f"    · {c[:80]}")
 
-    # _contradiction_filter smoke checks were removed together with the filter
-    # itself in the 2026-05-06 cleanup audit.
+    # _contradiction_filter is off by default (enable_contradiction_filter);
+    # its smoke checks live in the dedicated test suite, not here.
 
     print("\n" + "=" * 70)
     print("All smoke tests passed.")

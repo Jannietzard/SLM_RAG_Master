@@ -64,11 +64,9 @@ USAGE
 ================================================================================
 
     from src.pipeline import create_ingestion_pipeline
-    import yaml
+    from src.logic_layer._settings_loader import _load_settings
 
-    with open("config/settings.yaml") as f:
-        cfg = yaml.safe_load(f)
-
+    cfg = _load_settings()
     pipeline = create_ingestion_pipeline(config=cfg)
     metrics = pipeline.ingest("data/documents/")
     print(metrics.to_dict())

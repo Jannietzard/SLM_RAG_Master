@@ -255,15 +255,62 @@ navigator:
   corroboration_source_weight: 0.1
   corroboration_query_weight: 0.05
 
-  # Cross-encoder reranker (§12.29 — Tier 1 improvement)
-  # Applies after RRF fusion; re-ranks top-K by (query, chunk) relevance score.
-  # Requires: pip install sentence-transformers  (+22 MB model on first use)
-  # Enabled by default after the 2026-05-06 audit: the 22 MB cross-encoder is
-  # edge-feasible (~30 ms/pair on CPU). Toggle false only for strict no-model-
-  # download deployments or for ablation comparison runs.
+  # ===========================================================================
+  # Cross-encoder reranker (§12.29 — Tier 1 improvement; upgraded 2026-05-27)
+  # ===========================================================================
+  # Applies AFTER RRF fusion. Re-scores the top `reranker_top_k` candidate
+  # chunks with a (query, chunk) cross-encoder and re-sorts them. Unlike the
+  # bi-encoder embeddings used for vector search (which embed query and chunk
+  # separately), a cross-encoder reads query+chunk TOGETHER, so it models
+  # word-level interactions and ranks far more accurately — at the cost of one
+  # forward pass per candidate pair.
+  #
+  # Requires: pip install sentence-transformers
+  #
+  # ---- enable_reranker --------------------------------------------------------
+  #   true  : run the cross-encoder rerank stage (recommended; the reranker is
+  #           what surfaces the answer-bearing chunk into the top positions the
+  #           SLM actually reads).
+  #   false : skip reranking; rely on raw RRF order only. Use for the
+  #           "no-reranker" ablation row or strict no-model-download deployments.
   enable_reranker: true
-  reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  #
+  # ---- reranker_model ---------------------------------------------------------
+  # HuggingFace model id. Loaded once per process via sentence-transformers
+  # CrossEncoder; auto-downloaded + cached under HF_HOME on first use.
+  # Options (accuracy ↑ / size ↑ / latency ↑ as you go down the list):
+  #   "cross-encoder/ms-marco-MiniLM-L-6-v2"  ~22 MB,  ~30 ms/pair CPU  — fastest, weakest
+  #   "BAAI/bge-reranker-base"                ~1.1 GB, ~80-150 ms/pair  — DEFAULT (best size/accuracy tradeoff for edge)
+  #   "BAAI/bge-reranker-large"               ~2.2 GB, ~200-400 ms/pair — strongest, heaviest (tight on <8 GB edge RAM)
+  #   "BAAI/bge-reranker-v2-m3"               ~2.3 GB, multilingual     — only if you need non-English
+  # Changing this does NOT require re-ingestion (reranking is query-time only).
+  reranker_model: "BAAI/bge-reranker-base"
+  #
+  # ---- reranker_top_k ---------------------------------------------------------
+  # How many of the post-RRF candidates to re-score. Chunks beyond this rank
+  # keep their RRF order and are appended after the reranked head. Higher =
+  # more chunks rescored (better recall of a buried answer chunk) but slower.
+  # 10 means: rescore the top 10, leave the rest in RRF order.
   reranker_top_k: 10
+  #
+  # ---- reranker_max_length ----------------------------------------------------
+  # Token truncation length for each (query, chunk) pair fed to the cross-
+  # encoder. BGE rerankers REQUIRE this set explicitly (the MiniLM model also
+  # honours it). 512 fits a query + a ~400-word chunk. Lower = faster but may
+  # truncate long chunks before the answer span; higher than 512 is rejected by
+  # bge-reranker-base (its positional limit). Leave at 512 unless chunks are
+  # routinely longer than ~400 words.
+  reranker_max_length: 512
+  #
+  # ---- reranker_fp16 ----------------------------------------------------------
+  # Load the cross-encoder in half precision (float16).
+  #   true  : halves model memory (bge-reranker-base ~1.1 GB → ~550 MB,
+  #           bge-reranker-large ~2.2 GB → ~1.1 GB). Recommended on GPU and on
+  #           memory-tight edge devices. WARNING: on pure CPU, fp16 has no native
+  #           compute path and is often SLOWER than fp32 (values get upcast per
+  #           op). Use true only if memory is the binding constraint on CPU.
+  #   false : full fp32 (DEFAULT). Fastest on CPU; uses more RAM.
+  reranker_fp16: false
 
   # Contradiction filter thresholds (numeric heuristic).
   # Disabled by default (§12.33): the heuristic fires on population figures vs.
@@ -381,6 +428,25 @@ agent:
   enable_planner: true
   enable_verifier: true
 
+  # ---------------------------------------------------------------------------
+  # Confidence gate (Architecture A, 2026-05-27)
+  # ---------------------------------------------------------------------------
+  # When true, the pipeline runs a cheap single-pass baseline retrieval first
+  # and, if retrieval confidence is HIGH, answers directly from it -- skipping
+  # the Planner's iterative decomposition (which the ablation showed is a net
+  # cost when the answer is already cleanly retrievable). Only escalates to the
+  # full agentic path when confidence is NOT high. Refs: Geifman & El-Yaniv
+  # 2019 (selective prediction); Asai et al. 2024 (Self-RAG adaptive retrieval).
+  #   enable_confidence_gate: master toggle.
+  #   confidence_score_gap_threshold: top1/top2 RRF-score ratio for "dominant
+  #     top chunk" (Signal A). Higher = stricter (fewer HIGH verdicts).
+  #   confidence_require_signals: how many of the 3 signals (score-gap /
+  #     multi-source / entity-coverage) must fire for HIGH. 2 = balanced;
+  #     3 = very conservative (gate rarely fires); 1 = aggressive.
+  enable_confidence_gate: true
+  confidence_score_gap_threshold: 1.5
+  confidence_require_signals: 2
+
   # FIFO query-result cache (SHA-256-keyed, insertion-order eviction)
   enable_caching: true
   cache_max_size: 1000
@@ -473,6 +539,22 @@ verifier:
   # ---------------------------------------------------------------------------
   enable_entity_path_validation: true
   enable_credibility_scoring: true
+
+  # ---------------------------------------------------------------------------
+  # Structured (slot-filling) Chain-of-Thought (2026-05-27)
+  # ---------------------------------------------------------------------------
+  # When true, the first-iteration answer prompts are replaced with step-by-step
+  # templates that constrain the SLM to fill reasoning slots before a
+  # "FINAL ANSWER:" marker, which is parsed out before claim verification. This
+  # is SCAFFOLDED CoT (Khot et al. 2023, Decomposed Prompting), not free-form
+  # "think step by step" -- the latter only helps >10B models (Wei et al. 2022);
+  # small models need the fixed slots. The final answer is grounded in retrieved
+  # chunks (claims still verified against context, not the reasoning steps).
+  #   enable_structured_cot: master toggle.
+  #   cot_max_tokens: generation cap for the multi-step output (must exceed the
+  #     direct-answer max_tokens=200 so the FINAL ANSWER line is not truncated).
+  enable_structured_cot: true
+  cot_max_tokens: 400
 
   # Entity-path validation: minimum fraction of query entities that must
   # appear in the retrieved context for the check to pass.

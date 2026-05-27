@@ -3,17 +3,17 @@ Subject-Verb-Object relation extraction via SpaCy dependency parse.
 
 Complements REBEL by extracting NARRATIVE relations that REBEL misses.
 REBEL is trained on Wikipedia infoboxes (publication_date, country,
-date_of_birth) — useful but not what HotpotQA bridge questions ask about.
+date_of_birth) — useful but not what multi-hop bridge questions ask about.
 SVO triples derived from the dependency parse capture the narrative
 relations REBEL is silent on:
 
-    "Christopher Nolan directed Inception."
-        subj=Christopher Nolan, verb=direct, obj=Inception
-        -> (Nolan, direct, Inception)
+    "<PERSON> directed <WORK_OF_ART>."
+        subj=<PERSON>, verb=direct, obj=<WORK_OF_ART>
+        -> (<PERSON>, direct, <WORK_OF_ART>)
 
-    "Peter Schmeichel won the IFFHS award in 1992."
-        subj=Peter Schmeichel, verb=win, obj=IFFHS award
-        -> (Schmeichel, win, IFFHS_award)
+    "<PERSON> won <AWARD> in <YEAR>."
+        subj=<PERSON>, verb=win, obj=<AWARD>
+        -> (<PERSON>, win, <AWARD>)
 
 DESIGN CHOICES
 --------------
@@ -26,7 +26,7 @@ DESIGN CHOICES
   Reflects that SVO is more specific than cooccurrence but less curated
   than REBEL's beam search.
 - Only ROOT verbs and conjuncts are inspected -- avoids extracting verbs
-  inside relative clauses ("the man who directed Inception said ...")
+  inside relative clauses ("the man who directed <WORK> said ...")
   whose subject is the relative pronoun, not a content entity.
 - Prepositional objects are followed: "X was born in Paris" -> (X, bear, Paris).
 
@@ -103,7 +103,7 @@ def _np_head_text(head_token) -> str:
     Return the head + immediate compound/PROPN modifiers, ignoring
     determiners, adjectives, and longer subtree material.
 
-    "the brilliant Christopher Nolan" -> "Christopher Nolan"
+    "the brilliant Marie Curie" -> "Marie Curie"
     "Apple Inc." -> "Apple Inc."
     """
     parts: List[str] = []
@@ -146,10 +146,10 @@ def _find_passive_components(verb_tok):
     For a passive-voice verb, return (logical_subject, logical_object) so
     that the emitted SVO mirrors the active-voice meaning:
 
-        "Ed Wood was directed by Tim Burton"
-            nsubjpass = "Ed Wood"          (the patient / logical object)
-            agent pobj = "Tim Burton"      (the doer / logical subject)
-            -> emits (Tim Burton, direct, Ed Wood)
+        "<WORK_OF_ART> was directed by <PERSON>"
+            nsubjpass  = <WORK_OF_ART>     (the patient / logical object)
+            agent pobj = <PERSON>          (the doer / logical subject)
+            -> emits (<PERSON>, direct, <WORK_OF_ART>)
 
     Returns (None, None) if either component is missing — the caller
     falls back to skipping the verb entirely.
@@ -170,9 +170,9 @@ def _find_passive_components(verb_tok):
 
 def _inherit_from_conjunct_head(verb_tok):
     """
-    "Tim Burton directed and produced Ed Wood" — `produced` conjuncts with
-    `directed` and shares its subject. Walk up conj heads to recover the
-    subject/object the secondary verb implicitly inherits.
+    "<PERSON> directed and produced <WORK_OF_ART>" — `produced` conjuncts
+    with `directed` and shares its subject. Walk up conj heads to recover
+    the subject/object the secondary verb implicitly inherits.
     """
     if verb_tok.dep_ != "conj":
         return None, None

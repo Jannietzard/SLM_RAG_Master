@@ -42,18 +42,13 @@ Scientific references:
   SpaCy: Honnibal, M. et al. (2020). "spaCy: Industrial-strength Natural
          Language Processing in Python." https://spacy.io
 
-Review History:
-    Last Reviewed:  2026-04-20
-    Review Result:  0 CRITICAL, 0 IMPORTANT, 0 RECOMMENDED
-    Reviewer:       Code Review Prompt v2.1
-    Next Review:    After changes to entity type schema or cache format
-    ---
-    Previous Review: 2026-04-20 (first pass)
-    Previous Result: 0 CRITICAL, 3 IMPORTANT, 6 RECOMMENDED
-    Changes Since:   AttributeError in EntityCache get/put/get_batch/get_stats;
-                     _CACHE_HASH_LEN constant; spacy_fallback_model in config;
-                     _SPACY_FALLBACK_TYPE_MAP class constant; GPE→GPE consistency;
-                     seen_ids: set[str]; timing overwrite fix (cached=0ms)
+Confidence sentinels (module-level constants, see below):
+    _CONF_GLINER_SPACY_FALLBACK   SpaCy used as GLiNER fallback
+    _CONF_GLINER_REGEX_FALLBACK   Regex proper-noun heuristic (last resort)
+    _CONF_SPACY_LIGHT             Lightweight SpacyEntityPipeline
+    _CONF_CACHE_DEFAULT           Missing-field default in legacy cache entries
+
+Last reviewed: 2026-05-25 (audit pass, project version 5.4).
 """
 
 import logging
@@ -70,7 +65,35 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# ── Optional dependency flags ──────────────────────────────────────────────────
+# Public API. The other classes defined in this module (ExtractedEntity,
+# ExtractedRelation, ChunkExtractionResult, GLiNERExtractor, REBELExtractor,
+# SpacyEntityPipeline, EntityCache) are implementation details. They remain
+# importable by direct name from this module (tests rely on this), but are
+# intentionally NOT re-exported from the data_layer package.
+__all__ = [
+    "EntityExtractionPipeline",
+    "ExtractionConfig",
+    "create_extraction_pipeline",
+    "normalize_entity_name",
+]
+
+# ---------------------------------------------------------------------------
+# Confidence sentinels for non-probabilistic NER backends.
+# ---------------------------------------------------------------------------
+# Lifted out of in-method literals so the calibration is greppable and
+# documented in one place. The values reflect relative trust placed in each
+# backend, not measured probabilities:
+#   GLINER_SPACY_FALLBACK > SPACY_LIGHT > CACHE_DEFAULT >= GLINER_REGEX_FALLBACK
+# GLiNER itself emits per-span scores and is NOT covered by these constants.
+_CONF_GLINER_SPACY_FALLBACK: float = 0.7   # SpaCy en_core_web_sm under GLiNER
+_CONF_GLINER_REGEX_FALLBACK: float = 0.5   # regex proper-noun heuristic
+_CONF_SPACY_LIGHT: float = 0.8             # SpacyEntityPipeline (no GLiNER stack)
+_CONF_CACHE_DEFAULT: float = 0.5           # missing-field fallback for old cache rows
+
+
+# ---------------------------------------------------------------------------
+# Optional dependency flags
+# ---------------------------------------------------------------------------
 
 from .entity_types import GLINER_LABEL_MAP, SPACY_LABEL_MAP, SPACY_LABEL_MAP_FLAT
 
@@ -96,7 +119,7 @@ except ImportError:
     logger.warning("SpaCy not available. Install with: pip install spacy")
 
 
-# ── Module-level entity ID helper (shared by all extractor classes) ────────────
+# -- Module-level entity ID helper (shared by all extractor classes) ------------
 
 def _generate_entity_id(name: str, entity_type: str) -> str:
     """
@@ -124,7 +147,7 @@ def _generate_entity_id(name: str, entity_type: str) -> str:
     return hashlib.sha256(combined.encode()).hexdigest()[:24]
 
 
-# ── Data classes ───────────────────────────────────────────────────────────────
+# -- Data classes ---------------------------------------------------------------
 
 @dataclass
 class ExtractedEntity:
@@ -194,24 +217,25 @@ class ExtractionConfig:
     The values below serve as documented emergency fallbacks when no config
     file is provided (e.g. in unit tests).
     """
-    # ── GLiNER NER ────────────────────────────────────────────────────────────
+    # -- GLiNER NER ------------------------------------------------------------
     # Reference: Zaratiana et al. (2023). arXiv:2311.08526.
     gliner_model: str = "urchade/gliner_small-v2.1"
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
     # FIXED: OntoNotes-5 core entity-type set (Weischedel et al. 2013,
     # LDC2013T19). Mirrors config/settings.yaml exactly.
     # 9 GLiNER prompts -> 8 canonical types via GLINER_LABEL_MAP:
     #   person, organization, location, city, country, date, event,
     #   work of art, product.
     #
-    # ⚠ DO NOT change this list. It is the scientifically defensible label
-    # set across HotpotQA + 2WikiMultiHopQA + StrategyQA. Adding domain-
-    # specific types (state, landmark, album, film, movie, award, ...)
-    # breaks cross-dataset transfer and the reproducibility of the thesis.
+    # IMPORTANT: DO NOT change this list. It is the scientifically
+    # defensible label set across HotpotQA + 2WikiMultiHopQA + StrategyQA.
+    # Adding domain-specific types (state, landmark, album, film, movie,
+    # award, ...) breaks cross-dataset transfer and the reproducibility
+    # of the thesis.
     # The multi-prompt expansion (city + country alongside location) is a
     # recall optimisation, not a domain specialisation - all prompts map
     # to the same OntoNotes-5 canonical types in the graph.
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
     entity_types: List[str] = field(default_factory=lambda: [
         "person",
         "organization",
@@ -226,7 +250,7 @@ class ExtractionConfig:
     ner_confidence_threshold: float = 0.15   # recall-optimised; junk filtered downstream
     ner_batch_size: int = 16
 
-    # ── REBEL Relation Extraction ─────────────────────────────────────────────
+    # -- REBEL Relation Extraction ---------------------------------------------
     # Reference: Cabot & Navigli (2021). EMNLP 2021 Findings.
     rebel_model: str = "Babelscape/rebel-large"
     re_confidence_threshold: float = 0.5   # uniform sentinel — REBEL emits no per-triplet score
@@ -237,16 +261,16 @@ class ExtractionConfig:
     rebel_num_beams: int = 5               # beam search width
     device: str = "cpu"                    # "cuda" if GPU is available
 
-    # ── SpaCy fallback ────────────────────────────────────────────────────────
+    # -- SpaCy fallback --------------------------------------------------------
     spacy_fallback_model: str = "en_core_web_sm"
 
-    # ── Caching ───────────────────────────────────────────────────────────────
+    # -- Caching ---------------------------------------------------------------
     cache_enabled: bool = True
     cache_path: str = "./data/entity_cache.db"
     lru_cache_size: int = 10000
 
 
-# ── Entity Cache ───────────────────────────────────────────────────────────────
+# -- Entity Cache ---------------------------------------------------------------
 
 class EntityCache:
     """
@@ -506,7 +530,7 @@ class EntityCache:
         self.close()
 
 
-# ── Shared normalization (used by GLiNERExtractor AND hybrid_retriever) ────────
+# -- Shared normalization (used by GLiNERExtractor AND hybrid_retriever) --------
 
 # Types for which leading articles are grammatical, not part of the official name.
 _STRIP_ARTICLE_TYPES: frozenset = frozenset({"GPE", "LOCATION", "EVENT"})
@@ -544,7 +568,7 @@ def normalize_entity_name(name: str, entity_type: Optional[str] = None) -> str:
     return name
 
 
-# ── GLiNER NER Extractor ───────────────────────────────────────────────────────
+# -- GLiNER NER Extractor -------------------------------------------------------
 
 class GLiNERExtractor:
     """
@@ -762,7 +786,7 @@ class GLiNERExtractor:
                     entity_id=_generate_entity_id(ent.text, ent_type),
                     name=ent.text,
                     entity_type=ent_type,
-                    confidence=0.7,   # sentinel: supervised model, no per-span score
+                    confidence=_CONF_GLINER_SPACY_FALLBACK,
                     mention_span=(ent.start_char, ent.end_char),
                     source_chunk_id=chunk_id,
                 ))
@@ -785,14 +809,14 @@ class GLiNERExtractor:
                 entity_id=_generate_entity_id(match.group(1), "CONCEPT"),
                 name=match.group(1),
                 entity_type="CONCEPT",
-                confidence=0.5,   # sentinel: heuristic, not a model score
+                confidence=_CONF_GLINER_REGEX_FALLBACK,
                 mention_span=(match.start(), match.end()),
                 source_chunk_id=chunk_id,
             ))
         return results
 
 
-# ── REBEL Relation Extractor ───────────────────────────────────────────────────
+# -- REBEL Relation Extractor ---------------------------------------------------
 
 class REBELExtractor:
     """
@@ -825,6 +849,18 @@ class REBELExtractor:
         self.config = config
         self.model: Optional[Any] = None
         self.tokenizer: Optional[Any] = None
+        # re_batch_size is preserved in ExtractionConfig for settings.yaml
+        # compatibility but is currently a no-op: REBEL's variable-length
+        # seq2seq output does not support true input batching without
+        # additional padding logic. Warn loudly so a user who flips the
+        # setting expecting an effect does not get silent acceptance.
+        if config.re_batch_size != 1:
+            logger.warning(
+                "REBELExtractor: re_batch_size=%d requested but is a no-op in "
+                "this release; relation extraction is processed sequentially. "
+                "See REBELExtractor.extract_sequential() for the rationale.",
+                config.re_batch_size,
+            )
         self._load_model()
 
     def _load_model(self) -> None:
@@ -976,7 +1012,7 @@ class REBELExtractor:
         ]
 
 
-# ── Unified Extraction Pipeline ────────────────────────────────────────────────
+# -- Unified Extraction Pipeline ------------------------------------------------
 
 class EntityExtractionPipeline:
     """
@@ -1017,7 +1053,7 @@ class EntityExtractionPipeline:
         }
         logger.info("EntityExtractionPipeline initialized")
 
-    # ── Cache reconstruction ─────────────────────────────────────────────────
+    # -- Cache reconstruction -------------------------------------------------
 
     def _reconstruct_from_cache(
         self,
@@ -1036,7 +1072,7 @@ class EntityExtractionPipeline:
                 entity_id=e.get("entity_id", ""),
                 name=e.get("name", ""),
                 entity_type=e.get("entity_type", e.get("type", "CONCEPT")),
-                confidence=e.get("confidence", 0.5),
+                confidence=e.get("confidence", _CONF_CACHE_DEFAULT),
                 mention_span=tuple(e.get("mention_span", [0, 0])),
                 source_chunk_id=chunk_id,
             )
@@ -1047,14 +1083,14 @@ class EntityExtractionPipeline:
                 subject_entity=r.get("subject_entity", r.get("subject", "")),
                 relation_type=r.get("relation_type", r.get("relation", "")),
                 object_entity=r.get("object_entity", r.get("object", "")),
-                confidence=r.get("confidence", 0.5),
+                confidence=r.get("confidence", _CONF_CACHE_DEFAULT),
                 source_chunk_ids=[chunk_id],
             )
             for r in cached.get("relations", [])
         ]
         return entities, relations
 
-    # ── Public API ───────────────────────────────────────────────────────────
+    # -- Public API -----------------------------------------------------------
 
     def process_chunk(self, text: str, chunk_id: str) -> ChunkExtractionResult:
         """
@@ -1240,7 +1276,7 @@ class EntityExtractionPipeline:
         self.close()
 
 
-# ── Lightweight SpaCy-only Pipeline ───────────────────────────────────────────
+# -- Lightweight SpaCy-only Pipeline -------------------------------------------
 
 class SpacyEntityPipeline:
     """
@@ -1344,14 +1380,14 @@ class SpacyEntityPipeline:
                 entity_id=entity_id,
                 name=ent.text,
                 entity_type=ent_type,
-                confidence=0.8,   # sentinel: supervised model, no per-span score
+                confidence=_CONF_SPACY_LIGHT,
                 mention_span=(ent.start_char, ent.end_char),
                 source_chunk_id=chunk_id,
             ))
         return entities
 
 
-# ── Factory ────────────────────────────────────────────────────────────────────
+# -- Factory --------------------------------------------------------------------
 
 def create_extraction_pipeline(
     cfg: Optional[Dict[str, Any]] = None,
@@ -1435,7 +1471,7 @@ def create_extraction_pipeline(
     return EntityExtractionPipeline(config)
 
 
-# ── Smoke Demo + Test Runner ────────────────────────────────────────────────────
+# -- Smoke Demo + Test Runner ----------------------------------------------------
 
 def _main() -> None:
     """Smoke demo + test runner invoked when the module is run directly."""
@@ -1445,14 +1481,14 @@ def _main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    # ── 1. Smoke Demo ────────────────────────────────────────────────────────
+    # -- 1. Smoke Demo --------------------------------------------------------
     pipeline = create_extraction_pipeline(cache_enabled=False)
     demo_texts = [
         "Albert Einstein was born in Ulm, Germany in 1879.",
         "Microsoft was founded by Bill Gates and Paul Allen in Albuquerque.",
         "The Eiffel Tower is located in Paris, France.",
     ]
-    logger.info("── Entity Extraction Smoke Demo ──")
+    logger.info("-- Entity Extraction Smoke Demo --")
     for idx, demo_text in enumerate(demo_texts):
         demo_result = pipeline.process_chunk(demo_text, f"chunk_{idx}")
         logger.info(
@@ -1464,11 +1500,11 @@ def _main() -> None:
             logger.info("  %-30s [%-12s] conf=%.2f", ent.name, ent.entity_type, ent.confidence)
     pipeline.close()
 
-    # ── 2. Pytest Test Suite ─────────────────────────────────────────────────
+    # -- 2. Pytest Test Suite -------------------------------------------------
     # Runs the entity-related tests from test_data_layer.py so that
     # `python entity_extraction.py` serves as a self-contained verification.
     test_file = Path(__file__).parent / "test_data_layer.py"
-    logger.info("── Running pytest: %s ──", test_file)
+    logger.info("-- Running pytest: %s --", test_file)
     proc = subprocess.run(
         [sys.executable, "-X", "utf8", "-m", "pytest", str(test_file),
          "-v", "-k", "entity"],
